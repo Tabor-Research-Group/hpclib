@@ -112,7 +112,7 @@ sbatch --job-name=$job_name --open-mode=append --out="$SESSIONS_DIR/session-%j.l
 
 function stop_git_server() {
   if [ "$GIT_SERVER_JOB" != "" ]; then
-    kill $GIT_SERVER_JOB
+    kill $GIT_SERVER_JOB > /dev/null
     rm -f "$GIT_SOCKET_FILE"
   fi
 }
@@ -152,6 +152,6 @@ if [ "$SESSION_ID" = "" ]
       TUNNEL_ENV_FIlE="$SESSIONS_DIR/env-$SESSION_ID.sh"
       declare -px > "$TUNNEL_ENV_FIlE"
       connect_to_job -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $SESSION_ID "source $TUNNEL_ENV_FIlE; source $POST_SCRIPT"
-      scancel $SESSION_ID
-      cleanup
+#      scancel $SESSION_ID
+#      cleanup
 fi
