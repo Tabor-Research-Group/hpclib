@@ -120,8 +120,8 @@ function cancel_job() {
   scancel $SESSION_ID
 }
 function cleanup() {
+  scancel $SESSION_ID
   stop_git_server
-  cancel_job
 }
 
 # wait for job to start and connect to node
@@ -140,7 +140,7 @@ if [ "$SESSION_ID" = "" ]
         GIT_SERVER_JOB=$!
       fi
       
-      trap "cleanup" 0
+      trap "cleanup" 0 1 2 3
 
       if [ -f "$TUNNEL_DIR/preconnect.sh" ]; then
           source $TUNNEL_DIR/preconnect.sh
