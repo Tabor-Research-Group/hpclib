@@ -1,10 +1,8 @@
 #! /bin/bash
 
-# General setup, probably doesn't need to be changed
-. ~/bashrc
-module load WebProxy
-conda activate $CONDA_ENVIRONMENT
-python $HPCSERVERS_DIR/slurm_server.py &
+if [ -f "$TUNNEL_DIR/configure_job.sh"]; then
+  source $HPCTUNNELS_DIR/configure_job.sh
+fi
 
 # Load in user-specified configuration
 if [ -f "$TUNNEL_DIR/user.sh"]; then

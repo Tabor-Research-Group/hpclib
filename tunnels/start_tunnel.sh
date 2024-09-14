@@ -54,7 +54,9 @@ JOB_INITIALIZATION_PAUSE=5
 
 TUNNEL_NAME="$1"
 PROCESS_PORT=8080
+ENABLE_WEB_PROXY=true
 START_GIT_SERVER=true
+START_SLURM_SERVER=true
 TUNNEL_DIR=$HPCTUNNELS_DIR/$TUNNEL_NAME
 SESSIONS_DIR=$HPCSESSIONS_DIR/$TUNNEL_NAME
 SBATCH_SCRIPT=$TUNNEL_DIR/sbatch_script.sh
@@ -64,9 +66,8 @@ if [ ! -f "$TUNNEL_DIR/sbatch_script.sh" ]; then
   return 1
 fi
 
-if [ ! -f "$TUNNEL_DIR/tunnel_config.sh" ]; then
-  echo "Tunnel $TUNNEL_DIR doesn't exist"
-  return 1
+if [ -f "$TUNNEL_DIR/tunnel_config.sh" ]; then
+  source $TUNNEL_DIR/tunnel_config.sh
 fi
 
 
@@ -120,7 +121,7 @@ if [ "$job_id" = "" ]
 
       SESSION_FILE="$SESSIONS_DIR/session-$job_id.log"
 
-      if [ "START_GIT_SERVER" = "true" ]; then 
+      if [ "$START_GIT_SERVER" = "true" ]; then
         GIT_SOCKET_FILE="~/.gitsocket-$job_id"
         conda activate $CONDA_ENVIRONMENT
         python ./git_server.py &
