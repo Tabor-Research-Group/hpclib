@@ -9,6 +9,8 @@
 ##    - HPCSESSIONS_DIR: directory to use for session info
 ##
 
+set -a # make all variables accessible to sbatch process
+
 source ~/.bashrc
 if [ "$HPCLIB_DIR" = "" ]; then
   HPCLIB_DIR=~/hpclib
@@ -92,10 +94,14 @@ job_uuid=$(random_id)
 job_name="$TUNNEL_NAME-$job_uuid"
 
 # start sbatch script on correct port with given sbatch arg string
-port=$(mcoptvalue "P:" "P" $@)
-if [ "$port" = "" ];  then 
-    port=$DEFAULT_PORT
+HOST_PORT=$(mcoptvalue "P:" "P" $@)
+if [ "$HOST_PORT" = "" ];  then
+    HOST_PORT=$DEFAULT_PORT
 fi
+if [ "$PROCESS_PORT" = "" ]; then
+  PROCESS_PORT="$HOST_PORT"
+fi
+
 sbatch_args=$(mcargs "P:" $@)
 if [ "$sbatch_args" = "" ]; then
     sbatch_args="$DEFAULT_SBATCH_ARGS"
@@ -135,12 +141,8 @@ if [ "$job_id" = "" ]
       
       trap "cleanup" EXIT
 
-      if [ "$PROCESS_PORT" = "" ]; then
-        PROCESS_PORT="$port"
-      fi
-
       if [ -f "$TUNNEL_DIR/preconnect.sh" ]; then
           source $TUNNEL_DIR/preconnect.sh
       fi
-      connect_to_job -P $port:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $job_id "tail -f $SESSION_FILE"
+      connect_to_job -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $job_id "tail -f $SESSION_FILE"
 fi
