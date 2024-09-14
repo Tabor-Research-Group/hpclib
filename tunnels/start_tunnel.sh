@@ -150,5 +150,5 @@ if [ "$job_id" = "" ]
       if [ -f "POST_FILE" ]; then
           POST_SCRIPT="$HPCTUNNELS_DIR/postconnect.sh"
       fi
-      connect_to_job -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $job_id "$POST_SCRIPT"
+      connect_to_job -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $job_id "source $POST_SCRIPT"
 fi
