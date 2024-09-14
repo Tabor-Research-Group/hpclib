@@ -55,3 +55,5 @@ that `conda` is set up when loading the environment from `~/.bashrc`
 To configure that, one will either need to load a module that supplies conda in `~/.bashrc` or install something like
 `miniconda` in one's scratch directory
 
+** NGL **: this, like Jupyter, requires a package to be installed in the base conda environment, although this time it's `mdsrv` 
+from the people who make ngl
