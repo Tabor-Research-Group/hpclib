@@ -135,6 +135,7 @@ if [ "$job_id" = "" ]
       if [ "$START_GIT_SERVER" = "true" ]; then
         GIT_SOCKET_FILE="$SESSIONS_DIR/.gitsocket-$job_id"
         conda activate $CONDA_ENVIRONMENT
+        export GIT_SOCKET_FILE
         python "$HPCSERVERS_DIR/git_server.py" &
         GIT_SERVER_JOB=$!
       fi
@@ -144,5 +145,10 @@ if [ "$job_id" = "" ]
       if [ -f "$TUNNEL_DIR/preconnect.sh" ]; then
           source $TUNNEL_DIR/preconnect.sh
       fi
-      connect_to_job -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $job_id "tail -f $SESSION_FILE"
+      post_file="/tmp/postconnect-$TUNNEL_NAME-$job_id.sh"
+      if [ -f "$TUNNEL_DIR/postconnect.sh" ]; then
+          cp "$TUNNEL_DIR/postconnect.sh" "$post_file"
+      fi
+      connect_to_job -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $job_id \
+        "if [ -f $post_file ]; then source $post_file; fi; tail -f $SESSION_FILE"
 fi
