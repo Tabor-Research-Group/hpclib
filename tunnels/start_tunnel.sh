@@ -21,7 +21,7 @@ if [ "$HPCSERVERS_DIR" = "" ]; then
   HPCSERVERS_DIR="$HPCLIBDIR/servers"
 fi
 if [ "$HPCTUNNELS_DATA_DIR" = "" ]; then
-  $HPCTUNNELS_DATA_DIR=~/.tunnels
+  HPCTUNNELS_DATA_DIR=~/.tunnels
 fi
 if [ "$HPCSESSIONS_DIR" = "" ]; then
   HPCSESSIONS_DIR=$HPCTUNNELS_DATA_DIR/sessions
