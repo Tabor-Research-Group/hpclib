@@ -24,7 +24,7 @@ if [ "$HPCTUNNELS_DATA_DIR" = "" ]; then
   HPCTUNNELS_DATA_DIR=~/.tunnels
 fi
 if [ "$HPCSESSIONS_DIR" = "" ]; then
-  HPCSESSIONS_DIR=$HPCTUNNELS_DATA_DIR/sessions
+  HPCSESSIONS_DIR="$HPCTUNNELS_DATA_DIR/sessions"
 fi
 
 ################################################################################
@@ -44,8 +44,8 @@ JOB_CONNECT_RETRIES=60
 JOB_CONNECT_RETRY_WAIT_TIME=1
 JOB_INITIALIZATION_PAUSE=5
 
-if [ -f $HPCTUNNELS_DATA_DIR/config.sh ]; then
-  source $HPCTUNNELS_DATA_DIR/config.sh
+if [ -f "$HPCTUNNELS_DATA_DIR/config.sh" ]; then
+  source "$HPCTUNNELS_DATA_DIR/config.sh"
 fi
 
 ################################################################################
@@ -74,7 +74,7 @@ if [ ! -f "$TUNNEL_DIR/sbatch_script.sh" ]; then
 fi
 
 if [ -f "$TUNNEL_DIR/tunnel_config.sh" ]; then
-  source $TUNNEL_DIR/tunnel_config.sh
+  source "$TUNNEL_DIR/tunnel_config.sh"
 fi
 
 
@@ -101,13 +101,13 @@ if [ "$sbatch_args" = "" ]; then
     sbatch_args="$DEFAULT_SBATCH_ARGS"
 fi
 
-mkdir -p $SESSIONS_DIR
-sbatch --job-name=$job_name --out="$SESSIONS_DIR/session-%j.log" --export=ALL $sbatch_args $SBATCH_SCRIPT
+mkdir -p "$SESSIONS_DIR"
+sbatch --job-name=$job_name --out="$SESSIONS_DIR/session-%j.log" --export=ALL $sbatch_args "$SBATCH_SCRIPT"
 
 function stop_git_server() {
   if [ "$GIT_SERVER_JOB" != "" ]; then
     kill $GIT_SERVER_JOB
-    rm -f $GIT_SOCKET_FILE
+    rm -f "$GIT_SOCKET_FILE"
   fi
 }
 function cancel_job() {
@@ -129,7 +129,7 @@ if [ "$job_id" = "" ]
       if [ "$START_GIT_SERVER" = "true" ]; then
         GIT_SOCKET_FILE="$SESSIONS_DIR/.gitsocket-$job_id"
         conda activate $CONDA_ENVIRONMENT
-        python $HPCSERVERS_DIR/git_server.py &
+        python "$HPCSERVERS_DIR/git_server.py" &
         GIT_SERVER_JOB=$!
       fi
       
@@ -139,7 +139,7 @@ if [ "$job_id" = "" ]
         PROCESS_PORT="$port"
       fi
 
-      if [ -f "$TUNNEL_DIR/preconnect.sh"]; then
+      if [ -f "$TUNNEL_DIR/preconnect.sh" ]; then
           source $TUNNEL_DIR/preconnect.sh
       fi
       connect_to_job -P $port:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $job_id "tail -f $SESSION_FILE"
