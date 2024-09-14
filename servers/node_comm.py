@@ -8,6 +8,8 @@ import socket, socketserver, json, traceback, subprocess
 import sys
 
 __all__ = [
+    "NodeCommTCPServer",
+    "NodeCommUnixServer",
     "NodeCommHandler",
     "NodeCommClient"
 ]
@@ -17,20 +19,37 @@ def infer_mode(connection):
             isinstance(connection, tuple)
             and isinstance(connection[0], str) and isinstance(connection[1], int)
     ):
-        mode = "IP"
+        mode = "TCP"
     elif isinstance(connection, str):
         mode = "Unix"
     else:
         raise ValueError(f"invalid connection spec {connection}")
     return mode
 
+class NodeCommTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+class NodeCommUnixServer(socketserver.UnixStreamServer):
+    allow_reuse_address = True
+
+    def server_bind(self):
+        """Called by constructor to bind the socket.
+
+        May be overridden.
+
+        """
+        
+        if self.allow_reuse_address:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind(self.server_address)
+        self.server_address = self.socket.getsockname()
+        print(f"Connected on {self.server_address}")
+
 class NodeCommClient:
     def __init__(self, connection, timeout=10):
-        self.host = host
-        self.port = port
         self.conn = connection
         mode = infer_mode(connection)
-        if mode == "IP":
+        if mode == "TCP":
             self.mode = socket.AF_INET
         elif mode == "Unix":
             self.mode = socket.AF_UNIX
@@ -47,6 +66,10 @@ class NodeCommClient:
         request = request.encode()
 
         # Create a socket (SOCK_STREAM means a TCP socket)
+        mode = infer_mode(self.conn)
+        # print(f"Sending request over {mode}")
+        if mode == "Unix" and not os.path.exists(self.conn):
+            raise ValueError(f"socket file {self.conn} doesn't exist")
         with socket.socket(self.mode, socket.SOCK_STREAM) as sock:
             # Connect to server and send data
             sock.connect(self.conn)
@@ -143,6 +166,8 @@ class NodeCommHandler(socketserver.StreamRequestHandler):
     def get_methods(self) -> 'dict[str,method]':
         ...
 
+    TCP_SERVER = NodeCommTCPServer
+    UNIX_SERVER = NodeCommUnixServer
     DEFAULT_CONNECTION = ("localhost", 9999)
     @classmethod
     def start_server(cls, connection=None):
@@ -150,16 +175,22 @@ class NodeCommHandler(socketserver.StreamRequestHandler):
         if connection is None:
             connection = cls.DEFAULT_CONNECTION
         mode = infer_mode(connection)
-        if mode == "IP":
-            server_type = socketserver.TCPServer
+        print(f"Starting server at {connection} over {mode}")
+        if mode == "TCP":
+            server_type = cls.TCP_SERVER
         elif mode == "Unix":
-            server_type = socketserver.UnixStreamServer
+            server_type = cls.UNIX_SERVER
         else:
             raise NotImplementedError(mode)
-        with server_type(mode, cls) as server:
+        with server_type(connection, cls) as server:
             # Activate the server; this will keep running until you
             # interrupt the program with Ctrl-C
             server.serve_forever()
+            if mode == "Unix":
+                try:
+                    os.remove(connection)
+                except OSError:
+                    ...
 
     client_class = NodeCommClient
     @classmethod
