@@ -1,0 +1,1 @@
+cat ~/.config/code-server/config.yaml >> $SESSION_FILE
