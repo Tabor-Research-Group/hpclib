@@ -11,23 +11,25 @@
 
 source ~/.bashrc
 if [ "$HPCLIB_DIR" = "" ]; then
-  HPCLIB_DIR="~/hpclib"
+  HPCLIB_DIR=~/hpclib
 fi
-
 source $HPCLIB_DIR/hpclib.sh
 if [ "$HPCTUNNELS_DIR" = "" ]; then
   HPCTUNNELS_DIR="$HPCLIBDIR/tunnels"
 fi
 if [ "$HPCSERVERS_DIR" = "" ]; then
-  HPCSERVERS_DIR="$HPCSERVERS_DIR/servers"
+  HPCSERVERS_DIR="$HPCLIBDIR/servers"
+fi
+if [ "$HPCTUNNELS_DATA_DIR" = "" ]; then
+  $HPCTUNNELS_DATA_DIR=~/.tunnels
 fi
 if [ "$HPCSESSIONS_DIR" = "" ]; then
-  HPCSESSIONS_DIR="~/.tunnels/sessions"
+  HPCSESSIONS_DIR=$HPCTUNNELS_DATA_DIR/sessions
 fi
 
 ################################################################################
 ##
-##  Configure user specific defaults
+##  Configure user specific defaults (edit in ~/.tunnels/config.sh)
 ##    - port: which port to expose
 ##    - conda environment: which python/git is used
 ##    - sbatch args: job config
@@ -36,15 +38,19 @@ fi
 ##
 
 DEFAULT_PORT=8080
-CONDA_ENVIRONMENT="default"
+CONDA_ENVIRONMENT="base"
 DEFAULT_SBATCH_ARGS="--time=0-8:00:00 --mem=1gb --ntasks=1"
 JOB_CONNECT_RETRIES=60
 JOB_CONNECT_RETRY_WAIT_TIME=1
 JOB_INITIALIZATION_PAUSE=5
 
+if [ -f $HPCTUNNELS_DATA_DIR/config.sh ]; then
+  source $HPCTUNNELS_DATA_DIR/config.sh
+fi
+
 ################################################################################
 ##
-##  Configure tunel settings
+##  Configure tunel settings (edit in TUNNEL_NAME/tunnel_config.sh)
 ##    - TUNNEL_NAME: the name of the specific tunnel being built
 ##    - START_GIT_SERVER: whether or not to start a server to run git via ssh
 ##    - TUNNEL_DIR: where to find the tunnel config
@@ -63,7 +69,7 @@ SBATCH_SCRIPT=$TUNNEL_DIR/sbatch_script.sh
 
 if [ ! -f "$TUNNEL_DIR/sbatch_script.sh" ]; then
   echo "Tunnel $TUNNEL_DIR doesn't exist"
-  return 1
+  exit 1
 fi
 
 if [ -f "$TUNNEL_DIR/tunnel_config.sh" ]; then
@@ -94,9 +100,7 @@ if [ "$sbatch_args" = "" ]; then
     sbatch_args="$DEFAULT_SBATCH_ARGS"
 fi
 
-
 mkdir -p $SESSIONS_DIR
-$CONFIG_DIR
 sbatch --job-name=$job_name --out="$SESSIONS_DIR/session-%j.log" --export=ALL $sbatch_args $SBATCH_SCRIPT
 
 function stop_git_server() {
@@ -122,9 +126,9 @@ if [ "$job_id" = "" ]
       SESSION_FILE="$SESSIONS_DIR/session-$job_id.log"
 
       if [ "$START_GIT_SERVER" = "true" ]; then
-        GIT_SOCKET_FILE="~/.gitsocket-$job_id"
+        GIT_SOCKET_FILE="$SESSIONS_DIR/.gitsocket-$job_id"
         conda activate $CONDA_ENVIRONMENT
-        python ./git_server.py &
+        python $HPCSERVERS_DIR/git_server.py &
         GIT_SERVER_JOB=$!
       fi
       
