@@ -117,7 +117,7 @@ function stop_git_server() {
   fi
 }
 function cancel_job() {
-  scancel $job_id
+  scancel $SESSION_ID
 }
 function cleanup() {
   stop_git_server
@@ -125,17 +125,17 @@ function cleanup() {
 }
 
 # wait for job to start and connect to node
-job_id=$(get_job_id_by_name $job_name)
-if [ "$job_id" = "" ]
+SESSION_ID=$(get_job_id_by_name $job_name)
+if [ "$SESSION_ID" = "" ]
     then echo "Job seems to have failed to start, check 'squeue -u <username>' to make sure this is the case"
     else
 
-      SESSION_FILE="$SESSIONS_DIR/session-$job_id.log"
+      SESSION_FILE="$SESSIONS_DIR/session-$SESSION_ID.log"
 
       if [ "$START_GIT_SERVER" = "true" ]; then
-        export GIT_SOCKET_FILE="$SESSIONS_DIR/.gitsocket-$job_id"
+        export GIT_SOCKET_FILE="$SESSIONS_DIR/.gitsocket-$SESSION_ID"
         conda activate $CONDA_ENVIRONMENT
-        export GIT_SOCKET_FILE="$SESSIONS_DIR/.gitsocket-$job_id"
+        export GIT_SOCKET_FILE="$SESSIONS_DIR/.gitsocket-$SESSION_ID"
         python "$HPCSERVERS_DIR/git_server.py" &
         GIT_SERVER_JOB=$!
       fi
@@ -150,9 +150,9 @@ if [ "$job_id" = "" ]
       if [ -f "POST_FILE" ]; then
           POST_SCRIPT="$HPCTUNNELS_DIR/postconnect.sh"
       fi
-      TUNNEL_ENV_FIlE="$SESSIONS_DIR/env-$job_id.sh"
+      TUNNEL_ENV_FIlE="$SESSIONS_DIR/env-$SESSION_ID.sh"
       declare -px > "$TUNNEL_ENV_FIlE"
-      connect_to_job -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $job_id "source $TUNNEL_ENV_FIlE; source $POST_SCRIPT"
-      scancel $job_id
+      connect_to_job -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $SESSION_ID "source $TUNNEL_ENV_FIlE; source $POST_SCRIPT"
+      scancel $SESSION_ID
       cleanup
 fi
