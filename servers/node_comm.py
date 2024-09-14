@@ -75,7 +75,9 @@ class NodeCommClient:
             sock.settimeout(self.timeout)
             sock.sendall(request)
             # Receive data from the server and shut down
-            body = sock.recv(1024)
+            body = b''
+            while b'\n' not in body:
+                body = body + sock.recv(1024)
 
         response = json.loads(body.strip().decode())
         msg = response.get("stdout","")
@@ -99,7 +101,7 @@ class NodeCommHandler(socketserver.StreamRequestHandler):
                 "stderr": traceback.format_exc(limit=1)
             }
         try:
-            self.wfile.write(json.dumps(response).encode())
+            self.wfile.write(json.dumps(response).encode() + b'\n')
         except:
             traceback.print_exc(limit=1)  # big ol' fallback
 
