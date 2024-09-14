@@ -140,7 +140,7 @@ if [ "$job_id" = "" ]
         GIT_SERVER_JOB=$!
       fi
       
-      trap "cleanup" EXIT
+      trap "cleanup" 0
 
       if [ -f "$TUNNEL_DIR/preconnect.sh" ]; then
           source $TUNNEL_DIR/preconnect.sh
