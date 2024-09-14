@@ -133,9 +133,8 @@ if [ "$SESSION_ID" = "" ]
       SESSION_FILE="$SESSIONS_DIR/session-$SESSION_ID.log"
 
       if [ "$START_GIT_SERVER" = "true" ]; then
-        export GIT_SOCKET_FILE="$SESSIONS_DIR/.gitsocket-$SESSION_ID"
+        export GIT_SOCKET_HOST=$(hostname)
         conda activate $CONDA_ENVIRONMENT
-        export GIT_SOCKET_FILE="$SESSIONS_DIR/.gitsocket-$SESSION_ID"
         python "$HPCSERVERS_DIR/git_server.py" &
         GIT_SERVER_JOB=$!
       fi
