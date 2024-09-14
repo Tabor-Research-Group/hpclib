@@ -12,5 +12,5 @@ fi
 
 # Run VS Code container with singularity on default port
 mkdir -p /scratch/user/$VSCODE_USER/.config
-singularity run $VSCODE_CONTAINER
+singularity run --env-file="$TUNNEL_ENV_FIlE" $VSCODE_CONTAINER
 echo "Exited singularity"

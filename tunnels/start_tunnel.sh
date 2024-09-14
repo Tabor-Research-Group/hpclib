@@ -150,6 +150,7 @@ if [ "$job_id" = "" ]
       if [ -f "POST_FILE" ]; then
           POST_SCRIPT="$HPCTUNNELS_DIR/postconnect.sh"
       fi
-      declare -px > "$SESSIONS_DIR/env-$job_id.sh"
-      connect_to_job -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $job_id "source $SESSIONS_DIR/env-$job_id.sh; source $POST_SCRIPT"
+      TUNNEL_ENV_FIlE="$SESSIONS_DIR/env-$job_id.sh"
+      declare -px > "$TUNNEL_ENV_FIlE"
+      connect_to_job -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $job_id "source $TUNNEL_ENV_FIlE; source $POST_SCRIPT"
 fi
