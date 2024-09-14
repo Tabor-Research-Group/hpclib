@@ -108,7 +108,7 @@ if [ "$sbatch_args" = "" ]; then
 fi
 
 mkdir -p "$SESSIONS_DIR"
-sbatch --job-name=$job_name --out="$SESSIONS_DIR/session-%j.log" --export=ALL $sbatch_args "$SBATCH_SCRIPT"
+sbatch --job-name=$job_name --open-mode=append --out="$SESSIONS_DIR/session-%j.log" --export=ALL $sbatch_args "$SBATCH_SCRIPT"
 
 function stop_git_server() {
   if [ "$GIT_SERVER_JOB" != "" ]; then
@@ -144,11 +144,11 @@ if [ "$job_id" = "" ]
 
       if [ -f "$TUNNEL_DIR/preconnect.sh" ]; then
           source $TUNNEL_DIR/preconnect.sh
+        fi
+
+      POST_SCRIPT="$TUNNEL_DIR/postconnect.sh"
+      if [ -f "POST_FILE" ]; then
+          POST_SCRIPT="$HPCTUNNELS_DIR/postconnect.sh"
       fi
-      post_file="/tmp/postconnect-$TUNNEL_NAME-$job_id.sh"
-      if [ -f "$TUNNEL_DIR/postconnect.sh" ]; then
-          cp "$TUNNEL_DIR/postconnect.sh" "$post_file"
-      fi
-      connect_to_job -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $job_id \
-        "if [ -f $post_file ]; then source $post_file; fi; tail -f $SESSION_FILE"
+      connect_to_job -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $job_id "$POST_SCRIPT"
 fi
