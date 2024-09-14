@@ -43,7 +43,6 @@ class NodeCommUnixServer(socketserver.UnixStreamServer):
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.bind(self.server_address)
         self.server_address = self.socket.getsockname()
-        print(f"Connected on {self.server_address}")
 
 class NodeCommClient:
     def __init__(self, connection, timeout=10):
@@ -76,7 +75,9 @@ class NodeCommClient:
             sock.settimeout(self.timeout)
             sock.sendall(request)
             # Receive data from the server and shut down
-            body = sock.recv(1024)
+            body = b''
+            while b'\n' not in body:
+                body = body + sock.recv(1024)
 
         response = json.loads(body.strip().decode())
         msg = response.get("stdout","")
@@ -100,7 +101,7 @@ class NodeCommHandler(socketserver.StreamRequestHandler):
                 "stderr": traceback.format_exc(limit=1)
             }
         try:
-            self.wfile.write(json.dumps(response).encode())
+            self.wfile.write(json.dumps(response).encode() + b'\n')
         except:
             traceback.print_exc(limit=1)  # big ol' fallback
 
@@ -121,6 +122,27 @@ class NodeCommHandler(socketserver.StreamRequestHandler):
 
         return response
 
+    @property
+    def method_dispatch(self): 
+        return dict(
+            {
+                "cd": self.change_pwd,
+                "pwd": self.get_pwd
+            },
+            **self.get_methods()
+        )
+    def change_pwd(self, args):
+        os.chdir(args[0])
+        return {
+            'stdout':"",
+            'stderr':""
+        }
+    def get_pwd(self, args):
+        cwd = os.getcwd()
+        return {
+            'stdout':cwd,
+            'stderr':""
+        }
     def dispatch_request(self, request: dict):
         method = request.get("command", None)
         if method is None:

@@ -23,4 +23,4 @@ if __name__ == "__main__":
     if len(sys.argv) == 1:
         SLURMHandler.start_server()
     else:
-        SLURMHandler.client_request(sys.argv[1], sys.argv[1:])
+        SLURMHandler.client_request(sys.argv[1], sys.argv[2:])
