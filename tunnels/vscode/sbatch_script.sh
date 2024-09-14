@@ -13,7 +13,7 @@ fi
 # Run VS Code container with singularity on default port
 set -a
 mkdir -p /scratch/user/$VSCODE_USER/.config
-echo "Loading environment from $TUNNEL_ENV_FIlE"
-source $TUNNEL_ENV_FIlE
+echo "In VS Code terminals, start by running `source $TUNNEL_ENV_FIlE`"
+echo "If necessary, to load the same conda env, use `conda activate $CONDA_ENVIRONMENT`"
 singularity run $VSCODE_CONTAINER
 echo "Exited singularity"
