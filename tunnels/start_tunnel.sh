@@ -15,10 +15,10 @@ if [ "$HPCLIB_DIR" = "" ]; then
 fi
 source $HPCLIB_DIR/hpclib.sh
 if [ "$HPCTUNNELS_DIR" = "" ]; then
-  HPCTUNNELS_DIR="$HPCLIBDIR/tunnels"
+  HPCTUNNELS_DIR="$HPCLIB_DIR/tunnels"
 fi
 if [ "$HPCSERVERS_DIR" = "" ]; then
-  HPCSERVERS_DIR="$HPCLIBDIR/servers"
+  HPCSERVERS_DIR="$HPCLIB_DIR/servers"
 fi
 if [ "$HPCTUNNELS_DATA_DIR" = "" ]; then
   HPCTUNNELS_DATA_DIR=~/.tunnels
