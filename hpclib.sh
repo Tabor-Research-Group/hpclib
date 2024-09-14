@@ -219,6 +219,20 @@ function fwd_spec {
     echo "$addr:$port:$target_addr:$target_port"
 }
 
+function multi_fwd_spec {
+  local type=$1;
+  local forwarding=$2;
+  local fwd;
+  local ssh_args;
+
+  forwarding_specs=($(echo "$forwarding" | tr "," " "))
+  for fwd in ${forwarding_specs[@]}; do
+    fwd=$(fwd_spec $fwd)
+    ssh_args=$(_build_argstr "$ssh_args" "-$type $fwd")
+  done
+
+  echo "$ssh_args";
+}
 
 CONNECT_TO_JOB_OPTS="fnS:R:P:I:"
 function connect_to_job {
@@ -233,10 +247,7 @@ function connect_to_job {
 
   forwarding=$(mcoptvalue "$CONNECT_TO_JOB_OPTS" "P" $@)
   if [ "$forwarding" != "" ]; then
-    forwarding_specs=($(echo "$host" | tr "," " "))
-    for fwd in ${forwarding_specs[@]}; do
-      fwd=$(fwd_spec $fwd)
-      ssh_args=$(_build_argstr "$ssh_args" "-L $fwd")
+    ssh_args=$(multi_fwd_spec "L" "$forwarding")
   fi
 
   job_id=($(mcargs "$CONNECT_TO_JOB_OPTS" $@))
