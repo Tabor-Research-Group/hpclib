@@ -11,6 +11,9 @@ if [ -f "$TUNNEL_DIR/user.sh" ]; then
 fi
 
 # Run VS Code container with singularity on default port
+set -a
 mkdir -p /scratch/user/$VSCODE_USER/.config
-singularity run --env-file="$TUNNEL_ENV_FIlE" $VSCODE_CONTAINER
+echo "Loading environment from $TUNNEL_ENV_FIlE"
+source $TUNNEL_ENV_FIlE
+singularity run $VSCODE_CONTAINER
 echo "Exited singularity"
