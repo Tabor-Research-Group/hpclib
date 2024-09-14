@@ -153,4 +153,5 @@ if [ "$job_id" = "" ]
       TUNNEL_ENV_FIlE="$SESSIONS_DIR/env-$job_id.sh"
       declare -px > "$TUNNEL_ENV_FIlE"
       connect_to_job -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $job_id "source $TUNNEL_ENV_FIlE; source $POST_SCRIPT"
+      cancel_job
 fi
