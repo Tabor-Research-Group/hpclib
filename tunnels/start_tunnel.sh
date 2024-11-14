@@ -146,7 +146,7 @@ if [ "$SESSION_ID" = "" ]
         fi
 
       POST_SCRIPT="$TUNNEL_DIR/postconnect.sh"
-      if [ -f "POST_FILE" ]; then
+      if [ ! -f "$POST_SCRIPT" ]; then
           POST_SCRIPT="$HPCTUNNELS_DIR/postconnect.sh"
       fi
       TUNNEL_ENV_FIlE="$SESSIONS_DIR/env-$SESSION_ID.sh"
