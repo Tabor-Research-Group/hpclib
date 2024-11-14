@@ -1,6 +1,6 @@
 #! /bin/bash
 
-. ~/bashrc
+. ~/.bashrc
 
 if [ "$ENABLE_WEB_PROXY" = "true" ]; then
   module load WebProxy

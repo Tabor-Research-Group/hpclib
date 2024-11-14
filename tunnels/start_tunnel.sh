@@ -23,7 +23,7 @@ if [ "$HPCSERVERS_DIR" = "" ]; then
   HPCSERVERS_DIR="$HPCLIB_DIR/servers"
 fi
 if [ "$HPCTUNNELS_DATA_DIR" = "" ]; then
-  HPCTUNNELS_DATA_DIR=~/.tunnels
+  HPCTUNNELS_DATA_DIR=~/.local/tunnels
 fi
 if [ "$HPCSESSIONS_DIR" = "" ]; then
   HPCSESSIONS_DIR="$HPCTUNNELS_DATA_DIR/sessions"
@@ -31,7 +31,7 @@ fi
 
 ################################################################################
 ##
-##  Configure user specific defaults (edit in ~/.tunnels/config.sh)
+##  Configure user specific defaults (edit in ~/.local/tunnels/config.sh)
 ##    - port: which port to expose
 ##    - conda environment: which python/git is used
 ##    - sbatch args: job config
@@ -40,7 +40,7 @@ fi
 ##
 
 DEFAULT_PORT=8080
-CONDA_ENVIRONMENT="base"
+CONDA_ENVIRONMENT="default"
 DEFAULT_SBATCH_ARGS="--time=0-8:00:00 --mem=1gb --ntasks=1"
 JOB_CONNECT_RETRIES=60
 JOB_CONNECT_RETRY_WAIT_TIME=1
@@ -146,7 +146,7 @@ if [ "$SESSION_ID" = "" ]
         fi
 
       POST_SCRIPT="$TUNNEL_DIR/postconnect.sh"
-      if [ -f "POST_FILE" ]; then
+      if [ ! -f "POST_FILE" ]; then
           POST_SCRIPT="$HPCTUNNELS_DIR/postconnect.sh"
       fi
       TUNNEL_ENV_FIlE="$SESSIONS_DIR/env-$SESSION_ID.sh"

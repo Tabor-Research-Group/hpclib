@@ -32,7 +32,10 @@ if __name__ == "__main__":
     # GitHandler.DEFAULT_CONNECTION = os.environ.get("GIT_SOCKET_FILE", GitHandler.DEFAULT_CONNECTION)
     if len(sys.argv) == 1:
         GitHandler.DEFAULT_CONNECTION = ('', git_port)
-        GitHandler.start_server()
+        try:
+            GitHandler.start_server()
+        except OSError: # server exists
+            pass
     else:
         git_host = os.environ.get("GIT_SOCKET_HOST")
         GitHandler.DEFAULT_CONNECTION = (git_host, git_port)

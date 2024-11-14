@@ -10,5 +10,7 @@ if [ -f "$TUNNEL_DIR/user.sh" ]; then
     source $TUNNEL_DIR/user.sh
 fi
 
+echo "Launching Jupyter on $PROCESS_PORT"
 # Run JupyterLab on specified port
-jupyter lab --port=$PROCESS_PORT --no-browser
+
+jupyter lab --port=$PROCESS_PORT --notebook-dir="/" --no-browser

@@ -1,4 +1,4 @@
 #! /bin/bash
 
-tail -f $1
+tail -f $SESSION_FILE
 scancel $SESSION_ID
