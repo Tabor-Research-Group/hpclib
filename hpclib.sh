@@ -137,6 +137,65 @@ function get_job_node {
   echo "$job_str"
 }
 
+function _ssh_connected {
+  local ret;
+
+  ssh -o "ControlPath=$1" -O check ":)" 2> /tmp/ssh_doop_doop
+  ret=$(cat /tmp/ssh_doop_doop)
+  rm /tmp/ssh_doop_doop
+  if [[ "$ret" == "Master running"* ]]
+    then
+      echo "true"
+    else
+      echo "false"
+  fi
+
+}
+
+SSH_FLAGS="46AaCfgKkMNnqPRTtVvXxYy:b:c:D:E:e:F:f:i:I:J:L:l:m:O:o:p:Q:S:W:w:";
+function _ssh_like {
+  local cmd="$1";
+  local args;
+  local server;
+  local base_opts;
+  local conn_opt;
+  local socket;
+  local exists;
+  local connected;
+  local restart;
+  shift
+
+  base_opts=$(mcopts "$SSH_FLAGS" "o|R" $@);
+  conn_opt=$(mcoptvalue "$SSH_FLAGS" "o" $@);
+  restart=$(mcoptvalue "$SSH_FLAGS" "R" $@);
+  args=($(mcargs "$SSH_FLAGS" $@));
+  server=${args[0]}
+  servername=${server#*@}
+
+  SOCKET_DIR=~/.ssh/connections
+  mkdir -p $SOCKET_DIR
+  socket="$SOCKET_DIR/$servername"
+  if [ "$restart" ]; then
+    rm "$socket" 2> /dev/null
+  fi
+  connected=$(_ssh_connected "$socket")
+  conn_opt=$(_build_argstr "$conn_opt" "ControlPath=$socket")
+
+  if [[ "$connected" == "false" ]]; then
+    ssh -M -f -N $base_opts -o $conn_opt $server
+  fi
+
+  $cmd $base_opts -o $conn_opt ${args[@]}
+
+}
+
+function pssh {
+  _ssh_like ssh $@
+}
+function psftp {
+  _ssh_like sftp $@
+}
+
 DEFAULT_WAIT_FOR_JOB_RETRIES=5
 DEFAULT_WAIT_FOR_JOB_PAUSE=1
 WAIT_FOR_JOB_NODE_OPTS="S:R:"
