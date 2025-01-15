@@ -170,10 +170,11 @@ function _ssh_like {
   restart=$(mcoptvalue "$SSH_FLAGS" "R" $@);
   args=($(mcargs "$SSH_FLAGS" $@));
   server=${args[0]}
+  server=${server%:*}
   servername=${server#*@}
 
   SOCKET_DIR=~/.ssh/connections
-  mkdir -p $SOCKET_DIR
+  mkdir -p $SOCKET_DIR 
   socket="$SOCKET_DIR/$servername"
   if [ "$restart" ]; then
     rm "$socket" 2> /dev/null
@@ -189,11 +190,94 @@ function _ssh_like {
 
 }
 
+SCP_FLAGS="UEZ:u:s:346BCpqrvF:i:l:o:P:S:R:";
+function _scp_like {
+  local cmd="$1";
+  local args;
+  local server;
+  local base_opts;
+  local conn_opt;
+  local socket;
+  local exists;
+  local connected;
+  local restart;
+  shift
+
+  base_opts=$(mcopts "$SCP_FLAGS" "o|R" $@);
+  conn_opt=$(mcoptvalue "$SCP_FLAGS" "o" $@);
+  restart=$(mcoptvalue "$SCP_FLAGS" "R" $@);
+  args=($(mcargs "$SCP_FLAGS" $@));
+  server=${args[1]}
+  server=${server%:*}
+  servername=${server#*@}
+
+  SOCKET_DIR=~/.ssh/connections
+  mkdir -p $SOCKET_DIR 
+  socket="$SOCKET_DIR/$servername"
+  if [ "$restart" ]; then
+    rm "$socket" 2> /dev/null
+  fi
+  connected=$(_ssh_connected "$socket")
+  conn_opt=$(_build_argstr "$conn_opt" "ControlPath=$socket")
+
+  if [[ "$connected" == "false" ]]; then
+    ssh -M -f -N -o $conn_opt $server
+  fi
+
+  # echo "$cmd $base_opts -o $conn_opt ${args[@]}"
+  $cmd $base_opts -o $conn_opt ${args[@]}
+
+}
+
+RSYNC_FLAGS="rlptgDaqbudLkKHEAXsF:f:o:R:";
+function _rsync_like {
+  local cmd="$1";
+  local args;
+  local server;
+  local base_opts;
+  local conn_opt;
+  local socket;
+  local exists;
+  local connected;
+  local restart;
+  shift
+
+  base_opts=$(mcopts "$RSYNC_FLAGS" "o|R" $@);
+  conn_opt=$(mcoptvalue "$RSYNC_FLAGS" "o" $@);
+  restart=$(mcoptvalue "$RSYNC_FLAGS" "R" $@);
+  args=($(mcargs "$RSYNC_FLAGS" $@));
+  server=${args[1]}
+  server=${server%:*}
+  servername=${server#*@}
+
+  SOCKET_DIR=~/.ssh/connections
+  mkdir -p $SOCKET_DIR 
+  socket="$SOCKET_DIR/$servername"
+  if [ "$restart" ]; then
+    rm "$socket" 2> /dev/null
+  fi
+  connected=$(_ssh_connected "$socket")
+  conn_opt=$(_build_argstr "$conn_opt" "ControlPath=$socket")
+
+  if [[ "$connected" == "false" ]]; then
+    ssh -M -f -N -o $conn_opt $server
+  fi
+
+  $cmd $base_opts -e "ssh -o '$conn_opt'" ${args[@]}
+
+}
+
 function pssh {
   _ssh_like ssh $@
 }
+function pscp {
+  _scp_like scp $@
+}
 function psftp {
   _ssh_like sftp $@
+}
+function psync {
+  _rsync_like rsync $@
 }
 
 DEFAULT_WAIT_FOR_JOB_RETRIES=5
