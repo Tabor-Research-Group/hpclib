@@ -179,14 +179,17 @@ function _ssh_like {
   if [ "$restart" ]; then
     rm "$socket" 2> /dev/null
   fi
-  connected=$(_ssh_connected "$socket")
-  conn_opt=$(_build_argstr "$conn_opt" "ControlPath=$socket")
+  # connected=$(_ssh_connected "$socket")
+  conn_opt=$(_build_argstr "$conn_opt" "ControlMaster=auto")
+  # conn_opt=$(_build_argstr "$conn_opt" "ControlPersist=4h")
+  # conn_opt=$(_build_argstr "$conn_opt" "ControlPath=$socket")
 
-  if [[ "$connected" == "false" ]]; then
-    ssh -M -f -N $base_opts -o $conn_opt $server
-  fi
+  # if [[ "$connected" == "false" ]]; then
+  #   ssh -M -f -N $base_opts -o $conn_opt $server
+  # fi
 
-  $cmd $base_opts -o $conn_opt ${args[@]}
+  # echo "$cmd $base_opts -o $conn_opt ${args[@]}"
+  $cmd $base_opts -o "$conn_opt" -o 'ControlMaster=auto' -o 'ControlPersist=4h' ${args[@]}
 
 }
 
@@ -217,15 +220,17 @@ function _scp_like {
   if [ "$restart" ]; then
     rm "$socket" 2> /dev/null
   fi
-  connected=$(_ssh_connected "$socket")
+  # connected=$(_ssh_connected "$socket")
   conn_opt=$(_build_argstr "$conn_opt" "ControlPath=$socket")
+  # conn_opt=$(_build_argstr "$conn_opt" "ControlMaster=auto")
+  # conn_opt=$(_build_argstr "$conn_opt" "ControlPersist=4h")
 
-  if [[ "$connected" == "false" ]]; then
-    ssh -M -f -N -o $conn_opt $server
-  fi
+  # if [[ "$connected" == "false" ]]; then
+  #   ssh -M -f -N -o $conn_opt $server
+  # fi
 
   # echo "$cmd $base_opts -o $conn_opt ${args[@]}"
-  $cmd $base_opts -o $conn_opt ${args[@]}
+  $cmd $base_opts -o "$conn_opt" -o 'ControlMaster=auto' -o 'ControlPersist=4h' ${args[@]}
 
 }
 
@@ -256,14 +261,16 @@ function _rsync_like {
   if [ "$restart" ]; then
     rm "$socket" 2> /dev/null
   fi
-  connected=$(_ssh_connected "$socket")
+  # connected=$(_ssh_connected "$socket")
   conn_opt=$(_build_argstr "$conn_opt" "ControlPath=$socket")
+  # conn_opt=$(_build_argstr "$conn_opt" "ControlMaster=auto")
+  # conn_opt=$(_build_argstr "$conn_opt" "ControlPersist=4h")
 
-  if [[ "$connected" == "false" ]]; then
-    ssh -M -f -N -o $conn_opt $server
-  fi
-
-  $cmd $base_opts -e "ssh -o '$conn_opt'" ${args[@]}
+  # if [[ "$connected" == "false" ]]; then
+  #   ssh -M -f -N -o $conn_opt $server
+  # fi
+  echo $cmd $base_opts -e "ssh -o '$conn_opt' -o 'ControlMaster=auto' -o 'ControlPersist=4h'"  ${args[@]}
+  $cmd $base_opts -e "ssh -o '$conn_opt' -o 'ControlMaster=auto' -o 'ControlPersist=4h'" ${args[@]}
 
 }
 
@@ -375,6 +382,17 @@ function multi_fwd_spec {
   done
 
   echo "$ssh_args";
+}
+
+function pfwd {
+  local port=$1
+  shift
+  _ssh_like ssh -fN -L $(fwd_spec $port) $@
+}
+
+function listening_on {
+  local port=$1
+  echo $(lsof -iTCP -sTCP:LISTEN -n -P | grep :$port)
 }
 
 CONNECT_TO_JOB_OPTS="fnS:R:P:I:"

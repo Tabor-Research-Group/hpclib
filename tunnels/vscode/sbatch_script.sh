@@ -13,5 +13,5 @@ fi
 # Run VS Code container with singularity on default port
 set -a
 mkdir -p /scratch/user/$VSCODE_USER/.config
-singularity run $VSCODE_CONTAINER
+singularity run $VSCODE_CONTAINER --bind-addr localhost:$PROCESS_PORT
 echo "Exited singularity"
