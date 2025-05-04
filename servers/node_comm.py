@@ -178,7 +178,6 @@ class NodeCommHandler(socketserver.StreamRequestHandler):
     @classmethod
     def subprocess_response(cls, command, args):
         pipes = subprocess.Popen([command, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        # If you are using python 2.x, you need to include shell=True in the above line
         std_out, std_err = pipes.communicate()
         return {
             "stdout":std_out.strip().decode(),
@@ -191,9 +190,18 @@ class NodeCommHandler(socketserver.StreamRequestHandler):
     TCP_SERVER = NodeCommTCPServer
     UNIX_SERVER = NodeCommUnixServer
     DEFAULT_CONNECTION = ("localhost", 9999)
+    DEFAULT_PORT_ENV_VAR = None
+    DEFAULT_SOCKET_ENV_VAR = None
     @classmethod
-    def start_server(cls, connection=None):
+    def start_server(cls, connection=None, port=None):
         # Create the server, binding to localhost on port 9999
+        if connection is None:
+            connection = os.environ.get(cls.DEFAULT_SOCKET_ENV_VAR)
+        if connection is None:
+            if port is None:
+                port = os.environ.get(cls.DEFAULT_PORT_ENV_VAR)
+            if port is not None:
+                connection = ('localhost', port)
         if connection is None:
             connection = cls.DEFAULT_CONNECTION
         mode = infer_mode(connection)
@@ -222,3 +230,24 @@ class NodeCommHandler(socketserver.StreamRequestHandler):
         if connection is None:
             connection = cls.DEFAULT_CONNECTION
         return client_class(connection).communicate(*args)
+
+class ShellCommHandler(NodeCommHandler):
+
+    @abc.abstractmethod
+    def get_subprocess_call_list(self):
+        ...
+
+    def get_methods(self) -> 'dict[str,method]':
+        return {
+            k:self._wrap_subprocess_call(v)
+            for k,v in self.get_subprocess_call_list()
+        }
+
+    def _wrap_subprocess_call(self, command):
+        if isinstance(command, str):
+            def command(*args, _cmd=command, **kwargs):
+                return self.subprocess_response(_cmd, *args, **kwargs)
+        elif not callable(command):
+            def command(*args, _cmd=command, **kwargs):
+                return self.subprocess_response(*_cmd, *args, **kwargs)
+        return command

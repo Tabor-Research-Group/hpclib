@@ -180,7 +180,7 @@ function _ssh_like {
     rm "$socket" 2> /dev/null
   fi
   # connected=$(_ssh_connected "$socket")
-  conn_opt=$(_build_argstr "$conn_opt" "ControlMaster=auto")
+  # conn_opt=$(_build_argstr "$conn_opt" "ControlMaster=auto")
   # conn_opt=$(_build_argstr "$conn_opt" "ControlPersist=4h")
   # conn_opt=$(_build_argstr "$conn_opt" "ControlPath=$socket")
 
@@ -189,7 +189,11 @@ function _ssh_like {
   # fi
 
   # echo "$cmd $base_opts -o $conn_opt ${args[@]}"
-  $cmd $base_opts -o "$conn_opt" -o 'ControlMaster=auto' -o 'ControlPersist=4h' ${args[@]}
+  mkdir -p ~/.ssh/connections
+  if [ "$HPCLIB_ECHO_COMMANDS" ]; then
+    echo $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h' ${args[@]}
+  fi
+  $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h' ${args[@]}
 
 }
 
@@ -229,8 +233,11 @@ function _scp_like {
   #   ssh -M -f -N -o $conn_opt $server
   # fi
 
-  # echo "$cmd $base_opts -o $conn_opt ${args[@]}"
-  $cmd $base_opts -o "$conn_opt" -o 'ControlMaster=auto' -o 'ControlPersist=4h' ${args[@]}
+  mkdir -p ~/.ssh/connections
+  if [ "$HPCLIB_ECHO_COMMANDS" ]; then
+    echo $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h' ${args[@]}
+  fi
+  $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h' ${args[@]}
 
 }
 
@@ -262,15 +269,18 @@ function _rsync_like {
     rm "$socket" 2> /dev/null
   fi
   # connected=$(_ssh_connected "$socket")
-  conn_opt=$(_build_argstr "$conn_opt" "ControlPath=$socket")
+  # conn_opt=$(_build_argstr "$conn_opt" "ControlPath=$socket")
   # conn_opt=$(_build_argstr "$conn_opt" "ControlMaster=auto")
   # conn_opt=$(_build_argstr "$conn_opt" "ControlPersist=4h")
 
   # if [[ "$connected" == "false" ]]; then
   #   ssh -M -f -N -o $conn_opt $server
   # fi
-  echo $cmd $base_opts -e "ssh -o '$conn_opt' -o 'ControlMaster=auto' -o 'ControlPersist=4h'"  ${args[@]}
-  $cmd $base_opts -e "ssh -o '$conn_opt' -o 'ControlMaster=auto' -o 'ControlPersist=4h'" ${args[@]}
+    mkdir -p ~/.ssh/connections
+  if [ "$HPCLIB_ECHO_COMMANDS" ]; then
+    echo $cmd $base_opts -e "ssh -o \'ControlMaster=auto\' -o \'ControlPath=~/.ssh/connections/%r@%h:%p\' -o \'ControlPersist=4h\'" ${args[@]}
+  fi
+  $cmd $base_opts -e "ssh -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h'" ${args[@]}
 
 }
 
@@ -349,7 +359,7 @@ function fwd_spec {
       addr=${spec_array[0]}
       port=${spec_array[1]}
       target_addr=${spec_array[2]}
-      target_port=${spec_array[2]}
+      target_port=${spec_array[3]}
       ;;
     esac
 
