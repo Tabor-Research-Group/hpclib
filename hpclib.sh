@@ -405,7 +405,7 @@ function listening_on {
   echo $(lsof -iTCP -sTCP:LISTEN -n -P | grep :$port)
 }
 
-CONNECT_TO_JOB_OPTS="fnS:R:P:I:"
+CONNECT_TO_JOB_OPTS="46AaCfGgKkMNnqsTtVvXxYyfnb:B:c:e:E:L:l:i:J:F:D:o:O:Q:w:W:S:R:P:I:"
 function connect_to_job {
   local job_id;
   local forwarding;
@@ -427,7 +427,7 @@ function connect_to_job {
     else
       post_args="${job_id[@]:1}"
       job_id="${job_id[0]}"
-      wait_opts=$(mcopts "$CONNECT_TO_JOB_OPTS" "f|n|P|H|I" $@)
+      wait_opts=$(mcoptsfrom "$CONNECT_TO_JOB_OPTS" "S|R" $@)
       job_node=$(wait_for_job_node $wait_opts $job_id)
       if [ "$job_node" = "" ]
         then 
@@ -562,6 +562,39 @@ function mcopts {
       then
         :
       else
+        if [ "$opt_string" != "" ]
+          then opt_whitespace=" ";
+          else opt_whitespace="";
+        fi;
+        if [ "$OPTARG" != "" ]
+          then opt_string="$opt_string$opt_whitespace-$opt $OPTARG"
+          else opt_string="$opt_string$opt_whitespace-$opt"
+        fi
+    fi
+  done
+
+  printf "%s" "$opt_string"
+
+}
+
+function mcoptsfrom {
+
+  local flag_pat;
+  local match_path;
+  local opt_string;
+  local opt_whitespace;
+  local opt;
+  local OPTARG;
+  local OPTIND=1;
+
+  flag_pat="$1";
+  shift
+  ignore_pat="$1";
+  shift
+
+  while getopts "$flag_pat" opt; do
+    if [[ "$opt" =~ $ignore_pat ]]
+      then
         if [ "$opt_string" != "" ]
           then opt_whitespace=" ";
           else opt_whitespace="";

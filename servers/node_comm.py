@@ -195,10 +195,10 @@ class NodeCommHandler(socketserver.StreamRequestHandler):
     @classmethod
     def start_server(cls, connection=None, port=None):
         # Create the server, binding to localhost on port 9999
-        if connection is None:
+        if connection is None and cls.DEFAULT_SOCKET_ENV_VAR is not None:
             connection = os.environ.get(cls.DEFAULT_SOCKET_ENV_VAR)
         if connection is None:
-            if port is None:
+            if port is None and cls.DEFAULT_PORT_ENV_VAR:
                 port = os.environ.get(cls.DEFAULT_PORT_ENV_VAR)
             if port is not None:
                 connection = ('localhost', port)

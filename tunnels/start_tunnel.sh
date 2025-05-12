@@ -139,7 +139,7 @@ if [ "$SESSION_ID" = "" ]
         GIT_SERVER_JOB=$!
       fi
       
-      trap "cleanup" 0 1 2 3
+      trap cleanup 0 1 2 3
 
       if [ -f "$TUNNEL_DIR/preconnect.sh" ]; then
           source $TUNNEL_DIR/preconnect.sh
@@ -151,7 +151,7 @@ if [ "$SESSION_ID" = "" ]
       fi
       TUNNEL_ENV_FIlE="$SESSIONS_DIR/env-$SESSION_ID.sh"
       declare -px > "$TUNNEL_ENV_FIlE"
-      connect_to_job -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $SESSION_ID "source $TUNNEL_ENV_FIlE; source $POST_SCRIPT"
-#      scancel $SESSION_ID
-#      cleanup
+      connect_to_job -t -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $SESSION_ID "source $TUNNEL_ENV_FIlE; source $POST_SCRIPT"
+      scancel $SESSION_ID
+      cleanup
 fi

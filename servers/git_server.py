@@ -4,6 +4,7 @@ from node_comm import *
 class GitHandler(NodeCommHandler):
 
     DEFAULT_CONNECTION = None
+    DEFAULT_PORT_ENV_VAR = 'GIT_SOCKET_PORT'
     # DEFAULT_CONNECTION = os.path.expanduser("~/.gitsocket")
     def get_methods(self) -> 'dict[str,method]':
         return {
@@ -25,9 +26,9 @@ class GitHandler(NodeCommHandler):
 if __name__ == "__main__":
     import sys, os
 
-    git_port = os.environ.get("GIT_SOCKET_PORT", os.environ.get("SESSION_ID"))
+    git_port = os.environ.get(GitHandler.DEFAULT_PORT_ENV_VAR, os.environ.get("SESSION_ID"))
     if git_port is None:
-        raise ValueError("`GIT_SOCKET_PORT` must be set at the environment level")
+        raise ValueError(f"`{GitHandler.DEFAULT_PORT_ENV_VAR}` must be set at the environment level")
     git_port = GitHandler.get_valid_port(git_port)
     # GitHandler.DEFAULT_CONNECTION = os.environ.get("GIT_SOCKET_FILE", GitHandler.DEFAULT_CONNECTION)
     if len(sys.argv) == 1:
