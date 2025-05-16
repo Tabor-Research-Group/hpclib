@@ -56,11 +56,19 @@ class NodeCommClient:
             raise NotImplementedError(mode)
         self.timeout = timeout
 
-    def communicate(self, command, args):
 
+    SEND_CWD = True
+    def prep_command_env(self):
+        env = {}
+        if self.SEND_CWD:
+            env['pwd'] = os.getcwd()
+        return env
+
+    def communicate(self, command, args):
         request = json.dumps({
             "command": command,
-            "args": args
+            "args": args,
+            "env": self.prep_command_env()
         }) + "\n"
         request = request.encode()
 
@@ -116,8 +124,9 @@ class NodeCommHandler(socketserver.StreamRequestHandler):
         else:
             comm = request.get("command", '<unknown>')
             args = request.get("args", [])
+            env = request.get("env", {})
             print(f"Got: {comm} {args}")
-            response = self.dispatch_request(request)
+            response = self.dispatch_request(request, env)
             print(f"Sending: {response}")
 
         return response
@@ -143,7 +152,10 @@ class NodeCommHandler(socketserver.StreamRequestHandler):
             'stdout':cwd,
             'stderr':""
         }
-    def dispatch_request(self, request: dict):
+    def setup_env(self, env):
+        if 'pwd' in env:
+            os.chdir(env['pwd'])
+    def dispatch_request(self, request: dict, env:dict):
         method = request.get("command", None)
         if method is None:
             response = {
@@ -166,6 +178,7 @@ class NodeCommHandler(socketserver.StreamRequestHandler):
                     }
                 else:
                     try:
+                        self.setup_env(env)
                         response = caller(args)
                     except:
                         response = {
@@ -187,6 +200,15 @@ class NodeCommHandler(socketserver.StreamRequestHandler):
     def get_methods(self) -> 'dict[str,method]':
         ...
 
+    @staticmethod
+    def get_valid_port(git_port, min_port=4000, max_port=65535):
+        git_port = int(git_port)
+        if git_port > max_port:
+            git_port = git_port % max_port
+        if git_port < min_port:
+            git_port = max_port - (git_port % (max_port - min_port))
+        return git_port
+
     TCP_SERVER = NodeCommTCPServer
     UNIX_SERVER = NodeCommUnixServer
     DEFAULT_CONNECTION = ("localhost", 9999)
@@ -201,7 +223,7 @@ class NodeCommHandler(socketserver.StreamRequestHandler):
             if port is None and cls.DEFAULT_PORT_ENV_VAR:
                 port = os.environ.get(cls.DEFAULT_PORT_ENV_VAR)
             if port is not None:
-                connection = ('localhost', port)
+                connection = ('localhost', cls.get_valid_port(port))
         if connection is None:
             connection = cls.DEFAULT_CONNECTION
         mode = infer_mode(connection)

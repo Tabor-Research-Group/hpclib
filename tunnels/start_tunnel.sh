@@ -41,6 +41,7 @@ fi
 
 DEFAULT_PORT=8080
 CONDA_ENVIRONMENT="default"
+CREATE_ENV_FILE=true
 DEFAULT_SBATCH_ARGS="--time=0-8:00:00 --mem=1gb --ntasks=1"
 JOB_CONNECT_RETRIES=60
 JOB_CONNECT_RETRY_WAIT_TIME=1
@@ -113,7 +114,7 @@ sbatch --job-name=$job_name --open-mode=append --out="$SESSIONS_DIR/session-%j.l
 function stop_git_server() {
   if [ "$GIT_SERVER_JOB" != "" ]; then
     kill $GIT_SERVER_JOB > /dev/null
-    rm -f "$GIT_SOCKET_FILE"
+#    rm -f "$GIT_SOCKET_FILE"
   fi
 }
 function cancel_job() {
@@ -133,6 +134,7 @@ if [ "$SESSION_ID" = "" ]
       SESSION_FILE="$SESSIONS_DIR/session-$SESSION_ID.log"
 
       if [ "$START_GIT_SERVER" = "true" ]; then
+        export GIT_SOCKET_PORT=$(random_port 10000 65535)
         export GIT_SOCKET_HOST=$(hostname)
         conda activate $CONDA_ENVIRONMENT
         python "$HPCSERVERS_DIR/git_server.py" &
@@ -149,8 +151,12 @@ if [ "$SESSION_ID" = "" ]
       if [ ! -f "$POST_SCRIPT" ]; then
           POST_SCRIPT="$HPCTUNNELS_DIR/postconnect.sh"
       fi
-      TUNNEL_ENV_FIlE="$SESSIONS_DIR/env-$SESSION_ID.sh"
-      declare -px > "$TUNNEL_ENV_FIlE"
+      if [ "$CREATE_ENV_FILE" = "true" ]; then
+        TUNNEL_ENV_FIlE="$SESSIONS_DIR/env-$SESSION_ID.sh"
+        CURRENT_TUNNEL_ENV_FIlE="$SESSIONS_DIR/activate.sh"
+        declare -px > "$TUNNEL_ENV_FIlE"
+        cp "$TUNNEL_ENV_FIlE" "$CURRENT_TUNNEL_ENV_FIlE"
+      fi
       connect_to_job -t -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $SESSION_ID "source $TUNNEL_ENV_FIlE; source $POST_SCRIPT"
       scancel $SESSION_ID
       cleanup

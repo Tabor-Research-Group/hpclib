@@ -462,6 +462,22 @@ function random_id {
   echo "$rand_str"
 }
 
+function random_port() {
+  local min_port=$1;
+  local max_port=$2;
+  local port
+
+  if [ "$min_port" = "" ]; then
+    min_port=8000
+  fi
+  if [ "$max_port" = "" ]; then
+    max_port=40000
+  fi
+
+  port=$(shuf -i $min_port-$max_port -n 1)
+  echo $port
+}
+
 function slurm_job_setup() {
   # go to _real_ job dir just in case folder is messed up
   if [ -n $SLURM_JOB_ID ] ; then

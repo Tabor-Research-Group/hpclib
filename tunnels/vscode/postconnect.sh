@@ -9,5 +9,5 @@ echo "In VS Code terminals, start by running \`source $TUNNEL_ENV_FIlE\`"  >> $S
 echo "If necessary, to load the same conda env, use \`conda activate $CONDA_ENVIRONMENT\`"  >> $SESSION_FILE
 echo -e "\033[0m" >> $SESSION_FILE
 
-tail -f $SESSION_FILE
+tail -f -n +1 $SESSION_FILE
 scancel $SESSION_ID

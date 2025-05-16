@@ -12,32 +12,22 @@ class GitHandler(NodeCommHandler):
         }
     def do_git(self, args):
         return self.subprocess_response("git", args)
-    
-    @staticmethod
-    def get_valid_port(git_port, min_port=10000, max_port=65535):
-        git_port = int(git_port)
-        if git_port > max_port:
-            git_port = git_port % max_port
-        if git_port < min_port:
-            git_port = max_port - (git_port % (max_port - min_port))
-        return git_port
 
 
 if __name__ == "__main__":
     import sys, os
 
-    git_port = os.environ.get(GitHandler.DEFAULT_PORT_ENV_VAR, os.environ.get("SESSION_ID"))
-    if git_port is None:
+    port = os.environ.get(GitHandler.DEFAULT_PORT_ENV_VAR, os.environ.get("SESSION_ID"))
+    if port is None:
         raise ValueError(f"`{GitHandler.DEFAULT_PORT_ENV_VAR}` must be set at the environment level")
-    git_port = GitHandler.get_valid_port(git_port)
+    port = GitHandler.get_valid_port(port)
+
+    GIT_CONNECTION = ('localhost', GitHandler.get_valid_port(port))
     # GitHandler.DEFAULT_CONNECTION = os.environ.get("GIT_SOCKET_FILE", GitHandler.DEFAULT_CONNECTION)
     if len(sys.argv) == 1:
-        GitHandler.DEFAULT_CONNECTION = ('', git_port)
         try:
-            GitHandler.start_server()
+            GitHandler.start_server(connection=GIT_CONNECTION)
         except OSError: # server exists
             pass
     else:
-        git_host = os.environ.get("GIT_SOCKET_HOST")
-        GitHandler.DEFAULT_CONNECTION = (git_host, git_port)
-        GitHandler.client_request(sys.argv[1], sys.argv[2:])
+        GitHandler.client_request(sys.argv[1], sys.argv[2:], connection=GIT_CONNECTION)
