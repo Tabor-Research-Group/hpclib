@@ -20,9 +20,10 @@ mkdir -p $VSCODE_ROOT_DIR/.config
 echo "singularity run \
   --bind $VSCODE_ROOT_DIR/.config:/home/coder/.config,$VSCODE_BIND_PATHS \
   $VSCODE_CONTAINER \
-    --bind-addr localhost:$PROCESS_PORT"
+    --bind-addr 127.0.0.1:$PROCESS_PORT \
+    "
 singularity run \
   --bind $VSCODE_ROOT_DIR/.config:/home/coder/.config,$VSCODE_BIND_PATHS \
   $VSCODE_CONTAINER \
-    --bind-addr localhost:$PROCESS_PORT
+    --bind-addr 127.0.0.1:$PROCESS_PORT
 echo "Exited singularity"
