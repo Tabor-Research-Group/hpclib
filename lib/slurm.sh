@@ -318,7 +318,7 @@ function slurm_command_execute {
   if [ -z "$noscratch" ]; then
     echo "WORKING DIR: $WORK_DIR"
   else
-    echo "NO SCRATCH DIR"
+    echo "WORKING DIR: NO SCRATCH DIR"
   fi
   echo "RESULTS DIR: $RESULTS"
   echo "SYNC. FILES: $job_list"
@@ -356,8 +356,8 @@ function slurm_command_execute {
 
       input_file="\"$input_file\""
     fi
-    time_cmd="time -p $cmd "$input_file"  > \"$output_file\" & pid=\$!;"
-#    echo "$time_cmd"
+    time_cmd="time -p $cmd "$input_file" $rest > \"$output_file\" & pid=\$!;"
+    echo ":: $time_cmd"
     {
         # to allow commands to escape strings properly
         eval "$time_cmd"
@@ -376,8 +376,8 @@ function slurm_command_execute {
     if [ -n "$input_file" ]; then
       input_file="\"$input_file\""
     fi
-    time_cmd="time -p $cmd "$input_file" > \"$output_file\" & pid=\$!;"
-#    echo "$time_cmd"
+    time_cmd="time -p $cmd "$input_file" $rest > \"$output_file\" & pid=\$!;"
+    echo ":: $time_cmd"
     {
         # to allow commands to escape strings properly
         eval "$time_cmd"
