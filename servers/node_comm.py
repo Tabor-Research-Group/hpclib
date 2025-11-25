@@ -5,14 +5,35 @@ different nodes in SLURM systems
 import abc
 import os
 import socket, socketserver, json, traceback, subprocess
+import psutil, signal, threading, time
 import sys
 
 __all__ = [
     "NodeCommTCPServer",
     "NodeCommUnixServer",
     "NodeCommHandler",
-    "NodeCommClient"
+    "NodeCommClient",
+    "setup_parent_terminated_listener"
 ]
+
+# PUT HERE TO CHECK IF THE PROCESS SHOULD DIE OR NOT
+def check_kill_process(w_pid, cur_pid):
+    if not psutil.pid_exists(w_pid):
+        os.kill(cur_pid, signal.SIGKILL) # maybe make this less dramatic
+        exit(1)
+    return True
+
+def listen_for_proc(w_pid, cur_pid, polling_time=5):
+    while check_kill_process(w_pid, cur_pid):
+        time.sleep(polling_time)
+
+def setup_parent_terminated_listener(PARENT_PID, CURRENT_PID):
+    thread = threading.Thread(
+                              target=listen_for_proc,
+                              args=(PARENT_PID, CURRENT_PID)
+                              )
+    thread.start()
+    return thread
 
 def infer_mode(connection):
     if (

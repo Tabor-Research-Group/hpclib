@@ -258,6 +258,7 @@ function slurm_command_execute {
   local args=$(mcargs $SLURM_COMMAND_EXECUTE_FLAGS $@)
   local cmd="${args[0]}"
   local input_file="${args[1]}"
+  local rest="${args[2:]}"
   local CUR_DIR=$(pwd)
   local WORK_DIR
   local pid
@@ -309,6 +310,16 @@ function slurm_command_execute {
     exclude_list="--exclude=${exclude_list//,/ --exclude=}"
   fi
 
+  echo "### LAUCNHING ###"
+  echo "    COMMAND: $cmd"
+  echo " INPUT FILE: $input_file"
+  echo "   OUT FILE: $output_file"
+  echo "WORKING DIR: $WORK_DIR"
+  echo "RESULTS DIR: $RESULTS"
+  echo "SYNC. FILES: $job_list"
+  echo "EXCL. FILES: $job_exclude"
+  echo " RES. FILES: $results_list"
+  echo " RES. EXCL.: $exclude_list"
   if [ -d $SCRATCH ] && [ -z "$noscratch" ]; then
     #setup scratch dirs
     clock=`date +%s%15N`
@@ -337,7 +348,7 @@ function slurm_command_execute {
     if [ -n "$input_file" ]; then
       input_file="\"$input_file\""
     fi
-    time_cmd="time -p $cmd "$input_file" > \"$output_file\" & pid=\$!;"
+    time_cmd="time -p $cmd "$input_file"  > \"$output_file\" & pid=\$!;"
 #    echo "$time_cmd"
     {
         # to allow commands to escape strings properly
@@ -379,7 +390,7 @@ function slurm_job_footer() {
   echo "   END: $(date)"
   echo "  TIME: $SLURM_JOB_DIFF"
 
-  if [ -n "$debug"]; then
+  if [ -n "$debug" ]; then
 
     echo
     echo
@@ -401,4 +412,41 @@ function slurm_job_footer() {
 #  unset SLURM_JOB_END
 #  unset SLURM_JOB_DIFF
 
+}
+
+SLURM_COMMAND_DEFAULT_TIME=5:00:00
+SLURM_COMMAND_DEFAULT_MEM=10gb
+function submit_slurm_job() {
+  local scratch_dir="$(mclongoptvalue scratch-dir $@)"
+  local result_dir="$(mclongoptvalue result-dir $@)"
+  local output_file="$(mclongoptvalue output $@)"
+  local job_files="$(mclongoptvalue job-inputs $@)"
+  local job_exclude="$(mclongoptvalue job-exclude $@)"
+  local result_files="$(mclongoptvalue results $@)"
+  local result_exclude="$(mclongoptvalue result-exclude $@)"
+  local time="$(mclongoptvalue time $@)"
+  local mem="$(mclongoptvalue mem $@)"
+  local args=($(mclongargs $@))
+  local command=${args[0]}
+  local input_file=${args[1]}
+  local export_args
+
+#  local scratch_dir="$(mclongoptvalue scratch-dir $@)";
+
+  if [ -z "$mem" ]; then
+    mem="$SLURM_COMMAND_DEFAULT_MEM"
+  fi
+
+  if [ -z "$time" ]; then
+    time="$SLURM_COMMAND_DEFAULT_TIME"
+  fi
+
+  export_args="SCRATCH='$scratch_dir',RESULTS='$result_dir',INPUT_FILE='$input_file',OUTPUT_FILE='$output_file',
+JOB_FILES='$job_files',JOB_EXCLUDE='$job_exclude',RESULT_FILES='$result_files',RESULT_EXCLUDE='$result_exclude'"
+  sbatch \
+    --export="$export_args" \
+    --time=$time --mem=$mem --job-name=${input_file}\
+    $HPCLIB_DIR/templates/sbatch_core.sh \
+    $command \
+    ${args[@]:2}
 }

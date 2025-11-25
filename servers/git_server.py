@@ -17,6 +17,11 @@ class GitHandler(NodeCommHandler):
 if __name__ == "__main__":
     import sys, os
 
+    ppid = os.environ.get("PARENT_PROCESS_ID")
+    if ppid is not None:
+        curpid = os.environ.get("WORKER_PROCESS_ID", os.getpid())
+        setup_parent_terminated_listener(ppid, curpid)
+
     port = os.environ.get(GitHandler.DEFAULT_PORT_ENV_VAR, os.environ.get("SESSION_ID"))
     if port is None:
         raise ValueError(f"`{GitHandler.DEFAULT_PORT_ENV_VAR}` must be set at the environment level")

@@ -220,6 +220,52 @@ function mcoptvalue {
   printf "%s" "$opt_string"
 }
 
+function mclongoptvalue {
+  local target_opt="--$1"
+  local opt_value="";
+  local tmp_opt="";
+  local test_opt="";
+  shift
+  while [ "${1#*--}" != "$1" ]; do
+    case "$1" in
+      --)
+        break
+        ;;
+      *=*)
+        tmp_opt=${1#*=}
+        test_opt=${1%=*}
+        ;;
+      *)
+        test_opt="$1"
+        case "$2" in
+          "")
+            tmp_opt=true
+            ;;
+          --*)
+            tmp_opt=true
+            ;;
+          *)
+            shift
+            tmp_opt="$1"
+            ;;
+        esac
+    esac
+
+    if [ "$test_opt" = "$target_opt" ]; then
+      if [ -z "$tmp_opt" ]; then
+        shift
+        opt_value="$1"
+      else
+        opt_value="$tmp_opt"
+      fi
+      break
+    fi
+    shift
+  done
+
+  printf "%s" "$opt_value"
+}
+
 # mcargs: EXTRACT ARGUMENTS
 #     Takes a flag pattern and call signature
 #     Returns just the args
@@ -240,5 +286,32 @@ function mcargs {
   shift "$((OPTIND -1))";
 
   printf "%s" "$*"
+}
 
+function mclongargs {
+  while [ "${1#*--}" != "$1" ]; do
+    case "$1" in
+      --)
+        shift
+        break
+        ;;
+      *=*)
+        ;;
+      *)
+        case "$2" in
+          "")
+            ;;
+          --*)
+            ;;
+          *)
+            shift
+            ;;
+        esac
+    esac
+    shift
+  done
+
+#  shift "$((OPTIND -1))";
+
+  printf "%s" "$*"
 }
