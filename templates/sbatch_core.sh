@@ -7,7 +7,6 @@ if [ -z "$RESULTS" ]; then
   RESULTS=$(pwd)
 fi
 
-# SCRATCH=/scratch/user/`whoami`
 if [ -z "$SCRATCH" ]; then
   SCRATCH=/scratch/user/`whoami`
 fi

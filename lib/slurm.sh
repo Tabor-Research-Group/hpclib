@@ -314,7 +314,11 @@ function slurm_command_execute {
   echo "    COMMAND: $cmd"
   echo " INPUT FILE: $input_file"
   echo "   OUT FILE: $output_file"
-  echo "WORKING DIR: $WORK_DIR"
+  if [ -z "$noscratch" ]; then
+    echo "WORKING DIR: $WORK_DIR"
+  else
+    echo "NO SCRATCH DIR"
+  fi
   echo "RESULTS DIR: $RESULTS"
   echo "SYNC. FILES: $job_list"
   echo "EXCL. FILES: $job_exclude"
