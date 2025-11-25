@@ -465,7 +465,7 @@ function submit_slurm_job() {
       ${args[@]:2}
     sbatch \
       --export="$export_args" \
-      --time=$time --mem=$mem --job-name=${job_name} --out=${job_name}-%j.out\
+      --time=$time --mem=$mem --job-name=${job_name} --out=slurm-info-${job_name}-%j.out\
       $HPCLIB_DIR/templates/sbatch_core.sh \
       $command \
       ${args[@]:2}
