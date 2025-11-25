@@ -452,6 +452,10 @@ function submit_slurm_job() {
     time="$SLURM_COMMAND_DEFAULT_TIME"
   fi
 
+  if [ -z "$workdir" ]; then
+    workdir=$(pwd)
+  fi
+
   if [ -z "$no_scratch" ]; then
     if [ -z "$scratch_dir" ]; then
       no_scratch=true
