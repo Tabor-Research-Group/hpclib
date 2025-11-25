@@ -201,7 +201,6 @@ function slurm_job_info() {
   local SLURM_JOB_OUTPUT=$(slurm_job_output)
   local SLURM_JOB_TIME_LIMIT=$(slurm_job_time_limit)
 
-  cd $SLURM_JOB_DIR
   echo "===================================SLURM JOB==================================="
   echo "    JOB: $SLURM_JOB_NAME"
   echo "    NOW: $(date)"
