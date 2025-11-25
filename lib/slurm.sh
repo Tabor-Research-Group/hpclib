@@ -433,6 +433,7 @@ function submit_slurm_job() {
   local job_exclude="$(mclongoptvalue job-exclude $@)"
   local result_files="$(mclongoptvalue results $@)"
   local result_exclude="$(mclongoptvalue result-exclude $@)"
+  local workdir="$(mclongoptvalue workdir $@)"
   local time="$(mclongoptvalue time $@)"
   local mem="$(mclongoptvalue mem $@)"
   local args=($(mclongargs $@))
@@ -465,13 +466,13 @@ function submit_slurm_job() {
   JOB_FILES=$job_files,JOB_EXCLUDE=$job_exclude,RESULT_FILES=$result_files,RESULT_EXCLUDE=$result_exclude"
     echo "SUBMITTING:" sbatch \
       --export="$export_args" \
-      --time=$time --mem=$mem --job-name=${job_name} --out=slurm-info-${job_name}-%j.out\
+      --time=$time --mem=$mem --job-name=${job_name} --out=slurm-info-${job_name}-%j.out --chdir=${workdir}\
       $HPCLIB_DIR/templates/sbatch_core.sh \
       $command \
       ${args[@]:2}
     sbatch \
       --export="$export_args" \
-      --time=$time --mem=$mem --job-name=${job_name} --out=slurm-info-${job_name}-%j.out\
+      --time=$time --mem=$mem --job-name=${job_name} --out=slurm-info-${job_name}-%j.out --chdir=${workdir}\
       $HPCLIB_DIR/templates/sbatch_core.sh \
       $command \
       ${args[@]:2}
