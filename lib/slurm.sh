@@ -258,7 +258,7 @@ function slurm_command_execute {
   local args=$(mcargs $SLURM_COMMAND_EXECUTE_FLAGS $@)
   local cmd="${args[0]}"
   local input_file="${args[1]}"
-  local rest="${args[2:]}"
+  local rest="${args[@]:2:}"
   local CUR_DIR=$(pwd)
   local WORK_DIR
   local pid
@@ -384,7 +384,7 @@ function slurm_job_footer() {
 
   local debug=$1;
   local SLURM_JOB_END=$(date +%s.%N)
-  local SLURM_JOB_DIFF=$(echo "$SLURM_JOB_END - $SLURM_JOB_START_TIME" | bc)
+  local SLURM_JOB_DIFF=$(echo "$SLURM_JOB_END - $SLURM_JOB_START_TIME")
 
   echo "=============================================================================="
   echo "   END: $(date)"

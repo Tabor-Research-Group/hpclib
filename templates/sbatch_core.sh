@@ -53,5 +53,5 @@ argstr=$(_build_argstr "$argstr" "$RESULT_FILES" "-R")
 argstr=$(_build_argstr "$argstr" "$RESULT_EXCLUDE" "-E")
 
 slurm_job_info
-slurm_command_execute $argstr $COMMAND $INPUT_FILE
+slurm_command_execute $argstr $COMMAND $INPUT_FILE $@
 slurm_job_footer "$DEBUG"
