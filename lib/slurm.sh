@@ -225,8 +225,8 @@ function _slurm_cleanup {
   local rsync_list
 
   # move results of calc
-  touch job_manager-complete
-#    echo "Copying results back to ${RESULTS}"
+#  touch job_manager-complete
+  echo "### Copying results back to ${RESULTS}"
   rsync_list="-av $results_list $exclude_list $WORK_DIR/ $RESULTS"
   # a workaround for some bash string encoding issue...
   eval "rsync $rsync_list"
@@ -237,7 +237,7 @@ function _slurm_cleanup {
   cd $CUR_DIR
   rm $CUR_DIR/$SLURM_JOB_ID
   rm -R $WORK_DIR
-
+  echo "######"
 }
 
 SLURM_COMMAND_SCRATCH_DIR="/tmp"
@@ -328,7 +328,7 @@ function slurm_command_execute {
     #setup scratch dirs
     clock=`date +%s%15N`
     WORK_DIR=$SCRATCH/$SLURM_JOB_ID
-    echo "Setting up directories"
+    echo "### Setting up directories"
     echo "  syncing: -a $job_list $job_exclude $CUR_DIR/ $WORK_DIR"
 
     job_exclude=($job_exclude)
@@ -339,8 +339,9 @@ function slurm_command_execute {
     # a workaround for some bash string encoding issue...
     eval "rsync $rsync_list"
     ln -s $WORK_DIR $CUR_DIR/$SLURM_JOB_ID
-    cp $input_file $WORK_DIR/$input_file
+    cp $CUR_DIR/$input_file $WORK_DIR/$input_file
     cd $WORK_DIR
+    echo "#######"
 
     trap 'kill -9 $pid; _slurm_cleanup "$CUR_DIR" "$WORK_DIR" "$RESULTS" "$results_list" "$exclude_list" ; exit' SIGTERM SIGINT
 

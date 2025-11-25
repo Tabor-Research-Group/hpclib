@@ -42,9 +42,10 @@ if [ -n "$ENV" ]; then
 fi
 
 . ~/hpclib/hpclib.sh
-argstr=""
 if [ -n "$NOSCRATCH" ]; then
-  argstr=$(_build_argstr "$argstr" "" "-n")
+    argstr="-n"
+  else
+    argstr=""
 fi
 argstr=$(_build_argstr "$argstr" "$SCRATCH" "-S")
 argstr=$(_build_argstr "$argstr" "$RESULTS" "-W")
