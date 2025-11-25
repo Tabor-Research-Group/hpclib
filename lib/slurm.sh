@@ -281,7 +281,7 @@ function slurm_command_execute {
   if [ -z "$output_file" ]; then
     if [ -z "$input_file" ];
       then output_file="$SLURM_COMMAND_DEFAULT_OUTPUT_NAME"
-      else output_file="${filename%.*}-%j.out"
+      else output_file="${input_file%.*}-%j.out"
     fi
   fi
   output_file="${output_file//%j/$SLURM_JOB_ID}"
