@@ -381,7 +381,7 @@ function slurm_command_execute {
     {
         # to allow commands to escape strings properly
         eval "$time_cmd"
-    } 2>> "$output_file"
+    } #2>> "$output_file"
 
     wait
   fi
@@ -392,7 +392,7 @@ function slurm_job_footer() {
 
   local debug=$1;
   local SLURM_JOB_END=$(date +%s)
-  local SLURM_JOB_DIFF=$(echo "$(SLURM_JOB_END - $SLURM_JOB_START_TIME)")
+  local SLURM_JOB_DIFF=((SLURM_JOB_END - SLURM_JOB_START_TIME))
 
   echo "=============================================================================="
   echo "   END: $(date)"
