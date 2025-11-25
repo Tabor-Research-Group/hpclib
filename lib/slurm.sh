@@ -202,7 +202,7 @@ function slurm_job_info() {
   local SLURM_JOB_TIME_LIMIT=$(slurm_job_time_limit)
 
   cd $SLURM_JOB_DIR
-  echo"===================================SLURM JOB==================================="
+  echo "===================================SLURM JOB==================================="
   echo "    JOB: $SLURM_JOB_NAME"
   echo "  START: $SLURM_JOB_START_TIME"
   echo "    PWD: $PWD"
@@ -446,8 +446,14 @@ function submit_slurm_job() {
   if [ -z "$job_name" ]; then
     echo "No input file supplied"
   else
-    export_args="SCRATCH='$scratch_dir',RESULTS='$result_dir',INPUT_FILE='$input_file',OUTPUT_FILE='$output_file',
-  JOB_FILES='$job_files',JOB_EXCLUDE='$job_exclude',RESULT_FILES='$result_files',RESULT_EXCLUDE='$result_exclude'"
+    export_args="SCRATCH=$scratch_dir,RESULTS=$result_dir,INPUT_FILE=$input_file,OUTPUT_FILE=$output_file,
+  JOB_FILES=$job_files,JOB_EXCLUDE=$job_exclude,RESULT_FILES=$result_files,RESULT_EXCLUDE=$result_exclude"
+    echo "SUBMITTING:" sbatch \
+      --export="$export_args" \
+      --time=$time --mem=$mem --job-name=${job_name} --out=${job_name}-%j.out\
+      $HPCLIB_DIR/templates/sbatch_core.sh \
+      $command \
+      ${args[@]:2}
     sbatch \
       --export="$export_args" \
       --time=$time --mem=$mem --job-name=${job_name} --out=${job_name}-%j.out\
