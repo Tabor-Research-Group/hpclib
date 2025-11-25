@@ -44,6 +44,9 @@ fi
 
 . ~/hpclib/hpclib.sh
 argstr=""
+if [ -n "$NOSCRATCH" ]; then
+  argstr=$(_build_argstr "$argstr" "" "-n")
+fi
 argstr=$(_build_argstr "$argstr" "$SCRATCH" "-S")
 argstr=$(_build_argstr "$argstr" "$RESULTS" "-W")
 argstr=$(_build_argstr "$argstr" "$OUTPUT_FILE" "-O")

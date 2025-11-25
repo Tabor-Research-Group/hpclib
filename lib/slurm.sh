@@ -255,7 +255,7 @@ function slurm_command_execute {
   local job_exclude=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "H" $@)
   local results_list=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "R" $@)
   local exclude_list=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "E" $@)
-  local args=$(mcargs $SLURM_COMMAND_EXECUTE_FLAGS $@)
+  local args=($(mcargs $SLURM_COMMAND_EXECUTE_FLAGS $@))
   local cmd="${args[0]}"
   local input_file="${args[1]}"
   local rest="${args[@]:2:}"
@@ -335,6 +335,7 @@ function slurm_command_execute {
     # a workaround for some bash string encoding issue...
     eval "rsync $rsync_list"
     ln -s $WORK_DIR $CUR_DIR/$SLURM_JOB_ID
+    cp $input_file $WORK_DIR/$input_file
     cd $WORK_DIR
 
     trap 'kill -9 $pid; _slurm_cleanup "$CUR_DIR" "$WORK_DIR" "$RESULTS" "$results_list" "$exclude_list" ; exit' SIGTERM SIGINT
@@ -346,6 +347,7 @@ function slurm_command_execute {
     echo "Writing to: \"$output_file\""
 
     if [ -n "$input_file" ]; then
+
       input_file="\"$input_file\""
     fi
     time_cmd="time -p $cmd "$input_file"  > \"$output_file\" & pid=\$!;"
@@ -417,6 +419,7 @@ function slurm_job_footer() {
 SLURM_COMMAND_DEFAULT_TIME=5:00:00
 SLURM_COMMAND_DEFAULT_MEM=10gb
 function submit_slurm_job() {
+  local no_scratch="$(mclongoptvalue no-scratch $@)"
   local scratch_dir="$(mclongoptvalue scratch-dir $@)"
   local result_dir="$(mclongoptvalue result-dir $@)"
   local output_file="$(mclongoptvalue output $@)"
@@ -442,11 +445,17 @@ function submit_slurm_job() {
     time="$SLURM_COMMAND_DEFAULT_TIME"
   fi
 
+  if [ -z "$no_scratch" ]; then
+    if [ -z "$scratch_dir" ]; then
+      no_scratch=true
+    fi
+  fi
+
   job_name="${input_file%.*}"
   if [ -z "$job_name" ]; then
     echo "No input file supplied"
   else
-    export_args="SCRATCH=$scratch_dir,RESULTS=$result_dir,INPUT_FILE=$input_file,OUTPUT_FILE=$output_file,
+    export_args="NOSCRATCH=$no_scratch,SCRATCH=$scratch_dir,RESULTS=$result_dir,INPUT_FILE=$input_file,OUTPUT_FILE=$output_file,
   JOB_FILES=$job_files,JOB_EXCLUDE=$job_exclude,RESULT_FILES=$result_files,RESULT_EXCLUDE=$result_exclude"
     echo "SUBMITTING:" sbatch \
       --export="$export_args" \
