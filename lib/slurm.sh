@@ -392,7 +392,7 @@ function slurm_job_footer() {
 
   local debug=$1;
   local SLURM_JOB_END=$(date +%s)
-  local SLURM_JOB_DIFF=((SLURM_JOB_END - SLURM_JOB_START_TIME))
+  local SLURM_JOB_DIFF=$((SLURM_JOB_END - SLURM_JOB_START_TIME))
 
   echo "=============================================================================="
   echo "   END: $(date)"
