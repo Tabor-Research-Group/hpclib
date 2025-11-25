@@ -204,6 +204,7 @@ function slurm_job_info() {
   cd $SLURM_JOB_DIR
   echo "===================================SLURM JOB==================================="
   echo "    JOB: $SLURM_JOB_NAME"
+  echo "    NOW: $(date)"
   echo "  START: $SLURM_JOB_START_TIME"
   echo "    PWD: $PWD"
   echo "     ID: $SLURM_JOB_ID"
@@ -390,8 +391,8 @@ function slurm_command_execute {
 function slurm_job_footer() {
 
   local debug=$1;
-  local SLURM_JOB_END=$(date +%s.%N)
-  local SLURM_JOB_DIFF=$(echo "$SLURM_JOB_END - $SLURM_JOB_START_TIME")
+  local SLURM_JOB_END=$(date +%s)
+  local SLURM_JOB_DIFF=$(echo "$(SLURM_JOB_END - $SLURM_JOB_START_TIME)")
 
   echo "=============================================================================="
   echo "   END: $(date)"
