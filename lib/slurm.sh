@@ -443,12 +443,16 @@ function submit_slurm_job() {
   fi
 
   job_name="${input_file%.*}"
-  export_args="SCRATCH='$scratch_dir',RESULTS='$result_dir',INPUT_FILE='$input_file',OUTPUT_FILE='$output_file',
-JOB_FILES='$job_files',JOB_EXCLUDE='$job_exclude',RESULT_FILES='$result_files',RESULT_EXCLUDE='$result_exclude'"
-  sbatch \
-    --export="$export_args" \
-    --time=$time --mem=$mem --job-name=${job_name} --out=${job_name}-%j.out\
-    $HPCLIB_DIR/templates/sbatch_core.sh \
-    $command \
-    ${args[@]:2}
+  if [ -z "$job_name" ]; then
+    echo "No input file supplied"
+  else
+    export_args="SCRATCH='$scratch_dir',RESULTS='$result_dir',INPUT_FILE='$input_file',OUTPUT_FILE='$output_file',
+  JOB_FILES='$job_files',JOB_EXCLUDE='$job_exclude',RESULT_FILES='$result_files',RESULT_EXCLUDE='$result_exclude'"
+    sbatch \
+      --export="$export_args" \
+      --time=$time --mem=$mem --job-name=${job_name} --out=${job_name}-%j.out\
+      $HPCLIB_DIR/templates/sbatch_core.sh \
+      $command \
+      ${args[@]:2}
+  fi
 }
