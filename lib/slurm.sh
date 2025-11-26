@@ -258,7 +258,7 @@ function slurm_command_execute {
   local args=($(mcargs $SLURM_COMMAND_EXECUTE_FLAGS $@))
   local cmd="${args[0]}"
   local input_file="${args[1]}"
-  local rest="${args[@]:2:}"
+  local rest="${args[@]:2}"
   local CUR_DIR=$(pwd)
   local WORK_DIR
   local pid
