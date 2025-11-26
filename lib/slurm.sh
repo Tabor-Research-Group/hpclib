@@ -433,6 +433,7 @@ function submit_slurm_job() {
   local result_files="$(mclongoptvalue results $@)"
   local result_exclude="$(mclongoptvalue result-exclude $@)"
   local workdir="$(mclongoptvalue workdir $@)"
+  local env="$(mclongoptvalue env $@)"
   local time="$(mclongoptvalue time $@)"
   local mem="$(mclongoptvalue mem $@)"
   local args=($(mclongargs $@))
@@ -466,7 +467,7 @@ function submit_slurm_job() {
     echo "No input file supplied"
   else
     export_args="NOSCRATCH=$no_scratch,SCRATCH=$scratch_dir,RESULTS=$result_dir,INPUT_FILE=$input_file,OUTPUT_FILE=$output_file,
-  JOB_FILES=$job_files,JOB_EXCLUDE=$job_exclude,RESULT_FILES=$result_files,RESULT_EXCLUDE=$result_exclude"
+  JOB_FILES=$job_files,JOB_EXCLUDE=$job_exclude,RESULT_FILES=$result_files,RESULT_EXCLUDE=$result_exclude,ENV=$env"
     echo "SUBMITTING:" sbatch \
       --export="$export_args" \
       --time=$time --mem=$mem --job-name=${job_name} --out=slurm-info-${job_name}-%j.out --chdir=${workdir}\
