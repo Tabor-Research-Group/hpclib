@@ -380,7 +380,7 @@ function slurm_command_execute {
     {
         # to allow commands to escape strings properly
         eval "$time_cmd"
-    } #2>> "$output_file"
+    } 2>> "$output_file"
 
     wait
   fi
