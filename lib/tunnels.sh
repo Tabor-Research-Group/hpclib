@@ -118,7 +118,7 @@ function launch_tunnel {
             port=$(random_port)
           fi
 
-          if [ "-z" "$app" ]; then
+          if [ -z "$app" ]; then
             app="CodeLauncher"
           fi
 
