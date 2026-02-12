@@ -1,2 +1,3 @@
-PAI_USER=$(whoami)
+export PAI_USER=$(whoami)
 export PAI_ROOT_DIR=/scratch/user/$PAI_USER/pai
+export INCLUDE_DEV_ENDPOINTS=true

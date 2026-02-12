@@ -14,5 +14,5 @@ echo "Launching database connection on $PROCESS_PORT"
 # Run JupyterLab on specified port
 
 export PAI_PORT=$PROCESS_PORT
-cd $PAI_ROOT_DIR && \
-  bash singularity_compose.sh
+cd $PAI_ROOT_DIR/proto-auto-interface && \
+  bash singularity-compose.sh
