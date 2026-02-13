@@ -1,3 +1,5 @@
 unset ENABLE_WEB_PROXY
 unset START_GIT_SERVER
 unset START_SLURM_SERVER
+PROCESS_PORT=3100
+DEFAULT_SBATCH_ARGS="--time=6-23:00:00 --mem=10gb --ntasks=1 --cpus-per-task=6"
