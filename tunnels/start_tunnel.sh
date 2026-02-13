@@ -161,8 +161,8 @@ if [ "$SESSION_ID" = "" ]
 
       start_bg=$(mcoptvalue "$START_TUNNEL_FLAGS" "f" $@)
       ssh_flags="-t"
-      if if [ "$start_bg" = "true" ]; then
-          ssh_flags="ssh_flags -f"
+      if [ "$start_bg" = "true" ]; then
+          ssh_flags="$ssh_flags -f"
       fi
       connect_to_job $ssh_flags -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $SESSION_ID "source $TUNNEL_ENV_FIlE; source $POST_SCRIPT"
       scancel $SESSION_ID
