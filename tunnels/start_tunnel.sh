@@ -94,8 +94,9 @@ fi
 job_uuid=$(random_id)
 job_name="$TUNNEL_NAME-$job_uuid"
 
+START_TUNNEL_FLAGS="fP:"
 # start sbatch script on correct port with given sbatch arg string
-HOST_PORT=$(mcoptvalue "P:" "P" $@)
+HOST_PORT=$(mcoptvalue "$START_TUNNEL_FLAGS" "P" $@)
 if [ "$HOST_PORT" = "" ];  then
     HOST_PORT=$DEFAULT_PORT
 fi
@@ -103,7 +104,7 @@ if [ "$PROCESS_PORT" = "" ]; then
   PROCESS_PORT="$HOST_PORT"
 fi
 
-sbatch_args=$(mcargs "P:" $@)
+sbatch_args=$(mcargs "$START_TUNNEL_FLAGS" $@)
 if [ "$sbatch_args" = "" ]; then
     sbatch_args="$DEFAULT_SBATCH_ARGS"
 fi
@@ -157,7 +158,13 @@ if [ "$SESSION_ID" = "" ]
         declare -px > "$TUNNEL_ENV_FIlE"
         cp "$TUNNEL_ENV_FIlE" "$CURRENT_TUNNEL_ENV_FIlE"
       fi
-      connect_to_job -t -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $SESSION_ID "source $TUNNEL_ENV_FIlE; source $POST_SCRIPT"
+
+      start_bg=$(mcoptvalue "$START_TUNNEL_FLAGS" "f" $@)
+      ssh_flags="-t"
+      if if [ "$start_bg" = "true" ]; then
+          ssh_flags="ssh_flags -f"
+      fi
+      connect_to_job $ssh_flags -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $SESSION_ID "source $TUNNEL_ENV_FIlE; source $POST_SCRIPT"
       scancel $SESSION_ID
       cleanup
 fi
