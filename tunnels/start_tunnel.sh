@@ -142,7 +142,17 @@ if [ "$SESSION_ID" = "" ]
         GIT_SERVER_JOB=$!
       fi
       
-      trap cleanup 0 1 2 3
+
+      start_bg=$(mcoptvalue "$START_TUNNEL_FLAGS" "f" $@)
+      if [ "$start_bg" = "true" ]; 
+          then
+            echo "SLURM JOB: $SESSION_ID; GIT SERVER PID: $GIT_SERVER_JOB"
+            ssh_flags="-f"
+          else
+            ssh_flags="-t"
+            trap cleanup 0 1 2 3
+      fi
+
 
       if [ -f "$TUNNEL_DIR/preconnect.sh" ]; then
           source $TUNNEL_DIR/preconnect.sh
@@ -159,12 +169,13 @@ if [ "$SESSION_ID" = "" ]
         cp "$TUNNEL_ENV_FIlE" "$CURRENT_TUNNEL_ENV_FIlE"
       fi
 
-      start_bg=$(mcoptvalue "$START_TUNNEL_FLAGS" "f" $@)
-      ssh_flags="-t"
-      if [ "$start_bg" = "true" ]; then
-          ssh_flags="$ssh_flags -f"
-      fi
       connect_to_job $ssh_flags -P $HOST_PORT:$PROCESS_PORT -R $JOB_CONNECT_RETRIES -S $JOB_CONNECT_RETRY_WAIT_TIME -I $JOB_INITIALIZATION_PAUSE $SESSION_ID "source $TUNNEL_ENV_FIlE; source $POST_SCRIPT"
-      scancel $SESSION_ID
-      cleanup
+      
+      if [ "$start_bg" = "true" ]; 
+        then
+          echo "Connected to job $SESSION_ID"
+        else
+          scancel $SESSION_ID
+          cleanup
+      fi
 fi
