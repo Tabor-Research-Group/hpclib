@@ -1,30 +1,76 @@
 
 
 MCDEFAULT_SQUEUE_FORMAT="%.9i %.32j %.8u %.2t %.10M %.5C %.6D %R"
-UQUEUE_FLAGS="u:p:A:f:"
+UQUEUE_FLAGS="u:p:A:f:hij:lL:M:n:R:r:s:S:t:vVw:"
 function uqueue {
   local user;
   local partition;
   local account;
   local format;
-  local argstr
+  local args;
+  local argstr;
 
   user=$(mcoptvalue "$UQUEUE_FLAGS" 'u' $@);
-  paritition=$(mcoptvalue "$UQUEUE_FLAGS" 'p' $@);
+  partition=$(mcoptvalue "$UQUEUE_FLAGS" 'p' $@);
   account=$(mcoptvalue "$UQUEUE_FLAGS" 'A' $@);
   format=$(mcoptvalue "$UQUEUE_FLAGS" 'f' $@);
   if [ "$user" = "" ]
     then user=$MCDEFAULT_USER
   fi
+  if [ -z "$user" ]; then
+    user=$(whoami)
+  fi
   if [ "$format" = "" ]
     then format=$MCDEFAULT_SQUEUE_FORMAT
   fi
   argstr=$(_build_argstr "$argstr" "$user" "-u");
-  argstr=$(_build_argstr "$argstr" "$paritition" "-p");
+  argstr=$(_build_argstr "$argstr" "$partition" "-p");
   argstr=$(_build_argstr "$argstr" "$account" "-A");
-  argstr=$(_build_argstr "$argstr" "$format" "--format");
+  args=$(mcoptsfrom "$UQUEUE_FLAGS" "h|i|j|l|L|M|n|R|r|s|S|t|v|V|w" $@)
 
-  squeue $argstr
+  squeue $argstr --format="$format" $args
+}
+
+function uqueue_ids {
+  uqueue -h -f "%i" $@
+}
+
+FILTER_JOBS_PATTERN="u:p:A:n:m:M:L:R:r:s:S:t:w:"
+function filter_jobs {
+  local name_pattern;
+  local min;
+  local max;
+  local awk_pattern;
+  local format;
+  local argstr;
+  local args;
+  local ids;
+
+  min=$(mcoptvalue "$FILTER_JOBS_PATTERN" 'm' $@);
+  max=$(mcoptvalue "$FILTER_JOBS_PATTERN" 'M' $@);
+  name_pattern=$(mcoptvalue "$FILTER_JOBS_PATTERN" 'n' $@);
+  if [ -z "$min" ]; then
+    min="0"
+  fi
+  if [ -z "$name_pattern" ];
+    then
+      format="%i";
+      if [ -z "$max" ];
+        then awk_pattern='$1 > min';
+        else awk_pattern='$1 > min && $1 < max';
+      fi
+    else
+      format="%i %j"
+      if [ -z "$max" ];
+        then awk_pattern='$1 > min && $2 ~ pat { print $1 }';
+        else awk_pattern='$1 > min && $1 < max && $2 ~ pat { print $1 }';
+      fi
+  fi
+
+  args=$(mcoptsfrom "$FILTER_JOBS_PATTERN" "u|p|A|L|R|r|s|S|t|w" $@)
+
+  ids=$(squeue -h -o "$format" $argstr $args | awk -v pat="$name_pattern" -v min="$min" -v max="$max" "$awk_pattern")
+  printf "%s\n" "$ids"
 }
 
 function run_on_node {

@@ -96,6 +96,7 @@ function locate_browser_launcher {
   fi
 }
 
+LAUNCH_TUNNEL_DEFAULT_APP="Safari"
 LAUNCH_TUNNEL_ARGS="bP:A:"
 function launch_tunnel {
   local port=$(mcoptvalue "$LAUNCH_TUNNEL_ARGS" "P" $@);
@@ -119,7 +120,7 @@ function launch_tunnel {
           fi
 
           if [ -z "$app" ]; then
-            app="CodeLauncher"
+            app="$LAUNCH_TUNNEL_DEFAULT_APP"
           fi
 
           PS1="\u\@$address-$TUNNEL\$ "
