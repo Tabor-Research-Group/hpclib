@@ -20,6 +20,7 @@ from typing import Optional, Sequence
 from .decision import determine_action
 from .metadata import MetadataStore
 from .queue_db import QueueDB
+from .models import JobStatus
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -119,6 +120,19 @@ def _cmd_init(args: argparse.Namespace) -> int:
         print("Nothing copied (use --force to overwrite existing files).", file=sys.stderr)
     return 0
 
+def _cmd_record_result(args: argparse.Namespace) -> int:
+    store = MetadataStore(args.metadata)
+    if not store.exists():
+        print(f"No metadata file at {args.metadata}; nothing to record against", file=sys.stderr)
+        return 1
+    status = JobStatus.COMPLETED if args.status == "completed" else JobStatus.FAILED
+    meta = store.record_result(status=status, exit_code=args.exit_code, error_message=args.error_message)
+
+    queue = QueueDB()
+    queue.update_status(meta.job_id, status.value)
+
+    print(f"Recorded result: job_id={meta.job_id} status={status.value} exit_code={args.exit_code}")
+    return 0
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="job-queue", description=__doc__)
@@ -153,6 +167,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--dest", default=".", help="destination directory (default: cwd)")
     p_init.add_argument("--force", action="store_true", help="overwrite existing files")
     p_init.set_defaults(func=_cmd_init)
+
+    p_result = sub.add_parser("record-result", help="record a job's final outcome directly (no sacct polling)")
+    p_result.add_argument("--metadata", required=True)
+    p_result.add_argument("--status", required=True, choices=["completed", "failed"])
+    p_result.add_argument("--exit-code", type=int, default=None)
+    p_result.add_argument("--error-message", default=None)
+    p_result.set_defaults(func=_cmd_record_result)
 
     return parser
 

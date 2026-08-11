@@ -95,3 +95,22 @@ class MetadataStore:
         meta.error_message = None
         self.save(meta)
         return meta
+
+    def record_result(
+            self, status: JobStatus, exit_code: Optional[int] = None, error_message: Optional[str] = None
+    ) -> JobMetadata:
+        """Called once submit()/restart() has actually finished, with a
+        real exit code already in hand. Deliberately independent of
+        sacct.query_sacct()'s polling - the caller already knows the true
+        outcome, so there's no need to wait for or trust SLURM accounting,
+        which can lag or (per sacct.py's own fallback) be entirely
+        unavailable in a test environment.
+        """
+        meta = self.load()
+        if meta is None:
+            raise FileNotFoundError(f"No metadata file at {self.path}")
+        meta.status = status
+        meta.exit_code = exit_code
+        meta.error_message = error_message
+        self.save(meta)
+        return meta

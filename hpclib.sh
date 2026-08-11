@@ -15,3 +15,4 @@ fi
 . $HPCLIB_DIR/lib/slurm.sh
 . $HPCLIB_DIR/lib/tunnels.sh
 . $HPCLIB_DIR/lib/applications.sh
+. $HPCLIB_DIR/lib/job_queue.sh
