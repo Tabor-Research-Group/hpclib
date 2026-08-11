@@ -95,50 +95,50 @@ MCLONGOPTS_IMPLICIT_ARGUMENTS=true
 
 # Looks up $2 in the comma-separated long-spec $1, using the same
 # "name" (boolean) / "name:" (takes a value) idiom as the short-flag
-# FLAGS_PAT strings elsewhere in this file. Sets FOUND/TAKES_VALUE
-# rather than returning, since this runs once per token in a hot loop.
+# FLAGS_PAT strings elsewhere in this file. Sets MC_FOUND/MC_TAKES_VALUE
+# (plain globals, not "local -A") rather than returning, since this
+# runs once per token in a hot loop.
 function _mclong_lookup {
   local spec="$1" name="$2" tok
-  FOUND=false
-  TAKES_VALUE=false
+  MC_FOUND=false
+  MC_TAKES_VALUE=false
   local IFS=','
   for tok in $spec; do
     if [ "$tok" = "$name" ]; then
-      FOUND=true; return
+      MC_FOUND=true; return
     elif [ "$tok" = "${name}:" ]; then
-      FOUND=true; TAKES_VALUE=true; return
+      MC_FOUND=true; MC_TAKES_VALUE=true; return
     fi
   done
 }
 
-# The core fix. A single left-to-right pass over "$@" that classifies
-# each token by its ORIGINAL INDEX rather than bucketing into separate
-# lists and concatenating them - bucket-then-concatenate is what
-# destroys ordering for tools like `singularity run --wd=x img.sif
-# --copt=1`, where flags-before-the-positional and flags-after-it are
-# semantically different and must never be reshuffled relative to each
-# other or to the positionals between them.
+# The core parser. A single left-to-right pass over "$@" that
+# classifies each token by its ORIGINAL INDEX rather than bucketing
+# into separate lists and concatenating them - bucket-then-concatenate
+# is what destroys ordering for tools like `singularity run --wd=x
+# img.sif --copt=1`.
 #
-# Long-form tokens ("--foo", "--foo=bar") that match long_spec are
-# consumed into matched_long_ref (an associative array: name -> value,
-# or name -> true for booleans). Everything else - short flags,
-# positionals, undeclared "--foo" tokens, and a literal "--" - is left
-# completely alone, recorded with its original index in
-# short_stream_ref/short_index_ref (if it doesn't start with "--") or
-# long_remainder_ref/remainder_index_ref (if it does). getopts is only
-# ever run against short_stream_ref afterwards, so it can never be
-# handed a "--"-prefixed token and never gets corrupted by one.
+# bash <4.3 has no namerefs ("local -n"), so instead of writing
+# through caller-supplied array names, this always writes to a FIXED
+# set of globals (MC_SHORT_STREAM etc. below). That's safe here
+# specifically because none of mcopts/mcoptsfrom/mcoptvalue/mcargs
+# ever call each other, or themselves, before finishing with these
+# results - there's no reentrancy to worry about. Read the MC_* arrays
+# immediately after calling this, before calling it again.
+#
+# bash <4.0 also has no associative arrays ("local -A"), so
+# long-flag matches are stored as two PARALLEL indexed arrays
+# (MC_LONG_NAMES / MC_LONG_VALUES) instead of one assoc array; see
+# _mclong_get below for the corresponding lookup.
 function _mcparse_long {
   local long_spec="$1"; shift
-  local -n short_stream_ref=$1; shift
-  local -n short_index_ref=$1; shift
-  local -n long_remainder_ref=$1; shift
-  local -n remainder_index_ref=$1; shift
-  local -n matched_long_ref=$1; shift
 
-  short_stream_ref=(); short_index_ref=()
-  long_remainder_ref=(); remainder_index_ref=()
-  matched_long_ref=()
+  MC_SHORT_STREAM=()
+  MC_SHORT_INDEX=()
+  MC_LONG_REM=()
+  MC_LONG_REM_IDX=()
+  MC_LONG_NAMES=()
+  MC_LONG_VALUES=()
 
   local args=("$@")
   local n=${#args[@]}
@@ -156,27 +156,47 @@ function _mcparse_long {
         fi
 
         _mclong_lookup "$long_spec" "$key"
-        if ! $FOUND; then
-          long_remainder_ref+=("$tok")
-          remainder_index_ref+=("$i")
-        elif ! $TAKES_VALUE; then
-          matched_long_ref[$key]=true
+        if ! $MC_FOUND; then
+          MC_LONG_REM+=("$tok")
+          MC_LONG_REM_IDX+=("$i")
+        elif ! $MC_TAKES_VALUE; then
+          MC_LONG_NAMES+=("$key")
+          MC_LONG_VALUES+=(true)
         elif $has_eq; then
-          matched_long_ref[$key]="$val"
+          MC_LONG_NAMES+=("$key")
+          MC_LONG_VALUES+=("$val")
         elif $MCLONGOPTS_IMPLICIT_ARGUMENTS && [ $((i+1)) -lt $n ]; then
-          matched_long_ref[$key]="${args[$((i+1))]}"
+          MC_LONG_NAMES+=("$key")
+          MC_LONG_VALUES+=("${args[$((i+1))]}")
           i=$((i+1))                     # also consumes the value token
         else
-          matched_long_ref[$key]=""      # declared value-taking but no "="
+          MC_LONG_NAMES+=("$key")
+          MC_LONG_VALUES+=("")           # declared value-taking but no "="
         fi                               # and implicit-args off (or nothing left)
         ;;
       *)
-        short_stream_ref+=("$tok")
-        short_index_ref+=("$i")
+        MC_SHORT_STREAM+=("$tok")
+        MC_SHORT_INDEX+=("$i")
         ;;
     esac
     i=$((i+1))
   done
+}
+
+# Scans the MC_LONG_NAMES/MC_LONG_VALUES parallel arrays left behind by
+# the most recent _mcparse_long call. This - not a "local -A" lookup -
+# is the 3.2-compatible stand-in for hash-map access.
+function _mclong_get {
+  local name="$1"
+  local i
+  for i in "${!MC_LONG_NAMES[@]}"; do
+    if [ "${MC_LONG_NAMES[$i]}" = "$name" ]; then
+      printf "%s" "${MC_LONG_VALUES[$i]}"
+      return 0
+    fi
+  done
+  printf "%s" ""
+  return 1
 }
 
 # mcopts: EXTRACT OPTIONS
@@ -184,27 +204,13 @@ function _mcparse_long {
 #     signature. Returns the short opts that DON'T match ignore_pat.
 
 function mcopts {
+  local flag_pat="$1"; shift
+  local long_spec="$1"; shift
+  local ignore_pat="$1"; shift
+  local opt_string="" opt_whitespace opt OPTARG OPTIND=1
 
-  local flag_pat;
-  local long_spec;
-  local ignore_pat;
-  local opt_string;
-  local opt_whitespace;
-  local opt;
-  local OPTARG;
-  local OPTIND=1;
-  local short_stream short_idx long_rem long_rem_idx;
-  local -A long_matched;
-
-  flag_pat="$1";
-  shift
-  long_spec="$1";
-  shift
-  ignore_pat="$1";
-  shift
-
-  _mcparse_long "$long_spec" short_stream short_idx long_rem long_rem_idx long_matched "$@"
-  set -- "${short_stream[@]}"
+  _mcparse_long "$long_spec" "$@"
+  set -- "${MC_SHORT_STREAM[@]}"
 
   while getopts "$flag_pat" opt; do
     if [[ "$opt" =~ $ignore_pat ]]
@@ -223,7 +229,6 @@ function mcopts {
   done
 
   printf "%s" "$opt_string"
-
 }
 
 # mcoptsfrom: EXTRACT OPTIONS
@@ -231,27 +236,13 @@ function mcopts {
 #     signature. Returns the short opts that DO match match_pat.
 
 function mcoptsfrom {
+  local flag_pat="$1"; shift
+  local long_spec="$1"; shift
+  local ignore_pat="$1"; shift
+  local opt_string="" opt_whitespace opt OPTARG OPTIND=1
 
-  local flag_pat;
-  local long_spec;
-  local match_path;
-  local opt_string;
-  local opt_whitespace;
-  local opt;
-  local OPTARG;
-  local OPTIND=1;
-  local short_stream short_idx long_rem long_rem_idx;
-  local -A long_matched;
-
-  flag_pat="$1";
-  shift
-  long_spec="$1";
-  shift
-  ignore_pat="$1";
-  shift
-
-  _mcparse_long "$long_spec" short_stream short_idx long_rem long_rem_idx long_matched "$@"
-  set -- "${short_stream[@]}"
+  _mcparse_long "$long_spec" "$@"
+  set -- "${MC_SHORT_STREAM[@]}"
 
   while getopts "$flag_pat" opt; do
     if [[ "$opt" =~ $ignore_pat ]]
@@ -268,36 +259,22 @@ function mcoptsfrom {
   done
 
   printf "%s" "$opt_string"
-
 }
 
 # mcoptvalue: EXTRACT OPTION VALUE (short flags only - see mclongvalue
-# for the long-flag equivalent)
+# for the long-flag equivalent, and see mclongoptvalue below that for
+# the difference between the two)
 #     Takes a flag pattern, long-flag spec, opt key, and call
 #     signature. Returns the opt value for the key.
 
 function mcoptvalue {
+  local flag_pat="$1"; shift
+  local long_spec="$1"; shift
+  local value_pat="$1"; shift
+  local opt opt_string opt_whitespace OPTARG OPTIND=1
 
-  local flag_pat;
-  local long_spec;
-  local value_pat;
-  local opt;
-  local opt_string;
-  local opt_whitespace;
-  local OPTARG;
-  local OPTIND=1;
-  local short_stream short_idx long_rem long_rem_idx;
-  local -A long_matched;
-
-  flag_pat="$1";
-  shift
-  long_spec="$1";
-  shift
-  value_pat="$1";
-  shift
-
-  _mcparse_long "$long_spec" short_stream short_idx long_rem long_rem_idx long_matched "$@"
-  set -- "${short_stream[@]}"
+  _mcparse_long "$long_spec" "$@"
+  set -- "${MC_SHORT_STREAM[@]}"
 
   OPTIND=1;
 
@@ -382,20 +359,18 @@ function mclongoptvalue {
 }
 
 # mclongvalue: EXTRACT LONG OPTION VALUE
-#     Takes a long-flag spec and a name, and a call signature. Returns
-#     the value bound to that name by _mcparse_long (booleans read back
-#     as "true"/"", per MCLONGOPTS_IMPLICIT_ARGUMENTS as described
-#     above _mcparse_long). Use this - not mclongoptvalue - whenever
-#     you're also calling mcopts/mcoptsfrom/mcargs/mcoptvalue against
-#     the same argv and the same spec, so the whole argv is parsed
-#     exactly once and consistently.
+#     Takes a long-flag spec, a name, and a call signature. Returns
+#     the value bound to that name by _mcparse_long (booleans read
+#     back as "true"/"", per MCLONGOPTS_IMPLICIT_ARGUMENTS as
+#     described above _mcparse_long). Use this - not mclongoptvalue -
+#     whenever you're also calling mcopts/mcoptsfrom/mcargs/mcoptvalue
+#     against the same argv and the same spec, so the whole argv is
+#     parsed exactly once and consistently.
 function mclongvalue {
   local long_spec="$1"; shift
   local name="$1"; shift
-  local short_stream short_idx long_rem long_rem_idx
-  local -A long_matched
-  _mcparse_long "$long_spec" short_stream short_idx long_rem long_rem_idx long_matched "$@"
-  printf "%s" "${long_matched[$name]:-}"
+  _mcparse_long "$long_spec" "$@"
+  _mclong_get "$name"
 }
 
 # mcargs: EXTRACT ARGUMENTS
@@ -405,48 +380,41 @@ function mclongvalue {
 #     passthrough long options (declared or not) survive intact.
 
 function mcargs {
+  local flag_pat="$1"; shift
+  local long_spec="$1"; shift
+  local opt OPTARG OPTIND
 
-  local flag_pat;
-  local long_spec;
-  local opt;
-  local OPTARG;
-  local OPTIND;
-  local short_stream short_idx long_rem long_rem_idx;
-  local -A long_matched;
-
-  flag_pat="$1";
-  shift
-  long_spec="$1";
-  shift
-
-  _mcparse_long "$long_spec" short_stream short_idx long_rem long_rem_idx long_matched "$@"
+  _mcparse_long "$long_spec" "$@"
 
   # getopts only ever sees the short-shaped subsequence, so it can
   # never be corrupted by a "--foo" token; it still stops at the first
   # non-option exactly as before, leaving that suffix unconsumed.
   OPTIND=1
-  set -- "${short_stream[@]}"
+  set -- "${MC_SHORT_STREAM[@]}"
   while getopts "$flag_pat" opt; do
       :
   done
   shift "$((OPTIND -1))";
   local short_unmatched=("$@")
-  local n_matched_short=$(( ${#short_stream[@]} - ${#short_unmatched[@]} ))
+  local n_matched_short=$(( ${#MC_SHORT_STREAM[@]} - ${#short_unmatched[@]} ))
 
-  # Merge short_unmatched + long_rem back into ONE list ordered by
-  # original argv index - this is what preserves interleaving across
-  # both kinds of unmatched tokens.
-  local -A by_index=()
+  # Merge short_unmatched + MC_LONG_REM back into ONE list ordered by
+  # original argv index. A plain INDEXED array (not "local -A") is
+  # enough here - arbitrary non-negative integers are valid indexed-
+  # array subscripts too, and bash guarantees "${!by_index[@]}" comes
+  # back in ascending order for indexed arrays (it's only associative
+  # arrays that have no order guarantee) - so no extra sort is needed.
+  local by_index=()
   local j
   for ((j = 0; j < ${#short_unmatched[@]}; j++)); do
-    by_index[${short_idx[$((n_matched_short + j))]}]="${short_unmatched[$j]}"
+    by_index[${MC_SHORT_INDEX[$((n_matched_short + j))]}]="${short_unmatched[$j]}"
   done
-  for ((j = 0; j < ${#long_rem[@]}; j++)); do
-    by_index[${long_rem_idx[$j]}]="${long_rem[$j]}"
+  for ((j = 0; j < ${#MC_LONG_REM[@]}; j++)); do
+    by_index[${MC_LONG_REM_IDX[$j]}]="${MC_LONG_REM[$j]}"
   done
 
   local key sorted=()
-  for key in $(printf '%s\n' "${!by_index[@]}" | sort -n); do
+  for key in "${!by_index[@]}"; do
     sorted+=("${by_index[$key]}")
   done
   printf "%s" "${sorted[*]}"
@@ -474,8 +442,6 @@ function mclongargs {
     esac
     shift
   done
-
-#  shift "$((OPTIND -1))";
 
   printf "%s" "$*"
 }

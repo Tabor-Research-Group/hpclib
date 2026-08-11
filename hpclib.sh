@@ -1,11 +1,13 @@
+if [ "${BASH_VERSINFO[0]}" -lt 3 ] || { [ "${BASH_VERSINFO[0]}" -eq 3 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
+  echo "hpclib requires bash >= 3.2 (found ${BASH_VERSION})" >&2
+  return 1 2>/dev/null || exit 1
+fi
+
 MAIN_USER=$(whoami)
 MAIN_PARTITION=""
 
 if [ -z "$HPCLIB_DIR" ]; then
-  if [ "${BASH_SOURCE[0]}"="*/hpclib.sh" ];
-    then HPCLIB_DIR=$(dirname "${BASH_SOURCE[0]}")
-    else HPCLIB_DIR=$(dirname "$0")
-  fi
+  HPCLIB_DIR=$(dirname "${BASH_SOURCE[0]}")
 fi
 
 . $HPCLIB_DIR/lib/core.sh

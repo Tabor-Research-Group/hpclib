@@ -14,7 +14,24 @@ set -a # make all variables accessible to sbatch process
 
 source ~/.bashrc
 if [ "$HPCLIB_DIR" = "" ]; then
-  HPCLIB_DIR=~/hpclib
+  # Resolve the real, absolute location of THIS script - not $0
+  # (which can be wrong when sourced, or a relative path when
+  # invoked as `bash path/to/start_tunnel.sh`) - following symlinks
+  # manually since `readlink -f` isn't available on macOS's BSD
+  # readlink. start_tunnel.sh always lives at hpclib_root/tunnels/,
+  # so HPCLIB_DIR is one directory up from wherever this resolves to.
+  _src="${BASH_SOURCE[0]:-$0}"
+  while [ -h "$_src" ]; do
+    _dir="$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)"
+    _src="$(readlink "$_src")"
+    case "$_src" in
+      /*) ;;                      # already absolute
+      *) _src="$_dir/$_src" ;;    # relative symlink target -> make absolute
+    esac
+  done
+  _dir="$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)"
+  HPCLIB_DIR="$(cd -P "$_dir/.." >/dev/null 2>&1 && pwd)"
+  unset _src _dir
 fi
 source $HPCLIB_DIR/hpclib.sh
 if [ "$HPCTUNNELS_DIR" = "" ]; then
@@ -169,7 +186,7 @@ echo "submitting job..." > "$STATUS_FILE"
 # on this port immediately, or the browser just sees
 # connection-refused while SLURM queues the real job. Killed below the
 # instant the real compute node is reachable.
-python3 "$HPCSERVERS_DIR/waiting_shim.py" "$HOST_PORT" "$STATUS_FILE" "$TUNNEL_NAME" &
+python3 "$HPCSERVERS_DIR/waiting_shim.py" "$HOST_PORT" "$STATUS_FILE" "$TUNNEL_NAME" > "$STATUS_FILE" &
 SHIM_PID=$!
 
 sbatch --job-name=$job_name --open-mode=append --out="$SESSIONS_DIR/session-%j.log" --export="$export_spec" $sbatch_args "$SBATCH_SCRIPT"
