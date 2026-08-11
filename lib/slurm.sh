@@ -1,19 +1,24 @@
-
-
 MCDEFAULT_SQUEUE_FORMAT="%.9i %.32j %.8u %.2t %.10M %.5C %.6D %R"
 UQUEUE_FLAGS="u:p:A:f:hij:lL:M:n:R:r:s:S:t:vVw:"
+UQUEUE_LONG_FLAGS="user:,partition:,account:,format:,sort:,start,array,long"
 function uqueue {
   local user;
   local partition;
   local account;
   local format;
   local args;
+  local passthrough;
   local argstr;
 
-  user=$(mcoptvalue "$UQUEUE_FLAGS" 'u' $@);
-  partition=$(mcoptvalue "$UQUEUE_FLAGS" 'p' $@);
-  account=$(mcoptvalue "$UQUEUE_FLAGS" 'A' $@);
-  format=$(mcoptvalue "$UQUEUE_FLAGS" 'f' $@);
+  user=$(mcoptvalue "$UQUEUE_FLAGS" "$UQUEUE_LONG_FLAGS" 'u' $@);
+  if [ -z "$user" ]; then user=$(mclongvalue "$UQUEUE_LONG_FLAGS" "user" $@); fi
+  partition=$(mcoptvalue "$UQUEUE_FLAGS" "$UQUEUE_LONG_FLAGS" 'p' $@);
+  if [ -z "$partition" ]; then partition=$(mclongvalue "$UQUEUE_LONG_FLAGS" "partition" $@); fi
+  account=$(mcoptvalue "$UQUEUE_FLAGS" "$UQUEUE_LONG_FLAGS" 'A' $@);
+  if [ -z "$account" ]; then account=$(mclongvalue "$UQUEUE_LONG_FLAGS" "account" $@); fi
+  format=$(mcoptvalue "$UQUEUE_FLAGS" "$UQUEUE_LONG_FLAGS" 'f' $@);
+  if [ -z "$format" ]; then format=$(mclongvalue "$UQUEUE_LONG_FLAGS" "format" $@); fi
+
   if [ "$user" = "" ]
     then user=$MCDEFAULT_USER
   fi
@@ -26,9 +31,13 @@ function uqueue {
   argstr=$(_build_argstr "$argstr" "$user" "-u");
   argstr=$(_build_argstr "$argstr" "$partition" "-p");
   argstr=$(_build_argstr "$argstr" "$account" "-A");
-  args=$(mcoptsfrom "$UQUEUE_FLAGS" "h|i|j|l|L|M|n|R|r|s|S|t|v|V|w" $@)
+  args=$(mcoptsfrom "$UQUEUE_FLAGS" "$UQUEUE_LONG_FLAGS" "h|i|j|l|L|M|n|R|r|s|S|t|v|V|w" $@)
+  # any long flag not declared in UQUEUE_LONG_FLAGS (e.g. --array,
+  # --priority) rides through here untouched, in its original position
+  # relative to whatever else was on the command line
+  passthrough=$(mcargs "$UQUEUE_FLAGS" "$UQUEUE_LONG_FLAGS" $@)
 
-  squeue $argstr --format="$format" $args
+  squeue $argstr --format="$format" $args $passthrough
 }
 
 function uqueue_ids {
@@ -36,6 +45,7 @@ function uqueue_ids {
 }
 
 FILTER_JOBS_PATTERN="u:p:A:n:m:M:L:R:r:s:S:t:w:"
+FILTER_JOBS_LONG_PATTERN="user:,partition:,account:,name:,min:,max:"
 function filter_jobs {
   local name_pattern;
   local min;
@@ -46,9 +56,9 @@ function filter_jobs {
   local args;
   local ids;
 
-  min=$(mcoptvalue "$FILTER_JOBS_PATTERN" 'm' $@);
-  max=$(mcoptvalue "$FILTER_JOBS_PATTERN" 'M' $@);
-  name_pattern=$(mcoptvalue "$FILTER_JOBS_PATTERN" 'n' $@);
+  min=$(mcoptvalue "$FILTER_JOBS_PATTERN" "$FILTER_JOBS_LONG_PATTERN" 'm' $@);
+  max=$(mcoptvalue "$FILTER_JOBS_PATTERN" "$FILTER_JOBS_LONG_PATTERN" 'M' $@);
+  name_pattern=$(mcoptvalue "$FILTER_JOBS_PATTERN" "$FILTER_JOBS_LONG_PATTERN" 'n' $@);
   if [ -z "$min" ]; then
     min="0"
   fi
@@ -67,7 +77,7 @@ function filter_jobs {
       fi
   fi
 
-  args=$(mcoptsfrom "$FILTER_JOBS_PATTERN" "u|p|A|L|R|r|s|S|t|w" $@)
+  args=$(mcoptsfrom "$FILTER_JOBS_PATTERN" "$FILTER_JOBS_LONG_PATTERN" "u|p|A|L|R|r|s|S|t|w" $@)
 
   ids=$(squeue -h -o "$format" $argstr $args | awk -v pat="$name_pattern" -v min="$min" -v max="$max" "$awk_pattern")
   printf "%s\n" "$ids"
@@ -139,10 +149,11 @@ function get_job_node {
 DEFAULT_WAIT_FOR_JOB_RETRIES=5
 DEFAULT_WAIT_FOR_JOB_PAUSE=1
 WAIT_FOR_JOB_NODE_OPTS="S:R:"
+WAIT_FOR_JOB_NODE_LONG_OPTS=""
 function wait_for_job_node {
-  local job_id=$(mcargs "$WAIT_FOR_JOB_NODE_OPTS" $@);
-  local retries=$(mcoptvalue "$WAIT_FOR_JOB_NODE_OPTS" 'R' $@);
-  local pause_time=$(mcoptvalue "$WAIT_FOR_JOB_NODE_OPTS" 'S' $@);
+  local job_id=$(mcargs "$WAIT_FOR_JOB_NODE_OPTS" "$WAIT_FOR_JOB_NODE_LONG_OPTS" $@);
+  local retries=$(mcoptvalue "$WAIT_FOR_JOB_NODE_OPTS" "$WAIT_FOR_JOB_NODE_LONG_OPTS" 'R' $@);
+  local pause_time=$(mcoptvalue "$WAIT_FOR_JOB_NODE_OPTS" "$WAIT_FOR_JOB_NODE_LONG_OPTS" 'S' $@);
   local job_node;
   local i;
 
@@ -166,6 +177,7 @@ function wait_for_job_node {
 }
 
 CONNECT_TO_JOB_OPTS="46AaCfGgKkMNnqsTtVvXxYyfnb:B:c:e:E:L:l:i:J:F:D:o:O:Q:w:W:S:R:P:I:"
+CONNECT_TO_JOB_LONG_OPTS=""
 function connect_to_job {
   local job_id;
   local forwarding;
@@ -176,27 +188,27 @@ function connect_to_job {
   local post_args;
   local pause_time;
 
-  forwarding=$(mcoptvalue "$CONNECT_TO_JOB_OPTS" "P" $@)
+  forwarding=$(mcoptvalue "$CONNECT_TO_JOB_OPTS" "$CONNECT_TO_JOB_LONG_OPTS" "P" $@)
   if [ "$forwarding" != "" ]; then
     ssh_args=$(multi_fwd_spec "L" "$forwarding")
   fi
 
-  job_id=($(mcargs "$CONNECT_TO_JOB_OPTS" $@))
+  job_id=($(mcargs "$CONNECT_TO_JOB_OPTS" "$CONNECT_TO_JOB_LONG_OPTS" $@))
   if [ "$job_id" = "" ];
     then echo "No job ID provided"
     else
       post_args="${job_id[@]:1}"
       job_id="${job_id[0]}"
-      wait_opts=$(mcoptsfrom "$CONNECT_TO_JOB_OPTS" "S|R" $@)
+      wait_opts=$(mcoptsfrom "$CONNECT_TO_JOB_OPTS" "$CONNECT_TO_JOB_LONG_OPTS" "S|R" $@)
       job_node=$(wait_for_job_node $wait_opts $job_id)
       if [ "$job_node" = "" ]
         then
             echo "Timed out while waiting for job to start, canceling requested job"
             scancel $job_id
         else
-            ssh_opts=$(mcopts "$CONNECT_TO_JOB_OPTS" "S|R|P|I" $@)
+            ssh_opts=$(mcopts "$CONNECT_TO_JOB_OPTS" "$CONNECT_TO_JOB_LONG_OPTS" "S|R|P|I" $@)
             ssh_args=$(_build_argstr "$ssh_args" "$ssh_opts")
-            pause_time=$(mcoptvalue "$CONNECT_TO_JOB_OPTS" "I" $@)
+            pause_time=$(mcoptvalue "$CONNECT_TO_JOB_OPTS" "$CONNECT_TO_JOB_LONG_OPTS" "I" $@)
             sleep $pause_time
             printf "%s\n" "ssh $ssh_args $job_node $post_args"
             ssh $ssh_args $job_node "$post_args"
@@ -291,17 +303,8 @@ SLURM_COMMAND_DEFAULT_OUTPUT_NAME="output-%j.out"
 SLURM_COMMAND_DEFAULT_JOB_FILES=""
 SLURM_COMMAND_DEFAULT_OUTPUT_FILES="*.log,*.chk,*.out"
 SLURM_COMMAND_EXECUTE_FLAGS="nO:J:H:S:R:E:W:"
+SLURM_COMMAND_EXECUTE_LONG_FLAGS=""
 function slurm_command_execute {
-  local noscratch=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "n" $@)
-  local SCRATCH=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "S" $@)
-  local RESULTS=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "W" $@)
-#  local input_file=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "I" $@)
-  local output_file=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "O" $@)
-  local job_list=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "J" $@)
-  local job_exclude=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "H" $@)
-  local results_list=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "R" $@)
-  local exclude_list=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "E" $@)
-  local args=($(mcargs $SLURM_COMMAND_EXECUTE_FLAGS $@))
   local cmd="${args[0]}"
   local input_file="${args[1]}"
   local rest="${args[@]:2}"

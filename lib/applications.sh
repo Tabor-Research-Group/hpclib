@@ -2,8 +2,9 @@
 
 DEFAULT_GAUSSIAN_COMMAND=g16
 RUN_GAUSSIAN_FLAGS="g:"
+RUN_GAUSSIAN_LONG_FLAGS="gaussian:"
 function run_gaussian {
-  local gaussian_version=$(mcoptvalue "$RUN_GAUSSIAN_FLAGS" "g" $@)
+  local gaussian_version=$(mcoptvalue "$RUN_GAUSSIAN_FLAGS" "$RUN_GAUSSIAN_LONG_FLAGS" "g" $@)
   local input_file="$1"
 
   if [ -z "$gaussian_version" ]; then
@@ -14,7 +15,7 @@ function run_gaussian {
     return 1
   fi
 
-  if [ -z "$input_file"]; then
+  if [ -z "$input_file" ]; then
     echo "no Gaussian input file specified"
     return 1
   fi

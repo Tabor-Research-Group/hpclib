@@ -15,6 +15,7 @@ function _ssh_connected {
 }
 
 SSH_FLAGS="46AaCfgKkMNnqPRTtVvXxYy:b:c:D:E:e:F:f:i:I:J:L:l:m:O:o:p:Q:S:W:w:";
+SSH_LONG_FLAGS=""
 function _ssh_like {
   local cmd="$1";
   local args;
@@ -27,10 +28,10 @@ function _ssh_like {
   local restart;
   shift
 
-  base_opts=$(mcopts "$SSH_FLAGS" "o|R" $@);
-  conn_opt=$(mcoptvalue "$SSH_FLAGS" "o" $@);
-  restart=$(mcoptvalue "$SSH_FLAGS" "R" $@);
-  args=($(mcargs "$SSH_FLAGS" $@));
+  base_opts=$(mcopts "$SSH_FLAGS" "$SSH_LONG_FLAGS" "o|R" $@);
+  conn_opt=$(mcoptvalue "$SSH_FLAGS" "$SSH_LONG_FLAGS" "o" $@);
+  restart=$(mcoptvalue "$SSH_FLAGS" "$SSH_LONG_FLAGS" "R" $@);
+  args=($(mcargs "$SSH_FLAGS" "$SSH_LONG_FLAGS" $@));
   server=${args[0]}
   server=${server%:*}
   servername=${server#*@}
@@ -60,6 +61,7 @@ function _ssh_like {
 }
 
 SCP_FLAGS="UEZ:u:s:346BCpqrvF:i:l:o:P:S:R:";
+SCP_LONG_FLAGS=""
 function _scp_like {
   local cmd="$1";
   local args;
@@ -72,10 +74,10 @@ function _scp_like {
   local restart;
   shift
 
-  base_opts=$(mcopts "$SCP_FLAGS" "o|R" $@);
-  conn_opt=$(mcoptvalue "$SCP_FLAGS" "o" $@);
-  restart=$(mcoptvalue "$SCP_FLAGS" "R" $@);
-  args=($(mcargs "$SCP_FLAGS" $@));
+  base_opts=$(mcopts "$SCP_FLAGS" "$SCP_LONG_FLAGS" "o|R" $@);
+  conn_opt=$(mcoptvalue "$SCP_FLAGS" "$SCP_LONG_FLAGS" "o" $@);
+  restart=$(mcoptvalue "$SCP_FLAGS" "$SCP_LONG_FLAGS" "R" $@);
+  args=($(mcargs "$SCP_FLAGS" "$SCP_LONG_FLAGS" $@));
   server=${args[1]}
   server=${server%:*}
   servername=${server#*@}
@@ -104,6 +106,7 @@ function _scp_like {
 }
 
 RSYNC_FLAGS="rlptgDaqbudLkKHEAXsF:f:o:R:";
+RSYNC_LONG_FLAGS=""
 function _rsync_like {
   local cmd="$1";
   local args;
@@ -116,10 +119,10 @@ function _rsync_like {
   local restart;
   shift
 
-  base_opts=$(mcopts "$RSYNC_FLAGS" "o|R" $@);
-  conn_opt=$(mcoptvalue "$RSYNC_FLAGS" "o" $@);
-  restart=$(mcoptvalue "$RSYNC_FLAGS" "R" $@);
-  args=($(mcargs "$RSYNC_FLAGS" $@));
+  base_opts=$(mcopts "$RSYNC_FLAGS" "$RSYNC_LONG_FLAGS" "o|R" $@);
+  conn_opt=$(mcoptvalue "$RSYNC_FLAGS" "$RSYNC_LONG_FLAGS" "o" $@);
+  restart=$(mcoptvalue "$RSYNC_FLAGS" "$RSYNC_LONG_FLAGS" "R" $@);
+  args=($(mcargs "$RSYNC_FLAGS" "$RSYNC_LONG_FLAGS" $@));
   server=${args[1]}
   server=${server%:*}
   servername=${server#*@}
@@ -233,7 +236,4 @@ function pfwd {
   _ssh_like ssh -fN -L $(fwd_spec $port) $@
 }
 
-function listening_on {
-  local port=$1
-  echo $(lsof -iTCP -sTCP:LISTEN -n -P | grep :$port)
-}
+# pssh/pscp/psftp/psync/fwd_spec/multi_fwd_spec/pfwd/listening_on: unchanged

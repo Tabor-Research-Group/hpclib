@@ -10,7 +10,7 @@ function _launch_app {
 
   if [ -f "$default_path" ];
     then
-      echo $("$default_path" $@)
+      echo $("$default_path" "$@")
     else
       echo $(open -na "$fallback_name" --args "$@")
   fi
@@ -46,19 +46,19 @@ function _launch_chromium {
   shift
   local app="$1"
   shift
-  echo $(_launch_app "$DEFAULT_CHROMIUM_LAUNCH_PATH" "Chromium" "--app=$app" $@)
+  echo $(_launch_app "$DEFAULT_CHROMIUM_LAUNCH_PATH" "Chromium" "--app=$app" "$@")
 }
 
 function _launch_safari {
   local browser_mode="$1"
   shift
-  echo $(_launch_app "$DEFAULT_SAFARI_LAUNCH_PATH" "Safari" $@)
+  echo $(_launch_app "$DEFAULT_SAFARI_LAUNCH_PATH" "Safari" "$@")
 }
 
 function _launch_firefox {
   local browser_mode="$1"
   shift
-  echo $(_launch_app "$DEFAULT_FIREFOX_LAUNCH_PATH" "Firefox" $@)
+  echo $(_launch_app "$DEFAULT_FIREFOX_LAUNCH_PATH" "Firefox" "$@")
 }
 
 DEFAULT_LAUNCH_BROWSER="Chrome"
@@ -98,11 +98,12 @@ function locate_browser_launcher {
 
 LAUNCH_TUNNEL_DEFAULT_APP="Safari"
 LAUNCH_TUNNEL_ARGS="bP:A:"
+LAUNCH_TUNNEL_LONG_ARGS="port:,app:,browser"
 function launch_tunnel {
-  local port=$(mcoptvalue "$LAUNCH_TUNNEL_ARGS" "P" $@);
-  local app=$(mcoptvalue "$LAUNCH_TUNNEL_ARGS" "A" $@);
-  local browser_mode=$(mcoptvalue "$LAUNCH_TUNNEL_ARGS" "b" $@);
-  local args=$(mcargs "$LAUNCH_TUNNEL_ARGS" $@);
+  local port=$(mcoptvalue "$LAUNCH_TUNNEL_ARGS" "$LAUNCH_TUNNEL_LONG_ARGS" "P" "$@");
+  local app=$(mcoptvalue "$LAUNCH_TUNNEL_ARGS" "$LAUNCH_TUNNEL_LONG_ARGS" "A" "$@");
+  local browser_mode=$(mcoptvalue "$LAUNCH_TUNNEL_ARGS" "$LAUNCH_TUNNEL_LONG_ARGS" "b" "$@");
+  local args=$(mcargs "$LAUNCH_TUNNEL_ARGS" "$LAUNCH_TUNNEL_LONG_ARGS" "$@");
   args=($args)
   local address="${args[0]}"
   local tunnel="${args[1]}"
@@ -130,8 +131,8 @@ function launch_tunnel {
           psync -r $HPCLIB_DIR $address:hpclib
 
           launcher=$(locate_browser_launcher "$app")
-          launch_args=${args[@]:2}
-          $launcher "$browser_mode" http://localhost:$port ${launch_args[@]}
+          launch_args=("${args[@]:2}")
+          $launcher "$browser_mode" http://localhost:$port "${launch_args[@]}"
           pssh -t -L 127.0.0.1:$port:127.0.0.1:$port $address "/bin/bash hpclib/tunnels/start_tunnel.sh ${tunnel} -P $port"
       fi
   fi
