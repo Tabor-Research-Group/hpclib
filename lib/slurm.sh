@@ -305,6 +305,15 @@ SLURM_COMMAND_DEFAULT_OUTPUT_FILES="*.log,*.chk,*.out"
 SLURM_COMMAND_EXECUTE_FLAGS="nO:J:H:S:R:E:W:"
 SLURM_COMMAND_EXECUTE_LONG_FLAGS=""
 function slurm_command_execute {
+  local noscratch=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "$SLURM_COMMAND_EXECUTE_LONG_FLAGS" "n" $@)
+  local SCRATCH=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "$SLURM_COMMAND_EXECUTE_LONG_FLAGS" "S" $@)
+  local RESULTS=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "$SLURM_COMMAND_EXECUTE_LONG_FLAGS" "W" $@)
+  local output_file=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "$SLURM_COMMAND_EXECUTE_LONG_FLAGS" "O" $@)
+  local job_list=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "$SLURM_COMMAND_EXECUTE_LONG_FLAGS" "J" $@)
+  local job_exclude=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "$SLURM_COMMAND_EXECUTE_LONG_FLAGS" "H" $@)
+  local results_list=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "$SLURM_COMMAND_EXECUTE_LONG_FLAGS" "R" $@)
+  local exclude_list=$(mcoptvalue $SLURM_COMMAND_EXECUTE_FLAGS "$SLURM_COMMAND_EXECUTE_LONG_FLAGS" "E" $@)
+  local args=($(mcargs $SLURM_COMMAND_EXECUTE_FLAGS "$SLURM_COMMAND_EXECUTE_LONG_FLAGS" $@))
   local cmd="${args[0]}"
   local input_file="${args[1]}"
   local rest="${args[@]:2}"
