@@ -242,14 +242,21 @@ function slurm_job_output {
 }
 
 function slurm_job_time_limit {
-  local slurm_job_time_limit
+  local time_limit
 
-  if [ -n $SLURM_JOB_ID ] ; then
-    SLURM_JOB_TIME_LIMIT=$(echo $(scontrol show job $SLURM_JOB_ID | awk -F= '/TimeLimit=/{print $3}') | awk '{ print $1 }')
+  if [ -n "$SLURM_JOB_ID" ]; then
+    # split on whitespace first so we can match the TimeLimit= token
+    # directly, regardless of what else scontrol puts on that line or
+    # what order it puts it in
+    time_limit=$(scontrol show job "$SLURM_JOB_ID" | tr ' ' '\n' | awk -F= '/^TimeLimit=/{print $2}')
+    if [ -z "$time_limit" ]; then
+      time_limit="N/A"
+    fi
   else
-    SLURM_JOB_TIME_LIMIT="N/A"
+    time_limit="N/A"
   fi
 
+  echo "$time_limit"
 }
 
 function slurm_job_info() {
@@ -258,6 +265,12 @@ function slurm_job_info() {
   local SLURM_JOB_DIR=$(dirname $SLURM_JOB_SCRIPT)
   local SLURM_JOB_OUTPUT=$(slurm_job_output)
   local SLURM_JOB_TIME_LIMIT=$(slurm_job_time_limit)
+  local job_args=("$@")
+  local args_display="(none)"
+
+  if [ "${#job_args[@]}" -gt 0 ]; then
+    args_display="${job_args[*]}"
+  fi
 
   echo "===================================SLURM JOB==================================="
   echo "    JOB: $SLURM_JOB_NAME"
@@ -267,35 +280,12 @@ function slurm_job_info() {
   echo "     ID: $SLURM_JOB_ID"
   echo "    OUT: $SLURM_JOB_OUTPUT"
   echo " SCRIPT: $SLURM_JOB_SCRIPT"
+  echo "   ARGS: $args_display"
   echo "   TIME: $SLURM_JOB_TIME_LIMIT"
   echo "  NODES: $SLURM_JOB_NUM_NODES"
   echo "  PART.: $SLURM_JOB_PARTITION"
   echo "=============================================================================="
 
-}
-
-function _slurm_cleanup {
-  local CUR_DIR="$1"
-  local WORK_DIR="$2"
-  local RESULTS="$3"
-  local results_list="$4"
-  local exclude_list="$5"
-  local rsync_list
-
-  # move results of calc
-#  touch job_manager-complete
-  echo "### Copying results back to ${RESULTS}"
-  rsync_list="-av $results_list $exclude_list $WORK_DIR/ $RESULTS"
-  # a workaround for some bash string encoding issue...
-  eval "rsync $rsync_list"
-#      cp $WORK_DIR/job_manager-complete $RESULTS/
-#      cp $WORK_DIR/*.log $RESULTS/
-#      cp $WORK_DIR/*.chk $RESULTS/
-  echo 'Cleaning up'
-  cd $CUR_DIR
-  rm $CUR_DIR/$SLURM_JOB_ID
-  rm -R $WORK_DIR
-  echo "######"
 }
 
 SLURM_COMMAND_SCRATCH_DIR="/tmp"
