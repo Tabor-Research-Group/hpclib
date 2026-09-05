@@ -4,6 +4,11 @@ One metadata file per job (not one shared file for all jobs) so that
 concurrent SLURM jobs never contend for the same file lock. The shared
 SQLite queue (queue_db.py) is where cross-job visibility lives instead.
 """
+import fcntl  # POSIX-only; used to close a create-time race across
+              # concurrent processes racing to initialize the same
+              # job's metadata file (see load_or_create below). Fine
+              # for login/compute nodes; not portable to plain
+              # Windows, which this package has never targeted.
 import json
 import os
 import tempfile
@@ -43,19 +48,43 @@ class MetadataStore:
         If no job_id is supplied and none exists on disk, a UUID is
         generated here and persisted immediately so it stays stable
         across every future submit/restart cycle for this job.
+
+        Guarded by a file lock so that two processes racing to create
+        the SAME job's metadata at (almost) the same instant converge
+        on one job_id instead of each minting its own - a bare
+        check-then-act (load(), then save()) let both sides observe
+        "doesn't exist yet" and independently generate different
+        uuid4()s, which downstream showed up as a queue_db.py
+        UNIQUE-constraint crash on metadata_path once both tried to
+        upsert their own, different job_id against the same file path.
         """
         existing = self.load()
         if existing is not None:
             return existing
 
-        resolved_id = job_id or str(uuid.uuid4())
-        meta = JobMetadata(
-            job_id=resolved_id,
-            job_name=job_name or self.path.stem,
-            status=JobStatus.NEW,
-        )
-        self.save(meta)
-        return meta
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        with open(lock_path, "w") as lock_f:
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+            try:
+                # Re-check now that we hold the lock - another process
+                # may have created the file (and released the lock)
+                # while we were waiting for it, and we want ITS
+                # job_id, not a freshly-generated one of our own.
+                existing = self.load()
+                if existing is not None:
+                    return existing
+
+                resolved_id = job_id or str(uuid.uuid4())
+                meta = JobMetadata(
+                    job_id=resolved_id,
+                    job_name=job_name or self.path.stem,
+                    status=JobStatus.NEW,
+                )
+                self.save(meta)
+                return meta
+            finally:
+                fcntl.flock(lock_f, fcntl.LOCK_UN)
 
     def save(self, meta: JobMetadata) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

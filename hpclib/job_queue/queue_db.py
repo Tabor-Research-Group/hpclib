@@ -58,21 +58,43 @@ class QueueDB:
         submitted_at: Optional[str] = None,
     ) -> None:
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO jobs
-                    (job_id, job_name, metadata_path, status, slurm_job_id, submitted_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-                ON CONFLICT(job_id) DO UPDATE SET
-                    job_name      = excluded.job_name,
-                    metadata_path = excluded.metadata_path,
-                    status        = excluded.status,
-                    slurm_job_id  = COALESCE(excluded.slurm_job_id, jobs.slurm_job_id),
-                    submitted_at  = COALESCE(excluded.submitted_at, jobs.submitted_at),
-                    updated_at    = datetime('now')
-                """,
-                (job_id, job_name, metadata_path, status, slurm_job_id, submitted_at),
-            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO jobs
+                        (job_id, job_name, metadata_path, status, slurm_job_id, submitted_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT(job_id) DO UPDATE SET
+                        job_name      = excluded.job_name,
+                        metadata_path = excluded.metadata_path,
+                        status        = excluded.status,
+                        slurm_job_id  = COALESCE(excluded.slurm_job_id, jobs.slurm_job_id),
+                        submitted_at  = COALESCE(excluded.submitted_at, jobs.submitted_at),
+                        updated_at    = datetime('now')
+                    """,
+                    (job_id, job_name, metadata_path, status, slurm_job_id, submitted_at),
+                )
+            except sqlite3.IntegrityError:
+                # Only reachable if two DIFFERENT job_ids somehow got
+                # attached to the SAME metadata_path (metadata.py's
+                # own load_or_create lock is meant to prevent this, but
+                # e.g. an NFS mount that doesn't honor flock could
+                # still let it through). metadata_path is the real
+                # source of truth for "which file is this," so fold
+                # into that existing row instead of crashing the
+                # caller.
+                conn.execute(
+                    """
+                    UPDATE jobs SET
+                        job_name     = ?,
+                        status       = ?,
+                        slurm_job_id = COALESCE(?, slurm_job_id),
+                        submitted_at = COALESCE(?, submitted_at),
+                        updated_at   = datetime('now')
+                    WHERE metadata_path = ?
+                    """,
+                    (job_name, status, slurm_job_id, submitted_at, metadata_path),
+                )
 
     def mark_submitted(self, job_id: str, slurm_job_id: int) -> None:
         with self._connect() as conn:

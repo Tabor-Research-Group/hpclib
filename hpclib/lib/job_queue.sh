@@ -204,6 +204,10 @@ function job_queue_run {
     slurm_id=0
   fi
   job_queue record-submission --metadata "$METADATA" --slurm-job-id "$slurm_id" --script "${status}.sh"
+  if [ $? -ne 0 ]; then
+    echo "job-queue record-submission failed; aborting rather than running with unrecorded state." >&2
+    exit 1
+  fi
 
   JQ_FINALIZED=0
   JQ_WORK_PID=""
