@@ -134,12 +134,25 @@ function _jq_run_checkpoint_with_timeout {
   wait "$ckpt_pid" 2>/dev/null
 }
 
+# Falls back to the invoking script's OWN filename (minus .sh) rather
+# than its enclosing directory - job_queue scripts are commonly
+# siblings in one flat directory (unlike tunnels, one-per-directory),
+# so a directory-based fallback collides across every script in that
+# directory. Only matters when SLURM_JOB_NAME isn't set - i.e. when
+# testing via plain `bash` instead of a real `sbatch` submission.
+function _jq_default_job_name {
+  local src="${BASH_SOURCE[${#BASH_SOURCE[@]}-1]}"
+  local base
+  base="$(basename "$src")"
+  echo "${base%.sh}"
+}
+
 function job_queue {
   python -m job_queue "$@"
 }
 
 function job_queue_run {
-  JOB_NAME="${JOB_NAME:-${SLURM_JOB_NAME:-$(basename "$(_jq_script_dir)")}}"
+  JOB_NAME="${JOB_NAME:-${SLURM_JOB_NAME:-$(_jq_default_job_name)}}"
   METADATA="${METADATA:-metadata/${JOB_NAME}.json}"
   JQ_SCRIPT_DIR="$(_jq_script_dir)"
 
