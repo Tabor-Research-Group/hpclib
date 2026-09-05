@@ -24,6 +24,17 @@ setuptools.setup(
     include_package_data=True,
     python_requires=">=3.10",
     package_data={
-        "": ["*.sh"],   # bundles every .sh file inside every discovered package
+        "hpclib": [
+            "*.sh",  # hpclib/hpclib.sh itself
+            "lib/*.sh",  # hpclib/lib/core.sh, connections.sh, slurm.sh, tunnels.sh, applications.sh, job_queue.sh
+            "templates/*.sh",  # hpclib/templates/sbatch_core.sh
+            "tunnels/*.sh",  # hpclib/tunnels/start_tunnel.sh, configure_job.sh, postconnect.sh
+            "tunnels/*/*.sh",  # hpclib/tunnels/{jupyter,ngl,pai,vscode}/*.sh
+            "tunnels/*/*.py",  # hpclib/tunnels/ngl/mdsrv_start.py - not a package, so this is the ONLY
+            # way it gets installed at all
+        ],
+        "hpclib.job_queue": [
+            "templates/*.sh",  # hpclib/job_queue/templates/*.sh - same non-package-subdir situation
+        ],
     }
 )
