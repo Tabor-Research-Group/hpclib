@@ -153,20 +153,20 @@ def cli(func):
     return wrapper
 
 
-# --------------------------------------------------------------------------
-# Example usage
-# --------------------------------------------------------------------------
-if __name__ == "__main__":
-
-    @cli
-    def main(name: str, count: int = 1, shout: bool = False, tags: list = None):
-        """Greet someone, optionally more than once."""
-        greeting = f"Hello, {name}!"
-        if shout:
-            greeting = greeting.upper()
-        for _ in range(count):
-            print(greeting)
-        if tags:
-            print("tags:", tags)
-
-    main()
+# # --------------------------------------------------------------------------
+# # Example usage
+# # --------------------------------------------------------------------------
+# if __name__ == "__main__":
+#
+#     @cli
+#     def main(name: str, count: int = 1, shout: bool = False, tags: list = None):
+#         """Greet someone, optionally more than once."""
+#         greeting = f"Hello, {name}!"
+#         if shout:
+#             greeting = greeting.upper()
+#         for _ in range(count):
+#             print(greeting)
+#         if tags:
+#             print("tags:", tags)
+#
+#     main()
