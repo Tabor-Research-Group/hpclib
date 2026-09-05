@@ -135,7 +135,7 @@ function _jq_run_checkpoint_with_timeout {
 }
 
 function job_queue {
-  python -m $HPCLIBDIR/job_queue $@
+  python -m job_queue "$@"
 }
 
 function job_queue_run {
