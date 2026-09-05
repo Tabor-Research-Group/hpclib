@@ -23,12 +23,7 @@ setuptools.setup(
     packages=setuptools.find_packages(),
     include_package_data=True,
     python_requires=">=3.10",
-    install_requires=[
-        # "ase",
-        # "pysisyphus",
-        # "rdkit",
-        # "matplotlib",
-        # "mccoygroup-mcutils",
-        # "mccoygroup-psience"
-    ]
+    package_data={
+        "": ["*.sh"],   # bundles every .sh file inside every discovered package
+    }
 )
