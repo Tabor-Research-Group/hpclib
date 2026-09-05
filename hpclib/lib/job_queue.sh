@@ -43,13 +43,46 @@ function _jq_have_fn {
   declare -F "$1" >/dev/null 2>&1
 }
 
-# Directory of the ORIGINAL invoking script (the sbatch script, not
-# this file) - the last entry in BASH_SOURCE is always the outermost
-# file in the current source chain. Same symlink-following logic as
-# HPCLIB_DIR's own self-location inference, for the same reason: a
-# relative path or symlink shouldn't break lookup of sibling
-# submit.sh/restart.sh/etc files.
+# Directory of the script the USER ACTUALLY SUBMITTED - not
+# necessarily where the currently-running process's own file lives.
+# Under `sbatch`, SLURM copies the submitted script into a per-job
+# spool location and executes THAT copy - so BASH_SOURCE inside a real
+# job points at something like
+# /var/spool/slurmd/jobNNNN/slurm_script, never at the original
+# t8_file_hooks/sbatch_script.sh. Sibling-file hooks (submit.sh,
+# restart.sh, ...) would silently never be found if resolved that way.
+#
+# Fixed the same way lib/slurm.sh's slurm_job_script() already handles
+# this exact problem for slurm_job_info's SCRIPT: line: ask `scontrol
+# show job` for the Command= field, which SLURM reports as the actual
+# path given to sbatch. That path may be relative to wherever `sbatch`
+# was invoked from, so it's resolved against SLURM_SUBMIT_DIR (which
+# SLURM always sets to that submission-time cwd) before use.
+#
+# Falls back to the old BASH_SOURCE-based resolution when not running
+# under SLURM at all (e.g. manual `bash script.sh` testing, where
+# nothing copied the file anywhere first, so BASH_SOURCE is already
+# correct).
 function _jq_script_dir {
+  local cmd
+
+  if [ -n "${SLURM_JOB_ID:-}" ] && command -v scontrol >/dev/null 2>&1; then
+    cmd=$(scontrol show job "$SLURM_JOB_ID" 2>/dev/null | awk -F= '/Command=/{print $2; exit}')
+    if [ -n "$cmd" ]; then
+      case "$cmd" in
+        /*) ;;   # already absolute
+        *) cmd="${SLURM_SUBMIT_DIR:-$PWD}/$cmd" ;;
+      esac
+      if [ -f "$cmd" ]; then
+        cd -P "$(dirname "$cmd")" >/dev/null 2>&1 && pwd
+        return
+      fi                                                                                       
+    fi
+    # scontrol unavailable/empty/stale - fall through to BASH_SOURCE
+    # below rather than failing outright.
+  fi
+
+
   local src="${BASH_SOURCE[${#BASH_SOURCE[@]}-1]}"
   local dir
   while [ -h "$src" ]; do
