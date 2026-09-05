@@ -8,8 +8,7 @@ across different HPC systems
 On a login node run
 
 ```commandline
-cd ~
-git clone https://github.com/Tabor-Research-Group/hpclib.git
+pip install --target=$SCRATCH --no-dependencies --upgrade --ignore-installed git+https://github.com/Tabor-Research-Group/hpclib
 ```
 
 ## hpclib.sh

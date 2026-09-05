@@ -1,11 +1,11 @@
 # lib/job_queue.sh
 #
-# Bridges a single, self-contained sbatch script to the `job-queue`
+# Bridges a single, self-contained sbatch script to the `job_queue`
 # Python package (job_queue/ - see job_queue/README.md) so tracking
 # submit/restart/failure/completion needs only ONE call -
 # `job_queue_run` - at the bottom of that script, instead of the
 # separate sbatch_wrapper.sh/submit.sh/restart.sh/job_runner.sh/
-# checkpoint.sh files `job-queue init` scaffolds.
+# checkpoint.sh files `job_queue init` scaffolds.
 #
 # Expected shape of the calling script:
 #
@@ -134,6 +134,10 @@ function _jq_run_checkpoint_with_timeout {
   wait "$ckpt_pid" 2>/dev/null
 }
 
+function job_queue {
+  python -m $HPCLIBDIR/job_queue $@
+}
+
 function job_queue_run {
   JOB_NAME="${JOB_NAME:-${SLURM_JOB_NAME:-$(basename "$(_jq_script_dir)")}}"
   METADATA="${METADATA:-metadata/${JOB_NAME}.json}"
@@ -141,7 +145,7 @@ function job_queue_run {
 
   local status_log status
   status_log=$(mktemp)
-  status=$(job-queue status --metadata "$METADATA" --job-name "$JOB_NAME" 2>"$status_log")
+  status=$(job_queue status --metadata "$METADATA" --job-name "$JOB_NAME" 2>"$status_log")
 
   case "$status" in
     running)
@@ -163,7 +167,7 @@ function job_queue_run {
     submit|restart)
       ;;
     *)
-      echo "Unrecognized status '${status}' from job-queue status" >&2
+      echo "Unrecognized status '${status}' from job_queue status" >&2
       cat "$status_log" >&2
       rm -f "$status_log"
       exit 1
@@ -177,7 +181,7 @@ function job_queue_run {
   # and applies the same courtesy to a missing submit().
   if ! _jq_have_fn "$status" && [ ! -f "$JQ_SCRIPT_DIR/$status.sh" ]; then
     echo "No ${status}() function or ${status}.sh found for ${JOB_NAME}; cannot proceed." >&2
-    job-queue record-result --metadata "$METADATA" --status failed --error-message "no ${status}() defined"
+    job_queue record-result --metadata "$METADATA" --status failed --error-message "no ${status}() defined"
     exit 1
   fi
 
@@ -186,7 +190,7 @@ function job_queue_run {
     echo "Warning: SLURM_JOB_ID is unset (not running under sbatch?) - recording a placeholder id" >&2
     slurm_id=0
   fi
-  job-queue record-submission --metadata "$METADATA" --slurm-job-id "$slurm_id" --script "${status}.sh"
+  job_queue record-submission --metadata "$METADATA" --slurm-job-id "$slurm_id" --script "${status}.sh"
 
   JQ_FINALIZED=0
   JQ_WORK_PID=""
@@ -197,7 +201,7 @@ function job_queue_run {
     JQ_FINALIZED=1
     if [ "$exit_code" -eq 0 ]; then
       _jq_call_optional completed
-      job-queue record-result --metadata "$METADATA" --status completed --exit-code 0
+      job_queue record-result --metadata "$METADATA" --status completed --exit-code 0
       echo "Job ${JOB_NAME} completed."
     else
       local msg="exited with status ${exit_code}"
@@ -205,7 +209,7 @@ function job_queue_run {
         msg="terminated by SIGTERM (time limit or preemption)"
       fi
       _jq_call_optional failed "$exit_code"
-      job-queue record-result --metadata "$METADATA" --status failed --exit-code "$exit_code" --error-message "$msg"
+      job_queue record-result --metadata "$METADATA" --status failed --exit-code "$exit_code" --error-message "$msg"
       echo "Job ${JOB_NAME} failed (exit ${exit_code})." >&2
     fi
   }
