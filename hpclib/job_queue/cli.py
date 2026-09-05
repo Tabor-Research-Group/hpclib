@@ -19,7 +19,7 @@ from typing import Optional, Sequence
 
 from .decision import determine_action
 from .metadata import MetadataStore
-from .queue_db import QueueDB
+from .queue_db import QueueDB, QueueUnavailable
 from .models import JobStatus
 
 
@@ -79,7 +79,12 @@ def _cmd_get_checkpoint(args: argparse.Namespace) -> int:
 
 def _cmd_list(args: argparse.Namespace) -> int:
     queue = QueueDB()
-    rows = queue.list_jobs(status=args.status)
+    try:
+        rows = queue.list_jobs(status=args.status)
+    except QueueUnavailable as exc:
+        print(f"job-queue list: {exc}", file=sys.stderr)
+        print("Try again in a moment - the shared queue db is briefly locked.", file=sys.stderr)
+        return 1
     if not rows:
         print("No jobs found." if not args.status else f"No jobs with status {args.status}.")
         return 0
