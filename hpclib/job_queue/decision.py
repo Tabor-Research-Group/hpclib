@@ -9,6 +9,7 @@ re-deriving the rules.
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+import json
 
 from .metadata import MetadataStore
 from .models import ACTIVE_STATES, TERMINAL_FAILURE_STATES, JobStatus
@@ -54,6 +55,7 @@ def determine_action(
             job_name=meta.job_name,
             metadata_path=resolved_path,
             status=JobStatus.NEW.value,
+            metadata_json=json.dumps(meta.to_dict()),
         )
         return Decision(action="submit", job_id=meta.job_id)
 
@@ -66,6 +68,7 @@ def determine_action(
             job_name=meta.job_name,
             metadata_path=resolved_path,
             status=JobStatus.NEW.value,
+            metadata_json=json.dumps(meta.to_dict()),
         )
         return Decision(action="submit", job_id=meta.job_id)
 
@@ -76,21 +79,42 @@ def determine_action(
         # last-recorded status instead of silently treating it as done.
         live_status = meta.status
 
-    queue.update_status(meta.job_id, live_status.value)
+    # upsert_job (not update_status) from here on: the queue db is a
+    # secondary index and its own writes can be silently skipped under
+    # lock contention (see queue_db.py's graceful-degradation
+    # behavior), so a row can legitimately be missing here even though
+    # this job has definitely been submitted before. update_status is
+    # a plain UPDATE ... WHERE job_id = ? - if the row doesn't exist,
+    # that matches zero rows and does nothing, forever, since every
+    # later call would ALSO just be an UPDATE. upsert_job self-heals
+    # by creating the row if it's missing, same as the "never
+    # launched" branches above already do.
+    def _sync_queue(status_value: str) -> None:
+        queue.upsert_job(
+            job_id=meta.job_id,
+            job_name=meta.job_name,
+            metadata_path=resolved_path,
+            status=status_value,
+            slurm_job_id=meta.slurm_job_id,
+            metadata_json=json.dumps(meta.to_dict()),
+        )
 
     if live_status in ACTIVE_STATES:
+        _sync_queue(live_status.value)
         return Decision(
             action="running", job_id=meta.job_id,
             detail=f"SLURM state: {live_status.value}",
         )
 
     if live_status is JobStatus.COMPLETED:
-        store.update(status=JobStatus.COMPLETED, exit_code=exit_code)
+        meta = store.update(status=JobStatus.COMPLETED, exit_code=exit_code)
+        _sync_queue(live_status.value)
         return Decision(action="complete", job_id=meta.job_id)
 
     if live_status in TERMINAL_FAILURE_STATES:
         error_msg = meta.error_message or f"SLURM reported state {raw_state or live_status.value}"
-        store.update(status=live_status, exit_code=exit_code, error_message=error_msg)
+        meta = store.update(status=live_status, exit_code=exit_code, error_message=error_msg)
+        _sync_queue(live_status.value)
 
         if meta.attempt >= meta.max_attempts:
             return Decision(
@@ -102,6 +126,7 @@ def determine_action(
 
     # Anything unmapped (shouldn't normally happen) -> surface as error
     # rather than guessing.
+    _sync_queue(live_status.value)
     return Decision(
         action="error",
         job_id=meta.job_id,

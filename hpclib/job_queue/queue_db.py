@@ -8,11 +8,22 @@ is why lock contention here degrades gracefully rather than crashing:
 a WRITE that can't land (upsert_job/update_status/mark_submitted) just
 means the dashboard is briefly stale, not that the job itself is
 unrecorded - the metadata file already has the real, authoritative
-result. A READ that can't complete (get_job/list_jobs) genuinely can't
-answer the caller's question, so those raise QueueUnavailable instead
-of silently returning nothing - callers like `job-queue list` are
-expected to catch it and print a clean one-line message.
+result. A READ that can't complete (get_job/list_jobs/query_jobs)
+genuinely can't answer the caller's question, so those raise
+QueueUnavailable instead of silently returning nothing - callers like
+`job-queue list` are expected to catch it and print a clean one-line
+message.
+
+The `metadata` column stores each job's full JobMetadata as a
+serialized JSON blob (see upsert_job/update_status), so query_jobs()
+below can filter/inspect arbitrary metadata fields (attempt count,
+checkpoint_path, extra, ...) across every job without opening each
+per-job JSON file individually - useful for deciding which jobs are
+worth restarting without a separate pass over the filesystem.
 """
+import json
+import os
+import re
 import sqlite3
 import sys
 import time
@@ -21,6 +32,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .config import QUEUE_DB_PATH, ensure_queue_dir
+from .models import JobStatus
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -30,7 +42,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     slurm_job_id    INTEGER,
     status          TEXT NOT NULL DEFAULT 'NEW',
     submitted_at    TEXT,
-    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    metadata        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status    ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_slurm_id  ON jobs(slurm_job_id);
@@ -46,16 +59,37 @@ QUEUE_DB_LOCK_MAX_BACKOFF = 0.5       # seconds
 
 
 class QueueUnavailable(RuntimeError):
-    """Raised only for READ operations (get_job/list_jobs/etc.) that
-    could not complete after retrying a locked queue db - i.e. the
-    caller genuinely can't get an answer, as opposed to a write that
-    can be safely skipped since the per-job metadata file already has
-    the real result.
+    """Raised only for READ operations (get_job/list_jobs/query_jobs/
+    etc.) that could not complete after retrying a locked queue db -
+    i.e. the caller genuinely can't get an answer, as opposed to a
+    write that can be safely skipped since the per-job metadata file
+    already has the real result.
     """
 
 
 def _is_locked_error(exc: sqlite3.OperationalError) -> bool:
     return "locked" in str(exc).lower()
+
+
+def _sql_regexp(pattern: str, value: Optional[str]) -> bool:
+    # Registered as SQLite's REGEXP function: "X REGEXP Y" calls
+    # regexp(Y, X) - i.e. (pattern, value) in that order, matching
+    # this signature. Uses re.search (substring match), not
+    # re.fullmatch, so "t2" matches "jq_t2_fail_then_restart" the way
+    # someone filtering job names would expect.
+    if value is None:
+        return False
+    return re.search(pattern, value) is not None
+
+
+def _sql_job_dir(path: Optional[str]) -> str:
+    # Registered as SQLite's JOB_DIR function - dirname of a
+    # metadata_path, so dir_regex in query_jobs() below can filter on
+    # the job's DIRECTORY specifically, not the full path (which also
+    # contains the metadata filename itself).
+    if not path:
+        return ""
+    return os.path.dirname(path)
 
 
 class QueueDB:
@@ -70,13 +104,22 @@ class QueueDB:
         # QueueDB (status/record-submission/record-result all do).
         self._available = self._try_init_schema()
 
+    def _init_schema_once(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(SCHEMA)
+        # CREATE TABLE IF NOT EXISTS won't add columns to a jobs table
+        # that already existed before this version added `metadata` -
+        # migrate those in place, once, idempotently.
+        existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+        if "metadata" not in existing_cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN metadata TEXT")
+
     def _try_init_schema(self) -> bool:
         delay = QUEUE_DB_LOCK_INITIAL_BACKOFF
         last_exc: Optional[sqlite3.OperationalError] = None
         for _ in range(QUEUE_DB_LOCK_RETRIES):
             try:
                 with self._connect() as conn:
-                    conn.executescript(SCHEMA)
+                    self._init_schema_once(conn)
                 return True
             except sqlite3.OperationalError as exc:
                 if not _is_locked_error(exc):
@@ -96,6 +139,12 @@ class QueueDB:
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.execute("PRAGMA journal_mode=WAL")  # let readers/writers overlap safely
         conn.row_factory = sqlite3.Row
+        # Registered per-connection (sqlite3 doesn't share custom
+        # functions across connections) so query_jobs() can express
+        # name/dir regex filtering as ordinary SQL predicates rather
+        # than fetching every row and filtering in Python.
+        conn.create_function("REGEXP", 2, _sql_regexp)
+        conn.create_function("JOB_DIR", 1, _sql_job_dir)
         try:
             yield conn
             conn.commit()
@@ -155,6 +204,7 @@ class QueueDB:
         status: str = "NEW",
         slurm_job_id: Optional[int] = None,
         submitted_at: Optional[str] = None,
+        metadata_json: Optional[str] = None,
     ) -> None:
         def _do():
             with self._connect() as conn:
@@ -162,17 +212,18 @@ class QueueDB:
                     conn.execute(
                         """
                         INSERT INTO jobs
-                            (job_id, job_name, metadata_path, status, slurm_job_id, submitted_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                            (job_id, job_name, metadata_path, status, slurm_job_id, submitted_at, updated_at, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?)
                         ON CONFLICT(job_id) DO UPDATE SET
                             job_name      = excluded.job_name,
                             metadata_path = excluded.metadata_path,
                             status        = excluded.status,
                             slurm_job_id  = COALESCE(excluded.slurm_job_id, jobs.slurm_job_id),
                             submitted_at  = COALESCE(excluded.submitted_at, jobs.submitted_at),
+                            metadata      = COALESCE(excluded.metadata, jobs.metadata),
                             updated_at    = datetime('now')
                         """,
-                        (job_id, job_name, metadata_path, status, slurm_job_id, submitted_at),
+                        (job_id, job_name, metadata_path, status, slurm_job_id, submitted_at, metadata_json),
                     )
                 except sqlite3.IntegrityError:
                     # Only reachable if two DIFFERENT job_ids somehow
@@ -190,10 +241,11 @@ class QueueDB:
                             status       = ?,
                             slurm_job_id = COALESCE(?, slurm_job_id),
                             submitted_at = COALESCE(?, submitted_at),
+                            metadata     = COALESCE(?, metadata),
                             updated_at   = datetime('now')
                         WHERE metadata_path = ?
                         """,
-                        (job_name, status, slurm_job_id, submitted_at, metadata_path),
+                        (job_name, status, slurm_job_id, submitted_at, metadata_json, metadata_path),
                     )
 
         self._run_write("upsert_job", _do)
@@ -213,12 +265,18 @@ class QueueDB:
 
         self._run_write("mark_submitted", _do)
 
-    def update_status(self, job_id: str, status: str) -> None:
+    def update_status(
+        self, job_id: str, status: str, metadata_json: Optional[str] = None
+    ) -> None:
         def _do():
             with self._connect() as conn:
                 conn.execute(
-                    "UPDATE jobs SET status = ?, updated_at = datetime('now') WHERE job_id = ?",
-                    (status, job_id),
+                    """
+                    UPDATE jobs
+                    SET status = ?, metadata = COALESCE(?, metadata), updated_at = datetime('now')
+                    WHERE job_id = ?
+                    """,
+                    (status, metadata_json, job_id),
                 )
 
         self._run_write("update_status", _do)
@@ -240,14 +298,84 @@ class QueueDB:
         return self._run_read(_do)
 
     def list_jobs(self, status: Optional[str] = None) -> Iterable[sqlite3.Row]:
+        """Kept for backward compatibility / the simple case - prefer
+        query_jobs() for anything involving --incomplete or regex
+        filtering.
+        """
+        return self.query_jobs(status=status)
+
+    def query_jobs(
+        self,
+        *,
+        status: Optional[str] = None,
+        incomplete: bool = False,
+        name_regex: Optional[str] = None,
+        dir_regex: Optional[str] = None,
+    ) -> Iterable[sqlite3.Row]:
+        """The general-purpose query used by `job-queue list` and
+        available directly to Python callers (e.g. deciding which
+        directories still have work to restart without walking the
+        filesystem).
+
+        - incomplete=True: any status other than COMPLETED. Mutually
+          exclusive with `status` (raises ValueError if both given -
+          "give me everything incomplete" and "give me exactly this
+          one status" are different questions and silently picking one
+          over the other would be surprising).
+        - name_regex / dir_regex: plain Python regex (re.search
+          semantics - unanchored substring match), matched against
+          job_name and against the DIRECTORY portion of metadata_path
+          respectively (not the full path, which would also include
+          the metadata filename). Invalid patterns raise re.error
+          immediately, before touching the db, rather than surfacing
+          as an opaque sqlite3 error from inside the registered
+          REGEXP function.
+        """
+        if incomplete and status:
+            raise ValueError("incomplete=True and status=... are mutually exclusive")
+
+        # Validate up front - a bad pattern should fail clearly and
+        # immediately, not as a wrapped sqlite3.OperationalError from
+        # deep inside a retry loop.
+        if name_regex is not None:
+            re.compile(name_regex)
+        if dir_regex is not None:
+            re.compile(dir_regex)
+
         def _do():
+            clauses = []
+            params: list = []
+            if incomplete:
+                clauses.append("status != ?")
+                params.append(JobStatus.COMPLETED.value)
+            elif status:
+                clauses.append("status = ?")
+                params.append(status)
+            if name_regex is not None:
+                clauses.append("job_name REGEXP ?")
+                params.append(name_regex)
+            if dir_regex is not None:
+                clauses.append("JOB_DIR(metadata_path) REGEXP ?")
+                params.append(dir_regex)
+
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
             with self._connect() as conn:
-                if status:
-                    cur = conn.execute(
-                        "SELECT * FROM jobs WHERE status = ? ORDER BY updated_at DESC", (status,)
-                    )
-                else:
-                    cur = conn.execute("SELECT * FROM jobs ORDER BY updated_at DESC")
+                cur = conn.execute(f"SELECT * FROM jobs {where} ORDER BY updated_at DESC", params)
                 return cur.fetchall()
 
         return self._run_read(_do)
+
+    def get_metadata_dict(self, row: sqlite3.Row) -> Optional[dict]:
+        """Convenience for callers of query_jobs()/list_jobs() who want
+        the stored metadata blob as a dict rather than a raw JSON
+        string. Returns None if this row predates the metadata column
+        being populated (e.g. a job whose last write was before this
+        feature existed).
+        """
+        raw = row["metadata"] if "metadata" in row.keys() else None
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None

@@ -6,11 +6,16 @@ Subcommands:
     status              decide submit/restart/running/complete/error for a job
     record-submission   persist a new SLURM job id after `sbatch --parsable`
     record-checkpoint   persist a checkpoint path from checkpoint.sh
-    get-checkpoint       print a job's last-recorded checkpoint path (or "")
-    list                list jobs from the shared queue db, optionally by status
+    get-checkpoint      print a job's last-recorded checkpoint path (or "")
+    list                list jobs from the shared queue db - filterable by
+                        exact --status, --incomplete (anything not COMPLETED)
+                        --name-regex, and/or --dir-regex (job_name / metadata
+                        directory, both plain Python regex substring matches)
     init                scaffold the bundled shell templates into a directory
 """
 import argparse
+import json
+import re
 import shutil
 import sys
 from importlib import resources
@@ -52,6 +57,7 @@ def _cmd_record_submission(args: argparse.Namespace) -> int:
         metadata_path=str(Path(args.metadata).resolve()),
         status="PENDING",
         slurm_job_id=args.slurm_job_id,
+        metadata_json=json.dumps(meta.to_dict()),
     )
     queue.mark_submitted(job_id=meta.job_id, slurm_job_id=args.slurm_job_id)
 
@@ -78,25 +84,41 @@ def _cmd_get_checkpoint(args: argparse.Namespace) -> int:
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
+    if args.incomplete and args.status:
+        print("job_queue list: --incomplete and --status are mutually exclusive", file=sys.stderr)
+        return 1
+
     queue = QueueDB()
     try:
-        rows = queue.list_jobs(status=args.status)
+        rows = queue.query_jobs(
+            status=args.status,
+            incomplete=args.incomplete,
+            name_regex=args.name_regex,
+            dir_regex=args.dir_regex,
+        )
     except QueueUnavailable as exc:
         print(f"job-queue list: {exc}", file=sys.stderr)
         print("Try again in a moment - the shared queue db is briefly locked.", file=sys.stderr)
         return 1
+    except re.error as exc:
+        print(f"job-queue list: invalid regex - {exc}", file=sys.stderr)
+        return 1
     if not rows:
-        print("No jobs found." if not args.status else f"No jobs with status {args.status}.")
+        print("No jobs found matching the given filters.")
         return 0
     widths = {"job_name": 24, "status": 11, "slurm_job_id": 12, "job_id": 36}
-    header = f"{'JOB_NAME':<{widths['job_name']}} {'STATUS':<{widths['status']}} {'SLURM_ID':<{widths['slurm_job_id']}} JOB_ID"
+    header = (
+        f"{'JOB_NAME':<{widths['job_name']}} {'STATUS':<{widths['status']}} "
+        f"{'SLURM_ID':<{widths['slurm_job_id']}} {'JOB_ID':<{widths['job_id']}} METADATA_PATH"
+    )
     print(header)
     for row in rows:
         print(
             f"{row['job_name']:<{widths['job_name']}} "
             f"{row['status']:<{widths['status']}} "
             f"{str(row['slurm_job_id'] or ''):<{widths['slurm_job_id']}} "
-            f"{row['job_id']}"
+            f"{row['job_id']:<{widths['job_id']}} "
+f"{row['metadata_path']}"
         )
     return 0
 
@@ -134,7 +156,7 @@ def _cmd_record_result(args: argparse.Namespace) -> int:
     meta = store.record_result(status=status, exit_code=args.exit_code, error_message=args.error_message)
 
     queue = QueueDB()
-    queue.update_status(meta.job_id, status.value)
+    queue.update_status(meta.job_id, status.value, metadata_json=json.dumps(meta.to_dict()))
 
     print(f"Recorded result: job_id={meta.job_id} status={status.value} exit_code={args.exit_code}")
     return 0
@@ -165,7 +187,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_getckpt.set_defaults(func=_cmd_get_checkpoint)
 
     p_list = sub.add_parser("list", help="list jobs from the shared queue db")
-    p_list.add_argument("--status", default=None, help="filter by status, e.g. FAILED")
+    p_list.add_argument("--status", default=None, help="filter by exact status, e.g. FAILED")
+    p_list.add_argument(
+        "--incomplete", action="store_true",
+        help="show every job NOT in COMPLETED state; mutually exclusive with --status",
+    )
+    p_list.add_argument(
+        "--name-regex", default=None,
+        help="only show jobs whose job_name matches this regex (substring match)",
+    )
+    p_list.add_argument(
+        "--dir-regex", default=None,
+        help="only show jobs whose metadata directory matches this regex (substring match)",
+    )
     p_list.set_defaults(func=_cmd_list)
 
     p_init = sub.add_parser("init", help="scaffold the bundled shell templates into a directory")
