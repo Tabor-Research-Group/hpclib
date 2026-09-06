@@ -17,7 +17,7 @@ command -v job_queue >/dev/null 2>&1 || { echo "job_queue not on PATH - pip inst
 
 WORKDIR=$(mktemp -d)
 WORKDIR="$SCRIPT_DIR$WORKDIR"
-trap 'cleanup_tracked_jobs; rm -rf "$WORKDIR"' EXIT
+# trap 'cleanup_tracked_jobs; rm -rf "$WORKDIR"' EXIT
 
 function make_batch_file {
   # make_batch_file OUT job_name[:key=val,...] ...

@@ -271,7 +271,7 @@ function mcoptvalue {
   local flag_pat="$1"; shift
   local long_spec="$1"; shift
   local value_pat="$1"; shift
-  local opt opt_string opt_whitespace OPTARG OPTIND=1
+  local opt opt_string="" opt_whitespace OPTARG OPTIND=1
 
   _mcparse_long "$long_spec" "$@"
   set -- "${MC_SHORT_STREAM[@]}"
