@@ -137,7 +137,15 @@ class QueueDB:
     @contextmanager
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")  # let readers/writers overlap safely
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")  # let readers/writers overlap safely
+        except sqlite3.OperationalError:
+            # WAL needs shared-memory/locking support that many NFS-mounted
+            # $HOME filesystems don't provide (common on HPC clusters).
+            # DELETE mode is slower under real concurrency but at least
+            # doesn't crash outright - this is a secondary index anyway,
+            # not the source of truth for any one job (see module docstring).
+            conn.execute("PRAGMA journal_mode=DELETE")
         conn.row_factory = sqlite3.Row
         # Registered per-connection (sqlite3 doesn't share custom
         # functions across connections) so query_jobs() can express
