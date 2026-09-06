@@ -82,3 +82,24 @@ def write_job_dir(spec: JobSpec, config_dir: PathLike, sbatch_script: PathLike) 
     Returns the paths sbatch needs: the copied script (what actually
     gets sbatch'd) and the config file (its one command-line argument).
     """
+    config_dir = Path(config_dir)
+    sbatch_script = Path(sbatch_script)
+    if not sbatch_script.is_file():
+        raise FileNotFoundError(f"sbatch script not found: {sbatch_script}")
+
+    job_dir = (config_dir / spec.job_name).resolve()
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    config_path = job_dir / "config.json"
+    tmp_config = config_path.with_suffix(".json.tmp")
+    with open(tmp_config, "w") as f:
+        json.dump(spec.config, f, indent=2, sort_keys=True)
+    tmp_config.replace(config_path)
+
+    script_copy = job_dir / sbatch_script.name
+    tmp_script = script_copy.with_suffix(script_copy.suffix + ".tmp")
+    shutil.copyfile(sbatch_script, tmp_script)
+    tmp_script.chmod(tmp_script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    tmp_script.replace(script_copy)
+
+    return JobDir(job_name=spec.job_name, job_dir=job_dir, config_path=config_path, sbatch_script=script_copy)
