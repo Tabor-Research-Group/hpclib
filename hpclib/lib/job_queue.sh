@@ -238,7 +238,7 @@ function job_queue_run {
   fi
   job_queue record-submission --metadata "$METADATA" --slurm-job-id "$slurm_id" --script "${status}.sh"
   if [ $? -ne 0 ]; then
-    echo "job-queue record-submission failed; aborting rather than running with unrecorded state." >&2
+    echo "job_queue record-submission failed; aborting rather than running with unrecorded state." >&2
     exit 1
   fi
 
@@ -305,7 +305,7 @@ function job_queue_run {
 #   sbatch ... process_sbatch.sh CONFIG_FILE
 #
 # For process isolation, each job gets its OWN copy of process_sbatch.sh
-# (job-queue write-configs copies it) sitting next to that job's own
+# (job_queue write-configs copies it) sitting next to that job's own
 # config.json, both under $config_dir/$job_name/ - so concurrent jobs
 # never sbatch or read the same script file. It MUST end with
 # `job_queue_run`, exactly like a single hand-run job would:
@@ -344,7 +344,7 @@ function job_process_queue {
   local job_name config_path script_copy metadata_path status status_log
   # All JSON parsing, plus setting up each job's ISOLATED directory
   # (config.json + its own copy of $sbatch_script), happens once, up
-  # front, in job-queue write-configs - nothing below this line touches
+  # front, in job_queue write-configs - nothing below this line touches
   # the batch file's structure, or the shared script, again.
   while IFS=$'\t' read -r job_name config_path script_copy; do
     metadata_path="$metadata_dir/$job_name.json"
@@ -362,14 +362,14 @@ function job_process_queue {
     fi
 
 
-    # Same call job_queue_run itself makes (via `job-queue status`) once
+    # Same call job_queue_run itself makes (via `job_queue status`) once
     # a job is actually running - called here too, but on the login
     # node, BEFORE sbatch. This is what creates/persists the metadata
     # file as a side effect (determine_action -> load_or_create), so
     # "recording metadata" and "checking whether submitted" both happen
     # right here, ahead of sbatch, instead of after it.
     status_log=$(mktemp)
-    status=$(job-queue status --metadata "$metadata_path" --job-name "$job_name" 2>"$status_log")
+    status=$(job_queue status --metadata "$metadata_path" --job-name "$job_name" 2>"$status_log")
 
     case "$status" in
       running|complete)
@@ -389,5 +389,5 @@ function job_process_queue {
       "${extra_sbatch_args[@]}" \
       "$script_copy" "$config_path"
   rmdir "$lock_dir" 2>/dev/null
-  done < <(job-queue write-configs --batch-file "$batch_file" --sbatch-script "$sbatch_script" --config-dir "$config_dir")
+  done < <(job_queue write-configs --batch-file "$batch_file" --sbatch-script "$sbatch_script" --config-dir "$config_dir")
 }
