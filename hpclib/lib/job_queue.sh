@@ -76,7 +76,7 @@ function _jq_script_dir {
       if [ -f "$cmd" ]; then
         cd -P "$(dirname "$cmd")" >/dev/null 2>&1 && pwd
         return
-      fi                                                                                       
+      fi
     fi
     # scontrol unavailable/empty/stale - fall through to BASH_SOURCE
     # below rather than failing outright.
@@ -284,4 +284,110 @@ function job_queue_run {
   trap - TERM EXIT
   _jq_finalize "$work_status"
   exit "$work_status"
+}
+
+# job_process_queue: the LOGIN-NODE counterpart to job_queue_run.
+# job_queue_run decides submit-vs-restart AFTER sbatch, from inside the
+# job. job_process_queue's only job is to decide, per entry in a JSON
+# batch file, whether to call `sbatch` AT ALL - so a sweep of jobs that
+# are mostly already `running` or `complete` doesn't requeue a single
+# one of them.
+#
+# That's the ONE difference from job_queue_run: the status check (and,
+# as a side effect of determine_action, the metadata file's creation)
+# happens here, before sbatch, instead of after it. Everything else -
+# submit() vs restart(), checkpointing, recording the final result -
+# is still job_queue_run's job, unchanged, inside process_sbatch.sh.
+#
+# process_sbatch.sh is REQUIRED (not scaffolded - write your own, same
+# as any job_queue_run-based sbatch script) and is called as:
+#
+#   sbatch ... process_sbatch.sh CONFIG_FILE
+#
+# For process isolation, each job gets its OWN copy of process_sbatch.sh
+# (job-queue write-configs copies it) sitting next to that job's own
+# config.json, both under $config_dir/$job_name/ - so concurrent jobs
+# never sbatch or read the same script file. It MUST end with
+# `job_queue_run`, exactly like a single hand-run job would:
+#
+#   #SBATCH --time=... --signal=B:TERM@60
+#
+#   CONFIG_FILE="$1"
+#   function submit  { python train.py --config "$CONFIG_FILE"; }
+#   function restart { ...; }
+#
+#   . ~/hpclib/hpclib.sh
+#   job_queue_run
+JOB_PROCESS_QUEUE_FLAGS="s:m:c:"
+JOB_PROCESS_QUEUE_LONG_FLAGS="sbatch-script:,metadata-dir:,config-dir:"
+function job_process_queue {
+  local sbatch_script=$(mcoptvalue "$JOB_PROCESS_QUEUE_FLAGS" "$JOB_PROCESS_QUEUE_LONG_FLAGS" 's' $@)
+  local metadata_dir=$(mcoptvalue "$JOB_PROCESS_QUEUE_FLAGS" "$JOB_PROCESS_QUEUE_LONG_FLAGS" 'm' $@)
+  local config_dir=$(mcoptvalue "$JOB_PROCESS_QUEUE_FLAGS" "$JOB_PROCESS_QUEUE_LONG_FLAGS" 'c' $@)
+  local args=($(mcargs "$JOB_PROCESS_QUEUE_FLAGS" "$JOB_PROCESS_QUEUE_LONG_FLAGS" $@))
+  local batch_file="${args[0]}"
+  local extra_sbatch_args=("${args[@]:1}")
+
+  if [ -z "$batch_file" ]; then
+    echo "job_process_queue requires a batch JSON file" >&2
+    return 1
+  fi
+  if [ -z "$sbatch_script" ]; then
+    echo "job_process_queue requires -s/--sbatch-script PROCESS_SBATCH_SCRIPT" >&2
+    return 1
+  fi
+  if [ -z "$metadata_dir" ]; then metadata_dir="metadata"; fi
+  if [ -z "$config_dir" ]; then config_dir="configs"; fi
+
+  mkdir -p "$metadata_dir" "$config_dir"
+
+  local job_name config_path script_copy metadata_path status status_log
+  # All JSON parsing, plus setting up each job's ISOLATED directory
+  # (config.json + its own copy of $sbatch_script), happens once, up
+  # front, in job-queue write-configs - nothing below this line touches
+  # the batch file's structure, or the shared script, again.
+  while IFS=$'\t' read -r job_name config_path script_copy; do
+    metadata_path="$metadata_dir/$job_name.json"
+
+    # Guards against two job_process_queue invocations racing on the
+    # SAME job at the SAME moment (e.g. a cron run and a manual run
+    # overlapping). `mkdir` is atomic on every POSIX filesystem, so
+    # exactly one concurrent caller wins it; the other skips this job
+    # entirely rather than duplicating the status-check-then-sbatch
+    # sequence below.
+    lock_dir="$metadata_dir/.lock-$job_name"
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+      echo "[$job_name] locked by another job_process_queue run - skipping" >&2
+      continue
+    fi
+
+
+    # Same call job_queue_run itself makes (via `job-queue status`) once
+    # a job is actually running - called here too, but on the login
+    # node, BEFORE sbatch. This is what creates/persists the metadata
+    # file as a side effect (determine_action -> load_or_create), so
+    # "recording metadata" and "checking whether submitted" both happen
+    # right here, ahead of sbatch, instead of after it.
+    status_log=$(mktemp)
+    status=$(job-queue status --metadata "$metadata_path" --job-name "$job_name" 2>"$status_log")
+
+    case "$status" in
+      running|complete)
+        echo "[$job_name] $status - skipping"
+        cat "$status_log" >&2
+        rm -f "$status_log"
+        rmdir "$lock_dir" 2>/dev/null
+        continue
+        ;;
+    esac
+    cat "$status_log" >&2
+    rm -f "$status_log"
+
+    echo "[$job_name] $status - submitting ($script_copy)"
+    sbatch --job-name="$job_name" \
+      --export="ALL,JOB_NAME=$job_name,METADATA=$metadata_path" \
+      "${extra_sbatch_args[@]}" \
+      "$script_copy" "$config_path"
+  rmdir "$lock_dir" 2>/dev/null
+  done < <(job-queue write-configs --batch-file "$batch_file" --sbatch-script "$sbatch_script" --config-dir "$config_dir")
 }

@@ -26,6 +26,7 @@ from .decision import determine_action
 from .metadata import MetadataStore
 from .queue_db import QueueDB, QueueUnavailable
 from .models import JobStatus
+from .batch import load_job_specs, write_job_dir
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -43,6 +44,19 @@ def _cmd_status(args: argparse.Namespace) -> int:
         print(f"job_id={decision.job_id}", file=sys.stderr)
     if decision.detail:
         print(decision.detail, file=sys.stderr)
+    return 0
+
+def _cmd_write_configs(args: argparse.Namespace) -> int:
+    """Parse the batch file and set up one isolated directory per job
+    (config.json + its own copy of the shared sbatch script). Prints
+    "job_name<TAB>config_path<TAB>sbatch_script_copy" per line so
+    job_process_queue (lib/job_queue.sh) can loop over it without doing
+    any JSON parsing of its own in bash.
+    """
+    specs = load_job_specs(args.batch_file)
+    for spec in specs:
+        job_dir = write_job_dir(spec, args.config_dir, args.sbatch_script)
+        print(f"{spec.job_name}\t{job_dir.config_path}\t{job_dir.sbatch_script}")
     return 0
 
 
@@ -213,6 +227,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_result.add_argument("--exit-code", type=int, default=None)
     p_result.add_argument("--error-message", default=None)
     p_result.set_defaults(func=_cmd_record_result)
+
+    p_write = sub.add_parser("write-configs", help="parse a batch JSON file, setting up one isolated dir per job")
+    p_write.add_argument("--batch-file", required=True)
+    p_write.add_argument("--sbatch-script", required=True, help="shared process_sbatch.sh, copied into each job's dir")
+    p_write.add_argument("--config-dir", default="configs")
+    p_write.set_defaults(func=_cmd_write_configs)
 
     return parser
 
