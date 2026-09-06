@@ -150,6 +150,7 @@ state=$(wait_for_terminal_state "$id" 120)
 # in _jq_finalize is independent of that (see metadata.record_result's
 # docstring) and is what we assert on below.
 [ "$state" = "TIMEOUT" ] && fail "job hit its time limit before scancel could act - raise TEST_SBATCH_TIME"
+wait_for_metadata_status "$d/metadata.json" 60 >/dev/null || fail "sanity check: job_queue_run never finished recording its own result in time"
 
 lines=$(wc -l < "$d/checkpoint-count" 2>/dev/null || echo 0)
 assert_eq "$lines" "1" "checkpoint() ran exactly once under a real SIGTERM (TERM/EXIT traps didn't double-fire)"

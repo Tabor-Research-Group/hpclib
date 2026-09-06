@@ -112,6 +112,25 @@ function wait_for_metadata_recorded {
   return 1
 }
 
+function wait_for_metadata_status {
+  local metadata_path="$1" timeout="${2:-60}" waited=0 got
+  while [ "$waited" -lt "$timeout" ]; do
+    if [ -f "$metadata_path" ]; then
+      got=$(python3 -c "import json;print(json.load(open('$metadata_path')).get('status',''))" 2>/dev/null)
+      case "$got" in
+        COMPLETED|FAILED|TIMEOUT|CANCELLED|NODE_FAIL)
+          echo "$got"
+          return 0
+          ;;
+      esac
+    fi
+    sleep 1
+    waited=$((waited+1))
+  done
+  echo "TIMEOUT"
+  return 1
+}
+
 
 # Writes a process_sbatch.sh whose submit()/restart() bodies are
 # supplied by the caller as raw bash. Bakes in cluster-specific

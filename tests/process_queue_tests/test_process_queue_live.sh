@@ -16,6 +16,7 @@ export HPCLIB_DIR="$REPO_ROOT/hpclib"
 command -v job_queue >/dev/null 2>&1 || { echo "job_queue not on PATH - pip install -e hpclib/job_queue" >&2; exit 1; }
 
 WORKDIR=$(mktemp -d)
+WORKDIR="$SCRIPT_DIR$WORKDIR"
 trap 'cleanup_tracked_jobs; rm -rf "$WORKDIR"' EXIT
 
 function make_batch_file {
@@ -36,6 +37,10 @@ for spec in sys.argv[2:]:
 json.dump(entries, open(out, "w"))
 PY
 }
+
+TEST_SBATCH_ARGS="--ntasks=1"
+TEST_SBATCH_TIME=00:03:00
+TEST_SBATCH_MEM=100M
 
 
 ############################################################################
@@ -94,11 +99,11 @@ echo '{}' > "$d/configs/$job_done/config.json"
 cp "$d/process_sbatch.sh" "$d/configs/$job_long/process_sbatch.sh"
 write_process_sbatch "$d/configs/$job_done/process_sbatch.sh" 'exit 0' 'exit 0' "$HPCLIB_DIR"
 
-id_long=$(sbatch --job-name="$job_long" --export="ALL,JOB_NAME=$job_long,METADATA=$d/metadata/$job_long.json" \
-  "$d/configs/$job_long/process_sbatch.sh" "$d/configs/$job_long/config.json" | awk '{print $4}')
+id_long=$(sbatch --parsable --job-name="$job_long" --export="ALL,JOB_NAME=$job_long,METADATA=$d/metadata/$job_long.json" \
+  "$d/configs/$job_long/process_sbatch.sh" "$d/configs/$job_long/config.json" | cut -d';' -f1)
 track_job_id "$id_long"
-id_done=$(sbatch --job-name="$job_done" --export="ALL,JOB_NAME=$job_done,METADATA=$d/metadata/$job_done.json" \
-  "$d/configs/$job_done/process_sbatch.sh" "$d/configs/$job_done/config.json" | awk '{print $4}')
+id_done=$(sbatch --parsable --job-name="$job_done" --export="ALL,JOB_NAME=$job_done,METADATA=$d/metadata/$job_done.json" \
+  "$d/configs/$job_done/process_sbatch.sh" "$d/configs/$job_done/config.json" | cut -d';' -f1)
 track_job_id "$id_done"
 
 wait_for_squeue_state "$id_long" "R" 120 || fail "sanity check: job_long never reached RUNNING"
