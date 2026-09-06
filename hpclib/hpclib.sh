@@ -17,4 +17,5 @@ fi
 . $HPCLIB_DIR/lib/applications.sh
 . $HPCLIB_DIR/lib/job_queue.sh
 
-export PYTHONPATH="${PYTHONPATH:-}:${HPCLIB_DIR:-}"
+HPCLIB_ROOT=$(dirname "$HPCLIB_DIR")
+export PYTHONPATH="${PYTHONPATH:-}:${HPCLIB_ROOT:-}"
