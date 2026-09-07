@@ -181,7 +181,7 @@ function _jq_default_job_name {
 }
 
 function job_queue {
-  python -m job_queue "$@"
+  python -m hpclib.job_queue "$@"
 }
 
 function job_queue_run {
