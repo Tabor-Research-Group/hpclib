@@ -318,12 +318,20 @@ function job_queue_run {
 #
 #   . ~/hpclib/hpclib.sh
 #   job_queue_run
-JOB_PROCESS_QUEUE_FLAGS="s:m:c:"
-JOB_PROCESS_QUEUE_LONG_FLAGS="sbatch-script:,metadata-dir:,config-dir:"
+JOB_PROCESS_QUEUE_FLAGS="s:m:c:f"
+JOB_PROCESS_QUEUE_LONG_FLAGS="sbatch-script:,metadata-dir:,config-dir:,force"
 function job_process_queue {
   local sbatch_script=$(mcoptvalue "$JOB_PROCESS_QUEUE_FLAGS" "$JOB_PROCESS_QUEUE_LONG_FLAGS" 's' $@)
   local metadata_dir=$(mcoptvalue "$JOB_PROCESS_QUEUE_FLAGS" "$JOB_PROCESS_QUEUE_LONG_FLAGS" 'm' $@)
   local config_dir=$(mcoptvalue "$JOB_PROCESS_QUEUE_FLAGS" "$JOB_PROCESS_QUEUE_LONG_FLAGS" 'c' $@)
+  # -f is a boolean short flag (no colon in JOB_PROCESS_QUEUE_FLAGS) -
+  # mcoptvalue already reads bare-flag presence back as "true" (see its
+  # own OPTARG="" -> OPTARG=true fallback), same as every other
+  # value-extraction call here; it just never touches the LONG form,
+  # so --force still needs the usual mcoptvalue-then-mclongvalue
+  # fallback pair (see uqueue() in lib/slurm.sh for the same idiom).
+  local force=$(mcoptvalue "$JOB_PROCESS_QUEUE_FLAGS" "$JOB_PROCESS_QUEUE_LONG_FLAGS" 'f' $@)
+  if [ -z "$force" ]; then force=$(mclongvalue "$JOB_PROCESS_QUEUE_LONG_FLAGS" "force" $@); fi
   local args=($(mcargs "$JOB_PROCESS_QUEUE_FLAGS" "$JOB_PROCESS_QUEUE_LONG_FLAGS" $@))
   local batch_file="${args[0]}"
   local extra_sbatch_args=("${args[@]:1}")
@@ -370,6 +378,25 @@ function job_process_queue {
     # right here, ahead of sbatch, instead of after it.
     status_log=$(mktemp)
     status=$(job_queue status --metadata "$metadata_path" --job-name "$job_name" 2>"$status_log")
+
+    # --force: only meaningful for a job that isn't ACTUALLY active
+    # right now. Deliberately checked against the status we just read
+    # ABOVE, before ever touching the file - never remove the metadata
+    # for a job SLURM still reports as running, or the sbatch call
+    # below would start a second, duplicate copy of it into the same
+    # job directory. For every other status (submit/restart/complete/
+    # error), removing the metadata resets determine_action's decision
+    # back to "submit" (see its own "not store.exists()" branch), so
+    # the status gets re-checked once more against the now-absent file.
+    if [ "$force" = "true" ] && [ "$status" != "running" ]; then
+      if [ -f "$metadata_path" ]; then
+        echo "[$job_name] --force: removing existing metadata ($metadata_path)" >&2
+        rm -f "$metadata_path"
+      fi
+      rm -f "$status_log"
+      status_log=$(mktemp)
+      status=$(job_queue status --metadata "$metadata_path" --job-name "$job_name" 2>"$status_log")
+    fi
 
     case "$status" in
       running|complete)

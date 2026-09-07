@@ -70,6 +70,17 @@ class QueueUnavailable(RuntimeError):
 def _is_locked_error(exc: sqlite3.OperationalError) -> bool:
     return "locked" in str(exc).lower()
 
+def _is_corruption_error(exc: BaseException) -> bool:
+    """SQLite's own wording for on-disk corruption. Raised by the
+    sqlite3 module as a plain DatabaseError - NOT OperationalError -
+    so catching only OperationalError (as the lock-retry logic already
+    did) let this straight through, uncaught. Never a transient
+    condition worth retrying as-is: the file itself is broken, so
+    recovery means recreating it, not waiting and trying again.
+    """
+    msg = str(exc).lower()
+    return "malformed" in msg or "file is not a database" in msg
+
 
 def _sql_regexp(pattern: str, value: Optional[str]) -> bool:
     # Registered as SQLite's REGEXP function: "X REGEXP Y" calls
@@ -121,7 +132,11 @@ class QueueDB:
                 with self._connect() as conn:
                     self._init_schema_once(conn)
                 return True
-            except sqlite3.OperationalError as exc:
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+                if _is_corruption_error(exc):
+                    self._quarantine_corrupt_db(exc)
+                    last_exc = exc
+                    continue
                 if not _is_locked_error(exc):
                     raise
                 last_exc = exc
@@ -134,12 +149,46 @@ class QueueDB:
         )
         return False
 
+    def _quarantine_corrupt_db(self, exc: BaseException) -> None:
+        """Move the corrupt db file (and any -wal/-shm sidecars) aside
+        for forensics, clearing the way for _try_init_schema() to
+        create a fresh one in its place.
+
+        Safe to do unconditionally: this db is a secondary index,
+        never the source of truth for any one job's outcome (see
+        module docstring) - losing its history means a dashboard
+        that's briefly starting over, not lost work. The per-job
+        metadata file already has the real, authoritative result.
+        """
+        stamp = time.strftime("%Y%m%dT%H%M%S")
+        print(
+            f"job-queue: queue db appears corrupted ({exc}); "
+            f"quarantining it and starting a fresh one. Per-job metadata is unaffected.",
+            file=sys.stderr,
+        )
+        for suffix in ("", "-wal", "-shm"):
+            src = self.db_path.with_name(self.db_path.name + suffix)
+            if not src.exists():
+                continue
+            dst = self.db_path.with_name(f"{self.db_path.name}{suffix}.corrupt-{stamp}")
+            try:
+                src.rename(dst)
+            except OSError as rename_exc:
+                print(
+                    f"job-queue: couldn't quarantine {src} ({rename_exc}); removing it instead",
+                    file=sys.stderr,
+                )
+                try:
+                    src.unlink()
+                except OSError:
+                    pass
+
     @contextmanager
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30)
         try:
             conn.execute("PRAGMA journal_mode=WAL")  # let readers/writers overlap safely
-        except sqlite3.OperationalError:
+        except (sqlite3.OperationalError, sqlite3.DatabaseError):
             # WAL needs shared-memory/locking support that many NFS-mounted
             # $HOME filesystems don't provide (common on HPC clusters).
             # DELETE mode is slower under real concurrency but at least
@@ -175,7 +224,14 @@ class QueueDB:
             try:
                 fn()
                 return
-            except sqlite3.OperationalError as exc:
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+                if _is_corruption_error(exc):
+                    self._quarantine_corrupt_db(exc)
+                    self._available = self._try_init_schema()
+                    if not self._available:
+                        break
+                    last_exc = exc
+                    continue
                 if not _is_locked_error(exc):
                     raise
                 last_exc = exc
@@ -197,6 +253,13 @@ class QueueDB:
             try:
                 return fn()
             except sqlite3.OperationalError as exc:
+                if _is_corruption_error(exc):
+                    self._quarantine_corrupt_db(exc)
+                    self._available = self._try_init_schema()
+                    if not self._available:
+                        break
+                    last_exc = exc
+                    continue
                 if not _is_locked_error(exc):
                     raise
                 last_exc = exc
