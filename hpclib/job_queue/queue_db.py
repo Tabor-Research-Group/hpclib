@@ -81,6 +81,10 @@ def _is_corruption_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
     return "malformed" in msg or "file is not a database" in msg
 
+def _is_transient_io_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "disk i/o error" in msg or "unable to open database file" in msg
+
 
 def _sql_regexp(pattern: str, value: Optional[str]) -> bool:
     # Registered as SQLite's REGEXP function: "X REGEXP Y" calls
@@ -137,7 +141,7 @@ class QueueDB:
                     self._quarantine_corrupt_db(exc)
                     last_exc = exc
                     continue
-                if not _is_locked_error(exc):
+                if not (_is_locked_error(exc) or _is_transient_io_error(exc)):
                     raise
                 last_exc = exc
                 time.sleep(delay)
@@ -232,7 +236,7 @@ class QueueDB:
                         break
                     last_exc = exc
                     continue
-                if not _is_locked_error(exc):
+                if not (_is_locked_error(exc) or _is_transient_io_error(exc)):
                     raise
                 last_exc = exc
                 time.sleep(delay)
@@ -252,7 +256,7 @@ class QueueDB:
         for _ in range(QUEUE_DB_LOCK_RETRIES):
             try:
                 return fn()
-            except sqlite3.OperationalError as exc:
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
                 if _is_corruption_error(exc):
                     self._quarantine_corrupt_db(exc)
                     self._available = self._try_init_schema()
@@ -260,7 +264,7 @@ class QueueDB:
                         break
                     last_exc = exc
                     continue
-                if not _is_locked_error(exc):
+                if not (_is_locked_error(exc) or _is_transient_io_error(exc)):
                     raise
                 last_exc = exc
                 time.sleep(delay)
