@@ -412,6 +412,7 @@ function job_process_queue {
 
     echo "[$job_name] $status - submitting ($script_copy)"
     sbatch --job-name="$job_name" \
+      --output="$(dirname "$config_path")/$job_name-%j.out" \
       --export="ALL,JOB_NAME=$job_name,METADATA=$metadata_path" \
       "${extra_sbatch_args[@]}" \
       "$script_copy" "$config_path"
