@@ -135,11 +135,144 @@ function _wait_for_port {
   return 1
 }
 
+# Tunnel names are directory names, never paths. Reject traversal and
+# separators before using a name in either a lookup or an installation.
+function _hpclib_valid_tunnel_name {
+  case "$1" in
+    ''|[!a-zA-Z0-9]*|*[!a-zA-Z0-9_.-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Print the first tunnel directory containing an sbatch script.
+# HPCLIB_TUNNEL_PATH is searched from left to right.
+function resolve_tunnel {
+  local name="$1" root
+  local roots=()
+  _hpclib_valid_tunnel_name "$name" || return 2
+  IFS=: read -r -a roots <<< "$HPCLIB_TUNNEL_PATH"
+  for root in "${roots[@]}"; do
+    if [ -n "$root" ] && [ -f "$root/$name/sbatch_script.sh" ]; then
+      printf '%s\n' "$root/$name"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Resolve a tunnel-specific file through the same path, then fall back
+# to the common file shipped in hpclib/tunnels. The second argument is
+# optional inside start_tunnel.sh, where TUNNEL_NAME is already set.
+function resolve_tunnel_file {
+  local file="$1" name="${2:-$TUNNEL_NAME}" root
+  local roots=()
+  _hpclib_valid_tunnel_name "$name" || return 2
+  case "$file" in
+    ''|.|..|*/*) return 2 ;;
+  esac
+  IFS=: read -r -a roots <<< "$HPCLIB_TUNNEL_PATH"
+  for root in "${roots[@]}"; do
+    if [ -n "$root" ] && [ -f "$root/$name/$file" ]; then
+      printf '%s\n' "$root/$name/$file"
+      return 0
+    fi
+  done
+  if [ -f "$HPCTUNNELS_DIR/$file" ]; then
+    printf '%s\n' "$HPCTUNNELS_DIR/$file"
+    return 0
+  fi
+  return 1
+}
+export -f _hpclib_valid_tunnel_name resolve_tunnel resolve_tunnel_file
+
+# Install one downloaded/local tunnel folder. --target names the parent
+# directory into which the tunnel's own folder is placed.
+function install_tunnel {
+  local source='' target="$HPCLIB_TUNNEL_INSTALL_LOCATION" name destination staging
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --target)
+        if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+          echo 'install_tunnel: --target requires a directory' >&2
+          return 2
+        fi
+        target="$2"; shift 2 ;;
+      --target=*)
+        target="${1#--target=}"; shift ;;
+      --)
+        shift
+        if [ "$#" -ne 1 ] || [ -n "$source" ]; then
+          echo 'usage: install_tunnel [--target DIRECTORY] TUNNEL_FOLDER' >&2
+          return 2
+        fi
+        source="$1"; shift ;;
+      -*)
+        echo "install_tunnel: unknown option: $1" >&2
+        return 2 ;;
+      *)
+        if [ -n "$source" ]; then
+          echo 'usage: install_tunnel [--target DIRECTORY] TUNNEL_FOLDER' >&2
+          return 2
+        fi
+        source="$1"; shift ;;
+    esac
+  done
+  if [ -z "$source" ] || [ -z "$target" ] || [ ! -d "$source" ]; then
+    echo 'usage: install_tunnel [--target DIRECTORY] TUNNEL_FOLDER' >&2
+    return 2
+  fi
+  source="$(cd -P "$source" && pwd)" || return 1
+  name="${source##*/}"
+  if ! _hpclib_valid_tunnel_name "$name" || [ ! -f "$source/sbatch_script.sh" ]; then
+    echo "install_tunnel: $source is not a valid tunnel folder" >&2
+    return 2
+  fi
+  mkdir -p "$target" || return 1
+  target="$(cd -P "$target" && pwd)" || return 1
+  destination="$target/$name"
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    echo "install_tunnel: $destination already exists" >&2
+    return 1
+  fi
+  staging="$(mktemp -d "$target/.$name.install.XXXXXX")" || return 1
+  if ! cp -R "$source/." "$staging/"; then
+    rm -rf "$staging"
+    return 1
+  fi
+  if ! mv "$staging" "$destination"; then
+    rm -rf "$staging"
+    return 1
+  fi
+  if [ -f "$destination/install.sh" ]; then
+    if ! (cd "$destination" && HPCLIB_TUNNEL_DIR="$destination" bash ./install.sh) >&2; then
+      echo "install_tunnel: install.sh failed for $name" >&2
+      rm -rf "$destination"
+      return 1
+    fi
+  fi
+  printf '%s\n' "$destination"
+}
+
 LAUNCH_TUNNEL_DEFAULT_APP="Safari"
 LAUNCH_TUNNEL_ARGS="bP:A:"
 LAUNCH_TUNNEL_LONG_ARGS="browser-arg:"
 LAUNCH_TUNNEL_RSYNC="false"
 function launch_tunnel {
+  # Keep arguments after -- intact for the tunnel's sbatch script. The
+  # older option parser returns a flat string, so do not pass script
+  # arguments through it (factory expressions can contain spaces).
+  local launch_args=() tunnel_script_args=() has_script_args=false
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--" ]; then
+      has_script_args=true
+      shift
+      tunnel_script_args=("$@")
+      break
+    fi
+    launch_args+=("$1")
+    shift
+  done
+  set -- "${launch_args[@]}"
   local port=$(mcoptvalue "$LAUNCH_TUNNEL_ARGS" "$LAUNCH_TUNNEL_LONG_ARGS" "P" "$@");
   local app=$(mcoptvalue "$LAUNCH_TUNNEL_ARGS" "$LAUNCH_TUNNEL_LONG_ARGS" "A" "$@");
   local browser_mode=$(mcoptvalue "$LAUNCH_TUNNEL_ARGS" "$LAUNCH_TUNNEL_LONG_ARGS" "b" "$@");
@@ -152,7 +285,11 @@ function launch_tunnel {
   local address="${args[0]}"
   local tunnel="${args[1]}"
   local remote_args=("${args[@]:2}")   # e.g. --mem=30GB - forwarded to start_tunnel.sh, NOT the browser
-  local launcher
+  local launcher remote_command
+
+  if [ "$has_script_args" = true ]; then
+    remote_args+=(-- "${tunnel_script_args[@]}")
+  fi
 
   if [ -z "$address" ]; then
     echo  "launch_tunnel requires address and tunnel name"
@@ -191,10 +328,9 @@ function launch_tunnel {
             fi
           ) &
 
-          local quoted_remote_args
-          printf -v quoted_remote_args '%q ' "${remote_args[@]}"
-          printf "%s\n" "pssh -t -L 127.0.0.1:$port:127.0.0.1:$port $address \"/bin/bash hpclib/tunnels/start_tunnel.sh ${tunnel} -P $port ${quoted_remote_args}\""
-          pssh -t -L 127.0.0.1:$port:127.0.0.1:$port $address "/bin/bash hpclib/tunnels/start_tunnel.sh ${tunnel} -P $port ${quoted_remote_args}"
+          printf -v remote_command '%q ' /bin/bash hpclib/tunnels/start_tunnel.sh "$tunnel" -P "$port" "${remote_args[@]}"
+          printf '%s\n' "pssh -t -L 127.0.0.1:$port:127.0.0.1:$port $address \"$remote_command\""
+          pssh -t -L "127.0.0.1:$port:127.0.0.1:$port" "$address" "$remote_command"
       fi
   fi
 }

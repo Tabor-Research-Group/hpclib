@@ -4,8 +4,8 @@
 ##
 ##  Configure hpclib settings
 ##    - root directory HPCLIB can be set in ~.bashrc
-##    - HPCTUNNELS_DIR: tunnels shipped with hpclib (overwritten by psync)
-##    - USER_TUNNEL_DIR: your own persistent tunnels, checked FIRST
+##    - HPCLIB_TUNNEL_PATH: colon-separated tunnel search path
+##    - HPCLIB_TUNNEL_INSTALL_LOCATION: default install parent directory
 ##    - HPCSERVERS_DIR: directory to use for servers
 ##    - HPCSESSIONS_DIR: directory to use for session info
 ##
@@ -33,13 +33,7 @@ if [ "$HPCLIB_DIR" = "" ]; then
   HPCLIB_DIR="$(cd -P "$_dir/.." >/dev/null 2>&1 && pwd)"
   unset _src _dir
 fi
-source $HPCLIB_DIR/hpclib.sh
-if [ "$HPCTUNNELS_DIR" = "" ]; then
-  HPCTUNNELS_DIR="$HPCLIB_DIR/tunnels"
-fi
-if [ "$USER_TUNNEL_DIR" = "" ]; then
-  USER_TUNNEL_DIR="$HOME/.local/share/hpclib/tunnels"
-fi
+source "$HPCLIB_DIR/hpclib.sh"
 if [ "$HPCSERVERS_DIR" = "" ]; then
   HPCSERVERS_DIR="$HPCLIB_DIR/servers"
 fi
@@ -78,6 +72,21 @@ fi
 TUNNEL_NAME="$1"
 shift
 
+# Arguments after -- belong to the tunnel's sbatch script. Arguments
+# before it configure the tunnel or are passed to sbatch itself.
+START_TUNNEL_ARGS=()
+TUNNEL_SCRIPT_ARGS=()
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--" ]; then
+    shift
+    TUNNEL_SCRIPT_ARGS=("$@")
+    break
+  fi
+  START_TUNNEL_ARGS+=("$1")
+  shift
+done
+set -- "${START_TUNNEL_ARGS[@]}"
+
 START_TUNNEL_FLAGS="fP:"
 START_TUNNEL_LONG_FLAGS="port:,process-port:,env:"
 
@@ -96,14 +105,12 @@ CLI_SBATCH_ARGS=$(mcargs "$START_TUNNEL_FLAGS" "$START_TUNNEL_LONG_FLAGS" "$@")
 
 ################################################################################
 ##
-##  Resolve which tunnel to use: USER_TUNNEL_DIR (yours, persistent)
-##  takes precedence over HPCTUNNELS_DIR (hpclib's, overwritten by psync).
+##  Resolve through the same API available to hpclib.sh users.
 ##
 
-if [ -f "$USER_TUNNEL_DIR/$TUNNEL_NAME/sbatch_script.sh" ]; then
-  TUNNEL_DIR="$USER_TUNNEL_DIR/$TUNNEL_NAME"
-else
-  TUNNEL_DIR="$HPCTUNNELS_DIR/$TUNNEL_NAME"
+if ! TUNNEL_DIR=$(resolve_tunnel "$TUNNEL_NAME"); then
+  echo "Tunnel '$TUNNEL_NAME' not found in HPCLIB_TUNNEL_PATH ($HPCLIB_TUNNEL_PATH)" >&2
+  exit 1
 fi
 SESSIONS_DIR=$HPCSESSIONS_DIR/$TUNNEL_NAME
 SBATCH_SCRIPT="$TUNNEL_DIR/sbatch_script.sh"
@@ -111,32 +118,6 @@ PROCESS_PORT=8080
 ENABLE_WEB_PROXY=true
 START_GIT_SERVER=true
 START_SLURM_SERVER=true
-
-if [ ! -f "$SBATCH_SCRIPT" ]; then
-  echo "Tunnel '$TUNNEL_NAME' not found in $USER_TUNNEL_DIR or $HPCTUNNELS_DIR"
-  exit 1
-fi
-
-# Generic lookup for everything below - and exported, so
-# sbatch_script.sh templates (which run as their own sbatch-launched
-# process, not sourced from here) can call it too. User copy, then this
-# tunnel's shipped copy, then hpclib's shared default. First match wins.
-function resolve_tunnel_file {
-  local name="$1"
-  local candidate
-  for candidate in \
-    "$USER_TUNNEL_DIR/$TUNNEL_NAME/$name" \
-    "$TUNNEL_DIR/$name" \
-    "$HPCTUNNELS_DIR/$name"
-  do
-    if [ -f "$candidate" ]; then
-      echo "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
-export -f resolve_tunnel_file
 
 if tunnel_config_path=$(resolve_tunnel_file tunnel_config.sh); then
   source "$tunnel_config_path"
@@ -189,7 +170,7 @@ echo "submitting job..." > "$STATUS_FILE"
 python3 "$HPCSERVERS_DIR/waiting_shim.py" "$HOST_PORT" "$STATUS_FILE" "$TUNNEL_NAME" > "$STATUS_FILE" &
 SHIM_PID=$!
 
-sbatch --job-name=$job_name --open-mode=append --out="$SESSIONS_DIR/session-%j.log" --export="$export_spec" $sbatch_args "$SBATCH_SCRIPT"
+sbatch --job-name=$job_name --open-mode=append --out="$SESSIONS_DIR/session-%j.log" --export="$export_spec" $sbatch_args "$SBATCH_SCRIPT" "${TUNNEL_SCRIPT_ARGS[@]}"
 
 function stop_git_server() {
   if [ "$GIT_SERVER_JOB" != "" ]; then
