@@ -253,6 +253,210 @@ function install_tunnel {
   printf '%s\n' "$destination"
 }
 
+################################################################################
+##
+##  Installing hpclib itself on a remote (SLURM) system
+##
+
+# Where install_hpclib puts hpclib and where launch_tunnel looks for it,
+# relative to the remote home directory unless absolute.
+HPCLIB_REMOTE_INSTALL_LOCATION="${HPCLIB_REMOTE_INSTALL_LOCATION:-hpclib}"
+
+# Print the HPCLIB_VERSION assigned in an hpclib.sh, without sourcing it.
+function _hpclib_read_version {
+  sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}HPCLIB_VERSION=["'\'']\{0,1\}\([0-9A-Za-z.]*\).*/\2/p' "$1" 2>/dev/null | head -n 1
+}
+
+# Print -1, 0 or 1 as dotted version $1 is older than, equal to, or newer
+# than $2. Numeric fields compare as numbers (1.10 > 1.9) and missing
+# fields count as 0 (1.2 = 1.2.0); other fields compare as strings.
+function _hpclib_version_compare {
+  local a=() b=() i n x y
+  IFS=. read -r -a a <<< "$1"
+  IFS=. read -r -a b <<< "$2"
+  n=${#a[@]}
+  if [ "${#b[@]}" -gt "$n" ]; then n=${#b[@]}; fi
+  for ((i = 0; i < n; i++)); do
+    x="${a[$i]:-0}"; y="${b[$i]:-0}"
+    if [[ "$x" =~ ^[0-9]+$ ]] && [[ "$y" =~ ^[0-9]+$ ]]; then
+      x=$((10#$x)); y=$((10#$y))
+      if [ "$x" -lt "$y" ]; then echo -1; return; fi
+      if [ "$x" -gt "$y" ]; then echo 1; return; fi
+    elif [ "$x" != "$y" ]; then
+      if [[ "$x" < "$y" ]]; then echo -1; else echo 1; fi
+      return
+    fi
+  done
+  echo 0
+}
+
+# Strip a leading ~/ so remote paths can be passed quoted; the remote
+# shell starts in the home directory, so relative paths land there.
+function _hpclib_remote_path {
+  case "$1" in
+    '~') printf '.\n' ;;
+    '~/'*) printf '%s\n' "${1#\~/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+# Runs ON THE REMOTE HOST (shipped there by install_hpclib with
+# `declare -f`). In install mode the package tarball follows this script
+# on stdin. The version check is done here, at install time, so two
+# installs racing each other can't downgrade one another.
+function _hpclib_remote_install {
+  local mode="$1" target="$2" new_version="$3" force="$4"
+  local installed='' state cmp='' parent name staging staged_version
+  case "$target" in
+    /*) ;;
+    *) target="$HOME/$target" ;;
+  esac
+  if [ -f "$target/hpclib.sh" ]; then
+    state=installed
+    installed=$(_hpclib_read_version "$target/hpclib.sh")
+  elif [ -e "$target" ] || [ -L "$target" ]; then
+    state=foreign
+  else
+    state=missing
+  fi
+  if [ -n "$installed" ]; then
+    cmp=$(_hpclib_version_compare "$installed" "$new_version")
+  fi
+
+  local skip=''
+  if [ "$force" != true ]; then
+    if [ "$state" = foreign ]; then
+      echo "install_hpclib: $target exists and is not an hpclib install; use --force to replace it (it is kept as $target.previous)" >&2
+      [ "$mode" = install ] && cat > /dev/null
+      return 1
+    elif [ "$cmp" = 1 ]; then
+      skip="hpclib $installed at $target is newer than $new_version; not installing (use --force to downgrade)"
+    elif [ "$cmp" = 0 ]; then
+      skip="hpclib $installed at $target is up to date"
+    fi
+  fi
+  if [ -n "$skip" ]; then
+    echo "$skip"
+    [ "$mode" = install ] && cat > /dev/null
+    return 0
+  fi
+
+  local was="nothing"
+  case "$state" in
+    installed) was="hpclib ${installed:-(unversioned)}" ;;
+    foreign) was="a non-hpclib $target" ;;
+  esac
+  if [ "$mode" = check ]; then
+    echo "would install hpclib $new_version at $target (replacing $was)"
+    return 0
+  fi
+
+  parent=$(dirname "$target"); name=$(basename "$target")
+  mkdir -p "$parent" || { cat > /dev/null; return 1; }
+  staging=$(mktemp -d "$parent/.$name.install.XXXXXX") || { cat > /dev/null; return 1; }
+  if ! tar -xzf - -C "$staging"; then
+    echo "install_hpclib: failed to unpack hpclib on the remote host; $target is unchanged" >&2
+    rm -rf "$staging"
+    return 1
+  fi
+  staged_version=$(_hpclib_read_version "$staging/hpclib.sh")
+  if [ "$staged_version" != "$new_version" ]; then
+    echo "install_hpclib: unpacked version '$staged_version' does not match $new_version; $target is unchanged" >&2
+    rm -rf "$staging"
+    return 1
+  fi
+  chmod 755 "$staging"  # mktemp -d makes it 700
+  if [ "$state" != missing ]; then
+    rm -rf "$target.previous"
+    mv "$target" "$target.previous" || { rm -rf "$staging"; return 1; }
+  fi
+  if ! mv "$staging" "$target"; then
+    [ "$state" != missing ] && mv "$target.previous" "$target"
+    rm -rf "$staging"
+    return 1
+  fi
+  echo "installed hpclib $new_version at $target (replaced $was)"
+  if [ "$state" != missing ]; then
+    echo "previous install kept at $target.previous"
+  fi
+}
+
+# Tar up an hpclib package directory to stdout, without caches or
+# macOS metadata.
+function _hpclib_pack {
+  local tar_flags=()
+  if tar --version 2>/dev/null | grep -q bsdtar; then
+    tar_flags=(--no-mac-metadata --no-xattrs)
+  fi
+  (cd "$1" && COPYFILE_DISABLE=1 tar "${tar_flags[@]}" \
+    --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' -czf - .)
+}
+
+# Install (or upgrade) this copy of hpclib on a remote host over the
+# persistent pssh connection. Takes the same login arguments as
+# pssh/psftp ([ssh options] [user@]host). Installs only if the remote copy
+# is missing or older than this one, judged by HPCLIB_VERSION in hpclib.sh.
+function install_hpclib {
+  local usage='usage: install_hpclib [--target DIRECTORY] [--force] [--check] [ssh options] [user@]host'
+  local target="$HPCLIB_REMOTE_INSTALL_LOCATION" force=false mode=install
+  local login_args=() hosts=() source version script remote_command
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --target)
+        if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+          echo 'install_hpclib: --target requires a directory' >&2
+          return 2
+        fi
+        target="$2"; shift 2 ;;
+      --target=*)
+        target="${1#--target=}"; shift ;;
+      --force)
+        force=true; shift ;;
+      --check)
+        mode=check; shift ;;
+      -h|--help)
+        echo "$usage"; return 0 ;;
+      *)
+        login_args+=("$1"); shift ;;
+    esac
+  done
+  hosts=($(mcargs "$SSH_FLAGS" "$SSH_LONG_FLAGS" "${login_args[@]}"))
+  if [ "${#hosts[@]}" -ne 1 ]; then
+    echo "$usage" >&2
+    return 2
+  fi
+  target=$(_hpclib_remote_path "$target")
+  case "$target" in
+    ''|.|..|/|./|../)
+      echo "install_hpclib: refusing to install into '$target'" >&2
+      return 2 ;;
+  esac
+
+  source="$(cd -P "$HPCLIB_DIR" 2>/dev/null && pwd)"
+  if [ -z "$source" ] || [ ! -f "$source/hpclib.sh" ]; then
+    echo "install_hpclib: HPCLIB_DIR ($HPCLIB_DIR) is not an hpclib directory" >&2
+    return 1
+  fi
+  version=$(_hpclib_read_version "$source/hpclib.sh")
+  if [ -z "$version" ]; then
+    echo "install_hpclib: no HPCLIB_VERSION found in $source/hpclib.sh" >&2
+    return 1
+  fi
+
+  # The script travels on stdin ahead of the tarball: `bash -s` reads a
+  # pipe one command at a time, so the tar inside the function gets the
+  # rest of the stream. This also keeps the remote command line to plain
+  # words, which works whatever the remote login shell is.
+  script="$(declare -f _hpclib_read_version _hpclib_version_compare _hpclib_remote_install)
+_hpclib_remote_install \"\$@\"; exit \$?"
+  printf -v remote_command '%q ' bash -s -- "$mode" "$target" "$version" "$force"
+  if [ "$mode" = check ]; then
+    printf '%s\n' "$script" | pssh "${login_args[@]}" "$remote_command"
+  else
+    { printf '%s\n' "$script"; _hpclib_pack "$source"; } | pssh "${login_args[@]}" "$remote_command"
+  fi
+}
+
 LAUNCH_TUNNEL_DEFAULT_APP="Safari"
 LAUNCH_TUNNEL_ARGS="bP:A:"
 LAUNCH_TUNNEL_LONG_ARGS="browser-arg:"
@@ -286,6 +490,7 @@ function launch_tunnel {
   local tunnel="${args[1]}"
   local remote_args=("${args[@]:2}")   # e.g. --mem=30GB - forwarded to start_tunnel.sh, NOT the browser
   local launcher remote_command
+  local remote_hpclib=$(_hpclib_remote_path "$HPCLIB_REMOTE_INSTALL_LOCATION")
 
   if [ "$has_script_args" = true ]; then
     remote_args+=(-- "${tunnel_script_args[@]}")
@@ -310,7 +515,7 @@ function launch_tunnel {
           echo -ne "\033]0;$address-$TUNNEL\007"
 
           if [ "$LAUNCH_TUNNEL_RSYNC" = "true" ]; then
-            psync -r $HPCLIB_DIR $address:hpclib/
+            psync -r $HPCLIB_DIR $address:$remote_hpclib/
           fi
 
           launcher=$(locate_browser_launcher "$app")
@@ -328,7 +533,7 @@ function launch_tunnel {
             fi
           ) &
 
-          printf -v remote_command '%q ' /bin/bash hpclib/tunnels/start_tunnel.sh "$tunnel" -P "$port" "${remote_args[@]}"
+          printf -v remote_command '%q ' /bin/bash "$remote_hpclib/tunnels/start_tunnel.sh" "$tunnel" -P "$port" "${remote_args[@]}"
           printf '%s\n' "pssh -t -L 127.0.0.1:$port:127.0.0.1:$port $address \"$remote_command\""
           pssh -t -L "127.0.0.1:$port:127.0.0.1:$port" "$address" "$remote_command"
       fi

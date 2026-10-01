@@ -3,6 +3,10 @@ if [ "${BASH_VERSINFO[0]}" -lt 3 ] || { [ "${BASH_VERSINFO[0]}" -eq 3 ] && [ "${
   return 1 2>/dev/null || exit 1
 fi
 
+# Bump on every release: install_hpclib only replaces a remote copy
+# whose HPCLIB_VERSION is older than this one. setup.py reads it too.
+HPCLIB_VERSION="0.1.0"
+
 MAIN_USER=$(whoami)
 MAIN_PARTITION=""
 

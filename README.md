@@ -11,6 +11,25 @@ On a login node run
 pip install --target=$SCRATCH --no-dependencies --upgrade --ignore-installed git+https://github.com/Tabor-Research-Group/hpclib
 ```
 
+or, from a local copy of `hpclib`, install it on the cluster over the same persistent connection `pssh`/`psftp` use:
+
+```bash
+source /path/to/hpclib/hpclib/hpclib.sh
+install_hpclib user@login.example                     # installs to ~/hpclib on the cluster
+install_hpclib -i ~/.ssh/id_hpc -J jump.example user@login.example
+install_hpclib --target /scratch/user/me/hpclib user@login.example
+install_hpclib --check user@login.example             # report what would happen
+```
+
+`install_hpclib` takes the same login arguments as `pssh`/`psftp` (any `ssh` options, then `[user@]host`).
+It installs only when the cluster's copy is missing or older than the local one, comparing the `HPCLIB_VERSION`
+set in `hpclib/hpclib.sh` (which `setup.py` also reads), so bump that version for each release. A newer or equal
+copy is left alone unless `--force` is given, and a directory that isn't an hpclib install is never replaced
+without `--force`. The upload is unpacked and checked beside the target before it is swapped in, so a failed
+transfer leaves the old copy in place, and the replaced copy is kept as `TARGET.previous`. Relative targets are
+relative to the remote home directory. `launch_tunnel` starts tunnels from
+`$HPCLIB_REMOTE_INSTALL_LOCATION` (default `hpclib`), so set that variable when installing somewhere else.
+
 ## hpclib.sh
 
 The core library for simplifying HPC workflows. Provides assorted bash functions.

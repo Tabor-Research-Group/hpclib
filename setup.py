@@ -1,14 +1,19 @@
 #! /usr/bin/env python
 
 """Installer script."""
+import re
 import setuptools
+
+# single source of truth for the version: hpclib/hpclib.sh
+with open("hpclib/hpclib.sh") as f:
+    version = re.search(r'^HPCLIB_VERSION="([^"]+)"', f.read(), re.M).group(1)
 
 with open("README.md") as f:
     long_description = f.read()
 
 setuptools.setup(
     name="hpclib",
-    version="0.0.1",
+    version=version,
     description="Convenient HPC toolkits",
     long_description=long_description,
     long_description_content_type="text/markdown",
