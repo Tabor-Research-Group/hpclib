@@ -84,6 +84,52 @@ using `PROCESS_PORT` (5000 by default), with the debugger and reloader off.
 arguments after the app name are passed to `flask run`. This uses Flask's
 development server for interactive work.
 
+**REST**: a dependency-free (standard library only) JSON API for SLURM and file
+access, served by `hpclib/servers/rest_server.py`. Arguments after `--` go to the
+server; `--allow` (repeatable) restricts file access to those directories and
+their children, and without it file access is unrestricted:
+
+```bash
+launch_tunnel -P 5050 user@login.example rest \
+  --chdir=/scratch/user/me/project \
+  -- --allow /scratch/user/me/project --allow /scratch/user/me/data
+```
+
+Every request needs `Authorization: Bearer <token>`. On first launch the server
+writes a random token to `~/.local/tunnels/rest_token` (mode 600) on the cluster
+and reuses it afterwards; copy it to your machine once, and delete the file to
+rotate it. `HPC_REST_TOKEN_FILE` points at a different file. The server refuses to
+start if the token file is readable by other users.
+
+```bash
+TOKEN=$(ssh user@login.example cat .local/tunnels/rest_token)
+H="Authorization: Bearer $TOKEN"
+curl -H "$H" localhost:5050/health
+curl -H "$H" 'localhost:5050/slurm/squeue?arg=--me'
+curl -H "$H" -X POST localhost:5050/slurm/sbatch \
+  -d '{"args": ["--parsable", "run.sh"], "cwd": "jobs/a"}'
+curl -H "$H" -T input.xyz 'localhost:5050/files/content?path=jobs/a/input.xyz&parents=1'
+curl -H "$H" -o out.log 'localhost:5050/files/content?path=jobs/a/out.log'
+```
+
+SLURM routes are `POST /slurm/{sbatch,squeue,sacct,scontrol,scancel}` with a JSON
+body `{"args": [...], "cwd": "...", "input": "..."}` (`input` is sent on stdin, so
+`sbatch` can take a script inline), plus `GET` for `squeue` and `sacct` using
+repeated `arg=` query parameters. They return `returncode`, `stdout` and `stderr`
+with HTTP 200 whenever the command ran. File routes are `GET /files?path=` (list or
+stat), `GET`/`PUT /files/content?path=` (raw download/upload; `overwrite=1`,
+`parents=1`), `POST /files/mkdir?path=` and `DELETE /files?path=` (files, symlinks
+and empty directories only). Relative paths resolve against the first `--allow`
+directory, or the job's working directory. Uploads need a `Content-Length` and are
+capped by `--max-upload` (1G by default); use `rsync` over SSH for large or
+many files. Pass `--disable-file-changes` (or set
+`HPC_REST_DISABLE_FILE_CHANGES=1`) to refuse uploads, `mkdir` and deletes with
+403 while keeping downloads, listings and the SLURM routes; jobs submitted
+through `sbatch` can still write files when they run. The whitelist limits the file routes and the `cwd` of SLURM commands;
+it does not sandbox the jobs those commands submit. While the job is queued the
+forwarded port serves the HTML waiting page, so clients should wait for
+`/health` to return JSON.
+
 **VS Code**: this runs the `codercom/code-server` container. Installing the
 bundled tunnel with `install_tunnel /path/to/hpclib/tunnels/vscode` runs its
 `install.sh`, which pulls the image with Singularity to the path the tunnel uses:
