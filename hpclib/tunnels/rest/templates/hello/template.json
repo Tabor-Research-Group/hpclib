@@ -1,0 +1,9 @@
+{
+  "description": "Print a message from a compute node, optionally sleeping first. Useful for checking that job submission works.",
+  "parameters": {
+    "message": {"type": "string", "description": "text to print", "max_length": 200, "default": "hello from hpclib"},
+    "sleep_seconds": {"type": "integer", "description": "seconds to sleep before exiting", "minimum": 0, "maximum": 600, "default": 0}
+  },
+  "resources": {"time": "00:15:00", "mem": "1G", "cpus_per_task": "1"},
+  "overridable": ["time"]
+}

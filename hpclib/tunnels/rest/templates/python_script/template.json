@@ -1,0 +1,10 @@
+{
+  "description": "Run a Python script that already exists on the cluster with python3, with a working directory of the script's folder. Note: whatever the script does runs with your cluster account's full permissions.",
+  "parameters": {
+    "script": {"type": "path", "description": "the .py file to run", "kind": "file"},
+    "cpus": {"type": "integer", "description": "CPU cores for the job", "minimum": 1, "maximum": 16, "default": 1}
+  },
+  "resources": {"time": "01:00:00", "mem": "4G", "cpus_per_task": "${cpus}"},
+  "overridable": ["time", "mem"],
+  "workdir": "${script}/.."
+}

@@ -114,11 +114,13 @@ launch_tunnel -P 5050 user@login.example rest \
   -- --allow /scratch/user/me/project --allow /scratch/user/me/data
 ```
 
-Every request needs `Authorization: Bearer <token>`. On first launch the server
-writes a random token to `~/.local/tunnels/rest_token` (mode 600) on the cluster
-and reuses it afterwards; copy it to your machine once, and delete the file to
-rotate it. `HPC_REST_TOKEN_FILE` points at a different file. The server refuses to
-start if the token file is readable by other users.
+Every request needs `Authorization: Bearer <token>`. The owner token is read from
+`~/.local/tunnels/rest_token` on the cluster. If that file doesn't exist when the server first starts, the
+server writes a random token there (mode 600) and reuses it afterwards; copy it to your machine once, and
+delete the file to rotate it. The file can instead hold just `sha256:<hash of the token>`, which keeps the token
+itself off the cluster; `hpclib/examples/orca_scan/setup_cluster.sh` sets it up that way from the start.
+`HPC_REST_TOKEN_FILE` points at a different file. The server refuses to start if the token file is readable by
+other users. Scoped tokens are separate, and are stored as hashes in `~/.local/tunnels/rest/tokens.json`.
 
 ```bash
 TOKEN=$(ssh user@login.example cat .local/tunnels/rest_token)
@@ -148,6 +150,139 @@ through `sbatch` can still write files when they run. The whitelist limits the f
 it does not sandbox the jobs those commands submit. While the job is queued the
 forwarded port serves the HTML waiting page, so clients should wait for
 `/health` to return JSON.
+
+**REST jobs for LLMs and other limited clients**: besides the raw `/slurm` routes, the REST server can run
+*job templates* that you write, check them against resource limits, and give out *scoped tokens* that can
+only use those templates and a few directories. `hpclib/servers/rest_mcp.py` exposes this to LLM clients
+on your machine as MCP tools.
+
+- **Templates** live in `~/.local/tunnels/rest/templates/NAME/` on the cluster: a `template.json` (a
+  description, typed parameters, default resources, and which resources a client may override) and a
+  `script.sh` (the job body, with no `#SBATCH` lines). Parameters reach the script as shell-quoted
+  `HPC_PARAM_<NAME>` environment variables, never by text substitution, and resources become sbatch
+  options only after validation. Examples are in `hpclib/tunnels/rest/templates/`; copy the ones you want.
+  Templates are re-read on each request. A template that runs code a client wrote (like `python_script`)
+  gives that code your account's full permissions on the cluster.
+- **Limits and settings** go in `~/.local/tunnels/rest/config.json` (all optional):
+
+  ```json
+  {
+    "limits": {"partitions": ["short", "gpu"], "accounts": null, "qos": null, "max_time": "04:00:00",
+               "max_mem": "64G", "max_cpus": 16, "max_nodes": 1, "max_gpus": 1, "max_concurrent_jobs": 4},
+    "cluster_notes": "Free text for the model, e.g. which modules or conda environments to use",
+    "audit_log": "~/.local/tunnels/rest/audit.log"
+  }
+  ```
+
+  Unset limits fall back to `max_time` 1 day, `max_mem` 128G, `max_cpus` 32, `max_nodes` 1, `max_gpus` 0
+  and 4 concurrent jobs, with any partition, account or qos. The limits apply to template jobs only.
+- **Scoped tokens** are minted on the cluster and stored there only as hashes. Copy the printed token to your
+  machine:
+
+  ```bash
+  python3 ~/hpclib/servers/rest_server.py --add-token llm --scopes read,submit \
+    --token-allow /scratch/user/me/llm-jobs > llm_token        # shown once
+  python3 ~/hpclib/servers/rest_server.py --list-tokens
+  python3 ~/hpclib/servers/rest_server.py --revoke-token llm  # takes effect immediately
+  ```
+
+  The scopes are `read` (cluster info, templates, job status, reading files), `submit` (submitting and
+  cancelling template jobs), `files:write`, `slurm` (the raw routes, and every API job) and `*`.
+  Scoped tokens must name directories; a token only sees its own jobs; and `~/.local/tunnels` (tokens,
+  templates, the job registry, the audit log, session files) is never reachable through the API, even with
+  the owner token. Because a job runs as you and could read a plaintext `~/.local/tunnels/rest_token` (it
+  exists once the server has started), copy the token to your machine and then run
+  `rest_server.py --hash-token-file`, which leaves only a hash. Or create the file hashed from the start, as
+  `hpclib/examples/orca_scan/setup_cluster.sh` does.
+- **Endpoints**: `GET /cluster` (partitions and node types from `sinfo`, accounts from `sacctmgr`, limits,
+  templates, the token's directories, `cluster_notes`), `GET /templates`, `POST /jobs` (`{"template",
+  "params", "resources", "workdir", "idempotency_key", "dry_run"}`; `dry_run` runs `sbatch --test-only`),
+  `GET /jobs`, `GET /jobs/status?id=`, `GET /jobs/wait?id=&timeout=` (up to 300 s), `POST /jobs/cancel?id=`,
+  plus bounded `GET /files/read?path=&offset=&length=` and `GET /files/tail?path=&lines=`. Every request is
+  logged to the audit log.
+- **MCP**: `rest_mcp.py` is built on the official MCP Python SDK (mcp 1.x or 2.x), which only it needs. Install
+  it for the Python your LLM client will launch (`python3 -m pip install mcp`, or `pip install "hpclib[mcp]"`).
+  Nothing on the cluster or in `launch_tunnel` depends on it. Start the tunnel without a browser, then point
+  your LLM client at `rest_mcp.py` with the scoped token in a mode-600 file:
+
+  ```bash
+  launch_tunnel -A none -P 5050 user@login.example rest -- --allow /scratch/user/me
+  ```
+
+  ```json
+  {"mcpServers": {"hpclib": {"command": "/path/to/python-with-mcp",
+    "args": ["/path/to/hpclib/hpclib/servers/rest_mcp.py", "--url", "http://127.0.0.1:5050",
+             "--token-file", "/Users/me/.config/hpclib/llm_token"]}}}
+  ```
+
+  Its tools are `cluster_info`, `list_templates`, `submit_job`, `list_jobs`, `job_status`, `wait_for_job`,
+  `cancel_job`, `list_files`, `read_file` and `tail_file`. `write_file` and `make_directory` are added with
+  `--enable-file-writes`, and the token also needs `files:write` for them. Read-only tools are marked as such, so clients that auto-approve read-only tools can do so. Raw `sbatch`/`scontrol` are never
+  exposed. `hpclib/servers/rest_client.py` is the same client for your own scripts.
+
+**Workflows: config directories, job arrays, modules**
+
+- **Config directories.** Each template folder in `~/.local/tunnels/rest/templates/` is a config directory. Besides
+  `template.json` and `script.sh`, it can hold a `guide.md` that a client reads before planning (inputs to prepare,
+  how to check results, what to do about failures), and `examples/*.json` with example submissions. A folder with
+  only a `guide.md` is a *planning guide*: a multi-step workflow with no job of its own, for example "generate
+  inputs locally with X, then run template Y over them". `GET /templates` and `GET /cluster` list both kinds, and
+  `GET /templates/guide?name=` returns the text. The bundled `orca` template and the `writing_templates` guide are
+  examples.
+- **Modules in templates.** `"modules": ["GCC/12.2.0", "OpenMPI/4.1.4", "ORCA/5.0.4"]` in `template.json` loads those
+  modules, in order, before the script body. They are validated as plain module names.
+- **Job arrays.** A template with `"array": {"task_parameters": {...}}` runs one SLURM array task per input. A
+  submission gives either `"tasks": [{...}, ...]` or `"tasks_from"`, which reads the tasks out of a JSON manifest on
+  the cluster:
+
+  ```json
+  {"template": "orca", "params": {"nprocs": 4}, "label": "sample_scan", "throttle": 4,
+   "tasks_from": {"path": "scans/sample_scan/scan_info.json", "key": "steps", "fields": {"input": "file"},
+                  "select": [3, 7]}}
+  ```
+
+  - `fields` maps task parameters to manifest fields.
+  - Paths in the manifest are relative to the manifest, and are checked against the token's directories like any
+    other path.
+  - `select` reruns chosen entries.
+  - Each task's values reach the script as `$HPC_TASK_<NAME>`.
+  - `throttle` (at most `max_concurrent_jobs`) caps how many tasks run at once. It also counts as that many of the
+    concurrent-job slots.
+  - `limits.max_array_tasks` (default 1000) caps the array size.
+  - `GET /jobs/status?id=&tasks=1` gives every task's state, its manifest entry and its log file, and arrays report
+    `task_counts` and `failed_tasks`. `label` tags a submission, and `GET /jobs?label=` filters by it.
+- **Module discovery.** `GET /modules/avail?query=` and `GET /modules/spider?query=` run `module avail` and
+  `module spider` through a login shell. Queries are module names only, and results are cached for 10 minutes. A
+  `name/version` spider explains what must be loaded first. If `module` needs a different setup on your cluster,
+  set `"module_command": [...]` in the config.
+- **Template proposals.** A token with the `propose` scope can submit a template with
+  `POST /templates/propose` (`name`, `template`, `script`, `guide`, `rationale`). It is validated like a real
+  template and stored in `~/.local/tunnels/rest/proposals/`, and it can't run until you approve it:
+
+  ```bash
+  python3 ~/hpclib/servers/rest_server.py --list-proposals
+  python3 ~/hpclib/servers/rest_server.py --approve-template xtb   # --replace to swap an existing one
+  python3 ~/hpclib/servers/rest_server.py --reject-template xtb
+  ```
+
+- **Moving files.** `hpclib/servers/rest_client.py`'s `FileSync` copies files between your machine and the cluster
+  through the API. That means the token's scopes and directories apply, and pushing needs `files:write`. With
+  `rest_mcp.py --local-root DIR` (repeatable), the MCP server offers `list_local_files`, `push_files` and
+  `pull_files`, limited to those local directories.
+- **New MCP tools.** `read_guide`, `list_modules`, `search_modules`, `list_template_proposals` and
+  `propose_template`. `submit_job` takes `tasks`, `tasks_from`, `throttle` and `label`, and `job_status` takes
+  `include_tasks`.
+
+For example, a Psience scan, with a token that has `read,submit,files:write` on `/scratch/user/me/llm`:
+
+1. Generate the scan locally with `ScanManager.generate`.
+2. `push_files` the scan directory to `scans/NAME`.
+3. `submit_job` the `orca` template with `tasks_from` pointing at `scans/NAME/scan_info.json`, `key` `steps` and
+   `fields` `{"input": "file"}`. Run it with `dry_run` first.
+4. Follow it with `job_status`.
+5. `pull_files` the `*.out` files back next to the inputs, and run `ScanManager.parse` unchanged.
+
+**Worked example**: `hpclib/examples/orca_scan/` generates a Psience scan locally, runs every point on the cluster as one ORCA job array (from Claude through the MCP server, or from a script), and brings the outputs back for `ScanManager.parse`. Its README covers the one-time cluster setup (`setup_cluster.sh`).
 
 **VS Code**: this runs the `codercom/code-server` container. Installing the
 bundled tunnel with `install_tunnel /path/to/hpclib/tunnels/vscode` runs its

@@ -297,10 +297,11 @@ class TestTokenFile(unittest.TestCase):
 
     def test_creates_private_token_and_reuses_it(self):
         token_file = self.tmp / "sub" / "rest_token"
-        first = TokenAuth.load(str(token_file))
+        TokenAuth.load(str(token_file))
         self.assertEqual(stat.S_IMODE(token_file.stat().st_mode), 0o600)
-        self.assertGreaterEqual(len(first.token), 32)
-        self.assertEqual(TokenAuth.load(str(token_file)).token, first.token)
+        token = token_file.read_text().strip()
+        self.assertGreaterEqual(len(token), 32)
+        self.assertTrue(TokenAuth.load(str(token_file)).check(f"Bearer {token}"))
 
     def test_rejects_readable_token_file(self):
         token_file = self.tmp / "rest_token"
@@ -318,7 +319,8 @@ class TestTokenFile(unittest.TestCase):
 
     def test_env_token_wins(self):
         os.environ[TokenAuth.TOKEN_ENV_VAR] = "from-env"
-        self.assertEqual(TokenAuth.load(str(self.tmp / "unused")).token, "from-env")
+        self.assertTrue(TokenAuth.load(str(self.tmp / "unused")).check("Bearer from-env"))
+        self.assertNotIn(TokenAuth.TOKEN_ENV_VAR, os.environ)  # kept out of child processes
         self.assertFalse((self.tmp / "unused").exists())
 
     def test_header_check(self):

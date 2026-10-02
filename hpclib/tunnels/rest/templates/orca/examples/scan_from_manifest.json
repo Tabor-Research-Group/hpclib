@@ -1,0 +1,9 @@
+{
+  "template": "orca",
+  "params": {"nprocs": 4},
+  "resources": {"time": "01:00:00", "mem": "16G"},
+  "label": "sample_scan",
+  "tasks_from": {"path": "scans/sample_scan/scan_info.json", "key": "steps", "fields": {"input": "file"}},
+  "throttle": 4,
+  "idempotency_key": "sample_scan-v1"
+}

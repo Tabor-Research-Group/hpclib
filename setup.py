@@ -28,6 +28,8 @@ setuptools.setup(
     packages=setuptools.find_packages(),
     include_package_data=True,
     python_requires=">=3.10",
+    # only hpclib/servers/rest_mcp.py (run on your own machine) needs this
+    extras_require={"mcp": ["mcp>=1.10"]},
     package_data={
         "hpclib": [
             "*.sh",  # hpclib/hpclib.sh itself
@@ -37,6 +39,9 @@ setuptools.setup(
             "tunnels/*/*.sh",  # hpclib/tunnels/{jupyter,ngl,pai,vscode}/*.sh
             "tunnels/*/*.py",  # hpclib/tunnels/ngl/mdsrv_start.py - not a package, so this is the ONLY
             # way it gets installed at all
+            "tunnels/rest/templates/*/*",  # example REST job templates (template.json + script.sh)
+            "tunnels/rest/templates/*/*/*",  # ... and their examples/*.json
+            "examples/*/*",  # worked examples, e.g. examples/orca_scan
         ],
         "hpclib.job_queue": [
             "templates/*.sh",  # hpclib/job_queue/templates/*.sh - same non-package-subdir situation

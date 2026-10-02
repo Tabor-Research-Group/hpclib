@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "hpclib": {
+      "command": "/path/to/python-with-mcp",
+      "args": [
+        "/path/to/hpclib/hpclib/servers/rest_mcp.py",
+        "--url", "http://127.0.0.1:5050",
+        "--token-file", "/Users/me/.config/hpclib/llm_token",
+        "--local-root", "/Users/me/Desktop/scans"
+      ]
+    }
+  }
+}

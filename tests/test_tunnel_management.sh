@@ -143,4 +143,14 @@ printf '%s\n' --app mypackage.web:app run --no-threads --host=127.0.0.1 \
   --port=6123 --no-reload --no-debugger > "$test_dir/expected-flask-args"
 diff -u "$test_dir/expected-flask-args" "$test_dir/flask-args" || fail 'wrong Flask command'
 
+# -A none skips the browser entirely
+(
+  HOME="$test_dir/home"
+  _wait_for_port() { echo called > "$test_dir/browser-waited"; return 1; }
+  pssh() { :; }
+  launch_tunnel -A none -P 5050 login.example rest >/dev/null 2>&1
+  wait
+)
+[ ! -e "$test_dir/browser-waited" ] || fail '-A none still tried to open a browser'
+
 echo 'Tunnel management tests passed'

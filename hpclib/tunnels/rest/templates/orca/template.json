@@ -1,0 +1,14 @@
+{
+  "description": "Run ORCA on existing .inp files as one SLURM job array, one task per input. Each task writes NAME.out next to NAME.inp while it runs and copies ORCA's other results (.gbw, .xyz, ...) back when it finishes. Inputs must request the same core count as `nprocs` (%pal nprocs).",
+  "parameters": {
+    "nprocs": {"type": "integer", "description": "cores per calculation; must match %pal nprocs in the inputs (1 if they have no %pal block)", "minimum": 1, "maximum": 32, "default": 4}
+  },
+  "array": {
+    "task_parameters": {
+      "input": {"type": "path", "kind": "file", "description": "an ORCA .inp file"}
+    }
+  },
+  "resources": {"time": "04:00:00", "mem": "16G", "nodes": "1", "ntasks": "${nprocs}", "cpus_per_task": "1"},
+  "overridable": ["time", "mem", "partition"],
+  "modules": []
+}

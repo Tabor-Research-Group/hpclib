@@ -518,6 +518,8 @@ function launch_tunnel {
             psync -r $HPCLIB_DIR $address:$remote_hpclib/
           fi
 
+          # -A none: no browser, e.g. for the REST tunnel
+          if [ "$app" != "none" ]; then
           launcher=$(locate_browser_launcher "$app")
           # Wait for the forward to actually be live before opening the
           # browser, in a background subshell - NOT backgrounding pssh
@@ -532,6 +534,7 @@ function launch_tunnel {
               echo "Timed out waiting for tunnel on port $port" >&2
             fi
           ) &
+          fi
 
           printf -v remote_command '%q ' /bin/bash "$remote_hpclib/tunnels/start_tunnel.sh" "$tunnel" -P "$port" "${remote_args[@]}"
           printf '%s\n' "pssh -t -L 127.0.0.1:$port:127.0.0.1:$port $address \"$remote_command\""
