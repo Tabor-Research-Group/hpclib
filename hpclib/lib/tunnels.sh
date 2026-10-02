@@ -572,8 +572,8 @@ function _hpclib_remote_setup_agents {
 }
 
 # Runs ON THE REMOTE HOST: the owner token. MODE is check, install HASH
-# (only if there is none) or replace HASH; prints hashed, plaintext,
-# missing, installed or replaced.
+# (only if there is none), replace HASH or matches HASH; prints hashed,
+# plaintext, missing, installed, replaced, match or differs.
 function _hpclib_remote_owner_token {
   local f="${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/rest_token"
   case "$1" in
@@ -588,6 +588,8 @@ function _hpclib_remote_owner_token {
     replace)
       mkdir -p "$(dirname "$f")" &&
         (umask 077; printf 'sha256:%s\n' "$2" > "$f.new" && mv "$f.new" "$f") && echo replaced ;;
+    matches)  # is the owner token the one with hash $2?
+      if [ -e "$f" ] && [ "$(head -n 1 "$f" | tr -d '[:space:]')" = "sha256:$2" ]; then echo match; else echo differs; fi ;;
   esac
 }
 
@@ -616,6 +618,95 @@ function _hpclib_sha256 {  # the sha256 of a token file's contents, without trai
   python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.read().strip().encode()).hexdigest())' < "$1"
 }
 
+function _hpclib_agent_profiles {  # the profile store: lib/agent_profiles.py
+  python3 "$HPCLIB_DIR/lib/agent_profiles.py" "$@"
+}
+
+function _hpclib_agent_lines {  # _hpclib_agent_lines NAME KEY: a list-valued profile key, one item per line
+  _hpclib_agent_profiles get "$1" "$2" 2>/dev/null || true
+}
+
+# The Python that will run rest_mcp.py: $HPCLIB_MCP_PYTHON, or the first
+# python3 that has the MCP SDK. Prints the path; returns 1 (printing plain
+# python3's path) if none has it.
+function _hpclib_mcp_python {
+  local candidate
+  for candidate in "${HPCLIB_MCP_PYTHON:-}" "$(command -v python3)" /usr/local/bin/python3 /opt/homebrew/bin/python3; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+    if "$candidate" -c 'import mcp' > /dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  printf '%s\n' "${HPCLIB_MCP_PYTHON:-$(command -v python3)}"
+  return 1
+}
+
+# Terminal colours for the getting-started block: on for a terminal, off
+# for pipes and files, NO_COLOR, or HPCLIB_COLOR=never (HPCLIB_COLOR=always
+# forces them on).
+function _hpclib_colors {
+  if [ "${HPCLIB_COLOR:-auto}" = always ] ||
+      { [ "${HPCLIB_COLOR:-auto}" = auto ] && [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; }; then
+    _c_reset=$'\033[0m' _c_banner=$'\033[1;97;44m' _c_head=$'\033[1;36m' _c_cmd=$'\033[32m'
+    _c_json=$'\033[33m' _c_dim=$'\033[2m' _c_warn=$'\033[1;33m'
+  else
+    _c_reset='' _c_banner='' _c_head='' _c_cmd='' _c_json='' _c_dim='' _c_warn=''
+  fi
+}
+
+function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROFILE_NAME
+  local name="$1" host port process_port mcp_name token_file pdir mcp_python mcp_ok=yes local_hpclib
+  local _c_reset _c_banner _c_head _c_cmd _c_json _c_dim _c_warn line d allow=''
+  _hpclib_colors
+  host=$(_hpclib_agent_profiles get "$name" host)
+  port=$(_hpclib_agent_profiles get "$name" port)
+  process_port=$(_hpclib_agent_profiles get "$name" process_port)
+  mcp_name=$(_hpclib_agent_profiles get "$name" mcp_name)
+  token_file=$(_hpclib_agent_profiles get "$name" token_file)
+  pdir=$(_hpclib_agent_profiles dir "$name")
+  mcp_python=$(_hpclib_mcp_python) || mcp_ok=no
+  local_hpclib=$(cd -P "$HPCLIB_DIR" 2>/dev/null && pwd)
+  while IFS= read -r d; do
+    [ -n "$d" ] && allow="$allow --allow $d"
+  done < <(_hpclib_agent_lines "$name" work_dirs)
+
+  printf '\n%s  hpclib agents: %s is ready  %s\n\n' "$_c_banner" "$host" "$_c_reset"
+  printf '%sProfile%s  %s\n' "$_c_head" "$_c_reset" "$pdir"
+  printf '%s         ports %s (your machine and the login node) and %s (the compute node), picked at random%s\n\n' \
+    "$_c_dim" "$port" "$process_port" "$_c_reset"
+
+  printf '%s1. Start the tunnel%s (leave it running; it is a SLURM job)\n' "$_c_head" "$_c_reset"
+  printf '   %sagent_tunnel %s%s\n' "$_c_cmd" "$name" "$_c_reset"
+  printf '%s   = launch_tunnel -A none -P %s %s rest --process-port=%s --%s%s\n\n' \
+    "$_c_dim" "$port" "$host" "$process_port" "$allow" "$_c_reset"
+
+  printf '%s2. Add the MCP server to your LLM client%s, then restart the client\n' "$_c_head" "$_c_reset"
+  printf '   Claude Desktop: merge into "mcpServers" in ~/Library/Application Support/Claude/claude_desktop_config.json\n'
+  printf '   (also saved as %s/mcp.json):\n\n' "$pdir"
+  while IFS= read -r line; do
+    printf '%s%s%s\n' "$_c_json" "$line" "$_c_reset"
+  done < <(_hpclib_agent_profiles mcp "$name" "$mcp_python" "$local_hpclib/servers/rest_mcp.py")
+  printf '\n   Claude Code:\n'
+  printf '   %sclaude mcp add-json %s '"'"'%s'"'"'%s\n' "$_c_cmd" "$mcp_name" \
+    "$(_hpclib_agent_profiles mcp-entry "$name" "$mcp_python" "$local_hpclib/servers/rest_mcp.py")" "$_c_reset"
+  if [ "$mcp_ok" = no ]; then
+    printf '   %s%s has no MCP SDK: run `%s -m pip install mcp`, or set HPCLIB_MCP_PYTHON and rerun%s\n' \
+      "$_c_warn" "$mcp_python" "$mcp_python" "$_c_reset"
+  fi
+  printf '\n%s3. Check it%s (with the tunnel up)\n' "$_c_head" "$_c_reset"
+  printf '   %scurl -s -H "Authorization: Bearer $(cat %s)" http://127.0.0.1:%s/health%s\n' \
+    "$_c_cmd" "$token_file" "$port" "$_c_reset"
+  printf '   then ask the agent to run sandbox_info and cluster_info\n\n'
+  printf '%s4. Later%s\n' "$_c_head" "$_c_reset"
+  printf '   stop the tunnel:           %sagent_stop %s%s\n' "$_c_cmd" "$name" "$_c_reset"
+  printf '   clusters on this machine:  %sagent_list%s\n' "$_c_cmd" "$_c_reset"
+  printf '   for scripts (RESTClient):  %seval "$(agent_env %s)"%s\n' "$_c_cmd" "$name" "$_c_reset"
+  printf '   rerun, keeping everything: %ssetup_agents %s%s   (--rebuild replaces it all)\n' \
+    "$_c_cmd" "$name" "$_c_reset"
+  printf '   describe the cluster for agents: cluster_notes in ~/.local/tunnels/rest/config.json on the cluster\n\n'
+}
+
 # Prepare a cluster for agents (LLM clients) using the REST server's job
 # templates, from your own machine, over the same connection as pssh:
 #
@@ -629,8 +720,14 @@ function _hpclib_sha256 {  # the sha256 of a token file's contents, without trai
 #     readable, and the sandbox is tested on the login node
 #  4. creates the owner (full-access) token on this machine and gives the
 #     cluster only its hash
-#  5. mints a scoped token limited to the --work-dir directories, saved on
-#     this machine (mode 600)
+#  5. mints a scoped token limited to the --work-dir directories
+#  6. prints how to start the tunnel and the MCP client entry
+#
+# Everything about the cluster is kept in a profile, ~/.config/hpclib/agents/
+# [user@]host/ (agent_profiles.py): the login, a pair of randomly chosen
+# ports, the work directories, the tokens and the MCP server name. Reruns
+# and agent_tunnel/agent_stop read it, so later commands need only the
+# address (or the profile name). Options given on a rerun update it.
 #
 # Rerunning it is safe: existing templates, config and tokens are kept,
 # except that a config without a sandbox gets one. --rebuild replaces them
@@ -638,17 +735,19 @@ function _hpclib_sha256 {  # the sha256 of a token file's contents, without trai
 # sandbox's host image, the owner token's hash, and the scoped token (the old
 # one is revoked).
 function setup_agents {
-  local usage='usage: setup_agents --work-dir DIR [--work-dir DIR ...] [--token-name NAME] [--token-file FILE]
-       [--owner-token-file FILE] [--scopes LIST] [--templates LIST|all] [--config FILE]
-       [--bind DIR ...] [--no-sandbox] [--rebuild] [--no-install] [--target DIR] [ssh options] [user@]host'
-  local work_dirs=() binds=() login_args=() hosts=()
-  local token_name="llm" token_file="$HOME/.config/hpclib/llm_token"
-  local owner_file="$HOME/.config/hpclib/rest_token" scopes="read,submit,propose,files:write"
+  local usage='usage: setup_agents [--work-dir DIR ...] [--bind DIR ...] [--local-root DIR ...] [--templates LIST|all]
+       [--config FILE] [--no-sandbox] [--rebuild] [--no-install] [--target DIR] [--name NAME]
+       [--port N] [--process-port N] [--new-ports] [--token-name NAME] [--token-file FILE]
+       [--owner-token-file FILE] [--mcp-name NAME] [--scopes LIST] [ssh options] [user@]host'
+  local work_dirs=() binds=() local_roots=() login_args=() hosts=()
+  local name='' token_name='' token_file='' owner_file='' port='' process_port='' mcp_name='' new_ports=no
+  local scopes="read,submit,propose,files:write"
   local templates="hello,orca,writing_templates" base_config='' sandbox=yes rebuild=no install=yes
-  local target="$HPCLIB_REMOTE_INSTALL_LOCATION" token_custom=false
+  local target="$HPCLIB_REMOTE_INSTALL_LOCATION"
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --work-dir|--token-name|--token-file|--owner-token-file|--scopes|--templates|--config|--bind|--target)
+      --work-dir|--token-name|--token-file|--owner-token-file|--scopes|--templates|--config|--bind|--target|\
+--name|--port|--process-port|--mcp-name|--local-root)
         if [ "$#" -lt 2 ] || [ -z "$2" ]; then
           echo "setup_agents: $1 needs a value" >&2
           return 2
@@ -656,33 +755,56 @@ function setup_agents {
         case "$1" in
           --work-dir) work_dirs+=("$2") ;;
           --token-name) token_name="$2" ;;
-          --token-file) token_file="$2"; token_custom=true ;;
+          --token-file) token_file="$2" ;;
           --owner-token-file) owner_file="$2" ;;
           --scopes) scopes="$2" ;;
           --templates) templates="$2" ;;
           --config) base_config="$2" ;;
           --bind) binds+=("$2") ;;
           --target) target="$2" ;;
+          --name) name="$2" ;;
+          --port) port="$2" ;;
+          --process-port) process_port="$2" ;;
+          --mcp-name) mcp_name="$2" ;;
+          --local-root) local_roots+=("$2") ;;
         esac
         shift 2 ;;
       --no-sandbox) sandbox=no; shift ;;
       --rebuild) rebuild=yes; shift ;;
       --no-install) install=no; shift ;;
+      --new-ports) new_ports=yes; shift ;;
       -h|--help) echo "$usage"; return 0 ;;
       *) login_args+=("$1"); shift ;;
     esac
   done
+  if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 6))' 2> /dev/null; then
+    echo "setup_agents: needs python3 (3.6 or newer) on this machine" >&2
+    return 1
+  fi
   hosts=($(mcargs "$SSH_FLAGS" "$SSH_LONG_FLAGS" "${login_args[@]}"))
-  if [ "${#hosts[@]}" -ne 1 ] || [ "${#work_dirs[@]}" -eq 0 ]; then
+  local d
+  # `setup_agents NAME` (a profile name, or an address with a profile) reruns with the stored login
+  if [ "${#hosts[@]}" -eq 1 ] && [ "${#login_args[@]}" -eq 1 ] && [ -z "$name" ]; then
+    local found
+    if found=$(_hpclib_agent_profiles find "${hosts[0]}") && [ -n "$found" ]; then
+      name="$found"
+      login_args=()
+      while IFS= read -r d; do login_args+=("$d"); done < <(_hpclib_agent_lines "$name" login)
+      hosts=($(mcargs "$SSH_FLAGS" "$SSH_LONG_FLAGS" "${login_args[@]}"))
+    fi
+  fi
+  if [ "${#hosts[@]}" -ne 1 ]; then
     echo "$usage" >&2
     return 2
   fi
-  local d
   for d in "${work_dirs[@]}" "${binds[@]}"; do
     case "$d" in
       /*) ;;
       *) echo "setup_agents: $d must be an absolute path on the cluster" >&2; return 2 ;;
     esac
+  done
+  for d in "${local_roots[@]}"; do
+    [ -d "$d" ] || { echo "setup_agents: --local-root $d is not a directory on this machine" >&2; return 2; }
   done
   if [ -n "$base_config" ] && [ ! -f "$base_config" ]; then
     echo "setup_agents: $base_config does not exist" >&2
@@ -691,7 +813,48 @@ function setup_agents {
   if [ "$templates" = all ]; then
     templates=$(cd "$HPCLIB_DIR/tunnels/rest/templates" && ls | paste -sd, -)
   fi
-  [ "$token_custom" = true ] || [ "$token_name" = llm ] || token_file="$HOME/.config/hpclib/${token_name}_token"
+
+  # the profile: made on the first run, updated with whatever was given now
+  [ -n "$name" ] || name=$(_hpclib_agent_profiles name "${hosts[0]}") || return 1
+  local profile_state
+  profile_state=$(_hpclib_agent_profiles init "$name" "${hosts[0]}") || return 1
+  local updates=("host=${hosts[0]}" "login=")
+  for d in "${login_args[@]}"; do updates+=("login+=$d"); done
+  if [ "${#work_dirs[@]}" -gt 0 ]; then
+    updates+=("work_dirs=")
+    for d in "${work_dirs[@]}"; do updates+=("work_dirs+=$d"); done
+  fi
+  if [ "${#binds[@]}" -gt 0 ]; then
+    updates+=("binds=")
+    for d in "${binds[@]}"; do updates+=("binds+=$d"); done
+  fi
+  if [ "${#local_roots[@]}" -gt 0 ]; then
+    updates+=("local_roots=")
+    for d in "${local_roots[@]}"; do updates+=("local_roots+=$(cd -P "$d" && pwd)"); done
+  fi
+  [ -n "$token_name" ] && updates+=("token_name=$token_name")
+  [ -n "$token_file" ] && updates+=("token_file=$token_file")
+  [ -n "$owner_file" ] && updates+=("owner_token_file=$owner_file")
+  [ -n "$port" ] && updates+=("port=$port")
+  [ -n "$process_port" ] && updates+=("process_port=$process_port")
+  [ -n "$mcp_name" ] && updates+=("mcp_name=$mcp_name")
+  _hpclib_agent_profiles set "$name" "${updates[@]}" || return 1
+  if [ "$new_ports" = yes ]; then
+    _hpclib_agent_profiles new-ports "$name" || return 1
+  fi
+  work_dirs=() binds=()
+  while IFS= read -r d; do [ -n "$d" ] && work_dirs+=("$d"); done < <(_hpclib_agent_lines "$name" work_dirs)
+  while IFS= read -r d; do [ -n "$d" ] && binds+=("$d"); done < <(_hpclib_agent_lines "$name" binds)
+  if [ "${#work_dirs[@]}" -eq 0 ]; then
+    echo "setup_agents: give at least one --work-dir (a directory on the cluster the agent may use)" >&2
+    return 2
+  fi
+  token_name=$(_hpclib_agent_profiles get "$name" token_name)
+  token_file=$(_hpclib_agent_profiles get "$name" token_file)
+  owner_file=$(_hpclib_agent_profiles get "$name" owner_token_file)
+  token_file="${token_file/#\~/$HOME}" owner_file="${owner_file/#\~/$HOME}"
+  echo "== profile $name ($( [ "$profile_state" = created ] && echo new || echo existing ))"
+
   local _hpclib_agents_login=("${login_args[@]}")
   local remote_hpclib
   remote_hpclib=$(_hpclib_remote_path "$target")
@@ -703,18 +866,24 @@ function setup_agents {
   fi
 
   echo "== templates and server config"
-  local bind_list work_list
+  local bind_list
   bind_list=$(IFS=,; printf '%s' "${binds[*]}")
   _hpclib_agents_remote _hpclib_remote_setup_agents "$base_config" "$remote_hpclib" "$rebuild" "$sandbox" \
     "$templates" "$bind_list" "${work_dirs[@]}" || return 1
 
   echo "== owner token"
-  local state hash result
+  local state hash result legacy="$HOME/.config/hpclib/rest_token"
   state=$(_hpclib_agents_remote _hpclib_remote_owner_token "" check | tail -n 1)
   case "$state" in
     missing|hashed|plaintext) ;;
     *) echo "setup_agents: could not check the owner token on the cluster (got: $state)" >&2; return 1 ;;
   esac
+  # From before profiles: the cluster's owner token may be in ~/.config/hpclib/rest_token.
+  if [ "$state" = hashed ] && [ ! -e "$owner_file" ] && [ -s "$legacy" ] && [ "$legacy" != "$owner_file" ] &&
+      [ "$(_hpclib_agents_remote _hpclib_remote_owner_token "" matches "$(_hpclib_sha256 "$legacy")" | tail -n 1)" = match ]; then
+    mkdir -p "$(dirname "$owner_file")"
+    (umask 077; cp "$legacy" "$owner_file") && echo "copied this cluster's owner token from $legacy into the profile"
+  fi
   if [ "$state" = missing ] || [ "$rebuild" = yes ]; then
     if [ ! -e "$owner_file" ]; then
       mkdir -p "$(dirname "$owner_file")"
@@ -743,7 +912,22 @@ function setup_agents {
     echo "  ssh ${login_args[*]} python3 $rest_server --hash-token-file"
   fi
 
-  echo "== scoped token '$token_name' for ${work_dirs[*]}"
+  echo "== agent token '$token_name' for ${work_dirs[*]}"
+  # From before profiles: the agent token may be in ~/.config/hpclib/llm_token. Keep using it
+  # (and its name) if this cluster knows it.
+  local legacy_agent="$HOME/.config/hpclib/llm_token" known
+  if [ ! -e "$token_file" ] && [ "$rebuild" != yes ] && [ -s "$legacy_agent" ] && [ "$legacy_agent" != "$token_file" ]; then
+    known=$(HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" \
+      "$(printf '%q ' python3 "$rest_server" --lookup-token-hash "$(_hpclib_sha256 "$legacy_agent")")" \
+      < /dev/null 2>/dev/null | tail -n 1)
+    if [ -n "$known" ]; then
+      mkdir -p "$(dirname "$token_file")"
+      (umask 077; cp "$legacy_agent" "$token_file") || return 1
+      token_name="$known"
+      _hpclib_agent_profiles set "$name" "token_name=$token_name" || return 1
+      echo "copied this cluster's '$token_name' token from $legacy_agent into the profile"
+    fi
+  fi
   if [ -e "$token_file" ] && [ "$rebuild" != yes ]; then
     echo "$token_file already exists; rerun with --rebuild to replace it"
   else
@@ -769,7 +953,7 @@ function setup_agents {
     mkdir -p "$(dirname "$token_file")"
     local tmp
     tmp=$(umask 077; mktemp "$token_file.XXXXXX") || return 1
-    if ! HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$(printf '%q ' "${mint[@]}")" < /dev/null > "$tmp" ||
+    if ! HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$(printf '%q ' "${mint[@]}")" < /dev/null > "$tmp" 2>/dev/null ||
         [ ! -s "$tmp" ]; then
       rm -f "$tmp"
       echo "setup_agents: could not mint the '$token_name' token" >&2
@@ -779,24 +963,55 @@ function setup_agents {
     echo "saved to $token_file"
   fi
 
-  local allow_args='' mcp_python
-  for d in "${work_dirs[@]}"; do
-    allow_args="$allow_args --allow $d"
-  done
-  mcp_python=$(command -v python3)
-  local local_hpclib
-  local_hpclib=$(cd -P "$HPCLIB_DIR" 2>/dev/null && pwd)
-  cat <<EOF
+  _hpclib_agents_getting_started "$name"
+}
 
-Next:
-  - start the tunnel:  launch_tunnel -A none -P 5050 ${login_args[*]} rest --$allow_args
-  - point your MCP client (e.g. Claude Desktop) at the server, with the MCP SDK installed for that Python:
-      {"mcpServers": {"hpclib": {"command": "$mcp_python",
-        "args": ["$local_hpclib/servers/rest_mcp.py", "--url", "http://127.0.0.1:5050",
-                 "--token-file", "$token_file"]}}}
-  - edit cluster_notes (and limits) in ~/.local/tunnels/rest/config.json on the cluster; the agent's
-    sandbox_info tool reports what jobs can read once the tunnel is up
-EOF
+# Start the REST tunnel for a cluster set up with setup_agents, with the
+# profile's ports and directories:  agent_tunnel NAME|[user@]host [launch_tunnel options]
+# Extra options (e.g. --time=2:00:00) go to launch_tunnel.
+function agent_tunnel {
+  local name host port process_port d allow=()
+  if [ "$#" -lt 1 ]; then
+    echo "usage: agent_tunnel NAME|[user@]host [launch_tunnel options]" >&2
+    _hpclib_agent_profiles list >&2
+    return 2
+  fi
+  name=$(_hpclib_agent_profiles find "$1") || {
+    echo "agent_tunnel: no agent profile for '$1'; run setup_agents first (agent_list shows the profiles)" >&2
+    return 1
+  }
+  shift
+  host=$(_hpclib_agent_profiles get "$name" host)
+  port=$(_hpclib_agent_profiles get "$name" port)
+  process_port=$(_hpclib_agent_profiles get "$name" process_port)
+  while IFS= read -r d; do [ -n "$d" ] && allow+=(--allow "$d"); done < <(_hpclib_agent_lines "$name" work_dirs)
+  launch_tunnel -A none -P "$port" "$host" rest "--process-port=$process_port" "$@" -- "${allow[@]}"
+}
+
+# Stop a cluster's agent tunnel:  agent_stop NAME|[user@]host
+function agent_stop {
+  local name
+  name=$(_hpclib_agent_profiles find "${1:-}") || {
+    echo "agent_stop: no agent profile for '${1:-}' (agent_list shows the profiles)" >&2
+    return 1
+  }
+  stop_tunnel -P "$(_hpclib_agent_profiles get "$name" port)" "$(_hpclib_agent_profiles get "$name" host)"
+}
+
+# Point scripts that use RESTClient.from_env() (e.g. run_scan.py) at a
+# cluster's agent tunnel:  eval "$(agent_env NAME|[user@]host)"
+function agent_env {
+  local name
+  name=$(_hpclib_agent_profiles find "${1:-}") || {
+    echo "agent_env: no agent profile for '${1:-}' (agent_list shows the profiles)" >&2
+    return 1
+  }
+  _hpclib_agent_profiles env "$name"
+}
+
+# The clusters set up with setup_agents on this machine.
+function agent_list {
+  _hpclib_agent_profiles list
 }
 
 ################################################################################

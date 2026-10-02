@@ -90,7 +90,8 @@ Usage: rest_server.py [--host H] [--port P] [--allow DIR ...] [--config F]
                       [--token-file F] [--command-timeout S] [--max-upload N]
                       [--disable-file-changes]
        rest_server.py --add-token NAME --scopes read,submit --token-allow DIR [...]
-       rest_server.py --revoke-token NAME | --revoke-token-hash SHA256 | --list-tokens | --hash-token-file
+       rest_server.py --revoke-token NAME | --revoke-token-hash SHA256 | --lookup-token-hash SHA256
+       rest_server.py --list-tokens | --hash-token-file
        rest_server.py --list-proposals | --approve-template NAME [--replace] | --reject-template NAME
        rest_server.py --init-config [--config-base F] [--rebuild] [--no-sandbox] [--sandbox-bind DIR ...]
        rest_server.py --probe-sandbox
@@ -393,6 +394,15 @@ class TokenAuth:
         if len(kept) == len(entries):
             raise ValueError(f"no token named {name!r}")
         cls.write_private(tokens_file, json.dumps({"tokens": kept}, indent=2) + "\n")
+
+    @classmethod
+    def lookup_token_hash(cls, tokens_file, digest):
+        """The name of the scoped token whose sha256 is `digest`, or None."""
+        entries = cls.read_tokens_file(tokens_file) if os.path.exists(tokens_file) else []
+        for e in entries:
+            if hmac.compare_digest(str(e.get("sha256", "")), digest):
+                return e.get("name")
+        return None
 
     @classmethod
     def revoke_token_hash(cls, tokens_file, digest):
@@ -1073,6 +1083,8 @@ def parse_args(argv=None):
     tokens.add_argument("--revoke-token", metavar="NAME")
     tokens.add_argument("--revoke-token-hash", metavar="SHA256",
                         help="revoke the token with this sha256 (for a token file you have but whose name you don't)")
+    tokens.add_argument("--lookup-token-hash", metavar="SHA256",
+                        help="print the name of the token with this sha256 (exit 1 if there is none)")
     tokens.add_argument("--list-tokens", action="store_true")
     tokens.add_argument("--hash-token-file", action="store_true",
                         help="replace the owner token file's contents with a hash of the token")
@@ -1108,6 +1120,11 @@ def manage_tokens(opts, config):
     elif opts.revoke_token:
         TokenAuth.revoke_token(tokens_file, opts.revoke_token)
         print(f"revoked {opts.revoke_token!r}")
+    elif opts.lookup_token_hash:
+        found = TokenAuth.lookup_token_hash(tokens_file, opts.lookup_token_hash.strip().lower())
+        if found is None:
+            sys.exit(1)
+        print(found)
     elif opts.revoke_token_hash:
         print(f"revoked {TokenAuth.revoke_token_hash(tokens_file, opts.revoke_token_hash.strip().lower())!r}")
     elif opts.list_tokens:

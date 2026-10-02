@@ -35,11 +35,12 @@ The script runs hpclib's `setup_agents` (see the main README) with this demo's s
 3. it writes `~/.local/tunnels/rest/config.json` from `cluster_config.json`, with a job sandbox: each ORCA task
    runs in Singularity/Apptainer and can write only to `/scratch/user/me/llm`. Module trees on the cluster's
    `MODULEPATH` are made readable to jobs, and a test container is run on the login node;
-4. it creates the owner (full-access) token on your machine as `~/.config/hpclib/rest_token`, and gives the
-   cluster only its hash, in `~/.local/tunnels/rest_token`. Nothing on the cluster, a job included, can read the
+4. it creates the owner (full-access) token on your machine, in the cluster's agent profile
+   `~/.config/hpclib/agents/user@login.example/owner_token`, and gives the cluster only its hash, in
+   `~/.local/tunnels/rest_token`. Nothing on the cluster, a job included, can read the
    token back;
 5. it mints a token named `llm-scan` with the `read,submit,propose,files:write` scopes, limited to
-   `/scratch/user/me/llm`, and saves it as `~/.config/hpclib/llm_token`. With `propose`, the model can suggest
+   `/scratch/user/me/llm`, and saves it in the profile as `agent_token`. With `propose`, the model can suggest
    template changes, such as the right `modules`, for you to approve.
 
 Both local token files are mode 600. The cluster's `~/.local/tunnels/rest/tokens.json` holds only hashes of scoped
@@ -64,12 +65,13 @@ Then, on the cluster:
 3. **Let jobs read your software.** The config runs every job in a Singularity/Apptainer sandbox that can write only
    to `/scratch/user/me/llm` and reads `/usr`, `/etc` and `/opt` from the host. If ORCA and its modules live
    elsewhere (e.g. `/sw`), add those directories to `"binds"` in the config's `sandbox` section. Once the tunnel is
-   up, the model's `sandbox_info` tool (or `curl -H "Authorization: Bearer $TOKEN" localhost:5050/sandbox`) lists
-   the module trees to add and runs a test container.
+   up, the model's `sandbox_info` tool lists the module trees to add and runs a test container.
 
-On your machine, install the MCP SDK for the Python your LLM client will use (`python3 -m pip install mcp`). Add the
-entry from `mcp_config.json` to Claude Desktop's config (or `claude mcp add` for Claude Code), with your own paths.
-`--local-root` is the only local directory the model can read from or write to; here it is `~/Desktop/scans`.
+On your machine, install the MCP SDK for the Python your LLM client will use (`python3 -m pip install mcp`). The
+script ends by printing the MCP client entry for this cluster (also saved as `mcp.json` in the profile); add it to
+Claude Desktop's config, or run the `claude mcp add-json` line it prints for Claude Code. `mcp_config.json` here
+shows its shape. Add `--local-root ~/Desktop/scans` to its `args` (or pass `--local-root` to `setup_agents`): it is
+the only local directory the model can read from or write to.
 
 ## 2. Generate the scan
 
@@ -92,8 +94,11 @@ step. Frequency jobs need more memory than optimizations; raise `mem` (20G worke
 
 ```bash
 source hpclib/hpclib/hpclib.sh
-launch_tunnel -A none -P 5050 user@login.example rest -- --allow /scratch/user/me/llm
+agent_tunnel user@login.example
 ```
+
+This runs `launch_tunnel` with the profile's ports (picked at random by `setup_agents`, so you don't collide with
+other users of the cluster) and directories.
 
 Leave it running. It's a SLURM job (8 hours by default), and the REST server lives inside it. Your jobs don't:
 they keep running, and keep their records, when the tunnel ends. Start a new tunnel to check on them later.
@@ -119,7 +124,7 @@ your machine. It can't run `sbatch` or `scontrol` directly, and anything it prop
 ## 4b. Run it with the script
 
 ```bash
-export HPC_REST_URL=http://127.0.0.1:5050 HPC_REST_TOKEN_FILE=~/.config/hpclib/llm_token
+eval "$(agent_env user@login.example)"   # HPC_REST_URL and HPC_REST_TOKEN_FILE for this cluster
 python run_scan.py ~/Desktop/scans/sample_scan --remote-dir scans/sample_scan
 python run_scan.py ~/Desktop/scans/sample_scan --remote-dir scans/sample_scan --retry-failed JOB_ID
 ```

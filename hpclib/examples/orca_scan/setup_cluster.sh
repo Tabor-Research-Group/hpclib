@@ -7,8 +7,10 @@
 # limited to it, and the scan is copied under it. This is `setup_agents`
 # (hpclib/lib/tunnels.sh) with the demo's settings: the orca template and
 # the writing_templates guide, cluster_config.json as the starting config,
-# and a token named llm-scan saved as ~/.config/hpclib/llm_token. Jobs run
-# sandboxed; --rebuild replaces the templates, config and tokens.
+# and an agent token named llm-scan. Everything else, including the token
+# files and the tunnel's ports, goes in the cluster's agent profile,
+# ~/.config/hpclib/agents/USER@HOST/. Jobs run sandboxed; --rebuild replaces
+# the templates, config and tokens.
 #
 # Afterwards set the orca template's "modules" for your cluster (see README.md).
 set -eo pipefail  # not -u: hpclib.sh predates it
@@ -23,9 +25,11 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # shellcheck source=/dev/null
 source "$here/../../hpclib.sh"
+extra=()
+[ -n "${TOKEN_FILE:-}" ] && extra+=(--token-file "$TOKEN_FILE")
+[ -n "${OWNER_TOKEN_FILE:-}" ] && extra+=(--owner-token-file "$OWNER_TOKEN_FILE")
 setup_agents --work-dir "$work_dir" --templates orca,writing_templates --config "$here/cluster_config.json" \
-  --token-name "${TOKEN_NAME:-llm-scan}" --token-file "${TOKEN_FILE:-$HOME/.config/hpclib/llm_token}" \
-  --owner-token-file "${OWNER_TOKEN_FILE:-$HOME/.config/hpclib/rest_token}" "${login[@]}"
+  --token-name "${TOKEN_NAME:-llm-scan}" "${extra[@]}" "${login[@]}"
 
 cat <<'EOF2'
   - set "modules" in ~/.local/tunnels/rest/templates/orca/template.json on the cluster

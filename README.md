@@ -31,29 +31,53 @@ relative to the remote home directory. `launch_tunnel` starts tunnels from
 `$HPCLIB_REMOTE_INSTALL_LOCATION` (default `hpclib`), so set that variable when installing somewhere else.
 
 To let agents (LLM clients on your machine) run jobs through the REST server, `setup_agents` does the rest of the
-cluster setup in one go, over the same connection:
+cluster setup in one go, over the same connection, and `agent_tunnel` starts the tunnel:
 
 ```bash
-setup_agents --work-dir /scratch/user/me/llm user@login.example
-setup_agents --work-dir /scratch/user/me/llm --bind /sw --rebuild user@login.example
+setup_agents --work-dir /scratch/user/me/llm user@login.example    # once per cluster
+agent_tunnel user@login.example                                     # each time you want the agent to work there
+agent_stop user@login.example
+agent_list                                                          # every cluster set up on this machine
 ```
 
-It runs `install_hpclib`, copies the bundled `hello` and `orca` templates and the `writing_templates` guide
-(`--templates LIST` or `all`), and writes the REST server's `config.json` with a job sandbox: template jobs run
-in Singularity/Apptainer and can write only to the `--work-dir` directories (see *Sandboxed jobs* below). Module
-trees on the cluster's `MODULEPATH` and any `--bind` directories are made readable to jobs, and a test container
-is run on the login node. It then creates the owner token on your machine (`~/.config/hpclib/rest_token`),
-giving the cluster only its hash, and mints a scoped token limited to the `--work-dir` directories
-(`--token-name`, default `llm`, saved as `~/.config/hpclib/llm_token`; `--scopes`, default
-`read,submit,propose,files:write`). `--config FILE` starts the config from your own JSON, `--no-sandbox` leaves
-jobs unsandboxed, `--no-install` skips `install_hpclib`, and the ssh options and `[user@]host` are as for `pssh`.
-Rerunning it keeps your templates, config and tokens (a config without a sandbox gets one). `--rebuild` replaces
-them: the templates and config are regenerated (the old copies stay on the cluster, in
+`setup_agents` runs `install_hpclib`, copies the bundled `hello` and `orca` templates and the `writing_templates`
+guide (`--templates LIST` or `all`), and writes the REST server's `config.json` with a job sandbox: template jobs
+run in Singularity/Apptainer and can write only to the `--work-dir` directories (see *Sandboxed jobs* below).
+Module trees on the cluster's `MODULEPATH` and any `--bind` directories are made readable to jobs, and a test
+container is run on the login node. It then creates the owner token, giving the cluster only its hash, and mints
+an agent token limited to the `--work-dir` directories (`--scopes`, default `read,submit,propose,files:write`).
+It ends with a getting-started summary (in colour on a terminal; `NO_COLOR` or `HPCLIB_COLOR=never` turns that
+off): how to start the tunnel, the MCP client entry for Claude Desktop as JSON, the `claude mcp add-json` line for
+Claude Code, and a `curl` check.
+
+Everything about a cluster is kept in its **agent profile**, `~/.config/hpclib/agents/USER@HOST/`
+(`$HPCLIB_AGENTS_DIR` moves it), private to you:
+
+| File | What |
+| --- | --- |
+| `profile.json` | the login, the tunnel's two ports, the work directories and binds, the token name, the MCP server name |
+| `agent_token`, `owner_token` | that cluster's tokens (mode 600) |
+| `mcp.json` | the MCP client entry |
+
+The ports, one for your machine and the login node and one for the compute node, are picked at random (20000 to
+32000) when the profile is made and then kept, so you don't collide with other users of the cluster or with your
+other clusters; `--new-ports` picks new ones, and `--port`/`--process-port` set them. The agent token is named
+after this machine (`agent-HOSTNAME`, or `--token-name`), so each of your machines can have its own and be revoked
+on its own, and the MCP server is named after the cluster (`hpclib-entropy`, or `--mcp-name`), so several
+clusters can be configured side by side. Options given on a later run update the profile, and a later run needs
+only the address: `setup_agents user@login.example`. `--local-root DIR` (repeatable) adds the local directories
+the agent may push from and pull into to the MCP entry. `--config FILE` starts the cluster's config from your own
+JSON, `--no-sandbox` leaves jobs unsandboxed, `--no-install` skips `install_hpclib`, and ssh options go before the
+address as for `pssh`. Scripts that use `RESTClient.from_env()` pick a cluster with `eval "$(agent_env
+user@login.example)"`. Tokens from before profiles (`~/.config/hpclib/llm_token` and `rest_token`) are copied into
+the profile the first time, if the cluster recognizes them.
+
+Rerunning `setup_agents` keeps your templates, config and tokens (a config without a sandbox gets one).
+`--rebuild` replaces them: the templates and config are regenerated (the old copies stay on the cluster, in
 `~/.local/tunnels/rest/templates/.replaced/` and as `config.json.replaced-TIME`), the sandbox's host image is
-rebuilt, the owner token's hash is reinstalled from your machine (a new token is made if you have none), and the
-scoped token is replaced, revoking both the token in the local token file and any token with the same name. A
-running MCP server picks up the new token by itself: the client re-reads its token file when the server rejects
-a token. It ends by printing the `launch_tunnel` command and the MCP client entry to use.
+rebuilt, the owner token's hash is reinstalled from the profile (a new token is made if there is none), and the
+agent token is replaced, revoking both the token in the profile and any token with the same name. A running MCP
+server picks up the new token by itself: the client re-reads its token file when the server rejects a token.
 
 ## hpclib.sh
 
@@ -235,7 +259,8 @@ on your machine as MCP tools.
   The job script still loads the template's modules on the host; then the body runs in a container that
   can write only to the submitting token's directories (plus any `writable` ones), sees `/usr`, `/etc`,
   `/opt` and the `binds` read-only, and sees nothing else of the host: not your home directory, other
-  projects or `~/.local/tunnels`. The default image is a "host image", an empty directory whose system
+  projects or `~/.local/tunnels`. Its `/tmp`, `/var/tmp` and `/dev/shm` are private scratch, deleted with the
+  job; its home directory is not writable, so a program that writes to `~` fails rather than losing its output. The default image is a "host image", an empty directory whose system
   directories are the host's own, so host programs and modules work unchanged and nothing has to be built.
   Set `image` to a `.sif` or sandbox directory to use an image of your own, `flags` for runtime options
   such as `--nv`, and `scratch` for where the container's `/tmp` lives (by default a per-job directory under

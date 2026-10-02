@@ -131,7 +131,7 @@ class TestSandboxedJobs(SandboxServerTestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("hi there", res.stdout)                      # parameters reach the body
         args = json.loads(self.runtime_log.read_text().splitlines()[-1])
-        self.assertEqual(args[:5], ["-q", "exec", "--contain", "--pid", "--ipc"])
+        self.assertEqual(args[:6], ["-q", "exec", "--contain", "--no-home", "--pid", "--ipc"])
         self.assertIn("bind-paths", args)
         pairs = [args[i + 1] for i, a in enumerate(args) if a == "--bind"]
         self.assertIn(f"{self.llm_root}:{self.llm_root}", pairs)
@@ -238,6 +238,9 @@ class TestRealSingularity(unittest.TestCase):
             (: > /etc/.probe) 2>/dev/null && echo "etc_writable=yes" || echo "etc_writable=no"
             echo "pwd=$PWD"
             echo "tmp=$(touch /tmp/t && echo yes)"
+            echo "var_tmp=$(touch /var/tmp/t && echo yes)"
+            (: > "$HOME/x") 2>/dev/null && echo "home_writable=yes" || echo "home_writable=no"
+            (: > /.x) 2>/dev/null && echo "root_writable=yes" || echo "root_writable=no"
             """))
         self.assertEqual(res.returncode, 0, res.stderr)
         out = dict(line.split("=", 1) for line in res.stdout.splitlines() if "=" in line)
@@ -247,7 +250,10 @@ class TestRealSingularity(unittest.TestCase):
         self.assertEqual(out["usr_writable"], "no")
         self.assertEqual(out["etc_writable"], "no")
         self.assertEqual(out["pwd"], str(self.allowed))
-        self.assertEqual(out["tmp"], "yes")
+        self.assertEqual(out["tmp"], "yes")                  # scratch stays writable ...
+        self.assertEqual(out["var_tmp"], "yes")
+        self.assertEqual(out["home_writable"], "no")         # ... nothing else that would vanish is
+        self.assertEqual(out["root_writable"], "no")
         self.assertEqual((self.allowed / "written").read_text(), "ok\n")
 
     def test_python_body_and_host_programs(self):

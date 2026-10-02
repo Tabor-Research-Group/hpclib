@@ -13,8 +13,11 @@ the container. Inside the container:
     any `writable` directories from the config;
   - everything else that is bound is read-only;
   - nothing else from the host is visible: not your home directory, not
-    other projects, not ~/.local/tunnels. The container gets an empty
-    home and private /tmp, /dev/shm and process table.
+    other projects, not ~/.local/tunnels. The container gets its own
+    process table and private, writable /tmp, /var/tmp and /dev/shm (scratch
+    that is deleted with the job). Its home directory is not writable, so a
+    program that writes there fails with "Read-only file system" instead of
+    writing files that would be lost when the job ends.
 
 By default the container is a "host image": an almost empty directory
 whose /usr, /etc and /opt (and any `binds`, such as a software tree like
@@ -260,7 +263,8 @@ class Sandbox:
         runtime, image = plan["runtime"], plan["image"]
         if plan["host_image"]:
             build_host_image(image, plan["read_only"] + plan["read_write"])
-        args = [runtime, "-q", "exec", "--contain", "--pid", "--ipc"]
+        # --no-home: no writable stand-in for $HOME (allowed directories under it are still bound)
+        args = [runtime, "-q", "exec", "--contain", "--no-home", "--pid", "--ipc"]
         if self.supports(runtime, "--no-mount"):
             args += ["--no-mount", "bind-paths"]   # site-wide binds would add paths behind our back
         for path in plan["read_only"]:
@@ -441,6 +445,10 @@ def self_test(sandbox: Sandbox, base_dir):
         f'[ -e {shlex.quote(hidden)}/marker ] && echo "outside_hidden=no" || echo "outside_hidden=yes"',
         '(: > /usr/.hpc-sandbox-probe) 2>/dev/null && { rm -f /usr/.hpc-sandbox-probe; echo "usr_read_only=no"; } '
         '|| echo "usr_read_only=yes"',
+        '(: > "$HOME/.hpc-sandbox-probe") 2>/dev/null && { rm -f "$HOME/.hpc-sandbox-probe"; echo "home_read_only=no"; } '
+        '|| echo "home_read_only=yes"',
+        '(: > /tmp/.hpc-sandbox-probe) 2>/dev/null && { rm -f /tmp/.hpc-sandbox-probe; echo "tmp_writable=yes"; } '
+        '|| echo "tmp_writable=no"',
         'echo "pid_one=$(cat /proc/1/comm 2>/dev/null)"',
         'echo "programs=$(command -v bash >/dev/null && echo yes || echo no)"',
     ])
@@ -457,7 +465,8 @@ def self_test(sandbox: Sandbox, base_dir):
             return {"ran": False, "reason": "the test container did not finish within 120 s"}
         results = dict(line.split("=", 1) for line in res.stdout.splitlines() if "=" in line)
         checks = {k: results.get(k) == "yes"
-                  for k in ("write_allowed", "outside_hidden", "usr_read_only", "programs")}
+                  for k in ("write_allowed", "outside_hidden", "usr_read_only", "home_read_only", "tmp_writable",
+                            "programs")}
         return {"ran": True, "exit_code": res.returncode, "seconds": round(time.time() - start, 2),
                 "passed": res.returncode == 0 and all(checks.values()), "checks": checks,
                 "pid_one": results.get("pid_one"), "stderr": res.stderr[-2000:]}
