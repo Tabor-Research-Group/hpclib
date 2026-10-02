@@ -10,7 +10,7 @@ all 25 ORCA optimizations on the cluster as a single SLURM job array. It then br
 
 | File | Runs on | Purpose |
 | --- | --- | --- |
-| `setup_cluster.sh` | your machine | one-time: install hpclib on the cluster, add the `orca` template and a config, mint a scoped token |
+| `setup_cluster.sh` | your machine | one-time: `setup_agents` with this demo's template, config and token name |
 | `cluster_config.json` | (copied to the cluster) | resource limits and notes for the model, as `~/.local/tunnels/rest/config.json` |
 | `generate_scan.py` | your machine | write the scan's `.inp` files and `scan_info.json` (needs McUtils + Psience) |
 | `mcp_config.json` | your machine | MCP client entry for Claude Desktop / Claude Code |
@@ -27,15 +27,18 @@ cd hpclib/hpclib/examples/orca_scan
 bash setup_cluster.sh user@login.example /scratch/user/me/llm
 ```
 
-The script:
+The script runs hpclib's `setup_agents` (see the main README) with this demo's settings:
 
-1. runs `install_hpclib`;
-2. copies the `orca` template and the `writing_templates` guide into `~/.local/tunnels/rest/templates/` on the
+1. it runs `install_hpclib`;
+2. it copies the `orca` template and the `writing_templates` guide into `~/.local/tunnels/rest/templates/` on the
    cluster;
-3. installs `cluster_config.json` if you don't have a config yet;
-4. creates the owner (full-access) token on your machine as `~/.config/hpclib/rest_token`, and gives the cluster
-   only its hash, in `~/.local/tunnels/rest_token`. Nothing on the cluster, a job included, can read the token back;
-5. mints a token named `llm-scan` with the `read,submit,propose,files:write` scopes, limited to
+3. it writes `~/.local/tunnels/rest/config.json` from `cluster_config.json`, with a job sandbox: each ORCA task
+   runs in Singularity/Apptainer and can write only to `/scratch/user/me/llm`. Module trees on the cluster's
+   `MODULEPATH` are made readable to jobs, and a test container is run on the login node;
+4. it creates the owner (full-access) token on your machine as `~/.config/hpclib/rest_token`, and gives the
+   cluster only its hash, in `~/.local/tunnels/rest_token`. Nothing on the cluster, a job included, can read the
+   token back;
+5. it mints a token named `llm-scan` with the `read,submit,propose,files:write` scopes, limited to
    `/scratch/user/me/llm`, and saves it as `~/.config/hpclib/llm_token`. With `propose`, the model can suggest
    template changes, such as the right `modules`, for you to approve.
 
@@ -43,8 +46,10 @@ Both local token files are mode 600. The cluster's `~/.local/tunnels/rest/tokens
 tokens like `llm-scan`, never the owner token.
 
 Rerunning the script is safe: it upgrades hpclib only if your copy is newer, and keeps an existing template, config
-and tokens. If the cluster already has a plaintext owner token (the REST server writes one on its first start when
-there is none), the script prints the two commands to copy it to your machine and hash it.
+and tokens. `bash setup_cluster.sh --rebuild user@login.example /scratch/user/me/llm` replaces them all (old copies
+stay on the cluster) and replaces both tokens' hashes, revoking the old scoped token. If the cluster has a plaintext
+owner token (the REST server writes one on its first start when there is none), `--rebuild` replaces it with one
+kept on your machine.
 
 Then, on the cluster:
 
@@ -56,6 +61,11 @@ Then, on the cluster:
    `python3 ~/hpclib/servers/rest_server.py --list-proposals` and `--approve-template orca --replace`.
 2. **Describe your cluster for the model.** Edit `cluster_notes` in `~/.local/tunnels/rest/config.json`: partitions
    to prefer, scratch rules, anything a model should know.
+3. **Let jobs read your software.** The config runs every job in a Singularity/Apptainer sandbox that can write only
+   to `/scratch/user/me/llm` and reads `/usr`, `/etc` and `/opt` from the host. If ORCA and its modules live
+   elsewhere (e.g. `/sw`), add those directories to `"binds"` in the config's `sandbox` section. Once the tunnel is
+   up, the model's `sandbox_info` tool (or `curl -H "Authorization: Bearer $TOKEN" localhost:5050/sandbox`) lists
+   the module trees to add and runs a test container.
 
 On your machine, install the MCP SDK for the Python your LLM client will use (`python3 -m pip install mcp`). Add the
 entry from `mcp_config.json` to Claude Desktop's config (or `claude mcp add` for Claude Code), with your own paths.
@@ -71,9 +81,12 @@ The inputs ask for `%pal nprocs 4` and `MaxCore 3500`. Each task therefore needs
 `mem`, which is what `run_scan.py` and the example prompt use. If the counts don't match, the `orca` template
 stops each task immediately with exit code 4 and says which value to use.
 
-**Check the chemistry before running it.** The inputs are plain `Opt` jobs. Unless your job builder adds a
-constraint on the scanned atom (an ORCA `%geom Constraints` block), every point will relax away from its grid
-position, possibly to the same minimum.
+**Check the chemistry before running it.** By default the inputs are plain `Opt` jobs. Unless your job builder
+adds a constraint on the scanned atom (an ORCA `%geom Constraints` block), every point will relax away from its
+grid position, possibly to the same minimum. To keep every point on its grid position and get a Hessian there,
+use `--commands freq`; ORCA then writes a `.hess` file next to each `.out`, so pull `*.out,*.hess` in the last
+step. Frequency jobs need more memory than optimizations; raise `mem` (20G worked for this molecule with
+`--nprocs 4 --maxcore 3500`).
 
 ## 3. Start the tunnel
 
@@ -152,7 +165,12 @@ the manifest records the job type, and `parse` picks the `.out` files and the OR
   retry in a minute.
 - **Exit 3, `orca is not on PATH` or `could not load module`**: set the template's `modules` (step 1.1). A job
   script that loads modules runs as a login shell (`#!/bin/bash -l`), like `search_modules`, so a module that
-  search finds should load in the job too.
+  search finds should load in the job too. If the module loads but ORCA still isn't found, its directory isn't
+  bound into the sandbox: add it to the sandbox `binds` (step 1.3).
+- **503 "jobs must run sandboxed"**: neither `singularity` nor `apptainer` is on the REST server's PATH. Set the
+  sandbox `runtime` to its full path, or `"method": "none"` to run jobs unsandboxed.
+- **Exit 255 with `FATAL: container creation failed`** in the SLURM log: the sandbox didn't start; the message
+  names the bind or image that failed. `sandbox_info` with `refresh` reruns the test container.
 - **429 "concurrent slots"**: API jobs plus array throttles already reach `max_concurrent_jobs` in the config.
   Lower `throttle` or wait.
 - **422 with `violations`**: the request broke a limit or a parameter rule; the list says which.

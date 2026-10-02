@@ -30,6 +30,31 @@ transfer leaves the old copy in place, and the replaced copy is kept as `TARGET.
 relative to the remote home directory. `launch_tunnel` starts tunnels from
 `$HPCLIB_REMOTE_INSTALL_LOCATION` (default `hpclib`), so set that variable when installing somewhere else.
 
+To let agents (LLM clients on your machine) run jobs through the REST server, `setup_agents` does the rest of the
+cluster setup in one go, over the same connection:
+
+```bash
+setup_agents --work-dir /scratch/user/me/llm user@login.example
+setup_agents --work-dir /scratch/user/me/llm --bind /sw --rebuild user@login.example
+```
+
+It runs `install_hpclib`, copies the bundled `hello` and `orca` templates and the `writing_templates` guide
+(`--templates LIST` or `all`), and writes the REST server's `config.json` with a job sandbox: template jobs run
+in Singularity/Apptainer and can write only to the `--work-dir` directories (see *Sandboxed jobs* below). Module
+trees on the cluster's `MODULEPATH` and any `--bind` directories are made readable to jobs, and a test container
+is run on the login node. It then creates the owner token on your machine (`~/.config/hpclib/rest_token`),
+giving the cluster only its hash, and mints a scoped token limited to the `--work-dir` directories
+(`--token-name`, default `llm`, saved as `~/.config/hpclib/llm_token`; `--scopes`, default
+`read,submit,propose,files:write`). `--config FILE` starts the config from your own JSON, `--no-sandbox` leaves
+jobs unsandboxed, `--no-install` skips `install_hpclib`, and the ssh options and `[user@]host` are as for `pssh`.
+Rerunning it keeps your templates, config and tokens (a config without a sandbox gets one). `--rebuild` replaces
+them: the templates and config are regenerated (the old copies stay on the cluster, in
+`~/.local/tunnels/rest/templates/.replaced/` and as `config.json.replaced-TIME`), the sandbox's host image is
+rebuilt, the owner token's hash is reinstalled from your machine (a new token is made if you have none), and the
+scoped token is replaced, revoking both the token in the local token file and any token with the same name. A
+running MCP server picks up the new token by itself: the client re-reads its token file when the server rejects
+a token. It ends by printing the `launch_tunnel` command and the MCP client entry to use.
+
 ## hpclib.sh
 
 The core library for simplifying HPC workflows. Provides assorted bash functions.
@@ -141,7 +166,7 @@ Every request needs `Authorization: Bearer <token>`. The owner token is read fro
 `~/.local/tunnels/rest_token` on the cluster. If that file doesn't exist when the server first starts, the
 server writes a random token there (mode 600) and reuses it afterwards; copy it to your machine once, and
 delete the file to rotate it. The file can instead hold just `sha256:<hash of the token>`, which keeps the token
-itself off the cluster; `hpclib/examples/orca_scan/setup_cluster.sh` sets it up that way from the start.
+itself off the cluster; `setup_agents` (above) sets it up that way from the start.
 `HPC_REST_TOKEN_FILE` points at a different file. The server refuses to start if the token file is readable by
 other users. Scoped tokens are separate, and are stored as hashes in `~/.local/tunnels/rest/tokens.json`.
 
@@ -184,8 +209,9 @@ on your machine as MCP tools.
   `script.sh` (the job body, with no `#SBATCH` lines). Parameters reach the script as shell-quoted
   `HPC_PARAM_<NAME>` environment variables, never by text substitution, and resources become sbatch
   options only after validation. Examples are in `hpclib/tunnels/rest/templates/`; copy the ones you want.
-  Templates are re-read on each request. A template that runs code a client wrote (like `python_script`)
-  gives that code your account's full permissions on the cluster.
+  Templates are re-read on each request. Without a sandbox (below), a template that runs code a client wrote
+  (like `python_script`), or a program whose input a client wrote (ORCA can write its output files to any
+  path named in the input), runs with your account's full permissions on the cluster.
 - **Limits and settings** go in `~/.local/tunnels/rest/config.json` (all optional):
 
   ```json
@@ -199,6 +225,26 @@ on your machine as MCP tools.
 
   Unset limits fall back to `max_time` 1 day, `max_mem` 128G, `max_cpus` 32, `max_nodes` 1, `max_gpus` 0
   and 4 concurrent jobs, with any partition, account or qos. The limits apply to template jobs only.
+- **Sandboxed jobs**: add a `sandbox` section to the config to run every template body in Singularity or
+  Apptainer, as you, without root:
+
+  ```json
+  "sandbox": {"method": "auto", "binds": ["/sw"]}
+  ```
+
+  The job script still loads the template's modules on the host; then the body runs in a container that
+  can write only to the submitting token's directories (plus any `writable` ones), sees `/usr`, `/etc`,
+  `/opt` and the `binds` read-only, and sees nothing else of the host: not your home directory, other
+  projects or `~/.local/tunnels`. The default image is a "host image", an empty directory whose system
+  directories are the host's own, so host programs and modules work unchanged and nothing has to be built.
+  Set `image` to a `.sif` or sandbox directory to use an image of your own, `flags` for runtime options
+  such as `--nv`, and `scratch` for where the container's `/tmp` lives (by default a per-job directory under
+  `$TMPDIR`). With `"method": "auto"`, jobs are refused if neither runtime is on the server's PATH, unless
+  `"allow_unsandboxed": true`. Sandboxed jobs run on one node: `srun` and other SLURM commands don't work
+  inside them. `GET /sandbox` (the `sandbox_info` MCP tool) reports the node's security features, the
+  container runtime and its site-wide bind paths, the module trees to add to `binds`, and the result of
+  running a test container, with a recommended `sandbox` section. Without a `sandbox` section jobs run
+  unsandboxed, as before, and the server warns about it at startup.
 - **Scoped tokens** are minted on the cluster and stored there only as hashes. Copy the printed token to your
   machine:
 
@@ -216,8 +262,8 @@ on your machine as MCP tools.
   the owner token. Because a job runs as you and could read a plaintext `~/.local/tunnels/rest_token` (it
   exists once the server has started), copy the token to your machine and then run
   `rest_server.py --hash-token-file`, which leaves only a hash. Or create the file hashed from the start, as
-  `hpclib/examples/orca_scan/setup_cluster.sh` does.
-- **Endpoints**: `GET /cluster` (partitions and node types from `sinfo`, accounts from `sacctmgr`, limits,
+  `setup_agents` does.
+- **Endpoints**: `GET /sandbox` (see above), `GET /cluster` (partitions and node types from `sinfo`, accounts from `sacctmgr`, limits,
   templates, the token's directories, `cluster_notes`), `GET /templates`, `POST /jobs` (`{"template",
   "params", "resources", "workdir", "idempotency_key", "dry_run"}`; `dry_run` runs `sbatch --test-only`),
   `GET /jobs`, `GET /jobs/status?id=`, `GET /jobs/wait?id=&timeout=` (up to 300 s), `POST /jobs/cancel?id=`,
@@ -238,7 +284,9 @@ on your machine as MCP tools.
              "--token-file", "/Users/me/.config/hpclib/llm_token"]}}}
   ```
 
-  Its tools are `cluster_info`, `list_templates`, `submit_job`, `list_jobs`, `job_status`, `wait_for_job`,
+  The token is read from `--token-file` (unless `$HPC_REST_TOKEN` is set) and read again whenever the server
+  rejects it, so replacing the file switches tokens without restarting your LLM client; restart it only to pick
+  up changes to hpclib's code. Its tools are `cluster_info`, `sandbox_info`, `list_templates`, `submit_job`, `list_jobs`, `job_status`, `wait_for_job`,
   `cancel_job`, `list_files`, `read_file` and `tail_file`. `write_file` and `make_directory` are added with
   `--enable-file-writes`, and the token also needs `files:write` for them. Read-only tools are marked as such, so clients that auto-approve read-only tools can do so. Raw `sbatch`/`scontrol` are never
   exposed. `hpclib/servers/rest_client.py` is the same client for your own scripts.

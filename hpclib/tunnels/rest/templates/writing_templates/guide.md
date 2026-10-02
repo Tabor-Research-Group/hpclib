@@ -41,6 +41,10 @@ run until the cluster owner reviews it and approves it, so make the reviewer's j
 - Write results next to the input, or into the job's working directory; use `$TMPDIR` for scratch, and clean it up
   with a `trap`.
 - End with a check that the program actually succeeded, not just its exit code.
+- If `cluster_info` shows a `sandbox`, the script runs in a container that can write only to your allowed
+  directories and reads only the host's system directories and the sandbox `binds`. It can't run `srun`,
+  `sbatch` or other SLURM commands, so keep the job on one node. If the software lives in a directory the
+  sandbox doesn't bind, say so in the rationale so the owner can add it.
 
 ## Rationale
 

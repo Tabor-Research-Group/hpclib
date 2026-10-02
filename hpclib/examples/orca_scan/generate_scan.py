@@ -46,6 +46,9 @@ def main(argv=None):
     parser.add_argument("--nprocs", type=int, default=4, help="cores per calculation (default %(default)s)")
     parser.add_argument("--maxcore", type=int, default=3500, help="ORCA MaxCore, MB per core (default %(default)s)")
     parser.add_argument("--level-of-theory", default="B97-3c")
+    parser.add_argument("--commands", default="opt",
+                        help="comma-separated ORCA job keywords, e.g. opt, or freq for a Hessian at each fixed "
+                             "point (default %(default)s)")
     opts = parser.parse_args(argv)
 
     mol = Molecule.from_string(SMILES, 'smi').get_embedded_molecule()
@@ -64,7 +67,7 @@ def main(argv=None):
     scan_dir, info, steps = manager.generate(
         scan_iterator,
         job_type='orca',
-        commands=['opt'],
+        commands=[c.strip() for c in opts.commands.split(",") if c.strip()],
         level_of_theory=opts.level_of_theory,
         nproc=opts.nprocs,      # -> %pal nprocs; the orca template checks this against SLURM
         memory=opts.maxcore,    # -> %MaxCore; keep nprocs * maxcore under the job's `mem`

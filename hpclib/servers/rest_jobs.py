@@ -47,6 +47,11 @@ import threading
 import time
 from contextlib import closing
 
+try:
+    from . import rest_sandbox
+except ImportError:  # run as a script from the servers directory
+    import rest_sandbox
+
 __all__ = [
     "RESTError",
     "clean_env",
@@ -552,8 +557,12 @@ class JobTemplate:
         "fi"
     )
 
-    def render(self, values, tasks=None):
-        """The full job script: shebang, exports, module loads, per-task values, then the body."""
+    def render(self, values, tasks=None, sandbox: 'rest_sandbox.Sandbox' = None, writable=()):
+        """
+        The full job script: shebang, exports, module loads, per-task
+        values, then the body - which runs in `sandbox`, with `writable`
+        directories, when one is configured. Returns (script, sandbox plan).
+        """
         body = self.script
         shebang = "#!/bin/bash"
         if body.startswith("#!"):
@@ -588,7 +597,14 @@ class JobTemplate:
                 "esac",
                 'export HPC_TASK_INDEX="$SLURM_ARRAY_TASK_ID"',
             ]
-        return "\n".join(lines) + "\n\n" + body
+        plan = {"method": "none", "reason": "not sandboxed"}
+        if sandbox is not None:
+            launch, plan = sandbox.launch(shebang, body, writable)
+            if launch is not None:
+                if lines[0].strip() == shebang.strip() and not lines[0].startswith("#!/bin/bash"):
+                    lines[0] = "#!/bin/bash"   # the launcher is bash, whatever the body is
+                return "\n".join(lines) + "\n\n" + "\n".join(launch) + "\n", plan
+        return "\n".join(lines) + "\n\n" + body, plan
 
 
 def _guide_summary(text, limit=300):
@@ -874,6 +890,8 @@ class SlurmRunner:
         "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL",
         "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED", "SPECIAL_EXIT",
     })
+    # states of a job that hasn't started (yet, or again)
+    WAITING_STATES = frozenset({"PENDING", "REQUEUED", "REQUEUE_HOLD", "REQUEUE_FED", "RESV_DEL_HOLD"})
     SQUEUE_FIELDS = ("job_id", "name", "state", "elapsed", "time_limit", "reason", "partition", "nodes")
     SQUEUE_FORMAT = "%i|%j|%T|%M|%l|%R|%P|%N"
     SACCT_FIELDS = ("job_id", "name", "state", "exit_code", "elapsed", "start", "end",
@@ -978,15 +996,18 @@ class SlurmRunner:
         counts = {}
         for t in per_task.values():
             counts[t["state"]] = counts.get(t["state"], 0) + 1
-        active = any(s not in cls.TERMINAL_STATES and s != "UNKNOWN" for s in counts)
+        active = {s for s in counts if s not in cls.TERMINAL_STATES and s != "UNKNOWN"}
+        unfinished = set(counts) - {"COMPLETED"}
         if active:
-            state = "RUNNING" if "RUNNING" in counts else "PENDING"
+            # COMPLETING, CONFIGURING, SUSPENDED, ... have started; only a job with
+            # nothing past waiting is PENDING
+            state = "PENDING" if active <= cls.WAITING_STATES else "RUNNING"
         elif "UNKNOWN" in counts:
             state = "UNKNOWN"
-        elif set(counts) == {"COMPLETED"}:
+        elif not unfinished:
             state = "COMPLETED"
-        elif set(counts) == {"CANCELLED"}:
-            state = "CANCELLED"
+        elif unfinished == {"CANCELLED"}:
+            state = "CANCELLED"  # e.g. cancelled part way through; see task_counts
         else:
             state = "FAILED"  # finished, but not every task completed; see task_counts
         failed = sorted(t for t, v in per_task.items()
@@ -1175,7 +1196,7 @@ class JobManager:
 
     def __init__(self, templates: TemplateStore, registry: JobRegistry, limits: ResourceLimits,
                  runner: SlurmRunner, cluster_notes=None, poll_interval=10, proposals: ProposalStore = None,
-                 modules: ModuleSystem = None):
+                 modules: ModuleSystem = None, sandbox: 'rest_sandbox.Sandbox' = None):
         self.templates = templates
         self.registry = registry
         self.limits = limits
@@ -1185,6 +1206,7 @@ class JobManager:
         self.proposals = proposals
         self.cluster_notes = cluster_notes
         self.poll_interval = poll_interval
+        self.sandbox = sandbox or rest_sandbox.Sandbox(None)
         self.submit_lock = threading.Lock()
 
     def describe_templates(self):
@@ -1220,6 +1242,7 @@ class JobManager:
             "allowed_dirs": list(whitelist.roots) if whitelist.restricted else None,
             "base_dir": whitelist.base_dir,
             "notes": self.cluster_notes,
+            "sandbox": self.sandbox.describe(),
         })
         return info
 
@@ -1338,7 +1361,13 @@ class JobManager:
             raise RESTError(422, f"workdir {workdir} is not an existing directory")
 
         job_name = f"hpcrest-{template.name}"
-        script = template.render(values, tasks)
+        # A sandboxed job may write where its token may: the token's directories (narrowed
+        # by the server's --allow list), or just the workdir if neither restricts it.
+        writable = list(whitelist.roots) if whitelist.restricted else [workdir]
+        try:
+            script, sandbox_plan = template.render(values, tasks, sandbox=self.sandbox, writable=writable)
+        except rest_sandbox.SandboxError as e:
+            raise RESTError(503, str(e), see="GET /sandbox describes what this node supports")
         args = [
             "sbatch", "--parsable",
             f"--job-name={job_name}",
@@ -1352,7 +1381,7 @@ class JobManager:
         args += [f"{RESOURCE_FLAGS[k]}={v}" for k, v in sorted(resources.items())]
 
         plan = {"template": template.name, "params": values, "resources": resources, "workdir": workdir,
-                "sbatch_args": args[1:], "script": script}
+                "sbatch_args": args[1:], "script": script, "sandbox": sandbox_plan}
         if tasks is not None:
             plan.update(array_size=len(tasks), throttle=throttle, tasks=tasks, task_source=task_source)
         if dry_run:
@@ -1392,7 +1421,7 @@ class JobManager:
                                   for i, t in enumerate(tasks)])
             job["output"] = self._output_path(job)
             self.registry.record(job)
-        return 201, dict(self.job_view(self.registry.get(job_id)), duplicate=False)
+        return 201, dict(self.job_view(self.registry.get(job_id)), duplicate=False, sandbox=sandbox_plan)
 
     def job_view(self, job, status=None, include_tasks=False):
         view = {k: job.get(k) for k in ("job_id", "template", "params", "resources", "workdir",

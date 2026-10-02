@@ -102,6 +102,15 @@ def build_server(client: RESTClient, enable_file_writes=False, local_roots=None)
         return await call(client.cluster)
 
     @server.tool(annotations=read_only, description=(
+        "Report how this cluster can sandbox jobs: the node's kernel security features, user namespaces, "
+        "Singularity/Apptainer (version, setuid or not, site-wide bind paths), the module trees jobs need "
+        "to read, a self-test of the current sandbox, and a recommended `sandbox` section for the server's "
+        "config.json. Use it to help the cluster owner write that config; only the owner can change it. "
+        "Set refresh to probe again instead of using the result cached for 5 minutes."))
+    async def sandbox_info(refresh: bool = False) -> dict[str, Any]:
+        return await call(client.sandbox, refresh)
+
+    @server.tool(annotations=read_only, description=(
         "List the job templates you may submit, with each one's description, parameter JSON schema, default "
         "resources, and which resources may be overridden."))
     async def list_templates() -> dict[str, Any]:
@@ -289,11 +298,13 @@ def main(argv=None):
               f"run `{sys.executable} -m pip install mcp` ({MCP_IMPORT_ERROR})", file=sys.stderr)
         sys.exit(1)
     try:
-        token = os.environ.get("HPC_REST_TOKEN") or RESTClient.read_token_file(opts.token_file)
+        # A token from the file is re-read if the server rejects it, so replacing the file (e.g.
+        # with `setup_agents --rebuild`) doesn't need the MCP client to restart this server.
+        client = RESTClient(opts.url, token=os.environ.get("HPC_REST_TOKEN") or None,
+                            token_file=opts.token_file, timeout=60)
     except RESTClientError as e:
         print(f"hpclib MCP server: {e}", file=sys.stderr)
         sys.exit(1)
-    client = RESTClient(opts.url, token=token, timeout=60)
     build_server(client, enable_file_writes=opts.enable_file_writes, local_roots=opts.local_root).run("stdio")
 
 

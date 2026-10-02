@@ -449,6 +449,28 @@ class TestScopes(JobServerTestCase):
         self.expect_error(401, self.llm.health)
         RESTClient(self.url, token=self.other_token).health()
 
+    def test_client_rereads_a_replaced_token_file(self):
+        token_file = self.tmp / "llm_token"
+        token_file.write_text(self.llm_token + "\n")
+        token_file.chmod(0o600)
+        client = RESTClient(self.url, token_file=str(token_file))
+        self.assertEqual(client.health()["token"]["name"], "llm")
+        # what setup_agents --rebuild does: revoke the old token, write a new one to the same file
+        TokenAuth.revoke_token(str(self.tokens_file), "llm")
+        new = TokenAuth.add_token(str(self.tokens_file), "llm", ["read", "submit"], [str(self.llm_root)])
+        token_file.write_text(new + "\n")
+        self.assertEqual(client.health()["token"]["name"], "llm")      # no restart needed
+        self.assertEqual(client.token, new)
+        # a revoked token with nothing new in the file is reported, naming the file
+        TokenAuth.revoke_token(str(self.tokens_file), "llm")
+        with self.assertRaises(RESTClientError) as ctx:
+            client.health()
+        self.assertEqual(ctx.exception.status, 401)
+        self.assertIn(str(token_file), str(ctx.exception))
+        # an explicit token is used as given, never re-read
+        explicit = RESTClient(self.url, token=self.reader_token)
+        self.assertIsNone(explicit.token_file)
+
     def test_audit_log(self):
         job_id = self.llm.submit_job("hello")["job_id"]
         self.expect_error(401, RESTClient(self.url, token="wrong").health)
@@ -520,6 +542,20 @@ class TestUnitParsing(unittest.TestCase):
         problems = lim.violations({"partition": "gpu", "cpus_per_task": "4", "ntasks": "4", "gres": "gpu:2"})
         self.assertEqual(len(problems), 4, problems)  # partition, missing time, cpus, gpus
 
+    def test_array_summary_states(self):
+        def summary(*states):
+            out = rest_jobs.SlurmRunner.summarize({str(i): {"state": s} for i, s in enumerate(states)})
+            return out["state"], out["terminal"]
+        self.assertEqual(summary("PENDING", "PENDING"), ("PENDING", False))
+        self.assertEqual(summary("COMPLETED", "PENDING"), ("PENDING", False))
+        self.assertEqual(summary("COMPLETING", "PENDING"), ("RUNNING", False))   # started, wrapping up
+        self.assertEqual(summary("COMPLETED", "COMPLETING"), ("RUNNING", False))
+        self.assertEqual(summary("RUNNING", "PENDING"), ("RUNNING", False))
+        self.assertEqual(summary("COMPLETED", "COMPLETED"), ("COMPLETED", True))
+        self.assertEqual(summary("COMPLETED", "CANCELLED"), ("CANCELLED", True))  # cancelled part way
+        self.assertEqual(summary("COMPLETED", "CANCELLED", "FAILED"), ("FAILED", True))
+        self.assertEqual(summary("COMPLETED", "UNKNOWN"), ("UNKNOWN", False))
+
 
 class TestTokenManagement(unittest.TestCase):
 
@@ -586,7 +622,7 @@ class TestMCP(JobServerTestCase):
         params = StdioServerParameters(
             command=sys.executable,
             args=[str(SERVERS / "rest_mcp.py"), "--url", self.url, *extra_args],
-            env=dict(os.environ, HPC_REST_TOKEN=token or self.llm_token),
+            env=dict(os.environ, HPC_REST_TOKEN=self.llm_token if token is None else token),
         )
 
         async def go():
@@ -604,7 +640,7 @@ class TestMCP(JobServerTestCase):
         self.assertIn("dry_run", init.instructions)
         by_name = {t.name: t for t in tools}
         self.assertEqual(sorted(by_name), sorted([
-            "cluster_info", "list_templates", "submit_job", "list_jobs", "job_status", "wait_for_job",
+            "cluster_info", "sandbox_info", "list_templates", "submit_job", "list_jobs", "job_status", "wait_for_job",
             "cancel_job", "list_files", "read_file", "tail_file", "read_guide", "list_modules",
             "search_modules", "list_template_proposals", "propose_template"]))
         self.assertTrue(field(by_name["cluster_info"].annotations, "readOnlyHint"))
@@ -653,6 +689,28 @@ class TestMCP(JobServerTestCase):
         self.assertTrue(is_error(result))
         self.assertEqual(tool_payload(result)["status"], 403)  # llm token lacks files:write
         self.assertFalse((self.llm_root / "x.txt").exists())
+
+    def test_token_file_reloaded_after_401(self):
+        token_file = self.tmp / "mcp_token"
+        token_file.write_text(self.llm_token)
+        token_file.chmod(0o600)
+
+        async def body(session, init):
+            first = await session.call_tool("list_jobs", {})
+            TokenAuth.revoke_token(str(self.tokens_file), "llm")
+            new = TokenAuth.add_token(str(self.tokens_file), "llm", ["read", "submit"], [str(self.llm_root)])
+            token_file.write_text(new)
+            second = await session.call_tool("list_jobs", {})
+            return first, second
+
+        env_token = os.environ.pop("HPC_REST_TOKEN", None)
+        try:
+            first, second = self.session(body, "--token-file", str(token_file), token="")
+        finally:
+            if env_token is not None:
+                os.environ["HPC_REST_TOKEN"] = env_token
+        self.assertFalse(is_error(first))
+        self.assertFalse(is_error(second), second.content[0].text)
 
     def test_missing_token(self):
         env = {k: v for k, v in os.environ.items() if k != "HPC_REST_TOKEN"}

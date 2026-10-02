@@ -137,8 +137,9 @@ class TestSetupCluster(unittest.TestCase):
         rest = remote_home / ".local" / "tunnels" / "rest"
         self.assertTrue((remote_home / "hpclib" / "servers" / "rest_server.py").exists())
         self.assertTrue((rest / "templates" / "orca" / "template.json").exists())
-        self.assertEqual(json.loads((rest / "config.json").read_text()),
-                         json.loads((DEMO / "cluster_config.json").read_text()))
+        config, demo = json.loads((rest / "config.json").read_text()), json.loads((DEMO / "cluster_config.json").read_text())
+        self.assertEqual((config["limits"], config["cluster_notes"]), (demo["limits"], demo["cluster_notes"]))
+        self.assertEqual(config["sandbox"]["method"], "auto")     # jobs are sandboxed by default
         self.assertTrue(work.is_dir())
         token_file = local_home / ".config" / "hpclib" / "llm_token"
         self.assertEqual(stat.S_IMODE(token_file.stat().st_mode), 0o600)
@@ -169,9 +170,9 @@ class TestSetupCluster(unittest.TestCase):
                              capture_output=True, text=True, timeout=120)
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertIn("kept the existing orca", res.stdout)
-        self.assertIn("--revoke-token llm-scan", res.stdout)
-        self.assertIn("kept the existing config.json", res.stdout)
-        self.assertIn("already exists", res.stdout)
+        self.assertIn("kept the existing", res.stdout)
+        self.assertIn("config.json", res.stdout)
+        self.assertIn("already exists; rerun with --rebuild", res.stdout)
         self.assertIn("already has a hashed owner token", res.stdout)
         self.assertEqual((rest / "templates" / "orca" / "template.json").read_text(), "{\"edited\": true}")
         self.assertEqual(token_file.read_text().strip(), token)
@@ -197,12 +198,124 @@ class TestSetupCluster(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertIn("plaintext owner token", res.stdout)
         self.assertIn("--hash-token-file", res.stdout)
+        self.assertIn("rerun with --rebuild", res.stdout)
         self.assertEqual(plaintext.read_text(), "server-made-token\n")      # left for you to copy first
         self.assertFalse((local_home / ".config" / "hpclib" / "rest_token").exists())
 
     def test_usage(self):
         res = subprocess.run(["bash", str(DEMO / "setup_cluster.sh"), "only-one-arg"], capture_output=True, text=True)
         self.assertEqual(res.returncode, 2)
+
+
+class TestSetupAgents(unittest.TestCase):
+    """setup_agents (lib/tunnels.sh) against a fake ssh, like TestSetupCluster."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.remote_home, self.local_home, bin_dir = self.tmp / "remote home", self.tmp / "local", self.tmp / "bin"
+        for d in (self.remote_home, self.local_home, bin_dir):
+            d.mkdir()
+        (bin_dir / "ssh").write_text(FAKE_SSH)
+        (bin_dir / "ssh").chmod(0o755)
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("HPC", "HPCLIB"))}
+        self.env.update(HOME=str(self.local_home), PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                        TEST_REMOTE_HOME=str(self.remote_home), TEST_REMOTE_PATH=os.environ["PATH"])
+        self.rest = self.remote_home / ".local" / "tunnels" / "rest"
+        self.work = [self.tmp / "scratch" / "llm", self.tmp / "project" / "shared"]
+        self.token_file = self.local_home / ".config" / "hpclib" / "llm_token"
+
+    def setup_agents(self, *args, expect=0):
+        command = f'source {REPO / "hpclib" / "hpclib.sh"} && setup_agents "$@"'
+        res = subprocess.run(["bash", "-c", command, "setup_agents", *args], env=self.env,
+                             capture_output=True, text=True, timeout=180)
+        self.assertEqual(res.returncode, expect, res.stdout + res.stderr)
+        return res.stdout + res.stderr
+
+    def identify(self, token):
+        auth = TokenAuth("unused-owner", tokens_file=str(self.rest / "tokens.json"))
+        return auth.identify(f"Bearer {token}")
+
+    def config(self):
+        return json.loads((self.rest / "config.json").read_text())
+
+    def test_defaults_then_rebuild(self):
+        args = ["--work-dir", str(self.work[0]), "--work-dir", str(self.work[1]), "--bind", "/sw", "me@login.example"]
+        out = self.setup_agents(*args)
+        for t in ("hello", "orca", "writing_templates"):
+            self.assertTrue((self.rest / "templates" / t).is_dir(), t)
+        self.assertNotIn("python_script", os.listdir(self.rest / "templates"))
+        config = self.config()
+        self.assertEqual(config["sandbox"]["method"], "auto")
+        self.assertIn("/sw", config["sandbox"]["binds"])
+        self.assertIn("max_concurrent_jobs", config["limits"])
+        self.assertTrue(all(w.is_dir() for w in self.work))
+        token = self.token_file.read_text().strip()
+        identity = self.identify(token)
+        self.assertEqual((identity.name, sorted(identity.allow)), ("llm", sorted(map(str, self.work))))
+        self.assertEqual(sorted(identity.scopes), ["files:write", "propose", "read", "submit"])
+        owner = (self.local_home / ".config" / "hpclib" / "rest_token").read_text().strip()
+        self.assertIn("launch_tunnel -A none -P 5050 me@login.example rest -- --allow", out)
+
+        # your edits survive a plain rerun ...
+        (self.rest / "templates" / "orca" / "template.json").write_text('{"edited": true}')
+        config["cluster_notes"] = "mine"
+        (self.rest / "config.json").write_text(json.dumps(config))
+        out = self.setup_agents("--no-install", *args)
+        self.assertIn("kept the existing orca template", out)
+        self.assertEqual(self.config()["cluster_notes"], "mine")
+        self.assertEqual(self.token_file.read_text().strip(), token)
+
+        # ... and --rebuild replaces everything, keeping old copies on the cluster
+        image = self.rest / "sandbox" / "host"
+        image.mkdir(parents=True, exist_ok=True)
+        (image / "stale").write_text("")
+        out = self.setup_agents("--no-install", "--rebuild", *args)
+        self.assertNotIn("edited", (self.rest / "templates" / "orca" / "template.json").read_text())
+        self.assertEqual(json.loads(next((self.rest / "templates" / ".replaced").glob("orca-*")).joinpath(
+            "template.json").read_text()), {"edited": True})
+        self.assertNotEqual(self.config()["cluster_notes"], "mine")
+        self.assertEqual(len(list(self.rest.glob("config.json.replaced-*"))), 1)
+        self.assertFalse((image / "stale").exists())   # rebuilt (the probe may have made a fresh one)
+        new_token = self.token_file.read_text().strip()
+        self.assertNotEqual(new_token, token)
+        self.assertIsNone(self.identify(token))                 # the old token was revoked
+        self.assertEqual(self.identify(new_token).name, "llm")
+        self.assertIn("revoked 'llm' (the token in", out)
+        # the owner token is kept on this machine, and its hash reinstalled
+        self.assertEqual((self.local_home / ".config" / "hpclib" / "rest_token").read_text().strip(), owner)
+        self.assertEqual(TokenAuth.load(str(self.remote_home / ".local" / "tunnels" / "rest_token"))
+                         .identify(f"Bearer {owner}").name, "owner")
+
+    def test_rebuild_revokes_the_token_in_the_file_whatever_its_name(self):
+        args = ["--no-install", "--work-dir", str(self.work[0]), "--templates", "hello", "me@login.example"]
+        self.setup_agents("--token-name", "llm-scan", "--token-file", str(self.token_file),
+                          "--work-dir", str(self.work[0]), "--templates", "hello", "me@login.example")
+        old = self.token_file.read_text().strip()
+        self.assertEqual(self.identify(old).name, "llm-scan")
+        out = self.setup_agents("--rebuild", *args)      # default name llm, same file
+        self.assertIn("revoked 'llm-scan'", out)
+        self.assertIsNone(self.identify(old))
+        self.assertEqual(self.identify(self.token_file.read_text().strip()).name, "llm")
+
+    def test_existing_config_gets_a_sandbox(self):
+        self.rest.mkdir(parents=True)
+        (self.rest / "config.json").write_text(json.dumps({"cluster_notes": "old"}))
+        self.setup_agents("--work-dir", str(self.work[0]), "--templates", "hello", "me@login.example")
+        config = self.config()
+        self.assertEqual((config["cluster_notes"], config["sandbox"]["method"]), ("old", "auto"))
+        self.assertEqual(len(list(self.rest.glob("config.json.replaced-*"))), 1)
+
+    def test_no_sandbox_and_usage(self):
+        self.setup_agents("--work-dir", str(self.work[0]), "--no-sandbox", "--token-name", "bot",
+                          "--templates", "hello", "me@login.example")
+        self.assertEqual(self.config()["sandbox"], {"method": "none"})
+        self.assertTrue((self.local_home / ".config" / "hpclib" / "bot_token").exists())
+        self.setup_agents("me@login.example", expect=2)                               # no --work-dir
+        self.setup_agents("--work-dir", "relative/dir", "me@login.example", expect=2)
+        out = self.setup_agents("--no-install", "--work-dir", str(self.work[0]), "--templates", "nope",
+                                "me@login.example", expect=1)
+        self.assertIn("no template 'nope'", out)
 
 
 if __name__ == "__main__":

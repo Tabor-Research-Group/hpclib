@@ -149,6 +149,34 @@ rm "$test_dir/bin/tar"
 assert_contains "$(cat "$test_dir/out")" 'is unchanged'
 assert_equal "$(_hpclib_read_version "$installed/hpclib.sh")" 99.1.0
 [ -z "$(ls -A "$remote_home" | grep '\.install\.')" ] || fail 'left a staging directory after a failure'
+[ ! -e "$remote_home/.hpclib.install-lock" ] || fail 'left the install lock after a failure'
+set_version "$HPCLIB_DIR/hpclib.sh" "$local_version"
+
+# only one install at a time: a live lock holder is reported, a dead one is cleared
+lock="$remote_home/.hpclib.install-lock"
+set_version "$HPCLIB_DIR/hpclib.sh" 99.3.0
+mkdir "$lock"
+echo "$(hostname) $$ 2026-01-01T00:00:00" > "$lock/owner"   # this test shell: alive
+if install_hpclib login.example > "$test_dir/out" 2>&1; then fail 'installed while another install held the lock'; fi
+assert_contains "$(cat "$test_dir/out")" 'another install into'
+assert_equal "$(_hpclib_read_version "$installed/hpclib.sh")" 99.1.0
+[ -d "$lock" ] || fail "removed another install's lock"
+(exit 0) & dead_pid=$!; wait "$dead_pid"
+echo "$(hostname) $dead_pid 2026-01-01T00:00:00" > "$lock/owner"
+# leftovers of an interrupted install, and an old backup, are moved aside and deleted
+mkdir -p "$remote_home/.hpclib.install.abc123/sub"
+out="$(install_hpclib login.example)"
+assert_contains "$out" "cleared a stale lock left by pid $dead_pid"
+assert_contains "$out" 'leftovers of an interrupted install'
+assert_contains "$out" 'installed hpclib 99.3.0'
+assert_equal "$(_hpclib_read_version "$installed.previous/hpclib.sh")" 99.1.0
+[ ! -e "$lock" ] || fail 'left the install lock behind'
+[ -z "$(ls -A "$remote_home" | grep '\.install\.')" ] || fail 'left a staging directory'
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ -z "$(ls -A "$remote_home" | grep '\.trash\.')" ] && break
+  sleep 0.2
+done
+[ -z "$(ls -A "$remote_home" | grep '\.trash\.')" ] || fail 'did not delete the moved-aside files'
 set_version "$HPCLIB_DIR/hpclib.sh" "$local_version"
 
 # launch_tunnel runs start_tunnel.sh from HPCLIB_REMOTE_INSTALL_LOCATION

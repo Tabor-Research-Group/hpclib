@@ -9,5 +9,6 @@
     "max_concurrent_jobs": 8,
     "max_array_tasks": 500
   },
+  "sandbox": {"method": "auto", "binds": []},
   "cluster_notes": "ORCA scans: generate inputs locally with Psience's ScanManager, push them under scans/, run the orca template over scan_info.json, and pull the .out files back. Edit this note to describe your cluster (partitions to prefer, module names, scratch rules)."
 }

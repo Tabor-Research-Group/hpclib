@@ -31,9 +31,17 @@ class RESTClient:
     TUNNEL_HINT = ("start the tunnel first, e.g. `launch_tunnel -A none -P {port} user@login.example rest`")
 
     def __init__(self, url=None, token=None, token_file=None, timeout=60):
+        """
+        With `token`, that token is used as given. Otherwise it is read
+        from `token_file`, and read again whenever the server rejects it
+        (401), so a token replaced in the file (e.g. by `setup_agents
+        --rebuild`) takes effect without restarting the client.
+        """
         self.url = (url or self.DEFAULT_URL).rstrip("/")
+        self.token_file = None
         if token is None:
-            token = self.read_token_file(token_file or self.DEFAULT_TOKEN_FILE)
+            self.token_file = os.path.expanduser(token_file or self.DEFAULT_TOKEN_FILE)
+            token = self.read_token_file(self.token_file)
         self.token = token
         self.timeout = timeout
 
@@ -59,14 +67,43 @@ class RESTClient:
         with open(path) as f:
             return f.read().strip()
 
+    def reload_token(self):
+        """Re-read the token file; True if it now holds a different token."""
+        if self.token_file is None:
+            return False
+        try:
+            token = self.read_token_file(self.token_file)
+        except (RESTClientError, OSError):
+            return False
+        if not token or token == self.token:
+            return False
+        self.token = token
+        return True
+
     def request(self, verb, route, query=None, body=None, data=None, raw=False, timeout=None):
         url = self.url + route
         if query:
             query = {k: v for k, v in query.items() if v is not None}
             url += "?" + urllib.parse.urlencode(query, doseq=True)
-        headers = {"Authorization": f"Bearer {self.token}"}
         if body is not None:
             data = json.dumps(body).encode()
+        status, ctype, content = self._send(verb, url, data, body is not None, timeout)
+        if status == 401 and isinstance(data, (bytes, type(None))) and self.reload_token():
+            status, ctype, content = self._send(verb, url, data, body is not None, timeout)
+        if status == 401 and self.token_file is not None:
+            try:
+                payload = json.loads(content) if content else {}
+            except ValueError:
+                payload = {}
+            raise RESTClientError(
+                f"the server rejected the token in {self.token_file} ({payload.get('error', 'HTTP 401')}); it may "
+                f"have been revoked: put a current token in that file (setup_agents writes one)",
+                status=401, payload=payload)
+        return self._result(status, ctype, content, raw)
+
+    def _send(self, verb, url, data, is_json, timeout):
+        headers = {"Authorization": f"Bearer {self.token}"}
+        if is_json:
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, method=verb, headers=headers)
         try:
@@ -78,6 +115,9 @@ class RESTClient:
             port = urllib.parse.urlsplit(self.url).port or 80
             raise RESTClientError(f"hpclib REST server not reachable at {self.url} ({getattr(e, 'reason', e)}); "
                                   + self.TUNNEL_HINT.format(port=port))
+        return status, ctype, content
+
+    def _result(self, status, ctype, content, raw):
         if "text/html" in ctype:
             # the tunnel's waiting page: the forward is up, the job isn't yet
             raise RESTClientError("the tunnel is up but the REST server's job is still queued or starting; "
@@ -98,6 +138,9 @@ class RESTClient:
 
     def cluster(self):
         return self.request("GET", "/cluster")
+
+    def sandbox(self, refresh=False):
+        return self.request("GET", "/sandbox", query={"refresh": "1"} if refresh else None)
 
     def templates(self):
         return self.request("GET", "/templates")

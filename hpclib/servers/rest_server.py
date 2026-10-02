@@ -38,7 +38,10 @@ Protections
     (i.e. limited only by this user's own permissions). Symlinks and
     `..` are resolved before the check, so neither can escape a root.
     The whitelist governs the file endpoints and the `cwd` of SLURM
-    commands; it does NOT sandbox the jobs those commands submit.
+    commands. It sandboxes template jobs only when the config has a
+    `sandbox` section (see rest_sandbox.py): then each template body runs
+    in Singularity/Apptainer and can write only to the submitting token's
+    directories. GET /sandbox reports what the node supports.
     `$HPCTUNNELS_DATA_DIR` (tokens, templates, the job registry, the
     audit log, session files) is never reachable through the API.
   - Template jobs (see rest_jobs.py) can't add sbatch options or
@@ -56,6 +59,8 @@ Protections
 Endpoints (all responses are JSON unless noted)    scope
   GET    /health                                    any token
   GET    /cluster                                   read
+  GET    /sandbox[?refresh=1]   security features of this node, a self-test   read
+                                 of the sandbox, and a recommended config
   GET    /templates                                 read
   GET    /templates/guide?name=T                    read
   GET    /templates/proposals                       read
@@ -85,8 +90,10 @@ Usage: rest_server.py [--host H] [--port P] [--allow DIR ...] [--config F]
                       [--token-file F] [--command-timeout S] [--max-upload N]
                       [--disable-file-changes]
        rest_server.py --add-token NAME --scopes read,submit --token-allow DIR [...]
-       rest_server.py --revoke-token NAME | --list-tokens | --hash-token-file
+       rest_server.py --revoke-token NAME | --revoke-token-hash SHA256 | --list-tokens | --hash-token-file
        rest_server.py --list-proposals | --approve-template NAME [--replace] | --reject-template NAME
+       rest_server.py --init-config [--config-base F] [--rebuild] [--no-sandbox] [--sandbox-bind DIR ...]
+       rest_server.py --probe-sandbox
 """
 import abc
 import argparse
@@ -101,6 +108,7 @@ import shutil
 import signal
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -109,9 +117,10 @@ import traceback
 import urllib.parse
 
 try:
-    from . import rest_jobs
+    from . import rest_jobs, rest_sandbox
 except ImportError:  # run as a script from the servers directory
     import rest_jobs
+    import rest_sandbox
 RESTError = rest_jobs.RESTError  # re-exported
 
 __all__ = [
@@ -386,6 +395,17 @@ class TokenAuth:
         cls.write_private(tokens_file, json.dumps({"tokens": kept}, indent=2) + "\n")
 
     @classmethod
+    def revoke_token_hash(cls, tokens_file, digest):
+        """Revoke the token whose sha256 is `digest`; returns its name."""
+        entries = cls.read_tokens_file(tokens_file) if os.path.exists(tokens_file) else []
+        names = [e.get("name") for e in entries if hmac.compare_digest(str(e.get("sha256", "")), digest)]
+        if not names:
+            raise ValueError("no token has that hash")
+        cls.write_private(tokens_file, json.dumps({"tokens": [e for e in entries if e.get("name") not in names]},
+                                                  indent=2) + "\n")
+        return names[0]
+
+    @classmethod
     def hash_token_file(cls, token_file):
         token = cls.read_token_file(token_file)
         if token.startswith(cls.HASH_PREFIX):
@@ -437,6 +457,10 @@ class RESTServer(http.server.ThreadingHTTPServer):
         self.disable_file_changes = disable_file_changes
         self.jobs = jobs
         self.audit = audit
+        self.sandbox_prober = None
+        if jobs is not None:
+            probe_dir = os.path.join(jobs.sandbox.data_dir or tempfile.gettempdir(), "sandbox", "probe")
+            self.sandbox_prober = rest_sandbox.Prober(jobs.sandbox, probe_dir)
         umask = os.umask(0)
         os.umask(umask)
         self.file_mode = 0o666 & ~umask
@@ -629,6 +653,7 @@ class HPCRESTHandler(RESTHandler):
         **{
             ("GET", "/health"): None,
             ("GET", "/cluster"): "read",
+            ("GET", "/sandbox"): "read",
             ("GET", "/templates"): "read",
             ("GET", "/templates/guide"): "read",
             ("GET", "/templates/proposals"): "read",
@@ -658,6 +683,7 @@ class HPCRESTHandler(RESTHandler):
         routes = {
             ("GET", "/health"): self.do_health,
             ("GET", "/cluster"): self.do_cluster,
+            ("GET", "/sandbox"): self.do_sandbox,
             ("GET", "/templates"): self.do_templates,
             ("GET", "/templates/guide"): self.do_template_guide,
             ("GET", "/templates/proposals"): self.do_list_proposals,
@@ -711,6 +737,12 @@ class HPCRESTHandler(RESTHandler):
 
     def do_cluster(self):
         return 200, self.jobs.cluster_info(self.identity.name, self.whitelist, self.see_all_jobs)
+
+    def do_sandbox(self):
+        prober = self.server.sandbox_prober
+        if prober is None:
+            raise RESTError(503, "the sandbox probe is not configured on this server")
+        return 200, prober.get(refresh=self.query_flag("refresh"))
 
     def do_templates(self):
         return 200, self.jobs.describe_templates()
@@ -963,7 +995,7 @@ class HPCRESTHandler(RESTHandler):
 ##
 
 CONFIG_KEYS = {"limits", "templates_dir", "jobs_db", "audit_log", "tokens_file", "cluster_notes",
-               "poll_interval", "proposals_dir", "module_command"}
+               "poll_interval", "proposals_dir", "module_command", "sandbox"}
 
 def load_config(path):
     """
@@ -971,7 +1003,8 @@ def load_config(path):
       {"limits": {...ResourceLimits...}, "templates_dir": DIR, "jobs_db": FILE,
        "audit_log": FILE or null, "tokens_file": FILE, "cluster_notes": TEXT,
        "poll_interval": SECONDS, "proposals_dir": DIR,
-       "module_command": ["bash", "-lc", "module \"$@\" 2>&1", "hpclib-module"]}
+       "module_command": ["bash", "-lc", "module \"$@\" 2>&1", "hpclib-module"],
+       "sandbox": {...rest_sandbox.Sandbox...}}
     """
     explicit = path is not None
     path = os.path.expanduser(path or os.path.join(rest_data_dir(), "config.json"))
@@ -993,6 +1026,9 @@ def load_config(path):
     command = config.get("module_command")
     if command is not None and (not isinstance(command, list) or not all(isinstance(c, str) for c in command)):
         raise ValueError("`module_command` must be a list of strings")
+    sandbox = config.get("sandbox")
+    if sandbox is not None and not isinstance(sandbox, dict):
+        raise ValueError("`sandbox` must be an object")
     config["path"] = path
     return config
 
@@ -1035,6 +1071,8 @@ def parse_args(argv=None):
     tokens.add_argument("--token-allow", action="append", default=[], metavar="DIR",
                         help="directory the new token is limited to (repeatable; required unless --scopes '*')")
     tokens.add_argument("--revoke-token", metavar="NAME")
+    tokens.add_argument("--revoke-token-hash", metavar="SHA256",
+                        help="revoke the token with this sha256 (for a token file you have but whose name you don't)")
     tokens.add_argument("--list-tokens", action="store_true")
     tokens.add_argument("--hash-token-file", action="store_true",
                         help="replace the owner token file's contents with a hash of the token")
@@ -1044,6 +1082,20 @@ def parse_args(argv=None):
     review.add_argument("--replace", action="store_true", help="with --approve-template: replace an existing "
                                                                "template (the old one is kept as NAME.replaced-TIME)")
     review.add_argument("--reject-template", metavar="NAME")
+    setup = parser.add_argument_group("setup (run on the cluster; exits afterwards; used by setup_agents)")
+    setup.add_argument("--init-config", action="store_true",
+                       help="write the config file (with a job sandbox) if there is none; an existing one gets "
+                            "a `sandbox` section if it lacks one, and is otherwise kept")
+    setup.add_argument("--config-base", metavar="FILE", help="with --init-config: JSON to start from")
+    setup.add_argument("--rebuild", action="store_true",
+                       help="with --init-config: replace an existing config (kept as CONFIG.replaced-TIME) "
+                            "and rebuild the sandbox's host image")
+    setup.add_argument("--no-sandbox", action="store_true", help="with --init-config: don't add a sandbox")
+    setup.add_argument("--sandbox-bind", action="append", default=[], metavar="DIR",
+                       help="with --init-config: a directory jobs may read (repeatable); module trees found "
+                            "on MODULEPATH are added automatically")
+    setup.add_argument("--probe-sandbox", action="store_true",
+                       help="print what this node supports for sandboxing, and test the configured sandbox")
     return parser.parse_args(argv)
 
 def manage_tokens(opts, config):
@@ -1056,6 +1108,8 @@ def manage_tokens(opts, config):
     elif opts.revoke_token:
         TokenAuth.revoke_token(tokens_file, opts.revoke_token)
         print(f"revoked {opts.revoke_token!r}")
+    elif opts.revoke_token_hash:
+        print(f"revoked {TokenAuth.revoke_token_hash(tokens_file, opts.revoke_token_hash.strip().lower())!r}")
     elif opts.list_tokens:
         entries = TokenAuth.read_tokens_file(tokens_file) if os.path.exists(tokens_file) else []
         for e in entries:
@@ -1084,6 +1138,117 @@ def manage_proposals(opts, config):
         return False
     return True
 
+DEFAULT_CONFIG = {
+    "limits": {"max_time": "1-00:00:00", "max_mem": "64G", "max_cpus": 16, "max_nodes": 1, "max_gpus": 0,
+               "max_concurrent_jobs": 4, "max_array_tasks": 500},
+    "cluster_notes": "Describe this cluster for clients: partitions to prefer, module names, scratch rules.",
+}
+
+def _sandbox_section(given, binds):
+    """
+    `given` (a sandbox section, or None) completed for this node: method
+    auto unless set, and reading `binds` and the module trees on MODULEPATH.
+    """
+    section = dict(given or {})
+    section.setdefault("method", "auto")
+    _, roots = rest_sandbox._module_roots()
+    found = []
+    for path in list(section.get("binds", [])) + list(binds) + roots:
+        path = os.path.normpath(os.path.expanduser(path))
+        if path not in found and path not in rest_sandbox.HOST_IMAGE_BINDS:
+            found.append(path)
+    section["binds"] = found
+    return section
+
+def _detached_delete(path):
+    """Delete `path` in the background, so a slow filesystem can't hold up the caller."""
+    try:
+        subprocess.Popen(["rm", "-rf", path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+def init_config(opts):
+    """--init-config: write (or with --rebuild, replace) the config file; prints what it did."""
+    path = os.path.expanduser(opts.config or os.path.join(rest_data_dir(), "config.json"))
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    base = dict(DEFAULT_CONFIG)
+    if opts.config_base:
+        with open(opts.config_base) as f:
+            given = json.load(f)
+        if not isinstance(given, dict):
+            raise ValueError(f"{opts.config_base} must hold a JSON object")
+        base.update(given)
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    if os.path.exists(path) and not opts.rebuild:
+        with open(path) as f:
+            config = json.load(f)
+        if "sandbox" in config or opts.no_sandbox:
+            print(f"kept the existing {path}")
+            return
+        shutil.copy2(path, f"{path}.replaced-{stamp}")
+        config["sandbox"] = _sandbox_section(base.get("sandbox"), opts.sandbox_bind)
+        action = f"added a job sandbox to {path} (the old file is {path}.replaced-{stamp})"
+    else:
+        config = base
+        if opts.no_sandbox:
+            config["sandbox"] = {"method": "none"}
+        else:
+            config["sandbox"] = _sandbox_section(config.get("sandbox"), opts.sandbox_bind)
+        action = f"wrote {path}"
+        if os.path.exists(path):
+            os.replace(path, f"{path}.replaced-{stamp}")
+            action = f"rebuilt {path} (the old file is {path}.replaced-{stamp})"
+    rest_sandbox.Sandbox(config.get("sandbox"))   # validate before writing
+    unknown = set(config) - CONFIG_KEYS
+    if unknown:
+        raise ValueError(f"unknown config keys {sorted(unknown)}; known: {sorted(CONFIG_KEYS)}")
+    TokenAuth.write_private(path, json.dumps(config, indent=2) + "\n")
+    sandbox = config.get("sandbox", {})
+    print(action)
+    if sandbox.get("method") == "none":
+        print("  job sandbox: off")
+    else:
+        print(f"  job sandbox: {sandbox.get('method')}, reading {', '.join(sandbox.get('binds') or []) or '(only /usr, /etc, /opt)'}")
+    if opts.rebuild:
+        image = os.path.join(rest_data_dir(), "sandbox", "host")
+        if os.path.exists(image):
+            old = os.path.join(rest_data_dir(), "sandbox", f".host.old-{stamp}")
+            os.replace(image, old)
+            _detached_delete(old)
+            print("  the sandbox's host image will be rebuilt by the next job")
+
+def probe_sandbox(config):
+    """--probe-sandbox: a short report, from this node, of the sandbox the config describes."""
+    sandbox = rest_sandbox.Sandbox(config.get("sandbox"), data_dir=rest_data_dir())
+    probe_dir = os.path.join(rest_data_dir(), "sandbox", "probe")
+    os.makedirs(probe_dir, mode=0o700, exist_ok=True)
+    info = rest_sandbox.probe(sandbox, probe_dir)
+    print(f"sandbox probe on {info['node']} ({info['os']}, kernel {info['kernel']}):")
+    for r in info["container_runtimes"]:
+        mode = "setuid" if r.get("setuid_installed") and r.get("setuid_allowed") else "user namespaces"
+        print(f"  {r['version']} at {r['path']} ({mode})")
+    if not info["container_runtimes"]:
+        print("  no Singularity or Apptainer on PATH")
+    described = info["sandbox"]
+    print(f"  configured sandbox: {described['method']} -> {described['effective']}"
+          + (f" ({described.get('error') or described.get('reason')})" if described.get("error") or described.get("reason") else ""))
+    test = info.get("self_test")
+    if test:
+        if test.get("ran"):
+            failed = [k for k, ok in test["checks"].items() if not ok]
+            print(f"  test container: {'passed' if test['passed'] else 'FAILED'}"
+                  + (f" ({', '.join(failed)})" if failed else "") + f" in {test['seconds']} s")
+            if not test["passed"] and test.get("stderr"):
+                print("    " + test["stderr"].strip().replace("\n", "\n    "))
+        else:
+            print(f"  test container: not run ({test.get('reason')})")
+    for note in info["notes"]:
+        print(f"  note: {note}")
+    if not os.environ.get("SLURM_JOB_ID"):
+        print("  (probed on this node; jobs run on compute nodes, where GET /sandbox reports again)")
+    return test is None or test.get("passed", False)
+
 def build_jobs(config, command_timeout):
     runner = rest_jobs.SlurmRunner(timeout=command_timeout)
     templates = rest_jobs.TemplateStore(config["templates_dir"])
@@ -1096,6 +1261,7 @@ def build_jobs(config, command_timeout):
         runner=runner,
         cluster_notes=config.get("cluster_notes"),
         poll_interval=config.get("poll_interval", 10),
+        sandbox=rest_sandbox.Sandbox(config.get("sandbox"), data_dir=rest_data_dir()),
     )
 
 def protected_paths(config, auth):
@@ -1109,7 +1275,11 @@ def protected_paths(config, auth):
 
 def main(argv=None, handler_class=HPCRESTHandler):
     opts = parse_args(argv)
+    if opts.init_config:
+        return init_config(opts)
     config = load_config(opts.config)
+    if opts.probe_sandbox:
+        sys.exit(0 if probe_sandbox(config) else 1)
     if manage_tokens(opts, config):
         return
 
@@ -1134,6 +1304,14 @@ def main(argv=None, handler_class=HPCRESTHandler):
     print(f"  file changes: {'disabled' if opts.disable_file_changes else 'enabled'}")
     print(f"  templates: {jobs.templates.directory}")
     print(f"  audit log: {config.get('audit_log') or 'off'}")
+    sandbox = jobs.sandbox.describe()
+    if sandbox["effective"] == "singularity":
+        print(f"  job sandbox: {sandbox['runtime_path']}")
+    elif sandbox["effective"] == "unavailable":
+        print(f"  job sandbox: UNAVAILABLE, template jobs will be refused: {sandbox['error']}", file=sys.stderr)
+    else:
+        print(f"WARNING: template jobs are not sandboxed ({sandbox['reason']}); GET /sandbox recommends a "
+              f"config", file=sys.stderr)
     print(f"  base dir: {whitelist.base_dir}", flush=True)
 
     try:

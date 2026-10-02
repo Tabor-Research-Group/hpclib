@@ -11,6 +11,9 @@ Subcommands:
                         exact --status, --incomplete (anything not COMPLETED)
                         --name-regex, and/or --dir-regex (job_name / metadata
                         directory, both plain Python regex substring matches)
+    check               report where the queue db is, its journal mode and
+                        filesystem, and any deferred or quarantined files;
+                        applies deferred writes
     init                scaffold the bundled shell templates into a directory
 """
 import argparse
@@ -137,6 +140,61 @@ f"{row['metadata_path']}"
     return 0
 
 
+def _filesystem_type(path: Path) -> str:
+    """The filesystem type of the mount holding `path`, from
+    /proc/mounts (Linux); "unknown" elsewhere.
+    """
+    try:
+        target = str(path.resolve())
+        best, fstype = "", "unknown"
+        with open("/proc/mounts") as mounts:
+            for line in mounts:
+                fields = line.split()
+                if len(fields) < 3:
+                    continue
+                mount = fields[1].replace("\\040", " ")
+                if (target == mount or target.startswith(mount.rstrip("/") + "/")) and len(mount) > len(best):
+                    best, fstype = mount, fields[2]
+        return fstype
+    except OSError:
+        return "unknown"
+
+
+def _cmd_check(args: argparse.Namespace) -> int:
+    queue = QueueDB()
+    db = queue.db_path
+    fstype = _filesystem_type(db.parent)
+    print(f"queue db:      {db}")
+    print(f"filesystem:    {fstype}")
+    status = 0
+    try:
+        with queue._connect() as conn:
+            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        print(f"journal mode:  {mode} (wanted {queue.journal_mode})")
+        print(f"jobs:          {count}")
+    except Exception as exc:  # report whatever is wrong rather than a traceback
+        print(f"could not open it: {exc}")
+        status = 1
+    leftovers = sorted(p.name for p in db.parent.glob(db.name + "-*"))
+    if leftovers:
+        print(f"sidecar files: {', '.join(leftovers)}")
+    quarantined = sorted(p.name for p in db.parent.glob(db.name + "*.corrupt-*"))
+    if quarantined:
+        print(f"quarantined:   {len(quarantined)} file(s), latest {quarantined[-1]}")
+    waiting = queue.spooled()
+    if waiting:
+        try:
+            print(f"deferred:      applied {queue.flush_spool()} waiting write(s)")
+        except QueueUnavailable as exc:
+            print(f"deferred:      {waiting} write(s) waiting; could not apply them ({exc})")
+            status = 1
+    if fstype.startswith(("nfs", "lustre", "gpfs", "beegfs", "cifs", "smb", "fuse")) and queue.journal_mode == "wal":
+        print("warning: WAL mode on a network filesystem is unsafe; unset JOB_QUEUE_JOURNAL_MODE")
+        status = 1
+    return status
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     dest = Path(args.dest)
     dest.mkdir(parents=True, exist_ok=True)
@@ -215,6 +273,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="only show jobs whose metadata directory matches this regex (substring match)",
     )
     p_list.set_defaults(func=_cmd_list)
+
+    p_check = sub.add_parser("check", help="report on the queue db and apply deferred writes")
+    p_check.set_defaults(func=_cmd_check)
 
     p_init = sub.add_parser("init", help="scaffold the bundled shell templates into a directory")
     p_init.add_argument("--dest", default=".", help="destination directory (default: cwd)")

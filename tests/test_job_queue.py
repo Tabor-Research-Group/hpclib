@@ -324,6 +324,138 @@ class TestLockHandling(TempDirTestCase):
 
 
 # --------------------------------------------------------------------------
+# Network filesystems: no WAL, deferred writes instead of dropped ones,
+# and no quarantine on an unconfirmed "malformed"
+# --------------------------------------------------------------------------
+
+class TestNetworkFilesystemSafety(TempDirTestCase):
+    def _mode(self, path):
+        conn = sqlite3.connect(path)
+        try:
+            return conn.execute("PRAGMA journal_mode").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_fresh_db_uses_rollback_journal(self):
+        q = QueueDB(db_path=self.tmp_path / "q.db")
+        q.upsert_job(job_id="a", job_name="a", metadata_path="/m/a.json")
+        self.assertEqual(self._mode(q.db_path), "delete")
+        self.assertFalse(Path(str(q.db_path) + "-wal").exists())
+
+    def test_db_left_in_wal_mode_is_switched_back(self):
+        path = self.tmp_path / "q.db"
+        conn = sqlite3.connect(path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.close()
+        self.assertEqual(self._mode(path), "wal")
+        q = QueueDB(db_path=path)
+        q.upsert_job(job_id="a", job_name="a", metadata_path="/m/a.json")
+        self.assertEqual(self._mode(path), "delete")
+        self.assertEqual(q.get_job("a")["job_name"], "a")
+
+    def test_wal_only_when_asked(self):
+        with mock.patch.dict("os.environ", {"JOB_QUEUE_JOURNAL_MODE": "wal"}):
+            q = QueueDB(db_path=self.tmp_path / "q.db")
+        q.upsert_job(job_id="a", job_name="a", metadata_path="/m/a.json")
+        self.assertEqual(self._mode(q.db_path), "wal")
+        with capture_output() as captured:
+            self.assertEqual(QueueDB(db_path=self.tmp_path / "r.db", journal_mode="bogus").journal_mode, "delete")
+        self.assertIn("unknown journal mode", captured.err)
+
+    def test_writes_that_cannot_land_are_applied_later(self):
+        path = self.tmp_path / "q.db"
+        QueueDB(db_path=path).upsert_job(job_id="a", job_name="a", metadata_path="/m/a.json", status="PENDING")
+
+        def always_locked(p, timeout=30):
+            raise sqlite3.OperationalError("database is locked")
+
+        with mock.patch.object(queue_db_module, "QUEUE_DB_LOCK_INITIAL_BACKOFF", 0.001), \
+                mock.patch.object(queue_db_module.sqlite3, "connect", always_locked):
+            with capture_output() as captured:
+                q = QueueDB(db_path=path)
+                q.update_status("a", "RUNNING")
+                q.upsert_job(job_id="b", job_name="b", metadata_path="/m/b.json", status="NEW")
+                q.update_status("a", "COMPLETED")
+        self.assertIn("saved to", captured.err)
+        self.assertEqual(q.spooled(), 3)
+
+        # the next process to get through applies them, in order, before answering
+        later = QueueDB(db_path=path)
+        self.assertEqual(later.get_job("a")["status"], "COMPLETED")
+        self.assertEqual(later.get_job("b")["status"], "NEW")
+        self.assertEqual(later.spooled(), 0)
+
+    def test_deferred_write_does_not_undo_a_newer_one(self):
+        q = QueueDB(db_path=self.tmp_path / "q.db")
+        q.upsert_job(job_id="a", job_name="a", metadata_path="/m/a.json", status="PENDING")
+        q._spool("update_status", {"job_id": "a", "status": "RUNNING", "metadata_json": None},
+                 "2000-01-01 00:00:00")
+        q.update_status("a", "COMPLETED")             # drains the old RUNNING first
+        q._spool("update_status", {"job_id": "a", "status": "RUNNING", "metadata_json": None},
+                 "2000-01-01 00:00:00")
+        self.assertEqual(q.get_job("a")["status"], "COMPLETED")
+        self.assertEqual(q.spooled(), 0)
+
+    def test_unreadable_spool_file_is_set_aside(self):
+        q = QueueDB(db_path=self.tmp_path / "q.db")
+        q.spool_dir.mkdir()
+        (q.spool_dir / "0001.json").write_text("{not json")
+        with capture_output() as captured:
+            q.upsert_job(job_id="a", job_name="a", metadata_path="/m/a.json")
+        self.assertIn("unreadable spool file", captured.err)
+        self.assertTrue((q.spool_dir / "0001.bad").exists())
+        self.assertEqual(q.get_job("a")["job_name"], "a")
+
+    def test_unconfirmed_corruption_is_not_quarantined(self):
+        """On NFS a stale cache can make a healthy db look malformed for
+        a moment; moving the shared db aside then would split every
+        node's history.
+        """
+        path = self.tmp_path / "q.db"
+        q = QueueDB(db_path=path)
+        q.upsert_job(job_id="a", job_name="a", metadata_path="/m/a.json")
+        calls = {"n": 0}
+        real_get = q._op_update_status
+
+        def flaky(conn, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return real_get(conn, **kw)
+
+        with mock.patch.object(q, "_op_update_status", flaky):
+            q.update_status("a", "RUNNING")
+        self.assertEqual(q.get_job("a")["status"], "RUNNING")
+        self.assertEqual(list(self.tmp_path.glob("q.db*.corrupt-*")), [])
+
+    def test_confirmed_corruption_is_quarantined(self):
+        path = self.tmp_path / "q.db"
+        path.write_bytes(b"this is not a database" * 100)
+        with capture_output() as captured:
+            q = QueueDB(db_path=path)
+        self.assertTrue(q._available)
+        self.assertIn("quarantining", captured.err)
+        self.assertEqual(len(list(self.tmp_path.glob("q.db.corrupt-*"))), 1)
+        q.upsert_job(job_id="a", job_name="a", metadata_path="/m/a.json")
+        self.assertEqual(q.get_job("a")["job_name"], "a")
+
+    def test_cli_check(self):
+        db = self.tmp_path / "queue.db"
+        q = QueueDB(db_path=db)
+        q._spool("upsert_job", dict(job_id="a", job_name="a", metadata_path="/m/a.json", status="NEW",
+                                    slurm_job_id=None, submitted_at=None, metadata_json=None),
+                 "2026-01-01 00:00:00")
+        with mock.patch.object(queue_db_module, "QUEUE_DB_PATH", db), \
+                mock.patch.object(queue_db_module, "ensure_queue_dir", lambda: None):
+            with capture_output() as captured:
+                rc = cli_main(["check"])
+        self.assertEqual(rc, 0, captured.err)
+        self.assertIn("journal mode:  delete", captured.out)
+        self.assertIn("applied 1 waiting write", captured.out)
+        self.assertEqual(QueueDB(db_path=db).get_job("a")["job_name"], "a")
+
+
+# --------------------------------------------------------------------------
 # decision.py: the metadata blob written to the queue db must match the
 # FINAL on-disk metadata state for that decision, not a pre-update
 # snapshot (this was a real ordering bug fixed alongside this feature).

@@ -3,6 +3,11 @@
 Override JOB_QUEUE_HOME in the environment if you want the queue database
 to live somewhere other than the XDG-style default (e.g. for testing, or
 to share a queue across a cluster on a shared filesystem).
+
+The db runs in SQLite's rollback-journal (DELETE) mode, which is safe on
+NFS; JOB_QUEUE_JOURNAL_MODE=WAL is only for a queue db on a local disk
+used from a single machine. `job-queue check` reports which mode and
+filesystem the db is on.
 """
 from pathlib import Path
 import os

@@ -320,18 +320,18 @@ class TestOrcaScript(WorkflowTestCase):
     def test_module_loads_rendered(self):
         template = rest_jobs.TemplateStore(str(self.templates)).get("orca")
         template.spec["modules"] = ["GCC/12.2.0", "ORCA/5.0.4"]
-        script = template.render({"nprocs": 1}, [{"input": "/x.inp"}])
+        script, _ = template.render({"nprocs": 1}, [{"input": "/x.inp"}])
         self.assertTrue(script.startswith("#!/bin/bash -l\n"))  # same environment as search_modules
         self.assertIn("module load GCC/12.2.0 || {", script)
         self.assertLess(script.index("module load GCC"), script.index("module load ORCA"))
         self.assertLess(script.index("module load"), script.index('case "${SLURM_ARRAY_TASK_ID'))
         template.spec["modules"] = []
-        self.assertTrue(template.render({"nprocs": 1}, [{"input": "/x.inp"}]).startswith("#!/bin/bash\n"))
+        self.assertTrue(template.render({"nprocs": 1}, [{"input": "/x.inp"}])[0].startswith("#!/bin/bash\n"))
 
     def test_failed_module_load_stops_the_task(self):
         template = rest_jobs.TemplateStore(str(self.templates)).get("orca")
         template.spec["modules"] = ["ORCA/9.9.9"]
-        script = template.render({"nprocs": 1}, [{"input": str(self.tmp / "x.inp")}])
+        script, _ = template.render({"nprocs": 1}, [{"input": str(self.tmp / "x.inp")}])
         fake = self.tmp / "module-fail.sh"
         fake.write_text('module() { echo "Lmod: unknown module $2" >&2; return 1; }\n')
         res = subprocess.run(["bash", "-c", f". {fake}; " + script.split("\n", 1)[1]], capture_output=True,

@@ -1,1 +1,8 @@
-recursive-include . *.sh
+# Everything hpclib runs on a cluster or ships as data: the bash library and
+# tunnel scripts (lib/, tunnels/, templates/), the REST job templates
+# (template.json, script.sh, guide.md, examples/*.json), and the worked
+# examples. setup.py's include_package_data puts these in the wheel too.
+include README.md
+recursive-include hpclib *.sh *.py *.json *.md *.txt
+recursive-include tests *.sh *.py *.md
+global-exclude __pycache__ *.py[cod] .DS_Store
