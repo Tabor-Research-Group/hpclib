@@ -55,6 +55,29 @@ where `8895` is just an example port.
 
 Then by going to `http://localhost:8895` you will see your Jupyter notebook appear
 
+### Ending tunnels and stale ports
+
+A tunnel's pieces end with its SLURM job. When the job finishes, the session on the compute node returns, so
+the ssh forward the login node holds for it closes too. Ending the tunnel yourself (Ctrl-C, closing the
+terminal) cancels the job.
+
+Each tunnel records itself under `~/.local/tunnels/sessions/ports/` by login node and port. A new tunnel on the
+same port first stops anything an earlier one left behind on that login node: its script, its job, a stale
+forward or waiting page. If the port is held by something that isn't one of your tunnels, such as another
+user's program on a shared login node, `start_tunnel.sh` stops and says so; pick another `-P`.
+
+To clear a port from your own machine, for example after your laptop slept or the VPN dropped:
+
+```bash
+stop_tunnel -P 5050 user@login.example
+```
+
+This stops the tunnel's pieces on the login node, cancels its job, and drops the forward your local ssh
+connection holds. Login nodes behind one hostname may differ between connections. If the stale tunnel was
+started on another login node, the output says which one, so you can `ssh` there directly. `pssh` and the
+tunnels' second hop send keepalives, so a connection that has died errors out within about two minutes instead
+of hanging. Set `HPCLIB_SSH_KEEPALIVE=` to turn that off.
+
 ### Tunnel Configuration
 
 Source `hpclib/hpclib.sh` to use the tunnel management functions. `resolve_tunnel NAME`

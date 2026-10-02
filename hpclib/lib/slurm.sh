@@ -178,6 +178,7 @@ function wait_for_job_node {
 
 CONNECT_TO_JOB_OPTS="46AaCfGgKkMNnqsTtVvXxYyfnb:B:c:e:E:L:l:i:J:F:D:o:O:Q:w:W:S:R:P:I:"
 CONNECT_TO_JOB_LONG_OPTS=""
+CONNECT_TO_JOB_SSH_OPTS="-o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=4"
 function connect_to_job {
   local job_id;
   local forwarding;
@@ -210,6 +211,9 @@ function connect_to_job {
             ssh_args=$(_build_argstr "$ssh_args" "$ssh_opts")
             pause_time=$(mcoptvalue "$CONNECT_TO_JOB_OPTS" "$CONNECT_TO_JOB_LONG_OPTS" "I" $@)
             sleep $pause_time
+            # fail rather than run without the forward (e.g. the port is
+            # taken), and notice a dead connection instead of hanging
+            ssh_args=$(_build_argstr "$ssh_args" "$CONNECT_TO_JOB_SSH_OPTS")
             printf "%s\n" "ssh $ssh_args $job_node $post_args"
             ssh $ssh_args $job_node "$post_args"
       fi

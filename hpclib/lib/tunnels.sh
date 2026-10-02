@@ -457,6 +457,122 @@ _hpclib_remote_install \"\$@\"; exit \$?"
   fi
 }
 
+################################################################################
+##
+##  Clearing up after tunnels on a login node
+##
+##  start_tunnel.sh records itself in $HPCSESSIONS_DIR/ports/HOST-PORT as
+##  "PID [JOB]". A later tunnel on the same port, or stop_tunnel, uses the
+##  record to stop what an earlier tunnel left running: the tunnel script,
+##  its SLURM job, the ssh forward to the compute node, the waiting page.
+##
+
+function _hpclib_sessions_root {
+  printf '%s\n' "${HPCSESSIONS_DIR:-${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/sessions}"
+}
+
+function _hpclib_port_file {  # _hpclib_port_file PORT [HOST]
+  printf '%s/ports/%s-%s\n' "$(_hpclib_sessions_root)" "${2:-$(hostname -s)}" "$1"
+}
+
+function _hpclib_port_free {  # _hpclib_port_free PORT: can 127.0.0.1:PORT be bound here?
+  python3 -c '
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)' "$1" 2>/dev/null
+}
+
+function _hpclib_record_port {  # _hpclib_record_port PORT PID [JOB]
+  local file
+  file=$(_hpclib_port_file "$1")
+  mkdir -p "$(dirname "$file")"
+  printf '%s %s\n' "$2" "${3:-}" > "$file"
+}
+
+function _hpclib_forget_port {  # _hpclib_forget_port PORT PID: remove the record if it is still PID's
+  local file pid job
+  file=$(_hpclib_port_file "$1")
+  [ -f "$file" ] || return 0
+  read -r pid job < "$file"
+  if [ "$pid" = "$2" ]; then rm -f "$file"; fi
+}
+
+# _hpclib_clear_port PORT: stop whatever an earlier tunnel left on PORT on
+# this login node, then check the port is free. Only touches your own
+# processes, and only ones that look like hpclib tunnel pieces for PORT.
+function _hpclib_clear_port {
+  local port="$1" me file pid job other tries
+  me=$(id -un)
+  file=$(_hpclib_port_file "$port")
+  if [ -f "$file" ]; then
+    read -r pid job < "$file"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && ps -o args= -p "$pid" 2>/dev/null | grep -q start_tunnel; then
+      echo "stopping the earlier tunnel on port $port (pid $pid)" >&2
+      pkill -TERM -P "$pid" 2>/dev/null || true
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+    if [ -n "$job" ] && [ -n "$(squeue -h -j "$job" -o %i 2>/dev/null)" ]; then
+      echo "cancelling its job $job" >&2
+      scancel "$job" 2>/dev/null || true
+    fi
+    rm -f "$file"
+  fi
+  # pieces that outlive their tunnel script: the forward to the compute
+  # node (see connect_to_job) and the waiting page
+  if pkill -TERM -u "$me" -f "^ssh -L 127\.0\.0\.1:$port:" 2>/dev/null; then
+    echo "stopped a leftover port forward on $port" >&2
+  fi
+  if pkill -TERM -u "$me" -f "waiting_shim\.py $port " 2>/dev/null; then
+    echo "stopped a leftover waiting page on $port" >&2
+  fi
+  for other in "$(_hpclib_sessions_root)"/ports/*-"$port"; do
+    if [ -f "$other" ] && [ "$other" != "$file" ]; then
+      echo "note: a tunnel on port $port was also started on ${other##*/ports/}; clear it there if it is stale" >&2
+    fi
+  done
+  for tries in 1 2 3 4 5 6 7 8 9 10; do
+    if _hpclib_port_free "$port"; then return 0; fi
+    sleep 0.5
+  done
+  echo "port $port on $(hostname -s) is in use by something that isn't one of your tunnels:" >&2
+  ss -ltnp "sport = :$port" 2>/dev/null | tail -n +2 >&2 || true
+  echo "pick another port with -P" >&2
+  return 1
+}
+
+# Stop a tunnel from your own machine, including anything it left behind
+# on the login node, and drop the local forward:
+#   stop_tunnel -P PORT [ssh options] [user@]host
+function stop_tunnel {
+  local usage='usage: stop_tunnel -P PORT [ssh options] [user@]host'
+  local port='' login_args=() hosts=() script
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -P) port="$2"; shift 2 ;;
+      -P*) port="${1#-P}"; shift ;;
+      -h|--help) echo "$usage"; return 0 ;;
+      *) login_args+=("$1"); shift ;;
+    esac
+  done
+  hosts=($(mcargs "$SSH_FLAGS" "$SSH_LONG_FLAGS" "${login_args[@]}"))
+  case "$port" in
+    ''|*[!0-9]*) echo "$usage" >&2; return 2 ;;
+  esac
+  if [ "${#hosts[@]}" -ne 1 ]; then
+    echo "$usage" >&2
+    return 2
+  fi
+  script="$(declare -f _hpclib_sessions_root _hpclib_port_file _hpclib_port_free _hpclib_clear_port)
+_hpclib_clear_port \"\$1\" && echo \"port \$1 is free on \$(hostname -s)\""
+  printf '%s\n' "$script" | HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$(printf '%q ' bash -s -- "$port")"
+  # the forward this machine's ssh master holds for the tunnel
+  HPCLIB_ECHO_COMMANDS= pssh -O cancel -L "127.0.0.1:$port:127.0.0.1:$port" "${login_args[@]}" 2>/dev/null || true
+}
+
 LAUNCH_TUNNEL_DEFAULT_APP="Safari"
 LAUNCH_TUNNEL_ARGS="bP:A:"
 LAUNCH_TUNNEL_LONG_ARGS="browser-arg:"

@@ -15,6 +15,8 @@ function _ssh_connected {
 }
 
 SSH_FLAGS="46AaCfgKkMNnqPRTtVvXxYy:b:c:D:E:e:F:f:i:I:J:L:l:m:O:o:p:Q:S:W:w:";
+# a dead connection (sleep, VPN change) errors out in ~2 minutes instead of hanging
+HPCLIB_SSH_KEEPALIVE="${HPCLIB_SSH_KEEPALIVE--o ServerAliveInterval=30 -o ServerAliveCountMax=4}"
 SSH_LONG_FLAGS=""
 function _ssh_like {
   local cmd="$1";
@@ -54,9 +56,9 @@ function _ssh_like {
   # echo "$cmd $base_opts -o $conn_opt ${args[@]}"
   mkdir -p ~/.ssh/connections
   if [ "$HPCLIB_ECHO_COMMANDS" ]; then
-    echo $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h' ${args[@]}
+    echo $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h' $HPCLIB_SSH_KEEPALIVE ${args[@]}
   fi
-  $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h' ${args[@]}
+  $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h' $HPCLIB_SSH_KEEPALIVE ${args[@]}
 
 }
 
@@ -99,9 +101,9 @@ function _scp_like {
 
   mkdir -p ~/.ssh/connections
   if [ "$HPCLIB_ECHO_COMMANDS" ]; then
-    echo $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h' ${args[@]}
+    echo $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h' $HPCLIB_SSH_KEEPALIVE ${args[@]}
   fi
-  $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h' ${args[@]}
+  $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h' $HPCLIB_SSH_KEEPALIVE ${args[@]}
 
 }
 

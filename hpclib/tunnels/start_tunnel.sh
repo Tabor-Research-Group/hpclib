@@ -158,6 +158,15 @@ job_uuid=$(random_id)
 job_name="$TUNNEL_NAME-$job_uuid"
 
 mkdir -p "$SESSIONS_DIR"
+
+# Anything an earlier tunnel on this port left running (its forward, its
+# waiting page, its job) is stopped first; a port held by something else
+# is an error rather than a tunnel that silently doesn't work.
+if ! _hpclib_clear_port "$HOST_PORT"; then
+  exit 1
+fi
+_hpclib_record_port "$HOST_PORT" "$$"
+
 STATUS_FILE="$SESSIONS_DIR/status-$job_uuid.txt"
 echo "submitting job..." > "$STATUS_FILE"
 
@@ -187,6 +196,8 @@ function cleanup() {
   scancel $SESSION_ID 2>/dev/null
   stop_git_server
   stop_shim
+  pkill -TERM -P $$ 2>/dev/null   # e.g. the forward to the compute node
+  _hpclib_forget_port "$HOST_PORT" "$$"
 }
 trap cleanup 0 1 2 3   # Ctrl+C locally now also cleans up the shim
 
@@ -199,6 +210,7 @@ if [ "$SESSION_ID" = "" ]
     else
 
       SESSION_FILE="$SESSIONS_DIR/session-$SESSION_ID.log"
+      _hpclib_record_port "$HOST_PORT" "$$" "$SESSION_ID"
       echo "job $SESSION_ID submitted, waiting for a node..." > "$STATUS_FILE"
 
       if [ "$START_GIT_SERVER" = "true" ]; then

@@ -153,4 +153,143 @@ diff -u "$test_dir/expected-flask-args" "$test_dir/flask-args" || fail 'wrong Fl
 )
 [ ! -e "$test_dir/browser-waited" ] || fail '-A none still tried to open a browser'
 
+################################################################################
+# Clearing up after tunnels. These need the real python3, not the stub the
+# start_tunnel test above put on PATH.
+CLEAN_PATH="${PATH//$test_dir\/bin:/}"
+
+free_port() { PATH="$CLEAN_PATH" python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
+# a process listening on PORT whose command line is NAME (what pkill -f sees)
+listen_as() {  # listen_as PORT NAME...
+  local port="$1"; shift
+  (exec -a "$*" python3 -c 'import socket, sys, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(300)' "$port") &
+  for _ in $(seq 50); do _hpclib_port_free "$port" || break; sleep 0.1; done
+}
+mkdir -p "$test_dir/clear-bin"
+cat > "$test_dir/clear-bin/squeue" <<'SCRIPT'
+#!/usr/bin/env bash
+# answers from a script of responses, one line per call: "ID", "ended" or "down"
+n=$(cat "$TEST_SQUEUE_STATE.n" 2>/dev/null || echo 0); echo $((n + 1)) > "$TEST_SQUEUE_STATE.n"
+reply=$(sed -n "$((n + 1))p" "$TEST_SQUEUE_STATE"); [ -n "$reply" ] || reply=ended
+case "$reply" in
+  ended) echo "slurm_load_jobs error: Invalid job id specified" >&2; exit 1 ;;
+  down) echo "slurm_load_jobs error: Unable to contact slurm controller" >&2; exit 1 ;;
+  *) echo "$reply" ;;
+esac
+SCRIPT
+cat > "$test_dir/clear-bin/scancel" <<'SCRIPT'
+#!/usr/bin/env bash
+echo "$@" >> "$TEST_SCANCEL_LOG"
+SCRIPT
+chmod +x "$test_dir/clear-bin/"*
+(
+  PATH="$test_dir/clear-bin:$CLEAN_PATH"
+  HPCSESSIONS_DIR="$test_dir/clear-sessions"
+  TEST_SQUEUE_STATE="$test_dir/squeue-replies"; TEST_SCANCEL_LOG="$test_dir/scancel.log"
+  export PATH HPCSESSIONS_DIR TEST_SQUEUE_STATE TEST_SCANCEL_LOG
+
+  # postconnect.sh follows the log while the job is queued (riding out a
+  # controller hiccup), then returns and cancels the job
+  printf '%s\n' 777 down 777 ended > "$TEST_SQUEUE_STATE"
+  echo "server started" > "$test_dir/session.log"
+  out=$(SESSION_FILE="$test_dir/session.log" SESSION_ID=777 TUNNEL_POLL_INTERVAL=0.1 \
+        timeout 20 bash "$HPCLIB_DIR/tunnels/postconnect.sh") || fail "postconnect.sh did not return when the job ended"
+  case "$out" in *"server started"*"job 777 has ended"*) ;; *) fail "postconnect output: $out" ;; esac
+  assert_equal "$(cat "$TEST_SQUEUE_STATE.n")" 4
+  assert_equal "$(cat "$TEST_SCANCEL_LOG")" 777
+  if pgrep -f "tail -f -n \+1 $test_dir/session.log" >/dev/null; then fail 'postconnect.sh left tail running'; fi
+  rm -f "$TEST_SQUEUE_STATE"* "$TEST_SCANCEL_LOG"
+
+  # a leftover forward and waiting page on the port are stopped
+  port=$(free_port)
+  listen_as "$port" ssh -L "127.0.0.1:$port:127.0.0.1:5000" -t chem-node
+  _hpclib_port_free "$port" && fail 'test listener did not start'
+  _hpclib_clear_port "$port" 2> "$test_dir/clear.err" || fail "did not clear a stale forward: $(cat "$test_dir/clear.err")"
+  grep -q 'leftover port forward' "$test_dir/clear.err" || fail 'no message about the stale forward'
+  _hpclib_port_free "$port" || fail 'port still busy after clearing'
+
+  port=$(free_port)
+  listen_as "$port" python3 "$HPCLIB_DIR/servers/waiting_shim.py" "$port" /tmp/status rest
+  _hpclib_clear_port "$port" 2>/dev/null || fail 'did not clear a stale waiting page'
+
+  # an earlier tunnel script on the port is stopped and its job cancelled
+  port=$(free_port)
+  (exec -a "/bin/bash hpclib/tunnels/start_tunnel.sh rest -P $port" sleep 300) &
+  old=$!
+  _hpclib_record_port "$port" "$old" 4242
+  printf '%s\n' 4242 > "$TEST_SQUEUE_STATE"
+  _hpclib_clear_port "$port" 2> "$test_dir/clear.err" || fail 'did not clear an earlier tunnel'
+  sleep 0.3
+  if kill -0 "$old" 2>/dev/null; then fail 'earlier tunnel script still running'; fi
+  assert_equal "$(cat "$TEST_SCANCEL_LOG")" 4242
+  [ ! -e "$(_hpclib_port_file "$port")" ] || fail 'port record left behind'
+  rm -f "$TEST_SQUEUE_STATE"* "$TEST_SCANCEL_LOG"
+
+  # a dead PID in the record (or one reused by an unrelated process) is left alone
+  port=$(free_port)
+  sleep 300 & unrelated=$!
+  _hpclib_record_port "$port" "$unrelated"
+  _hpclib_clear_port "$port" 2>/dev/null || fail 'stale record blocked the port'
+  kill -0 "$unrelated" 2>/dev/null || fail 'killed an unrelated process with a recycled PID'
+  kill "$unrelated"
+
+  # a port held by something else is an error, and that process is left alone
+  port=$(free_port)
+  listen_as "$port" python3 -m some_other_service
+  holder=$!
+  if _hpclib_clear_port "$port" 2> "$test_dir/clear.err"; then fail 'claimed a port held by another program'; fi
+  grep -q 'pick another port' "$test_dir/clear.err" || fail 'no advice for a busy port'
+  kill -0 "$holder" 2>/dev/null || fail 'killed a process that is not a tunnel'
+  kill "$holder"
+
+  # records are only forgotten by their owner
+  _hpclib_record_port 1234 111 9
+  _hpclib_forget_port 1234 222
+  [ -e "$(_hpclib_port_file 1234)" ] || fail 'forgot a record that belongs to another tunnel'
+  _hpclib_forget_port 1234 111
+  [ ! -e "$(_hpclib_port_file 1234)" ] || fail 'did not forget its own record'
+)
+
+# the forward to the compute node fails instead of running without its port
+(
+  HOME="$test_dir/home"
+  wait_for_job_node() { echo node7; }
+  ssh() { printf '%s\n' "$@" > "$test_dir/connect-args"; }
+  connect_to_job -P 5999:5000 -R 1 -S 0 -I 0 123 "echo hi" >/dev/null
+)
+grep -qx 'ExitOnForwardFailure=yes' "$test_dir/connect-args" || fail 'connect_to_job without ExitOnForwardFailure'
+grep -qx 'ServerAliveInterval=30' "$test_dir/connect-args" || fail 'connect_to_job without keepalives'
+grep -qx '127.0.0.1:5999:127.0.0.1:5000' "$test_dir/connect-args" || fail 'connect_to_job lost its forward'
+
+# stop_tunnel clears the login node over ssh and cancels the local forward
+mkdir -p "$test_dir/stop-bin"
+cat > "$test_dir/stop-bin/ssh" <<'SCRIPT'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$TEST_SSH_LOG"
+after_host=false; remote=''
+for a in "$@"; do
+  if [ "$after_host" = true ]; then remote="$remote${remote:+ }$a"
+  elif [ "$a" = login.example ]; then after_host=true; fi
+done
+case " $* " in *" -O cancel "*) exit 0 ;; esac
+exec bash -c "$remote"
+SCRIPT
+chmod +x "$test_dir/stop-bin/ssh"
+(
+  HOME="$test_dir/home"; PATH="$test_dir/stop-bin:$test_dir/clear-bin:$CLEAN_PATH"
+  HPCSESSIONS_DIR="$test_dir/stop-sessions"; TEST_SSH_LOG="$test_dir/stop-ssh.log"
+  TEST_SQUEUE_STATE="$test_dir/none"; TEST_SCANCEL_LOG="$test_dir/stop-scancel.log"
+  export HOME PATH HPCSESSIONS_DIR TEST_SSH_LOG TEST_SQUEUE_STATE TEST_SCANCEL_LOG
+  port=$(free_port)
+  listen_as "$port" ssh -L "127.0.0.1:$port:127.0.0.1:5000" -t chem-node
+  out=$(stop_tunnel -P "$port" login.example 2>&1) || fail "stop_tunnel failed: $out"
+  case "$out" in *"port $port is free"*) ;; *) fail "stop_tunnel output: $out" ;; esac
+  _hpclib_port_free "$port" || fail 'stop_tunnel left the port busy'
+  grep -q -- "-O cancel -L 127.0.0.1:$port:127.0.0.1:$port" "$TEST_SSH_LOG" || fail 'local forward not cancelled'
+  grep -q 'ServerAliveInterval=30' "$TEST_SSH_LOG" || fail 'pssh without keepalives'
+  if stop_tunnel login.example >/dev/null 2>&1; then fail 'stop_tunnel ran without -P'; fi
+)
+
 echo 'Tunnel management tests passed'
