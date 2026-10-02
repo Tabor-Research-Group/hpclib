@@ -281,6 +281,12 @@ class Sandbox:
             delimiter,
             ")",
             f"unset {' '.join(RUNTIME_BIND_VARS)}",
+            # The runtime replaces PATH and LD_LIBRARY_PATH with the image's defaults; pass the
+            # host's (with the template's modules loaded) through. /tmp inside is the job's scratch.
+            'export SINGULARITYENV_PATH="$PATH" APPTAINERENV_PATH="$PATH"',
+            'if [ -n "${LD_LIBRARY_PATH:-}" ]; then',
+            '  export SINGULARITYENV_LD_LIBRARY_PATH="$LD_LIBRARY_PATH" APPTAINERENV_LD_LIBRARY_PATH="$LD_LIBRARY_PATH"',
+            'fi',
         ]
         if self.scratch == "job":
             lines += [
@@ -296,6 +302,7 @@ class Sandbox:
                 '{ echo "hpclib: could not make the sandbox scratch directory" >&2; exit 125; }',
                 'hpc_sandbox_workdir=(--workdir "$hpc_sandbox_tmp")',
             ]
+        lines.append("export SINGULARITYENV_TMPDIR=/tmp APPTAINERENV_TMPDIR=/tmp")
         interp = " ".join(shlex.quote(w) for w in self.interpreter(shebang))
         lines += [
             f'{quoted} "${{hpc_sandbox_workdir[@]}}" --pwd "$PWD" {shlex.quote(image)} '

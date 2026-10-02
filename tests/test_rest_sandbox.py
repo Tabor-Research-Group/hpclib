@@ -209,6 +209,25 @@ class TestRealSingularity(unittest.TestCase):
         return subprocess.run(["bash", "-c", script], cwd=self.allowed, capture_output=True, text=True,
                               timeout=120, env=dict(os.environ, HPC_PARAM_X="from the host"))
 
+    def test_host_environment_reaches_the_body(self):
+        """Modules put programs and libraries on PATH and LD_LIBRARY_PATH, which the runtime would reset."""
+        bin_dir = self.allowed / "bin"
+        bin_dir.mkdir()
+        prog = bin_dir / "from-a-module"
+        prog.write_text("#!/bin/sh\necho module program ran\n")
+        prog.chmod(0o755)
+        lines, _ = self.sandbox.launch("#!/bin/bash", 'from-a-module; echo "ld=$LD_LIBRARY_PATH"; echo "tmp=$TMPDIR"',
+                                       [str(self.allowed)])
+        script = "\n".join(["#!/bin/bash"] + lines) + "\n"
+        env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", LD_LIBRARY_PATH="/software/lib",
+                   TMPDIR=str(self.tmp))
+        res = subprocess.run(["bash", "-c", script], cwd=self.allowed, capture_output=True, text=True,
+                             timeout=120, env=env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("module program ran", res.stdout)
+        self.assertIn("ld=/software/lib", res.stdout)
+        self.assertIn("tmp=/tmp\n", res.stdout)
+
     def test_isolation(self):
         res = self.run_body(textwrap.dedent(f"""\
             set -u
