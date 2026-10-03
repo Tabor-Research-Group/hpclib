@@ -122,7 +122,7 @@ instead: `agent_console --static agent-console --open` serves the minimal front 
 | `GET /api/clusters/NAME/mcp` | the MCP client entry |
 | `GET`/`PUT /api/clusters/NAME/settings` | this machine's tunnel settings for the cluster: `auto_approve_templates` (`all`, `new`, `review`) and `tunnel_args` (sbatch options for the tunnel job, e.g. `--time=12:00:00`), and `connection_hours` (how long the ssh login is kept, default 12); `agent_tunnel` reads them, and its own options win |
 | `POST /api/clusters/NAME/tunnel/start` (`{"auto_approve_templates": "all"\|"new"\|"review"}`, default `all`), `.../tunnel/stop`, `GET .../tunnel/log` | `agent_tunnel` and `agent_stop`, logged to `~/.config/hpclib/console/logs/` |
-| `ANY /api/clusters/NAME/rest/ROUTE` | the cluster's REST route, with the owner token (`?as=agent`: the agent token) |
+| `ANY /api/clusters/NAME/rest/ROUTE` | the cluster's REST route, with the owner token (`?as=agent`: the agent token); downloads (`files/content`) are streamed through |
 | `GET /api/jobs`, `GET /api/proposals` | jobs and pending proposals from every live cluster, with each cluster's `ok`/`error` |
 
 The console starts tunnels without a terminal, so it first needs an ssh login it can reuse. `pssh` (and so

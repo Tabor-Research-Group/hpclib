@@ -83,6 +83,7 @@ import agent_profiles  # noqa: E402
 VERSION = "0.1"
 DEFAULT_PORT = 27180
 CLUSTER_NAME_RE = re.compile(r"[A-Za-z0-9._@-]{1,120}")
+STREAMED_ROUTES = ("files/content",)   # passed through in chunks rather than read whole
 LOGIN_HOST_RE = re.compile(r"[A-Za-z0-9._-]{1,64}@[A-Za-z0-9.-]{1,253}")
 JUMP_HOST_RE = re.compile(r"([A-Za-z0-9._-]{1,64}@)?[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?")
 CLUSTER_PATH_RE = re.compile(r"/[^\0\n\r]{0,1023}")
@@ -460,6 +461,21 @@ class Clusters:
             raise ConsoleError(502, f"the tunnel to {profile['name']} is not answering on port {profile['port']} "
                                     f"({getattr(e, 'reason', e)}); start it with POST "
                                     f"/api/clusters/{profile['name']}/tunnel/start")
+
+    def open_stream(self, profile, route, query=None, as_agent=False, timeout=60):
+        """A GET on the cluster's REST server as an open response, for streaming a download through."""
+        token, _ = self.token(profile, as_agent)
+        url = f"http://127.0.0.1:{profile['port']}{route}"
+        if query:
+            url += "?" + urllib.parse.urlencode(query, doseq=True)
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            return e
+        except (urllib.error.URLError, ConnectionError, TimeoutError, socket.timeout) as e:
+            raise ConsoleError(502, f"the tunnel to {profile['name']} is not answering on port {profile['port']} "
+                                    f"({getattr(e, 'reason', e)})")
 
     def call_json(self, profile, verb, route, query=None, as_agent=False, timeout=None):
         status, ctype, content = self.call(profile, verb, route, query, as_agent=as_agent, timeout=timeout)
@@ -920,6 +936,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             raise ConsoleError(400, f"invalid cluster route {route!r}")
         query = {k: v for k, v in self.query.items() if k != "as"}
         as_agent = self.query.get("as", [""])[-1] == "agent"
+        if verb == "GET" and route in STREAMED_ROUTES:
+            return self.proxy_stream(profile, route, query, as_agent)
         data = self.body(self.server.max_body) if verb in ("POST", "PUT") else None
         headers = {}
         if self.headers.get("Content-Type"):
@@ -933,6 +951,36 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             raise ConsoleError(502, f"{profile['name']} refused the stored token (HTTP 401); it may have been "
                                     f"revoked: rerun setup_agents --rebuild", cluster_status=401)
         self.send_bytes(status, ctype or "application/octet-stream", content)
+        return status, None
+
+    def proxy_stream(self, profile, route, query, as_agent):
+        """Pass a file download through in chunks, so a large file never sits in memory here."""
+        res = self.server.clusters.open_stream(profile, "/" + route, query, as_agent=as_agent)
+        with res:
+            status = getattr(res, "status", None) or res.code
+            ctype = res.headers.get("Content-Type", "")
+            if "text/html" in ctype:
+                raise ConsoleError(503, f"the tunnel to {profile['name']} is up but its REST server job is still "
+                                        f"queued or starting")
+            if status == 401:
+                raise ConsoleError(502, f"{profile['name']} refused the stored token (HTTP 401)", cluster_status=401)
+            if status >= 400:
+                self.send_bytes(status, ctype or "application/json", res.read())
+                return status, None
+            self.send_response(status)
+            self.cors_headers()
+            self.send_header("Content-Type", ctype or "application/octet-stream")
+            for header in ("Content-Length", "Content-Disposition"):
+                if res.headers.get(header):
+                    self.send_header(header, res.headers[header])
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            while True:
+                chunk = res.read(1 << 20)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
         return status, None
 
     def all_jobs(self):

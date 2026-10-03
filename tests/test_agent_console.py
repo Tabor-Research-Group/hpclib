@@ -493,6 +493,25 @@ class TestProxy(ConsoleTestCase):
         status, out = self.call("POST", f"/api/clusters/{self.live}/rest/admin/proposals/approve", {"name": "xtb"})
         self.assertEqual((status, out["approved"]), (200, "xtb"))
 
+    def test_file_download_is_streamed(self):
+        data = os.urandom(3 << 20) + b"end"
+        (self.llm_root / "big.bin").write_bytes(data)
+        with mock.patch.object(agent_console.Clusters, "call", side_effect=AssertionError("buffered")):
+            status, content, headers = self.call(
+                "GET", f"/api/clusters/{self.live}/rest/files/content?path={self.llm_root / 'big.bin'}", raw=True)
+        self.assertEqual((status, content), (200, data))
+        self.assertEqual(headers["Content-Length"], str(len(data)))
+        self.assertIn("big.bin", headers["Content-Disposition"])
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        status, content, _ = self.call("GET", f"/api/clusters/{self.live}/rest/files/content?path=/etc/passwd",
+                                       raw=True)
+        self.assertEqual(status, 403)
+        self.assertIn(b"outside", content)
+        status, _, _ = self.call("GET", f"/api/clusters/{self.live}/rest/files/content?path={self.llm_root}/nope",
+                                 raw=True)
+        self.assertEqual(status, 404)
+        self.assertEqual(self.call("GET", f"/api/clusters/{self.dead}/rest/files/content?path=x")[0], 502)
+
     def test_dead_tunnel(self):
         status, out = self.call("GET", f"/api/clusters/{self.dead}/rest/health")
         self.assertEqual(status, 502)

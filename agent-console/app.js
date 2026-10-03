@@ -465,6 +465,158 @@ async function activityPage() {
   ];
 }
 
+// ---------------------------------------------------------------- files
+
+const MB = 1 << 20;
+const TEXT_LIMIT = 5 * MB;       // text shown whole up to this; larger: the first 1 MB
+const VIEW_LIMIT = 25 * MB;      // images, SVG and HTML shown up to this
+const DOWNLOAD_WARN = 25 * MB;   // downloads pass through the browser's memory; ask above this
+const IMAGE_TYPES = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp",
+                      bmp: "image/bmp", svg: "image/svg+xml" };
+let filesState = { cluster: null, path: null, base: null };
+
+const ext = (name) => (name.match(/\.([^.]+)$/) || [])[1]?.toLowerCase() || "";
+const kindOf = (name) => ext(name) === "svg" ? "image" : (IMAGE_TYPES[ext(name)] ? "image" :
+  (["html", "htm"].includes(ext(name)) ? "html" : "text"));
+
+function size(n) {
+  if (n === null || n === undefined) return "";
+  if (n < 1024) return `${n} B`;
+  if (n < MB) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * MB) return `${(n / MB).toFixed(1)} MB`;
+  return `${(n / 1024 / MB).toFixed(2)} GB`;
+}
+
+async function fetchFile(c, path) {
+  // the file's bytes, through the console (which adds the cluster's token) with the session key
+  const res = await fetch(`${API}/api/${cluster(c)}/rest/files/content?path=${encodeURIComponent(path)}`,
+                          { headers: { Authorization: `Bearer ${key}` } });
+  if (!res.ok) {
+    let payload = {};
+    try { payload = await res.json(); } catch { /* not JSON */ }
+    throw new ApiError(res.status, payload);
+  }
+  return res.blob();
+}
+
+async function downloadFile(c, entry) {
+  if (entry.size > DOWNLOAD_WARN && !confirm(
+      `${entry.name} is ${size(entry.size)}. The browser keeps the whole file in memory while it downloads, ` +
+      `which can be slow or fail for large files; psync or the agent's pull_files copy large files better.\n\n` +
+      `Download it anyway?`)) {
+    return;
+  }
+  const blob = await fetchFile(c, entry.path);
+  const url = URL.createObjectURL(blob);
+  const a = el("a", { href: url, download: entry.name });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+async function viewFile(c, entry, box) {
+  const download = el("button", {}, "Download");
+  download.addEventListener("click", busy(download, () => downloadFile(c, entry)));
+  const close = el("button", {}, "Close");
+  close.addEventListener("click", () => box.replaceChildren());
+  const head = el("div", { class: "toolbar" }, el("strong", {}, entry.name),
+    el("span", { class: "muted" }, `${size(entry.size)} · ${when(entry.mtime)}`), download, close);
+  box.replaceChildren(el("section", { class: "card viewer" }, head, el("p", { class: "muted" }, "Loading…")));
+  const card = box.firstChild;
+  const body = (...nodes) => card.replaceChildren(head, ...nodes);
+  const kind = kindOf(entry.name);
+  try {
+    if (kind !== "text" && entry.size > VIEW_LIMIT) {
+      body(el("p", { class: "muted" }, `Too large to show here (${size(entry.size)}); download it instead.`));
+    } else if (kind === "image") {
+      const blob = await fetchFile(c, entry.path);
+      // typed by its name, and shown with <img>: an SVG's scripts don't run there
+      const url = URL.createObjectURL(new Blob([blob], { type: IMAGE_TYPES[ext(entry.name)] }));
+      const img = el("img", { src: url, alt: entry.name });
+      img.addEventListener("load", () => setTimeout(() => URL.revokeObjectURL(url), 1000));
+      body(img);
+    } else if (kind === "html") {
+      const text = await (await fetchFile(c, entry.path)).text();
+      // a sandboxed frame: no scripts unless asked, and never the console's origin, storage or session key
+      const frame = el("iframe", { sandbox: "", title: entry.name });
+      frame.srcdoc = text;
+      const scripts = el("input", { type: "checkbox" });
+      scripts.addEventListener("change", () => {
+        frame.setAttribute("sandbox", scripts.checked ? "allow-scripts" : "");
+        frame.srcdoc = text;
+      });
+      body(el("label", { class: "muted" }, scripts,
+        " Run its scripts (still sandboxed: it can't reach the console or your session). Files it links to " +
+        "by relative path don't load here."), frame);
+    } else if (entry.size <= TEXT_LIMIT) {
+      const bytes = new Uint8Array(await (await fetchFile(c, entry.path)).arrayBuffer());
+      if (bytes.subarray(0, 8192).includes(0)) {
+        body(el("p", { class: "muted" }, "A binary file; download it to open it."));
+      } else {
+        body(el("pre", { class: "file" }, new TextDecoder().decode(bytes)));
+      }
+    } else {
+      const part = await api(`${cluster(c)}/rest/files/read?path=${encodeURIComponent(entry.path)}&length=${MB}`);
+      body(...(part.binary ? [el("p", { class: "muted" }, "A binary file; download it to open it.")] : [
+        el("p", { class: "muted" }, `The first ${size(part.length)} of ${size(part.size)}; download it for the rest.`),
+        el("pre", { class: "file" }, part.text)]));
+    }
+  } catch (err) {
+    body(errorBox(err));
+  }
+}
+
+async function filesPage() {
+  const { clusters } = await api("clusters");
+  const live = clusters.filter((x) => x.tunnel && x.tunnel.state === "up" && x.has_owner_token);
+  if (!live.length) {
+    return [el("h2", {}, "Files"), el("p", { class: "muted" }, "No cluster with a running tunnel and an owner token.")];
+  }
+  const wanted = decodeURIComponent((location.hash.match(/^#\/files\/(.+)$/) || [])[1] || "");
+  const c = live.find((x) => x.name === wanted) || live.find((x) => x.name === filesState.cluster) || live[0];
+  if (filesState.cluster !== c.name) filesState = { cluster: c.name, path: null, base: null };
+  const listing = await api(`${cluster(c.name)}/rest/files?path=${encodeURIComponent(filesState.path || ".")}`);
+  if (!filesState.base) filesState.base = listing.path;
+  filesState.path = listing.path;
+
+  const pick = el("select", {}, live.map((x) => el("option", { value: x.name, selected: x.name === c.name }, x.name)));
+  pick.addEventListener("change", () => { location.hash = "#/files/" + encodeURIComponent(pick.value); });
+  const go = (path) => { filesState.path = path; render(); };
+  const atBase = listing.path === filesState.base;
+  const up = el("button", { type: "button", disabled: atBase }, "Up");
+  up.addEventListener("click", () => go(listing.path.replace(/\/[^/]+\/?$/, "") || "/"));
+  const home = el("button", { type: "button", disabled: atBase }, "Top");
+  home.addEventListener("click", () => go(filesState.base));
+  const viewer = el("div");
+
+  const entries = listing.entries.slice().sort((a, b) =>
+    (a.type === "directory" ? 0 : 1) - (b.type === "directory" ? 0 : 1) || a.name.localeCompare(b.name));
+  const rows = entries.map((e) => {
+    const isDir = e.type === "directory";
+    const name = isDir ? el("a", { href: "javascript:void 0", class: "dir" }, e.name + "/") : el("span", {}, e.name);
+    if (isDir) name.addEventListener("click", () => go(e.path));
+    const actions = el("div", { class: "actions" });
+    if (e.type === "file") {
+      const view = el("button", {}, "View");
+      view.addEventListener("click", () => viewFile(c.name, e, viewer));
+      const dl = el("button", {}, "Download");
+      dl.addEventListener("click", busy(dl, () => downloadFile(c.name, e)));
+      actions.append(view, dl);
+    }
+    return el("tr", {}, el("td", {}, name), el("td", { class: "num" }, isDir ? "" : size(e.size)),
+      el("td", { class: "num" }, when(e.mtime)), el("td", {}, actions));
+  });
+  return [
+    el("h2", {}, "Files"),
+    el("div", { class: "toolbar" }, pick, home, up, el("code", {}, listing.path)),
+    viewer,
+    entries.length ? el("table", {},
+      el("thead", {}, el("tr", {}, ["Name", "Size", "Modified", ""].map((h) => el("th", {}, h)))),
+      el("tbody", {}, rows)) : el("p", { class: "muted" }, "Empty directory."),
+  ];
+}
+
 // ---------------------------------------------------------------- settings
 
 const TUNNEL_FIELDS = [
@@ -675,7 +827,8 @@ async function settingsPage() {
 
 // ---------------------------------------------------------------- shell
 
-const PAGES = { clusters: clustersPage, proposals: proposalsPage, activity: activityPage, settings: settingsPage };
+const PAGES = { clusters: clustersPage, proposals: proposalsPage, activity: activityPage, files: filesPage,
+                settings: settingsPage };
 
 function stopFollowing() {
   if (followTimer) clearInterval(followTimer);
