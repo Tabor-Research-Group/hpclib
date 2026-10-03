@@ -27,7 +27,10 @@ options after validation against the server's limits.
 
 Clients can also propose new templates. Proposals are validated and
 stored separately; nothing runs until the owner approves one with
-`rest_server.py --approve-template NAME`.
+`rest_server.py --approve-template NAME`, unless the server was started
+with `--auto-approve-templates`, which approves proposals for new names
+(or, with `=all`, replacements too) as soon as they pass validation, but
+only while template jobs are sandboxed.
 
 Standard library only.
 """
@@ -78,15 +81,15 @@ class RESTError(Exception):
         self.payload = dict({"error": message}, **extra)
 
 
-SECRET_ENV_PREFIXES = ("HPC_REST_TOKEN",)
+SECRET_ENV_PREFIXES = rest_sandbox.SECRET_ENV_PREFIXES
 
 def clean_env(env=None):
-    """The environment for child processes, minus anything secret."""
-    env = dict(os.environ if env is None else env)
-    for key in list(env):
-        if key.startswith(SECRET_ENV_PREFIXES):
-            del env[key]
-    return env
+    """
+    The environment for child processes, minus anything secret: without the
+    Python launcher's modules (rest_sandbox.child_env), so sbatch'd jobs and
+    module commands see the user's own environment.
+    """
+    return rest_sandbox.child_env(env)
 
 
 ################################################################################
@@ -715,8 +718,15 @@ class ProposalStore:
         except ValueError as e:
             raise RESTError(422, f"invalid template: {e}")
         target = os.path.join(self.directory, name)
+        revised = False
         if os.path.exists(target):
-            raise RESTError(409, f"a proposal named {name!r} is already waiting for review")
+            earlier = self._meta(name)
+            if earlier is None or earlier.get("token") != token_name:
+                raise RESTError(409, f"a proposal named {name!r} from another client is already waiting for review")
+            # a client may revise its own pending proposal; the earlier draft is kept for the reviewer
+            os.makedirs(os.path.join(self.directory, ".superseded"), mode=0o700, exist_ok=True)
+            os.rename(target, os.path.join(self.directory, ".superseded", f"{name}-{int(time.time() * 1000)}"))
+            revised = True
         os.makedirs(self.directory, mode=0o700, exist_ok=True)
         staging = target + ".tmp"
         os.makedirs(staging)
@@ -729,24 +739,33 @@ class ProposalStore:
                 f.write(guide)
         templates, guides, _ = self.templates.load()
         meta = {"name": name, "token": token_name, "proposed": time.time(), "rationale": rationale,
-                "replaces_existing": name in templates or name in guides}
+                "replaces_existing": name in templates or name in guides, "revised": revised}
         with open(os.path.join(staging, self.META_FILE), "w") as f:
             json.dump(meta, f, indent=2)
         os.rename(staging, target)
         return 201, dict(meta, status="waiting for the cluster owner to review and approve")
+
+    def _meta(self, name):
+        try:
+            with open(os.path.join(self.directory, name, self.META_FILE)) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
 
     def list(self):
         out = []
         if not os.path.isdir(self.directory):
             return out
         for name in sorted(os.listdir(self.directory)):
+            if name.startswith("."):
+                continue
             meta = os.path.join(self.directory, name, self.META_FILE)
             if os.path.isfile(meta):
                 with open(meta) as f:
                     out.append(json.load(f))
         return out
 
-    def approve(self, name, replace=False):
+    def approve(self, name, replace=False, approved_by="owner"):
         source = os.path.join(self.directory, name)
         if not JobTemplate.NAME_RE.fullmatch(name) or not os.path.isdir(source):
             raise ValueError(f"no proposal named {name!r}")
@@ -755,18 +774,77 @@ class ProposalStore:
         if os.path.exists(target):
             if not replace:
                 raise ValueError(f"template {name!r} already exists; pass --replace to swap it in")
-            backup = target + f".replaced-{int(time.time())}"
-            os.rename(target, backup)
+            # replaced templates go in a hidden directory, which the server doesn't load
+            backups = os.path.join(self.templates.directory, ".replaced")
+            os.makedirs(backups, exist_ok=True)
+            os.rename(target, os.path.join(backups, f"{name}-{time.strftime('%Y%m%dT%H%M%S')}"))
         os.makedirs(self.templates.directory, exist_ok=True)
+        meta = self._meta(name) or {}
+        meta.update(approved=time.time(), approved_by=approved_by)
         os.remove(os.path.join(source, self.META_FILE))
+        with open(os.path.join(source, ".proposal.json"), "w") as f:   # who proposed and approved it
+            json.dump(meta, f, indent=2)
         shutil.move(source, target)
         return target
 
-    def reject(self, name):
+    def reject(self, name, reason=None, rejected_by="owner"):
+        """Set the proposal aside in `.rejected/`, with who rejected it and why."""
         source = os.path.join(self.directory, name)
         if not JobTemplate.NAME_RE.fullmatch(name) or not os.path.isdir(source):
             raise ValueError(f"no proposal named {name!r}")
-        shutil.rmtree(source)
+        if reason is not None and (not isinstance(reason, str) or len(reason) > self.MAX_RATIONALE):
+            raise ValueError(f"`reason` must be a string of at most {self.MAX_RATIONALE} characters")
+        meta = self._meta(name) or {"name": name}
+        meta.update(rejected=time.time(), rejected_by=rejected_by, reason=reason or "")
+        with open(os.path.join(source, self.META_FILE), "w") as f:
+            json.dump(meta, f, indent=2)
+        rejected = os.path.join(self.directory, ".rejected")
+        os.makedirs(rejected, mode=0o700, exist_ok=True)
+        os.rename(source, os.path.join(rejected, f"{name}-{int(time.time() * 1000)}"))
+        return meta
+
+    REVIEW_FILES = ("template.json", "script.sh", JobTemplate.GUIDE_FILE)
+    MAX_REVIEW_FILE = 256 << 10
+
+    @classmethod
+    def _read_review_files(cls, directory):
+        out = {}
+        for fname in cls.REVIEW_FILES:
+            path = os.path.join(directory, fname)
+            if os.path.isfile(path):
+                with open(path, errors="replace") as f:
+                    out[fname] = f.read(cls.MAX_REVIEW_FILE)
+        return out
+
+    def detail(self, name):
+        """
+        A proposal with its files and, when it would replace a template, the
+        current template's files and a unified diff of each file.
+        """
+        import difflib
+        source = os.path.join(self.directory, name)
+        meta = self._meta(name) if JobTemplate.NAME_RE.fullmatch(name or "") else None
+        if meta is None:
+            raise ValueError(f"no proposal named {name!r}")
+        proposed = self._read_review_files(source)
+        current_dir = os.path.join(self.templates.directory, name) if self.templates.directory else None
+        current = self._read_review_files(current_dir) if current_dir and os.path.isdir(current_dir) else None
+        diffs = {}
+        for fname in self.REVIEW_FILES:
+            old, new = (current or {}).get(fname), proposed.get(fname)
+            if old == new or (old is None and new is None):
+                continue
+            diffs[fname] = "".join(difflib.unified_diff(
+                (old or "").splitlines(keepends=True), (new or "").splitlines(keepends=True),
+                fromfile=f"templates/{name}/{fname}" if old is not None else "/dev/null",
+                tofile=f"proposals/{name}/{fname}" if new is not None else "/dev/null"))
+        try:
+            JobTemplate(name, json.loads(proposed.get("template.json", "null")), proposed.get("script.sh", ""))
+            valid, error = True, None
+        except (ValueError, TypeError) as e:
+            valid, error = False, str(e)
+        return {"proposal": meta, "files": proposed, "current": current, "diff": diffs,
+                "valid": valid, "error": error}
 
 
 ################################################################################
@@ -1196,7 +1274,7 @@ class JobManager:
 
     def __init__(self, templates: TemplateStore, registry: JobRegistry, limits: ResourceLimits,
                  runner: SlurmRunner, cluster_notes=None, poll_interval=10, proposals: ProposalStore = None,
-                 modules: ModuleSystem = None, sandbox: 'rest_sandbox.Sandbox' = None):
+                 modules: ModuleSystem = None, sandbox: 'rest_sandbox.Sandbox' = None, auto_approve=None):
         self.templates = templates
         self.registry = registry
         self.limits = limits
@@ -1207,6 +1285,9 @@ class JobManager:
         self.cluster_notes = cluster_notes
         self.poll_interval = poll_interval
         self.sandbox = sandbox or rest_sandbox.Sandbox(None)
+        if auto_approve not in (None, "new", "all"):
+            raise ValueError("auto_approve must be None, 'new' or 'all'")
+        self.auto_approve = auto_approve
         self.submit_lock = threading.Lock()
 
     def describe_templates(self):
@@ -1219,15 +1300,73 @@ class JobManager:
     def guide(self, name):
         return self.templates.guide(name)
 
+    def proposal_policy(self):
+        """How proposals are approved on this server, for clients."""
+        if not self.auto_approve:
+            return {"review": "owner", "detail": "proposals wait until the cluster owner approves them"}
+        if self.sandbox.describe().get("effective") != "singularity":
+            return {"review": "owner", "detail": "the server would approve proposals automatically, but only "
+                                                 "while template jobs are sandboxed, and they are not"}
+        return {"review": "automatic", "replace_existing": self.auto_approve == "all",
+                "detail": "valid proposals become templates immediately" + (
+                    "" if self.auto_approve == "all" else "; one that would replace an existing template still "
+                                                          "waits for the owner")}
+
     def propose_template(self, token_name, request):
         if self.proposals is None:
             raise RESTError(503, "template proposals are not configured on this server")
-        return self.proposals.propose(token_name, request)
+        status, out = self.proposals.propose(token_name, request)
+        policy = self.proposal_policy()
+        if policy["review"] == "automatic" and (not out["replaces_existing"] or policy["replace_existing"]):
+            try:
+                self.proposals.approve(out["name"], replace=out["replaces_existing"], approved_by="automatic")
+            except (OSError, ValueError) as e:
+                return status, dict(out, status=f"waiting for the owner: automatic approval failed ({e})")
+            return status, dict(out, approved=True, status=f"approved automatically; template {out['name']!r} "
+                                                           f"can be used now (try a dry run first)")
+        return status, dict(out, approved=False, status=f"waiting for the cluster owner to review and approve it "
+                                                         f"({policy['detail']})")
 
     def list_proposals(self):
         if self.proposals is None:
             return {"proposals": []}
         return {"proposals": self.proposals.list()}
+
+    # owner review (the /admin routes)
+    @property
+    def _proposal_store(self):
+        if self.proposals is None:
+            raise RESTError(503, "template proposals are not configured on this server")
+        return self.proposals
+
+    def review_proposals(self):
+        return {"proposals": self._proposal_store.list(), "policy": self.proposal_policy()}
+
+    def proposal_detail(self, name):
+        try:
+            return self._proposal_store.detail(name)
+        except ValueError as e:
+            raise RESTError(404, str(e))
+
+    def approve_proposal(self, name, replace=False, approved_by="owner"):
+        store = self._proposal_store
+        if store._meta(name) is None:
+            raise RESTError(404, f"no proposal named {name!r}")
+        try:
+            target = store.approve(name, replace=replace, approved_by=approved_by)
+        except ValueError as e:
+            raise RESTError(409 if "already exists" in str(e) else 422, str(e))
+        return {"approved": name, "template_dir": target, "replaced": replace}
+
+    def reject_proposal(self, name, reason=None, rejected_by="owner"):
+        store = self._proposal_store
+        if store._meta(name) is None:
+            raise RESTError(404, f"no proposal named {name!r}")
+        try:
+            meta = store.reject(name, reason=reason, rejected_by=rejected_by)
+        except ValueError as e:
+            raise RESTError(400, str(e))
+        return {"rejected": name, "reason": meta.get("reason", "")}
 
     def cluster_info(self, token_name, whitelist, see_all):
         info = dict(self.cluster.snapshot())
@@ -1243,6 +1382,7 @@ class JobManager:
             "base_dir": whitelist.base_dir,
             "notes": self.cluster_notes,
             "sandbox": self.sandbox.describe(),
+            "template_proposals": self.proposal_policy(),
         })
         return info
 

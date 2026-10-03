@@ -290,14 +290,47 @@ function _hpclib_version_compare {
   echo 0
 }
 
-# Strip a leading ~/ so remote paths can be passed quoted; the remote
-# shell starts in the home directory, so relative paths land there.
+# Strip a leading ~/ so remote paths can be passed quoted. A relative
+# remote path means one in the remote home directory; commands use
+# _hpclib_remote_home_word for it, since the remote shell need not start
+# there (a .bashrc may cd to scratch, and is left to do so).
 function _hpclib_remote_path {
   case "$1" in
     '~') printf '.\n' ;;
     '~/'*) printf '%s\n' "${1#\~/}" ;;
     *) printf '%s\n' "$1" ;;
   esac
+}
+
+# A path as one word of a remote command line: absolute paths quoted as
+# they are, relative ones anchored at the remote "$HOME", which the remote
+# shell expands. Commands still run in whatever directory the user's login
+# setup leaves them in.
+function _hpclib_remote_home_word {  # _hpclib_remote_home_word PATH
+  case "$1" in
+    /*) printf '%q\n' "$1" ;;
+    .) printf '"$HOME"\n' ;;
+    *) printf '"$HOME"/%q\n' "$1" ;;
+  esac
+}
+
+# A remote command line: PROGRAM SCRIPT ARGS..., with SCRIPT (a path in the
+# hpclib install) anchored at the remote home and the rest quoted.
+function _hpclib_remote_script_cmd {  # _hpclib_remote_script_cmd PROGRAM SCRIPT [ARG...]
+  local program="$1" script="$2" quoted=''
+  shift 2
+  [ "$#" -gt 0 ] && printf -v quoted ' %q' "$@"
+  printf '%q %s%s\n' "$program" "$(_hpclib_remote_home_word "$script")" "$quoted"
+}
+
+# A remote command line running hpclib's SCRIPT with ARGS through the
+# cluster's Python launcher (written by setup_agents; see _hpclib_remote_python).
+function _hpclib_remote_python_cmd {  # _hpclib_remote_python_cmd SCRIPT [ARG...]
+  local script="$1" quoted=''
+  shift
+  [ "$#" -gt 0 ] && printf -v quoted ' %q' "$@"
+  printf '"${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}"/rest/python %s%s\n' \
+    "$(_hpclib_remote_home_word "$script")" "$quoted"
 }
 
 # Runs ON THE REMOTE HOST (shipped there by install_hpclib with
@@ -515,6 +548,131 @@ _hpclib_remote_install \"\$@\"; exit \$?"
 ##  Setting a cluster up for agents (LLM clients) on the REST server
 ##
 
+# Runs ON THE REMOTE HOST: choose the Python that hpclib's servers run with
+# (HPCLIB_MIN_PYTHON or newer) and record it as the launcher
+# ~/.local/tunnels/rest/python, which the REST tunnel and setup_agents run
+# everything through. Arguments: REBUILD(yes|no) SPEC, where SPEC is "" (find
+# one: python3 or pythonX.Y on PATH, then the newest suitable Python module,
+# loading what Lmod's spider says it needs first), "modules:M1 M2 ..." or
+# "path:COMMAND". An existing launcher that still works is kept unless
+# REBUILD or SPEC says otherwise. Prints a summary line "python|VERSION|HOW".
+function _hpclib_remote_python {
+  local rebuild="$1" spec="$2" min="${3:-3.9}"
+  local data="${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/rest"
+  local launcher="$data/python" kind='' found='' mods='' version='' c m prereq tried=0
+  local check="import sys; sys.exit(sys.version_info < tuple(int(x) for x in '$min'.split('.')))"
+  _hp_ok() { "$@" -c "$check" > /dev/null 2>&1; }
+  _hp_version() { "$@" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2> /dev/null; }
+  _hp_init_modules() {
+    type module > /dev/null 2>&1 && return 0
+    local f
+    for f in /etc/profile.d/lmod.sh /etc/profile.d/modules.sh /usr/share/lmod/lmod/init/bash \
+        /usr/share/Modules/init/bash; do
+      if [ -f "$f" ]; then
+        . "$f" > /dev/null 2>&1
+        type module > /dev/null 2>&1 && return 0
+      fi
+    done
+    return 1
+  }
+  # in a subshell, so the caller's environment is untouched: load the modules, print python3 if new enough
+  _hp_try_modules() {
+    (
+      module load "$@" > /dev/null 2>&1 || exit 1
+      local p
+      p=$(command -v python3) || exit 1
+      _hp_ok "$p" && printf '%s\n' "$p"
+    )
+  }
+  _hp_prereqs() {  # the first set of modules Lmod's spider says must be loaded before $1
+    module spider "$1" 2>&1 | awk '/You will need to load all module\(s\) on any one of the lines below/ {f = 1; next}
+      f && NF {sub(/^[ \t]+/, ""); sub(/[ \t]+$/, ""); print; exit}'
+  }
+
+  mkdir -p "$data" || return 1
+  if [ -z "$spec" ] && [ "$rebuild" != yes ] && [ -x "$launcher" ] && _hp_ok "$launcher"; then
+    printf 'python|%s|kept the existing %s\n' "$(_hp_version "$launcher")" "$launcher"
+    return 0
+  fi
+
+  case "$spec" in
+    path:*)
+      kind=path found="${spec#path:}"
+      _hp_ok "$found" || { echo "setup_agents: $found is not Python $min or newer" >&2; return 1; } ;;
+    modules:*)
+      kind=modules mods="${spec#modules:}"
+      _hp_init_modules || { echo "setup_agents: no module command on the cluster" >&2; return 1; }
+      found=$(_hp_try_modules $mods) ||
+        { echo "setup_agents: loading $mods gives no python3 of version $min or newer" >&2; return 1; } ;;
+    '')
+      for c in ${HPCLIB_PYTHON_NAMES:-python3 python3.14 python3.13 python3.12 python3.11 python3.10 python3.9}; do
+        c=$(command -v "$c" 2> /dev/null) || continue
+        if _hp_ok "$c"; then kind=path found="$c"; break; fi
+      done
+      if [ -z "$found" ] && _hp_init_modules; then
+        # every module named like a Python (or a conda distribution), newest first; spider sees
+        # modules that a hierarchy hides from avail
+        local candidates
+        candidates=$({ module -t spider 2>&1; module -t avail 2>&1; } | sed 's/([^)]*)//g; s/[[:space:]]*$//' |
+          grep -E '^([Pp]ython3?|[Aa]naconda3?|[Mm]iniconda3?|[Mm]iniforge3?)/[0-9]' |
+          grep -Ev '^[Pp]ython3?/(2\.|3\.[0-8]([^0-9]|$))' | sort -u |
+          awk -F/ '{print (tolower($1) ~ /^python/ ? 0 : 1) "\t" $0}' | sort -t"$(printf '\t')" -k1,1 -k2,2Vr |
+          cut -f2)
+        for m in $candidates; do
+          [ "$tried" -lt 8 ] || break
+          tried=$((tried + 1))
+          if c=$(_hp_try_modules "$m"); then
+            kind=modules mods="$m" found="$c"; break
+          fi
+          prereq=$(_hp_prereqs "$m")
+          if [ -n "$prereq" ] && c=$(_hp_try_modules $prereq "$m"); then
+            kind=modules mods="$prereq $m" found="$c"; break
+          fi
+        done
+      fi
+      if [ -z "$found" ]; then
+        echo "setup_agents: found no Python $min or newer, on PATH or as a module; install one (e.g. with" >&2
+        echo "  conda or uv) and rerun with --remote-python /path/to/python3, or name its modules with --python-module" >&2
+        return 1
+      fi ;;
+    *) echo "setup_agents: unknown Python spec '$spec'" >&2; return 1 ;;
+  esac
+
+  version=$(if [ "$kind" = modules ]; then _hp_init_modules; module load $mods > /dev/null 2>&1; fi; _hp_version "$found")
+  local tmp="$launcher.tmp.$$"
+  {
+    printf '#!/bin/bash\n'
+    printf '# Written by setup_agents (hpclib): the Python (%s) that hpclib runs its servers with on this\n' "$version"
+    printf '# cluster. Rerun setup_agents with --rebuild, --python-module or --remote-python to change it.\n'
+    if [ "$kind" = modules ]; then
+      printf '# The environment from before these modules are loaded is saved for the server to give the\n'
+      printf "# jobs and commands it starts, so they don't inherit this Python's modules.\n"
+      printf 'if [ -z "${HPCLIB_BASE_ENV:-}" ]; then\n'
+      printf '  HPCLIB_BASE_ENV=$(env -0 2> /dev/null | base64 | tr -d "\\n") && export HPCLIB_BASE_ENV\n'
+      printf 'fi\n'
+      printf 'if ! type module > /dev/null 2>&1; then\n'
+      printf '  for f in /etc/profile.d/lmod.sh /etc/profile.d/modules.sh /usr/share/lmod/lmod/init/bash /usr/share/Modules/init/bash; do\n'
+      printf '    if [ -f "$f" ]; then . "$f" > /dev/null 2>&1; type module > /dev/null 2>&1 && break; fi\n'
+      printf '  done\n'
+      printf 'fi\n'
+      printf 'module load %s > /dev/null 2>&1 || {\n' "$mods"
+      printf '  echo "hpclib: could not load %s for Python; rerun setup_agents --rebuild to choose again" >&2\n' "$mods"
+      printf '  exit 1\n'
+      printf '}\n'
+      printf 'exec python3 "$@"\n'
+    else
+      printf 'exec %q "$@"\n' "$found"
+    fi
+  } > "$tmp" && chmod 700 "$tmp" && mv "$tmp" "$launcher" || { rm -f "$tmp"; return 1; }
+  printf '{"version": "%s", "kind": "%s", "python": "%s", "modules": "%s"}\n' "$version" "$kind" "$found" "$mods" \
+    > "$data/python.json"
+  if [ "$kind" = modules ]; then
+    printf 'python|%s|module %s\n' "$version" "$mods"
+  else
+    printf 'python|%s|%s\n' "$version" "$found"
+  fi
+}
+
 # Runs ON THE REMOTE HOST: copy bundled templates and write the REST
 # server's config. Arguments: HPCLIB_DIR REBUILD(yes|no) SANDBOX(yes|no)
 # TEMPLATES(comma list) BINDS(comma list) WORK_DIR... ; stdin is a base
@@ -522,9 +680,11 @@ _hpclib_remote_install \"\$@\"; exit \$?"
 function _hpclib_remote_setup_agents {
   local hpclib="$1" rebuild="$2" sandbox="$3" templates="$4" binds="$5"
   shift 5
+  case "$hpclib" in /*) ;; *) hpclib="$HOME/$hpclib" ;; esac   # don't depend on where the shell started
   local data="${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/rest"
-  local stamp t d base status=0
+  local stamp t d base status=0 python="$data/python"
   local args=(--init-config)
+  [ -x "$python" ] || python=python3   # _hpclib_remote_python normally made it first
   stamp=$(date +%Y%m%dT%H%M%S)
   base=$(mktemp) || return 1
   cat > "$base"
@@ -562,10 +722,10 @@ function _hpclib_remote_setup_agents {
     [ -n "$d" ] && args+=(--sandbox-bind "$d")
   done
   unset IFS
-  python3 "$hpclib/servers/rest_server.py" "${args[@]}" || status=1
+  "$python" "$hpclib/servers/rest_server.py" "${args[@]}" || status=1
   rm -f "$base"
   if [ "$sandbox" != no ]; then
-    python3 "$hpclib/servers/rest_server.py" --probe-sandbox ||
+    "$python" "$hpclib/servers/rest_server.py" --probe-sandbox ||
       echo "setup_agents: the test container failed on this node; check the messages above, and GET /sandbox once the tunnel runs" >&2
   fi
   return "$status"
@@ -649,15 +809,15 @@ function _hpclib_colors {
   if [ "${HPCLIB_COLOR:-auto}" = always ] ||
       { [ "${HPCLIB_COLOR:-auto}" = auto ] && [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; }; then
     _c_reset=$'\033[0m' _c_banner=$'\033[1;97;44m' _c_head=$'\033[1;36m' _c_cmd=$'\033[32m'
-    _c_json=$'\033[33m' _c_dim=$'\033[2m' _c_warn=$'\033[1;33m'
+    _c_json=$'\033[33m' _c_dim=$'\033[2m' _c_warn=$'\033[1;33m' _c_alert=$'\033[1;31m'
   else
-    _c_reset='' _c_banner='' _c_head='' _c_cmd='' _c_json='' _c_dim='' _c_warn=''
+    _c_reset='' _c_banner='' _c_head='' _c_cmd='' _c_json='' _c_dim='' _c_warn='' _c_alert=''
   fi
 }
 
 function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROFILE_NAME
   local name="$1" host port process_port mcp_name token_file pdir mcp_python mcp_ok=yes local_hpclib
-  local _c_reset _c_banner _c_head _c_cmd _c_json _c_dim _c_warn line d allow=''
+  local _c_reset _c_banner _c_head _c_cmd _c_json _c_dim _c_warn _c_alert line d allow='' roots=''
   _hpclib_colors
   host=$(_hpclib_agent_profiles get "$name" host)
   port=$(_hpclib_agent_profiles get "$name" port)
@@ -670,26 +830,36 @@ function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROF
   while IFS= read -r d; do
     [ -n "$d" ] && allow="$allow --allow $d"
   done < <(_hpclib_agent_lines "$name" work_dirs)
+  while IFS= read -r d; do
+    [ -n "$d" ] && roots="$roots${roots:+, }$d"
+  done < <(_hpclib_agent_lines "$name" local_roots)
 
   printf '\n%s  hpclib agents: %s is ready  %s\n\n' "$_c_banner" "$host" "$_c_reset"
   printf '%sProfile%s  %s\n' "$_c_head" "$_c_reset" "$pdir"
-  printf '%s         ports %s (your machine and the login node) and %s (the compute node), picked at random%s\n\n' \
+  printf '%s         ports %s (your machine and the login node) and %s (the compute node), picked at random%s\n' \
     "$_c_dim" "$port" "$process_port" "$_c_reset"
+  printf '%s         local folders the agent may push from and pull into: %s%s\n\n' \
+    "$_c_dim" "${roots:-none (rerun with --local-root DIR)}" "$_c_reset"
 
   printf '%s1. Start the tunnel%s (leave it running; it is a SLURM job)\n' "$_c_head" "$_c_reset"
   printf '   %sagent_tunnel %s%s\n' "$_c_cmd" "$name" "$_c_reset"
   printf '%s   = launch_tunnel -A none -P %s %s rest --process-port=%s --%s%s\n\n' \
     "$_c_dim" "$port" "$host" "$process_port" "$allow" "$_c_reset"
 
-  printf '%s2. Add the MCP server to your LLM client%s, then restart the client\n' "$_c_head" "$_c_reset"
+  printf '%s2. REQUIRED: add the MCP server to your LLM client.%s setup_agents does not change the client'"'"'s config, and\n' \
+    "$_c_alert" "$_c_reset"
+  printf '   %suntil you do, the agent has no tools for this cluster (or an old entry'"'"'s port and token).%s\n' \
+    "$_c_alert" "$_c_reset"
   printf '   Claude Desktop: merge into "mcpServers" in ~/Library/Application Support/Claude/claude_desktop_config.json\n'
   printf '   (also saved as %s/mcp.json):\n\n' "$pdir"
   while IFS= read -r line; do
     printf '%s%s%s\n' "$_c_json" "$line" "$_c_reset"
   done < <(_hpclib_agent_profiles mcp "$name" "$mcp_python" "$local_hpclib/servers/rest_mcp.py")
-  printf '\n   Claude Code:\n'
-  printf '   %sclaude mcp add-json %s '"'"'%s'"'"'%s\n' "$_c_cmd" "$mcp_name" \
+  printf '\n   Claude Code (remove an older entry first with `claude mcp remove %s`):\n' "$mcp_name"
+  printf '   %sclaude mcp add-json %s '"'"'%s'"'"'%s\n' "$_c_alert" "$mcp_name" \
     "$(_hpclib_agent_profiles mcp-entry "$name" "$mcp_python" "$local_hpclib/servers/rest_mcp.py")" "$_c_reset"
+  printf '   %sThen quit the client completely (Claude Desktop: Cmd-Q, not just closing the window) and reopen it.%s\n' \
+    "$_c_alert" "$_c_reset"
   if [ "$mcp_ok" = no ]; then
     printf '   %s%s has no MCP SDK: run `%s -m pip install mcp`, or set HPCLIB_MCP_PYTHON and rerun%s\n' \
       "$_c_warn" "$mcp_python" "$mcp_python" "$_c_reset"
@@ -705,6 +875,7 @@ function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROF
   printf '   rerun, keeping everything: %ssetup_agents %s%s   (--rebuild replaces it all)\n' \
     "$_c_cmd" "$name" "$_c_reset"
   printf '   describe the cluster for agents: cluster_notes in ~/.local/tunnels/rest/config.json on the cluster\n\n'
+  printf '%sNot done yet: add the MCP entry from step 2 to your LLM client and restart it.%s\n\n' "$_c_alert" "$_c_reset"
 }
 
 # Prepare a cluster for agents (LLM clients) using the REST server's job
@@ -725,7 +896,9 @@ function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROF
 #
 # Everything about the cluster is kept in a profile, ~/.config/hpclib/agents/
 # [user@]host/ (agent_profiles.py): the login, a pair of randomly chosen
-# ports, the work directories, the tokens and the MCP server name. Reruns
+# ports, the work directories, the tokens, the MCP server name and the
+# local folders the agent may push and pull (by default ~/Documents/Claude,
+# the Claude desktop app's working folder). Reruns
 # and agent_tunnel/agent_stop read it, so later commands need only the
 # address (or the profile name). Options given on a rerun update it.
 #
@@ -737,17 +910,18 @@ function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROF
 function setup_agents {
   local usage='usage: setup_agents [--work-dir DIR ...] [--bind DIR ...] [--local-root DIR ...] [--templates LIST|all]
        [--config FILE] [--no-sandbox] [--rebuild] [--no-install] [--target DIR] [--name NAME]
-       [--port N] [--process-port N] [--new-ports] [--token-name NAME] [--token-file FILE]
+       [--no-local-root] [--python-module MODULE ...] [--remote-python PATH] [--port N] [--process-port N] [--new-ports] [--token-name NAME] [--token-file FILE]
        [--owner-token-file FILE] [--mcp-name NAME] [--scopes LIST] [ssh options] [user@]host'
   local work_dirs=() binds=() local_roots=() login_args=() hosts=()
   local name='' token_name='' token_file='' owner_file='' port='' process_port='' mcp_name='' new_ports=no
+  local no_local_root=no python_modules=() remote_python=''
   local scopes="read,submit,propose,files:write"
   local templates="hello,orca,writing_templates" base_config='' sandbox=yes rebuild=no install=yes
   local target="$HPCLIB_REMOTE_INSTALL_LOCATION"
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --work-dir|--token-name|--token-file|--owner-token-file|--scopes|--templates|--config|--bind|--target|\
---name|--port|--process-port|--mcp-name|--local-root)
+--name|--port|--process-port|--mcp-name|--local-root|--python-module|--remote-python)
         if [ "$#" -lt 2 ] || [ -z "$2" ]; then
           echo "setup_agents: $1 needs a value" >&2
           return 2
@@ -767,12 +941,15 @@ function setup_agents {
           --process-port) process_port="$2" ;;
           --mcp-name) mcp_name="$2" ;;
           --local-root) local_roots+=("$2") ;;
+          --python-module) python_modules+=("$2") ;;
+          --remote-python) remote_python="$2" ;;
         esac
         shift 2 ;;
       --no-sandbox) sandbox=no; shift ;;
       --rebuild) rebuild=yes; shift ;;
       --no-install) install=no; shift ;;
       --new-ports) new_ports=yes; shift ;;
+      --no-local-root) no_local_root=yes; shift ;;
       -h|--help) echo "$usage"; return 0 ;;
       *) login_args+=("$1"); shift ;;
     esac
@@ -829,8 +1006,17 @@ function setup_agents {
     for d in "${binds[@]}"; do updates+=("binds+=$d"); done
   fi
   if [ "${#local_roots[@]}" -gt 0 ]; then
-    updates+=("local_roots=")
+    updates+=("local_roots=" "local_roots_off=no")
     for d in "${local_roots[@]}"; do updates+=("local_roots+=$(cd -P "$d" && pwd)"); done
+  elif [ "$no_local_root" = yes ]; then
+    updates+=("local_roots=" "local_roots_off=yes")
+  elif [ -z "$(_hpclib_agent_lines "$name" local_roots)" ] &&
+      [ "$(_hpclib_agent_profiles get "$name" local_roots_off 2>/dev/null)" != yes ]; then
+    # By default the agent may use the Claude desktop app's own working folder.
+    d="${HPCLIB_AGENT_LOCAL_ROOT:-$HOME/Documents/Claude}"
+    if mkdir -p "$d" 2> /dev/null; then
+      updates+=("local_roots=$(cd -P "$d" && pwd)")
+    fi
   fi
   [ -n "$token_name" ] && updates+=("token_name=$token_name")
   [ -n "$token_file" ] && updates+=("token_file=$token_file")
@@ -838,6 +1024,11 @@ function setup_agents {
   [ -n "$port" ] && updates+=("port=$port")
   [ -n "$process_port" ] && updates+=("process_port=$process_port")
   [ -n "$mcp_name" ] && updates+=("mcp_name=$mcp_name")
+  if [ "${#python_modules[@]}" -gt 0 ]; then
+    updates+=("python_spec=modules:${python_modules[*]}")
+  elif [ -n "$remote_python" ]; then
+    updates+=("python_spec=path:$remote_python")
+  fi
   _hpclib_agent_profiles set "$name" "${updates[@]}" || return 1
   if [ "$new_ports" = yes ]; then
     _hpclib_agent_profiles new-ports "$name" || return 1
@@ -864,6 +1055,28 @@ function setup_agents {
     echo "== installing hpclib"
     install_hpclib --target "$target" "${login_args[@]}" || return 1
   fi
+
+  echo "== Python on the cluster (3.9 or newer, for hpclib's servers)"
+  local python_spec python_line
+  python_spec=$(_hpclib_agent_profiles get "$name" python_spec 2>/dev/null || true)
+  # an explicit choice made now is applied now; a stored one only on --rebuild or if the launcher stopped working
+  if [ "${#python_modules[@]}" -eq 0 ] && [ -z "$remote_python" ] && [ "$rebuild" != yes ]; then
+    python_line=$(_hpclib_agents_remote _hpclib_remote_python "" no "" | tail -n 1)
+    if [ "${python_line%%|*}" != python ] && [ -n "$python_spec" ]; then
+      python_line=$(_hpclib_agents_remote _hpclib_remote_python "" yes "$python_spec" | tail -n 1)
+    fi
+  else
+    python_line=$(_hpclib_agents_remote _hpclib_remote_python "" yes "$python_spec" | tail -n 1)
+  fi
+  case "$python_line" in
+    python\|*)
+      local python_version="${python_line#python|}"
+      echo "using Python ${python_version%%|*} (${python_version#*|})"
+      _hpclib_agent_profiles set "$name" "remote_python=${python_version%%|*} (${python_version#*|})" || return 1 ;;
+    *)
+      echo "setup_agents: could not set up a Python for hpclib on the cluster" >&2
+      return 1 ;;
+  esac
 
   echo "== templates and server config"
   local bind_list
@@ -909,7 +1122,7 @@ function setup_agents {
     echo "the cluster has a plaintext owner token, made when the REST server first started; rerun with --rebuild"
     echo "to replace it with one kept on this machine, or hash it in place:"
     echo "  (umask 077; ssh ${login_args[*]} cat .local/tunnels/rest_token > $owner_file)"
-    echo "  ssh ${login_args[*]} python3 $rest_server --hash-token-file"
+    echo "  ssh ${login_args[*]} python3 $(case "$rest_server" in /*) printf %s "$rest_server" ;; *) printf '~/%s' "$rest_server" ;; esac) --hash-token-file"
   fi
 
   echo "== agent token '$token_name' for ${work_dirs[*]}"
@@ -918,7 +1131,7 @@ function setup_agents {
   local legacy_agent="$HOME/.config/hpclib/llm_token" known
   if [ ! -e "$token_file" ] && [ "$rebuild" != yes ] && [ -s "$legacy_agent" ] && [ "$legacy_agent" != "$token_file" ]; then
     known=$(HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" \
-      "$(printf '%q ' python3 "$rest_server" --lookup-token-hash "$(_hpclib_sha256 "$legacy_agent")")" \
+      "$(_hpclib_remote_python_cmd "$rest_server" --lookup-token-hash "$(_hpclib_sha256 "$legacy_agent")")" \
       < /dev/null 2>/dev/null | tail -n 1)
     if [ -n "$known" ]; then
       mkdir -p "$(dirname "$token_file")"
@@ -931,7 +1144,7 @@ function setup_agents {
   if [ -e "$token_file" ] && [ "$rebuild" != yes ]; then
     echo "$token_file already exists; rerun with --rebuild to replace it"
   else
-    local mint=(python3 "$rest_server" --add-token "$token_name" --scopes "$scopes")
+    local mint=(--add-token "$token_name" --scopes "$scopes")
     for d in "${work_dirs[@]}"; do
       mint+=(--token-allow "$d")
     done
@@ -941,19 +1154,19 @@ function setup_agents {
       local old_name
       if [ -s "$token_file" ]; then
         old_name=$(HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" \
-          "$(printf '%q ' python3 "$rest_server" --revoke-token-hash "$(_hpclib_sha256 "$token_file")")" \
+          "$(_hpclib_remote_python_cmd "$rest_server" --revoke-token-hash "$(_hpclib_sha256 "$token_file")")" \
           < /dev/null 2>/dev/null | tail -n 1)
         case "$old_name" in
           "revoked "*) echo "$old_name (the token in $token_file)" ;;
         esac
       fi
-      HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$(printf '%q ' python3 "$rest_server" --revoke-token "$token_name")" \
+      HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$(_hpclib_remote_python_cmd "$rest_server" --revoke-token "$token_name")" \
         < /dev/null > /dev/null 2>&1 && echo "revoked the old '$token_name' token"
     fi
     mkdir -p "$(dirname "$token_file")"
     local tmp
     tmp=$(umask 077; mktemp "$token_file.XXXXXX") || return 1
-    if ! HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$(printf '%q ' "${mint[@]}")" < /dev/null > "$tmp" 2>/dev/null ||
+    if ! HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$(_hpclib_remote_python_cmd "$rest_server" "${mint[@]}")" < /dev/null > "$tmp" 2>/dev/null ||
         [ ! -s "$tmp" ]; then
       rm -f "$tmp"
       echo "setup_agents: could not mint the '$token_name' token" >&2
@@ -967,10 +1180,13 @@ function setup_agents {
 }
 
 # Start the REST tunnel for a cluster set up with setup_agents, with the
-# profile's ports and directories:  agent_tunnel NAME|[user@]host [launch_tunnel options]
-# Extra options (e.g. --time=2:00:00) go to launch_tunnel.
+# profile's ports and directories:
+#   agent_tunnel NAME|[user@]host [--auto-approve-templates[=all]] [launch_tunnel options]
+# --auto-approve-templates lets the agent's template proposals be used without
+# your review (new template names only; =all also replacements), while jobs
+# are sandboxed. Other options (e.g. --time=2:00:00) go to launch_tunnel.
 function agent_tunnel {
-  local name host port process_port d allow=()
+  local name host port process_port d allow=() launch=()
   if [ "$#" -lt 1 ]; then
     echo "usage: agent_tunnel NAME|[user@]host [launch_tunnel options]" >&2
     _hpclib_agent_profiles list >&2
@@ -985,7 +1201,18 @@ function agent_tunnel {
   port=$(_hpclib_agent_profiles get "$name" port)
   process_port=$(_hpclib_agent_profiles get "$name" process_port)
   while IFS= read -r d; do [ -n "$d" ] && allow+=(--allow "$d"); done < <(_hpclib_agent_lines "$name" work_dirs)
-  launch_tunnel -A none -P "$port" "$host" rest "--process-port=$process_port" "$@" -- "${allow[@]}"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --auto-approve-templates|--auto-approve-templates=new|--auto-approve-templates=all)
+        allow+=("$1") ;;   # an option for the REST server, not launch_tunnel
+      --auto-approve-templates=*)
+        echo "agent_tunnel: --auto-approve-templates takes new or all" >&2
+        return 2 ;;
+      *) launch+=("$1") ;;
+    esac
+    shift
+  done
+  launch_tunnel -A none -P "$port" "$host" rest "--process-port=$process_port" "${launch[@]}" -- "${allow[@]}"
 }
 
 # Stop a cluster's agent tunnel:  agent_stop NAME|[user@]host
@@ -1012,6 +1239,14 @@ function agent_env {
 # The clusters set up with setup_agents on this machine.
 function agent_list {
   _hpclib_agent_profiles list
+}
+
+# The Agent Console backend: a local HTTP API (127.0.0.1 only, with a session
+# key) for a front end to watch tunnels, jobs, proposals and the audit log of
+# the clusters set up with setup_agents.
+#   agent_console [--port N] [--static DIR [--open]] [--allow-origin ORIGIN]
+function agent_console {
+  python3 "$HPCLIB_DIR/servers/agent_console.py" "$@"
 }
 
 ################################################################################
@@ -1209,7 +1444,8 @@ function launch_tunnel {
           ) &
           fi
 
-          printf -v remote_command '%q ' /bin/bash "$remote_hpclib/tunnels/start_tunnel.sh" "$tunnel" -P "$port" "${remote_args[@]}"
+          remote_command=$(_hpclib_remote_script_cmd /bin/bash "$remote_hpclib/tunnels/start_tunnel.sh" "$tunnel" \
+            -P "$port" "${remote_args[@]}")
           printf '%s\n' "pssh -t -L 127.0.0.1:$port:127.0.0.1:$port $address \"$remote_command\""
           pssh -t -L "127.0.0.1:$port:127.0.0.1:$port" "$address" "$remote_command"
       fi

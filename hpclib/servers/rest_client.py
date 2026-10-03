@@ -184,6 +184,29 @@ class RESTClient:
     def cancel_job(self, job_id):
         return self.request("POST", "/jobs/cancel", query={"id": job_id})
 
+    # owner only (the `*` scope)
+    def admin_proposals(self):
+        return self.request("GET", "/admin/proposals")
+
+    def admin_proposal_diff(self, name):
+        return self.request("GET", "/admin/proposals/diff", {"name": name})
+
+    def approve_proposal(self, name, replace=False):
+        return self.request("POST", "/admin/proposals/approve", body={"name": name, "replace": replace})
+
+    def reject_proposal(self, name, reason=""):
+        return self.request("POST", "/admin/proposals/reject", body={"name": name, "reason": reason})
+
+    def audit(self, since=None, limit=200, token=None, route=None, status=None):
+        query = {"since": since, "limit": limit, "token": token, "route": route, "status": status}
+        return self.request("GET", "/admin/audit", {k: v for k, v in query.items() if v is not None})
+
+    def tokens(self):
+        return self.request("GET", "/admin/tokens")
+
+    def revoke_token(self, name):
+        return self.request("POST", "/admin/tokens/revoke", body={"name": name})
+
     def list_files(self, path="."):
         return self.request("GET", "/files", query={"path": path})
 

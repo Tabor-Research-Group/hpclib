@@ -63,7 +63,43 @@ import tempfile
 import threading
 import time
 
-__all__ = ["SandboxError", "Sandbox", "build_host_image", "probe"]
+__all__ = ["SandboxError", "Sandbox", "build_host_image", "probe", "child_env"]
+
+# Set by the Python launcher setup_agents writes when it loads a Python module:
+# the environment from before that, base64 of `env -0`. Commands and jobs the
+# server starts get it, so they don't inherit the server's Python modules.
+BASE_ENV_VAR = "HPCLIB_BASE_ENV"
+SECRET_ENV_PREFIXES = ("HPC_REST_TOKEN",)
+
+
+def _decode_base_env(text):
+    import base64
+    try:
+        raw = base64.b64decode(text.encode(), validate=False)
+    except (ValueError, TypeError):
+        return None
+    env = {}
+    for item in raw.split(b"\0"):
+        key, sep, value = item.partition(b"=")
+        if sep and key:
+            env[key.decode("utf-8", "surrogateescape")] = value.decode("utf-8", "surrogateescape")
+    return env or None
+
+
+def child_env(env=None):
+    """
+    The environment for processes the server starts: `env`, or the one saved
+    from before the Python launcher loaded its modules (else this process's),
+    minus anything secret.
+    """
+    if env is None:
+        saved = os.environ.get(BASE_ENV_VAR)
+        env = (_decode_base_env(saved) if saved else None) or os.environ
+    env = dict(env)
+    for key in list(env):
+        if key.startswith(SECRET_ENV_PREFIXES) or key == BASE_ENV_VAR:
+            del env[key]
+    return env
 
 METHODS = ("auto", "singularity", "none")
 RUNTIMES = ("apptainer", "singularity")
@@ -216,7 +252,7 @@ class Sandbox:
             if runtime not in self._help_cache:
                 try:
                     out = subprocess.run([runtime, "exec", "--help"], capture_output=True, text=True,
-                                         timeout=30, stdin=subprocess.DEVNULL).stdout
+                                         timeout=30, stdin=subprocess.DEVNULL, env=child_env()).stdout
                 except (OSError, subprocess.TimeoutExpired):
                     out = ""
                 self._help_cache[runtime] = out
@@ -350,7 +386,8 @@ def _read(path, limit=1 << 16):
 
 def _run(args, timeout=30):
     try:
-        res = subprocess.run(args, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        res = subprocess.run(args, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+                             env=child_env())
         return res.returncode, res.stdout, res.stderr
     except FileNotFoundError:
         return None, "", f"{args[0]} not found"
@@ -459,7 +496,7 @@ def self_test(sandbox: Sandbox, base_dir):
         script = "\n".join(["#!/bin/bash", f"cd {shlex.quote(allowed)}"] + lines) + "\n"
         start = time.time()
         try:
-            res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120,
+            res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120, env=child_env(),
                                  stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
             return {"ran": False, "reason": "the test container did not finish within 120 s"}

@@ -292,4 +292,59 @@ chmod +x "$test_dir/stop-bin/ssh"
   if stop_tunnel login.example >/dev/null 2>&1; then fail 'stop_tunnel ran without -P'; fi
 )
 
+# A tunnel job that dies before it gets a node is reported, not waited on forever
+mkdir -p "$test_dir/dead-bin" "$test_dir/dead-sessions/rest"
+cat > "$test_dir/dead-bin/sbatch" <<'SCRIPT'
+#!/usr/bin/env bash
+echo "(from job_submit) your job is charged as below" >&2   # like Grace's job_submit plugin
+echo "conda: command not found" > "$TEST_DEAD_SESSIONS/rest/session-4242.log"
+echo 4242
+SCRIPT
+cat > "$test_dir/dead-bin/squeue" <<'SCRIPT'
+#!/usr/bin/env bash
+case " $* " in *" -j 4242 "*) echo "slurm_load_jobs error: Invalid job id specified" >&2; exit 1 ;; esac
+exit 0
+SCRIPT
+cat > "$test_dir/dead-bin/sacct" <<'SCRIPT'
+#!/usr/bin/env bash
+echo 'FAILED|127:0'
+SCRIPT
+printf '#!/usr/bin/env bash\nexit 0\n' > "$test_dir/dead-bin/scancel"
+chmod +x "$test_dir/dead-bin/"*
+if HOME="$test_dir/home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PATH="$HPCLIB_DIR/tunnels" \
+    HPCSESSIONS_DIR="$test_dir/dead-sessions" TEST_DEAD_SESSIONS="$test_dir/dead-sessions" \
+    HPCSERVERS_DIR="$HPCLIB_DIR/servers" PATH="$test_dir/dead-bin:$PATH" \
+    timeout 60 bash "$HPCLIB_DIR/tunnels/start_tunnel.sh" rest -P 23456 > "$test_dir/dead.log" 2>&1; then
+  fail 'start_tunnel succeeded with a job that died'
+fi
+dead_out=$(cat "$test_dir/dead.log")
+case "$dead_out" in *'Job 4242 ended before the tunnel connected (FAILED 127:0)'*) ;; *) fail "no report of the dead job: $dead_out" ;; esac
+case "$dead_out" in *'conda: command not found'*) ;; *) fail "the job's log was not shown: $dead_out" ;; esac
+case "$dead_out" in *'Submitted batch job 4242'*) ;; *) fail "the job id was not read from sbatch: $dead_out" ;; esac
+
+# configure_job.sh: conda is used when there, loaded from CONDA_MODULE if asked, and otherwise skipped
+mkdir -p "$test_dir/conda-home" "$test_dir/conda-bin"
+: > "$test_dir/conda-home/.bashrc"
+cat > "$test_dir/conda-bin/conda" <<'SCRIPT'
+#!/usr/bin/env bash
+# a conda from a module: its shell hook defines the conda function that can activate
+[ "$1 $2" = "shell.bash hook" ] && echo 'conda() { echo "activated $2" >> "$TEST_CONDA_LOG"; }'
+SCRIPT
+chmod +x "$test_dir/conda-bin/conda"
+run_configure() {  # run_configure ENV... : configure_job.sh under set -e, as the sbatch scripts source it
+  env -i HOME="$test_dir/conda-home" PATH="$CLEAN_PATH" TEST_CONDA_LOG="$test_dir/conda.log" "$@" \
+    bash -c "set -e; source '$HPCLIB_DIR/tunnels/configure_job.sh'; echo configured"
+}
+out=$(run_configure CONDA_ENVIRONMENT=default 2>&1) || fail "a missing conda stopped the job: $out"
+case "$out" in *"conda isn't available"*configured*) ;; *) fail "no warning about the missing conda: $out" ;; esac
+out=$(run_configure CONDA_ENVIRONMENT= 2>&1) || fail "configure_job failed without a conda environment: $out"
+case "$out" in *conda*) fail "mentioned conda although no environment was asked for: $out" ;; esac
+module_fn="() { [ \"\$1 \$2\" = \"load Anaconda3/2024.02\" ] && PATH=\"$test_dir/conda-bin:\$PATH\"; }"
+out=$(run_configure CONDA_ENVIRONMENT=myenv CONDA_MODULE=Anaconda3/2024.02 "BASH_FUNC_module%%=$module_fn" 2>&1) ||
+  fail "conda from a module failed: $out"
+assert_equal "$(cat "$test_dir/conda.log")" 'activated myenv'
+if run_configure CONDA_ENVIRONMENT=myenv REQUIRE_CONDA=true > /dev/null 2>&1; then
+  fail 'REQUIRE_CONDA=true accepted a missing conda'
+fi
+
 echo 'Tunnel management tests passed'

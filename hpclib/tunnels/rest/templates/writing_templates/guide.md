@@ -1,7 +1,10 @@
 # Writing a job template
 
-Read this before using `propose_template`. A proposal is checked the same way as a real template, but it cannot
-run until the cluster owner reviews it and approves it, so make the reviewer's job easy.
+Read this before using `propose_template`. A proposal is checked the same way as a real template. On most servers
+it then waits until the cluster owner reviews and approves it, so make the reviewer's job easy. If `cluster_info`
+shows `template_proposals` with `"review": "automatic"`, a valid proposal becomes a template at once: then you are
+the only reviewer, so read your script again and start with a dry run and a single small job. To fix a proposal
+that is still waiting, propose it again under the same name.
 
 ## Find the software first
 

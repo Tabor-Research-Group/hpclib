@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_rest_jobs import (  # noqa: E402
@@ -138,11 +139,20 @@ class TestProposals(WorkflowTestCase):
 
     def test_propose_review_approve(self):
         out = self.builder.propose_template("xtb", self.SPEC, self.SCRIPT, guide="# xtb\n", rationale="for GFN2")
-        self.assertEqual((out["token"], out["replaces_existing"]), ("builder", False))
+        self.assertEqual((out["token"], out["replaces_existing"], out["approved"]), ("builder", False, False))
+        self.assertIn("waiting for the cluster owner", out["status"])
+        self.assertEqual(self.llm.cluster()["template_proposals"]["review"], "owner")
         self.assertTrue((self.proposals_dir / "xtb" / "script.sh").exists())
         self.assertNotIn("xtb", [t["name"] for t in self.llm.templates()["templates"]])
         self.expect_error(404, self.builder.submit_job, "xtb")   # nothing runs before approval
-        self.expect_error(409, self.builder.propose_template, "xtb", self.SPEC, self.SCRIPT)
+        # the proposer may revise its own pending proposal (the draft is kept); another client may not
+        out = self.builder.propose_template("xtb", self.SPEC, self.SCRIPT + "echo revised\n")
+        self.assertTrue(out["revised"])
+        self.assertIn("revised", (self.proposals_dir / "xtb" / "script.sh").read_text())
+        self.assertEqual(len(list((self.proposals_dir / ".superseded").iterdir())), 1)
+        other = RESTClient(self.url, token=rest_server.TokenAuth.add_token(
+            str(self.tokens_file), "other-builder", ["read", "propose"], [str(self.llm_root)]))
+        self.expect_error(409, other.propose_template, "xtb", self.SPEC, self.SCRIPT)
         self.assertEqual([p["name"] for p in self.llm.proposals()["proposals"]], ["xtb"])
         # proposals are unreachable through the file routes, like the rest of the server's data
         self.expect_error(403, self.owner.read_file, str(self.proposals_dir / "xtb" / "script.sh"))
@@ -155,6 +165,8 @@ class TestProposals(WorkflowTestCase):
         described = {t["name"]: t for t in self.llm.templates()["templates"]}
         self.assertEqual(described["xtb"]["modules"], ["xtb/6.6.1"])
         self.assertFalse((self.templates / "xtb" / "proposal.json").exists())
+        record = json.loads((self.templates / "xtb" / ".proposal.json").read_text())
+        self.assertEqual((record["token"], record["approved_by"]), ("builder", "owner"))
         self.assertEqual(self.llm.proposals()["proposals"], [])
 
     def test_replacing_needs_flag(self):
@@ -164,7 +176,62 @@ class TestProposals(WorkflowTestCase):
             store.approve("hello")
         store.approve("hello", replace=True)
         self.assertEqual(self.llm.templates()["templates"][0]["description"], "new hello")
-        self.assertTrue(any(p.name.startswith("hello.replaced-") for p in self.templates.iterdir()))
+        self.assertTrue(any(p.name.startswith("hello-") for p in (self.templates / ".replaced").iterdir()))
+        self.assertEqual(self.llm.templates().get("errors"), None)     # the backup isn't loaded as a template
+
+    def sandboxed(self):
+        runtime = lambda name: sys.executable if name == "singularity" else None  # noqa: E731 (macOS has no /bin/true)
+        self.jobs.sandbox = rest_jobs.rest_sandbox.Sandbox({"method": "auto"}, which=runtime)
+
+    def test_auto_approve_new_templates(self):
+        self.sandboxed()
+        self.jobs.auto_approve = "new"
+        self.assertEqual(self.llm.cluster()["template_proposals"]["review"], "automatic")
+        out = self.builder.propose_template("xtb", self.SPEC, self.SCRIPT, rationale="for GFN2")
+        self.assertTrue(out["approved"])
+        self.assertIn("approved automatically", out["status"])
+        self.assertIn("xtb", [t["name"] for t in self.llm.templates()["templates"]])
+        self.assertEqual(self.llm.proposals()["proposals"], [])
+        record = json.loads((self.templates / "xtb" / ".proposal.json").read_text())
+        self.assertEqual((record["approved_by"], record["rationale"]), ("automatic", "for GFN2"))
+        dry = self.builder.submit_job("xtb", params={"xyz": str(self._xyz())}, dry_run=True)
+        self.assertTrue(dry["dry_run"])
+        # replacing an existing template still waits for the owner ...
+        out = self.builder.propose_template("hello", dict(self.SPEC, description="new hello"), self.SCRIPT)
+        self.assertFalse(out["approved"])
+        self.assertIn("replace an existing template", out["status"])
+        self.assertNotEqual(self.llm.templates()["templates"][0]["description"], "new hello")
+        # ... unless the server allows that too
+        self.jobs.auto_approve = "all"
+        out = self.builder.propose_template("hello", dict(self.SPEC, description="newer hello"), self.SCRIPT)
+        self.assertTrue(out["approved"])
+        described = {t["name"]: t for t in self.llm.templates()["templates"]}
+        self.assertEqual(described["hello"]["description"], "newer hello")
+        self.assertTrue(any(p.name.startswith("hello-") for p in (self.templates / ".replaced").iterdir()))
+
+    def _xyz(self):
+        path = self.llm_root / "mol.xyz"
+        path.write_text("1\n\nH 0 0 0\n")
+        return path
+
+    def test_no_auto_approval_without_a_sandbox(self):
+        self.jobs.auto_approve = "all"                          # but jobs aren't sandboxed here
+        policy = self.llm.cluster()["template_proposals"]
+        self.assertEqual(policy["review"], "owner")
+        self.assertIn("not", policy["detail"])
+        out = self.builder.propose_template("xtb", self.SPEC, self.SCRIPT)
+        self.assertFalse(out["approved"])
+        self.expect_error(404, self.builder.submit_job, "xtb")
+
+    def test_auto_approve_flag(self):
+        self.assertEqual(rest_server.parse_args(["--auto-approve-templates"]).auto_approve_templates, "new")
+        self.assertEqual(rest_server.parse_args(["--auto-approve-templates", "all"]).auto_approve_templates, "all")
+        self.assertIsNone(rest_server.parse_args([]).auto_approve_templates)
+        with mock.patch.dict(os.environ, {"HPC_REST_AUTO_APPROVE_TEMPLATES": "all"}):
+            self.assertEqual(rest_server.parse_args([]).auto_approve_templates, "all")
+        with self.assertRaises(ValueError):
+            rest_jobs.JobManager(templates=None, registry=None, limits=None, runner=self.jobs.runner,
+                                 auto_approve="yes")
 
     def test_invalid_proposals(self):
         self.expect_error(422, self.builder.propose_template, "bad", self.SPEC, "#SBATCH --gres=gpu:8\nrun\n")
@@ -179,6 +246,102 @@ class TestProposals(WorkflowTestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             rest_server.main(["--reject-template", "xtb"])
         self.assertFalse((self.proposals_dir / "xtb").exists())
+
+
+class TestAdmin(WorkflowTestCase):
+    """The owner-only /admin routes the Agent Console uses."""
+
+    SPEC, SCRIPT = TestProposals.SPEC, TestProposals.SCRIPT
+
+    def test_scoped_tokens_are_refused(self):
+        for client in (self.llm, self.builder):
+            self.expect_error(403, client.admin_proposals)
+            self.expect_error(403, client.audit)
+            self.expect_error(403, client.tokens)
+            self.expect_error(403, client.revoke_token, "other")
+            self.expect_error(403, client.approve_proposal, "x")
+
+    def test_review_new_proposal(self):
+        self.builder.propose_template("xtb", self.SPEC, self.SCRIPT, rationale="for GFN2")
+        listing = self.owner.admin_proposals()
+        self.assertEqual([p["name"] for p in listing["proposals"]], ["xtb"])
+        self.assertEqual(listing["policy"]["review"], "owner")
+        detail = self.owner.admin_proposal_diff("xtb")
+        self.assertTrue(detail["valid"])
+        self.assertIsNone(detail["current"])
+        self.assertEqual(detail["proposal"]["token"], "builder")
+        self.assertIn("+xtb", detail["diff"]["script.sh"])
+        self.assertIn("/dev/null", detail["diff"]["script.sh"])
+        out = self.owner.approve_proposal("xtb")
+        self.assertEqual(out["approved"], "xtb")
+        self.assertIn("xtb", [t["name"] for t in self.llm.templates()["templates"]])
+        record = json.loads((self.templates / "xtb" / ".proposal.json").read_text())
+        self.assertEqual(record["approved_by"], "owner")
+        self.expect_error(404, self.owner.approve_proposal, "xtb")
+
+    def test_replacement_needs_replace(self):
+        self.builder.propose_template("hello", dict(self.SPEC, description="new hello"), self.SCRIPT)
+        detail = self.owner.admin_proposal_diff("hello")
+        self.assertIsNotNone(detail["current"])
+        self.assertIn("-", detail["diff"]["template.json"])
+        self.expect_error(409, self.owner.approve_proposal, "hello")
+        self.owner.approve_proposal("hello", replace=True)
+        described = {t["name"]: t for t in self.llm.templates()["templates"]}
+        self.assertEqual(described["hello"]["description"], "new hello")
+
+    def test_reject_keeps_a_record(self):
+        self.builder.propose_template("xtb", self.SPEC, self.SCRIPT)
+        out = self.owner.reject_proposal("xtb", reason="use the orca template")
+        self.assertEqual(out["reason"], "use the orca template")
+        self.assertFalse((self.proposals_dir / "xtb").exists())
+        kept = list((self.proposals_dir / ".rejected").iterdir())
+        meta = json.loads((kept[0] / "proposal.json").read_text())
+        self.assertEqual((meta["rejected_by"], meta["reason"]), ("owner", "use the orca template"))
+        self.assertEqual(self.owner.admin_proposals()["proposals"], [])
+        self.expect_error(404, self.owner.reject_proposal, "xtb")
+        self.expect_error(404, self.owner.admin_proposal_diff, "../etc")
+
+    def test_audit(self):
+        self.llm.cluster()
+        self.expect_error(403, self.reader_client().submit_job, "hello")
+        everything = self.owner.audit()["entries"]
+        self.assertTrue(any(e["token"] == "llm" and e["path"] == "/cluster" for e in everything))
+        mine = self.owner.audit(token="llm")["entries"]
+        self.assertTrue(mine and all(e["token"] == "llm" for e in mine))
+        refused = self.owner.audit(status=403)["entries"]
+        self.assertTrue(refused and all(e["status"] == 403 for e in refused))
+        latest = self.owner.audit()["latest"]
+        self.llm.health()
+        newer = self.owner.audit(since=latest)["entries"]
+        self.assertTrue(any(e["path"] == "/health" and e["token"] == "llm" for e in newer))
+        self.assertTrue(all(e["time"] > latest for e in newer))
+        limited = self.owner.audit(limit=1)
+        self.assertEqual((len(limited["entries"]), limited["more"]), (1, True))
+        self.assertEqual(self.owner.audit(route="/admin")["entries"][0]["token"], "owner")
+
+    def reader_client(self):
+        return RESTClient(self.url, token=self.reader_token)
+
+    def test_audit_off(self):
+        self.server.audit = None
+        self.expect_error(503, self.owner.audit)
+        self.assertFalse(self.owner.tokens()["last_used_known"])
+
+    def test_tokens_and_revoke(self):
+        self.llm.cluster()
+        out = self.owner.tokens()
+        by_name = {t["name"]: t for t in out["tokens"]}
+        self.assertEqual(set(by_name), {"owner", "llm", "other", "reader", "builder"})
+        self.assertNotIn("sha256", json.dumps(out))
+        self.assertTrue(by_name["llm"]["last_used"])
+        self.assertIsNone(by_name["other"]["last_used"])
+        self.assertEqual(by_name["reader"]["scopes"], ["read"])
+        self.owner.revoke_token("other")
+        self.expect_error(401, RESTClient(self.url, token=self.other_token).health)
+        self.assertNotIn("other", {t["name"] for t in self.owner.tokens()["tokens"]})
+        self.expect_error(404, self.owner.revoke_token, "other")
+        self.expect_error(400, self.owner.revoke_token, "owner")
+        self.llm.health()  # the others still work
 
 
 class TestArrays(WorkflowTestCase):

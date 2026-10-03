@@ -179,7 +179,12 @@ echo "submitting job..." > "$STATUS_FILE"
 python3 "$HPCSERVERS_DIR/waiting_shim.py" "$HOST_PORT" "$STATUS_FILE" "$TUNNEL_NAME" > "$STATUS_FILE" &
 SHIM_PID=$!
 
-sbatch --job-name=$job_name --open-mode=append --out="$SESSIONS_DIR/session-%j.log" --export="$export_spec" $sbatch_args "$SBATCH_SCRIPT" "${TUNNEL_SCRIPT_ARGS[@]}"
+# --parsable: the job id comes straight from sbatch, whatever else the site's
+# job_submit plugin or squeue defaults print
+submit_out=$(sbatch --parsable --job-name=$job_name --open-mode=append --out="$SESSIONS_DIR/session-%j.log" \
+  --export="$export_spec" $sbatch_args "$SBATCH_SCRIPT" "${TUNNEL_SCRIPT_ARGS[@]}")
+SUBMITTED_ID=$(printf '%s\n' "$submit_out" | grep -Eo '^[0-9]+' | tail -n 1)
+[ -n "$SUBMITTED_ID" ] && echo "Submitted batch job $SUBMITTED_ID"
 
 function stop_git_server() {
   if [ "$GIT_SERVER_JOB" != "" ]; then
@@ -201,7 +206,8 @@ function cleanup() {
 }
 trap cleanup 0 1 2 3   # Ctrl+C locally now also cleans up the shim
 
-SESSION_ID=$(get_job_id_by_name $job_name)
+SESSION_ID="$SUBMITTED_ID"
+[ -n "$SESSION_ID" ] || SESSION_ID=$(get_job_id_by_name $job_name)
 if [ "$SESSION_ID" = "" ]
     then
       echo "job seems to have failed to submit; check 'squeue -u <username>'" > "$STATUS_FILE"
@@ -216,7 +222,9 @@ if [ "$SESSION_ID" = "" ]
       if [ "$START_GIT_SERVER" = "true" ]; then
         export GIT_SOCKET_PORT=$(random_port 10000 65535)
         export GIT_SOCKET_HOST=$(hostname)
-        conda activate $CONDA_ENVIRONMENT
+        if [ -n "$CONDA_ENVIRONMENT" ] && type conda > /dev/null 2>&1; then
+          conda activate "$CONDA_ENVIRONMENT" || true
+        fi
         python "$HPCSERVERS_DIR/git_server.py" &
         GIT_SERVER_JOB=$!
       fi
@@ -227,8 +235,20 @@ if [ "$SESSION_ID" = "" ]
       job_node=""
       poll=0
       while [ -z "$job_node" ]; do
-        job_node=$(get_job_node "$SESSION_ID")
+        job_node=$(get_job_node "$SESSION_ID" 2>/dev/null)
         if [ -z "$job_node" ]; then
+          # A job that ended before it got going (a failing setup step, say) leaves the
+          # queue: report how it ended and the end of its log, rather than waiting forever.
+          if [ -z "$(squeue -j "$SESSION_ID" -h -o "%T" 2>/dev/null)" ]; then
+            final=$(sacct -j "$SESSION_ID" -X -n -P -o State,ExitCode 2>/dev/null | head -n 1 | tr '|' ' ')
+            echo "job $SESSION_ID ended before the tunnel connected (${final:-no longer in the queue})" > "$STATUS_FILE"
+            echo "Job $SESSION_ID ended before the tunnel connected (${final:-no longer in the queue})." >&2
+            if [ -s "$SESSION_FILE" ]; then
+              echo "The end of its log, $SESSION_FILE:" >&2
+              tail -n 20 "$SESSION_FILE" | sed 's/^/  /' >&2
+            fi
+            exit 1
+          fi
           reason=$(squeue -j "$SESSION_ID" -h -o "%R" 2>/dev/null)
           echo "job $SESSION_ID queued (${reason:-waiting}) - poll #$poll" > "$STATUS_FILE"
           poll=$((poll+1))

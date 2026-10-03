@@ -48,7 +48,20 @@ container is run on the login node. It then creates the owner token, giving the 
 an agent token limited to the `--work-dir` directories (`--scopes`, default `read,submit,propose,files:write`).
 It ends with a getting-started summary (in colour on a terminal; `NO_COLOR` or `HPCLIB_COLOR=never` turns that
 off): how to start the tunnel, the MCP client entry for Claude Desktop as JSON, the `claude mcp add-json` line for
-Claude Code, and a `curl` check.
+Claude Code, and a `curl` check. **`setup_agents` never edits your LLM client's config**: add the printed entry
+yourself (the summary shows that step in red), then quit the client completely and reopen it. Until then the agent
+has no tools for the new cluster, or keeps an older entry's port, token and local folders.
+
+**Python on the cluster.** hpclib's servers need Python 3.9 or newer there (the REST server alone needs 3.7).
+`setup_agents` looks for one: `python3` and `python3.X` on `PATH` (`$HPCLIB_PYTHON_NAMES` changes the list),
+then the newest Python module (or Anaconda/Miniconda/Miniforge) from `module spider`/`module avail`, loading
+whatever Lmod says it needs first. It records the choice on the cluster as the launcher
+`~/.local/tunnels/rest/python` (and `python.json`), which the REST tunnel and `setup_agents` itself run
+through, and in the profile. `--python-module MODULE` (repeatable, in load order) or `--remote-python PATH`
+chooses explicitly; a later run keeps the choice unless you pass `--rebuild` or one of those, or it stops working.
+The launcher saves the environment from before it loads any module, and the server gives that to `sbatch`,
+`module` and the sandbox, so jobs don't inherit the server's Python modules. `HPC_REST_PYTHON` on the
+cluster still overrides it for the tunnel.
 
 Everything about a cluster is kept in its **agent profile**, `~/.config/hpclib/agents/USER@HOST/`
 (`$HPCLIB_AGENTS_DIR` moves it), private to you:
@@ -65,8 +78,10 @@ other clusters; `--new-ports` picks new ones, and `--port`/`--process-port` set 
 after this machine (`agent-HOSTNAME`, or `--token-name`), so each of your machines can have its own and be revoked
 on its own, and the MCP server is named after the cluster (`hpclib-entropy`, or `--mcp-name`), so several
 clusters can be configured side by side. Options given on a later run update the profile, and a later run needs
-only the address: `setup_agents user@login.example`. `--local-root DIR` (repeatable) adds the local directories
-the agent may push from and pull into to the MCP entry. `--config FILE` starts the cluster's config from your own
+only the address: `setup_agents user@login.example`. The MCP entry lets the agent push files from and pull them
+into `~/Documents/Claude`, the Claude desktop app's own working folder (created if missing;
+`$HPCLIB_AGENT_LOCAL_ROOT` changes the default). `--local-root DIR` (repeatable) replaces it with your own
+directories, and `--no-local-root` leaves the agent no local file access. `--config FILE` starts the cluster's config from your own
 JSON, `--no-sandbox` leaves jobs unsandboxed, `--no-install` skips `install_hpclib`, and ssh options go before the
 address as for `pssh`. Scripts that use `RESTClient.from_env()` pick a cluster with `eval "$(agent_env
 user@login.example)"`. Tokens from before profiles (`~/.config/hpclib/llm_token` and `rest_token`) are copied into
@@ -78,6 +93,48 @@ Rerunning `setup_agents` keeps your templates, config and tokens (a config witho
 rebuilt, the owner token's hash is reinstalled from the profile (a new token is made if there is none), and the
 agent token is replaced, revoking both the token in the profile and any token with the same name. A running MCP
 server picks up the new token by itself: the client re-reads its token file when the server rejects a token.
+
+**The Agent Console** is a local backend for a front end (kept in its own repository) or for `curl`: it shows
+every cluster's tunnel, jobs, template proposals and audit log, and holds the cluster tokens itself so the
+browser never sees them.
+
+```bash
+agent_console                                   # http://127.0.0.1:27180; prints a fresh session key
+KEY=$(python3 -c 'import json,os; print(json.load(open(os.path.expanduser("~/.config/hpclib/console/session")))["key"])')
+curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:27180/api/clusters
+curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:27180/api/proposals
+curl -s -H "Authorization: Bearer $KEY" -X POST -d '{"name": "xtb"}' \
+  http://127.0.0.1:27180/api/clusters/user@login.example/rest/admin/proposals/approve
+```
+
+It listens on 127.0.0.1 only, refuses other `Host` headers, and needs the session key
+(`Authorization: Bearer KEY`) on every `/api` call; the key is new at each launch and is written to
+`~/.config/hpclib/console/session` (mode 600). Browsers on other origins are refused unless you name one with
+`--allow-origin http://127.0.0.1:5173`; `--static DIR [--open]` serves a built front end from the same origin
+instead. Routes (all JSON; the module docstring of `hpclib/servers/agent_console.py` is the reference):
+
+| Route | What |
+| --- | --- |
+| `GET /api/health` | the console is up |
+| `GET /api/clusters`, `GET /api/clusters/NAME` | profiles and tunnel state (`down`, `starting`, `up`, `error`); never token values |
+| `GET /api/clusters/NAME/mcp` | the MCP client entry |
+| `POST /api/clusters/NAME/tunnel/start` (`{"auto_approve_templates": "new"}`), `.../tunnel/stop`, `GET .../tunnel/log` | `agent_tunnel` and `agent_stop`, logged to `~/.config/hpclib/console/logs/` |
+| `ANY /api/clusters/NAME/rest/ROUTE` | the cluster's REST route, with the owner token (`?as=agent`: the agent token) |
+| `GET /api/jobs`, `GET /api/proposals` | jobs and pending proposals from every live cluster, with each cluster's `ok`/`error` |
+
+The console starts tunnels without a terminal, so the ssh login has to work without prompting (keys, or an open
+ssh ControlMaster); otherwise start the tunnel with `agent_tunnel` and the console finds it on its port.
+
+Owner-only REST routes, which the console uses (they need the owner token; agent tokens get 403):
+
+| Route | What |
+| --- | --- |
+| `GET /admin/proposals` | pending proposals and the approval policy |
+| `GET /admin/proposals/diff?name=` | a proposal's files, the template it would replace, a unified diff per file, and whether it is valid |
+| `POST /admin/proposals/approve` (`{"name", "replace"}`) | approve; 409 if it would replace a template and `replace` is not set |
+| `POST /admin/proposals/reject` (`{"name", "reason"}`) | set it aside in `proposals/.rejected/` with the reason |
+| `GET /admin/audit?since=&limit=&token=&route=&status=` | audit log entries, oldest first; `latest` is the `since` for the next poll |
+| `GET /admin/tokens`, `POST /admin/tokens/revoke` (`{"name"}`) | token names, scopes, directories and last use (no hashes); revoke one |
 
 ## hpclib.sh
 
@@ -358,8 +415,22 @@ on your machine as MCP tools.
   ```bash
   python3 ~/hpclib/servers/rest_server.py --list-proposals
   python3 ~/hpclib/servers/rest_server.py --approve-template xtb   # --replace to swap an existing one
-  python3 ~/hpclib/servers/rest_server.py --reject-template xtb
+  python3 ~/hpclib/servers/rest_server.py --reject-template xtb   # kept in proposals/.rejected/
   ```
+
+  or from your machine through the Agent Console (above), or the owner-only `/admin/proposals` routes.
+
+  A client can revise its own pending proposal by proposing again under the same name (the earlier draft is
+  kept in `proposals/.superseded/`). Approved templates keep a record of who proposed and approved them in
+  `templates/NAME/.proposal.json`, and a template that was replaced goes to `templates/.replaced/`.
+
+  To skip the review, start the tunnel with `--auto-approve-templates`: `agent_tunnel user@login.example
+  --auto-approve-templates`, or `rest_server.py --auto-approve-templates` (`$HPC_REST_AUTO_APPROVE_TEMPLATES`).
+  A valid proposal for a new template name then becomes a template at once; with `--auto-approve-templates=all`,
+  so does one that replaces an existing template. This only applies while template jobs are sandboxed
+  (*Sandboxed jobs* above), so an auto-approved template still writes only to the token's directories; on a
+  server without a sandbox, proposals keep waiting for you. `cluster_info` tells clients which policy applies,
+  and the server prints it at startup.
 
 - **Moving files.** `hpclib/servers/rest_client.py`'s `FileSync` copies files between your machine and the cluster
   through the API. That means the token's scopes and directories apply, and pushing needs `files:write`. With

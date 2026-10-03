@@ -110,7 +110,8 @@ FAKE_SSH = textwrap.dedent("""\
         after_host=true
       fi
     done
-    cd "$TEST_REMOTE_HOME"
+    # TEST_REMOTE_START_DIR: where the remote shell is when the command runs, like a .bashrc that cds away
+    cd "${TEST_REMOTE_START_DIR:-$TEST_REMOTE_HOME}"
     exec env -u HPCTUNNELS_DATA_DIR HOME="$TEST_REMOTE_HOME" PATH="$TEST_REMOTE_PATH" bash -c "$remote"
 """)
 
@@ -284,8 +285,12 @@ class TestSetupAgents(unittest.TestCase):
         self.assertIn(f"launch_tunnel -A none -P {profile['port']} me@login.example rest "
                       f"--process-port={profile['process_port']} -- --allow {self.work[0]} --allow {self.work[1]}", out)
         mcp = json.loads((self.profile_dir / "mcp.json").read_text())["mcpServers"]["hpclib-login"]
+        claude_dir = self.local_home / "Documents" / "Claude"     # the Claude desktop app's working folder
+        self.assertTrue(claude_dir.is_dir())
         self.assertEqual(mcp["args"][1:], ["--url", f"http://127.0.0.1:{profile['port']}",
-                                           "--token-file", str(self.token_file)])
+                                           "--token-file", str(self.token_file), "--local-root", str(claude_dir)])
+        self.assertIn("2. REQUIRED: add the MCP server", out)
+        self.assertIn("Not done yet: add the MCP entry", out)
         self.assertIn('"hpclib-login": {', out)                        # the JSON is in the output
         self.assertIn("claude mcp add-json hpclib-login", out)
         self.assertNotIn("\033[", out[out.index("hpclib agents:"):])     # no colours when not a terminal
@@ -352,17 +357,45 @@ class TestSetupAgents(unittest.TestCase):
         out = self.bash('launch_tunnel() { printf "%s\\n" "$*"; }; agent_tunnel "$@"', "hpclib-login", "--time=2:00:00")
         self.assertIn(f"-A none -P {profile['port']} me@login.example rest --process-port={profile['process_port']} "
                       f"--time=2:00:00 -- --allow {self.work[0]}", out)
+        out = self.bash('launch_tunnel() { printf "%s\\n" "$*"; }; agent_tunnel "$@"', "hpclib-login",
+                        "--auto-approve-templates")
+        self.assertIn(f"--process-port={profile['process_port']} -- --allow {self.work[0]} --auto-approve-templates",
+                      out)                                         # a server option, so after the --
+        self.bash('launch_tunnel() { :; }; agent_tunnel "$@"', "hpclib-login", "--auto-approve-templates=yes",
+                  expect=2)
         out = self.bash('stop_tunnel() { printf "%s\\n" "$*"; }; agent_stop "$@"', "me@login.example")
         self.assertIn(f"-P {profile['port']} me@login.example", out)
         self.bash("agent_tunnel nowhere", expect=1)
         out = self.bash('eval "$(agent_env me@login.example)" && echo "$HPC_REST_URL $HPC_REST_TOKEN_FILE"')
         self.assertIn(f"http://127.0.0.1:{profile['port']} {self.token_file}", out)
 
+    def test_local_roots(self):
+        mine = self.tmp / "my inputs"
+        mine.mkdir()
+        self.setup_agents("--work-dir", str(self.work[0]), "--templates", "hello", "--local-root", str(mine),
+                          "me@login.example")
+        self.assertEqual(self.profile()["local_roots"], [str(mine)])
+        self.assertFalse((self.local_home / "Documents" / "Claude").exists())   # no default when one is given
+        self.setup_agents("--no-install", "me@login.example")                    # kept on a rerun
+        self.assertEqual(self.profile()["local_roots"], [str(mine)])
+        self.setup_agents("--no-install", "--no-local-root", "me@login.example")
+        self.assertEqual(self.profile()["local_roots"], [])
+        out = self.setup_agents("--no-install", "me@login.example")             # and "none" is remembered
+        self.assertEqual(self.profile()["local_roots"], [])
+        self.assertIn("none (rerun with --local-root DIR)", out)
+        self.assertNotIn("--local-root", (self.profile_dir / "mcp.json").read_text())
+        env = dict(self.env, HPCLIB_AGENT_LOCAL_ROOT=str(self.tmp / "elsewhere"))
+        self.bash('setup_agents "$@"', "--work-dir", str(self.work[1]), "--templates", "hello", "--name", "two",
+                  "--token-name", "second", "me@login.example", env=env)
+        self.assertEqual(self.profile("two")["local_roots"], [str(self.tmp / "elsewhere")])
+
     def test_colours_on_request(self):
         env = dict(self.env, HPCLIB_COLOR="always")
         out = self.bash('setup_agents "$@"', "--work-dir", str(self.work[0]), "--templates", "hello",
                         "me@login.example", env=env)
         self.assertIn("\033[1;97;44m", out)
+        self.assertIn("\033[1;31m2. REQUIRED", out)                    # the MCP step is in red
+        self.assertIn("\033[1;31mclaude mcp add-json", out)
         self.assertIn("\033[33m{", out)                                # the JSON block is coloured
         json_lines = [line[len("\033[33m"):-len("\033[0m")] for line in out.splitlines()
                       if line.startswith("\033[33m")]
@@ -394,6 +427,125 @@ class TestSetupAgents(unittest.TestCase):
         self.assertIn("revoked 'llm-scan'", out)
         self.assertIsNone(self.identify(old))
         self.assertEqual(self.identify(self.token_file.read_text().strip()).name, "renamed")
+
+    def test_login_shell_that_changes_directory(self):
+        """Like a .bashrc ending in `cd /scratch/$USER`: hpclib's paths are anchored at the remote home, while
+        commands keep running where the login setup put them."""
+        elsewhere = self.tmp / "scratch start"
+        elsewhere.mkdir()
+        self.env["TEST_REMOTE_START_DIR"] = str(elsewhere)
+        out = self.setup_agents("--work-dir", str(self.work[0]), "--templates", "hello,orca", "me@login.example")
+        self.assertNotIn("has no template", out)
+        self.assertNotIn("can't open file", out)
+        self.assertTrue((self.remote_home / "hpclib" / "servers" / "rest_server.py").exists())
+        self.assertTrue((self.rest / "templates" / "orca" / "template.json").exists())
+        self.assertEqual(self.identify(self.token_file.read_text().strip()).name, self.agent_name)
+        self.assertEqual(list(elsewhere.iterdir()), [])                 # nothing landed in the start directory
+        out = self.bash('pssh() { printf "%s\\n" "${@: -1}"; }; launch_tunnel "$@"', "-A", "none", "-P", "20001",
+                        "me@login.example", "rest")
+        self.assertIn('/bin/bash "$HOME"/hpclib/tunnels/start_tunnel.sh rest', out)
+        self.assertNotIn("cd ", out)                                     # the start directory is left alone
+
+    def fake_modules(self):
+        """
+        A cluster whose python3 is too old, where Python/3.11.5 can only be loaded after GCCcore/12.3.0 (as
+        Lmod hierarchies do) and Python/3.8.6 is too old. Returns the directory the module puts on PATH.
+        """
+        old = self.tmp / "old-python"
+        old.mkdir()
+        (old / "python3").write_text("#!/bin/sh\necho 'Python 3.6.8 (fake)' >&2\nexit 1\n")
+        (old / "python3").chmod(0o755)
+        new = self.tmp / "module-python"
+        new.mkdir()
+        (new / "python3").symlink_to(sys.executable)
+        self.env["TEST_REMOTE_PATH"] = f"{old}{os.pathsep}{self.env['TEST_REMOTE_PATH']}"
+        self.env["HPCLIB_PYTHON_NAMES"] = "python3"         # only the old one on PATH
+        self.env["FAKE_MODULE_PYTHON"] = str(new)
+        self.env["BASH_FUNC_module%%"] = textwrap.dedent("""\
+            () { case "$1" in
+              -t) case "$2" in
+                    spider|avail) printf '%s\\n' GCCcore/12.3.0 Python/3.8.6 Python/3.11.5 'Anaconda3/2023.09 (D)' >&2 ;;
+                  esac ;;
+              spider) case "$2" in
+                    Python/3.11.5) printf '%s\\n' '  You will need to load all module(s) on any one of the lines below before the "Python/3.11.5" module is available to load.' '' '      GCCcore/12.3.0' >&2 ;;
+                  esac ;;
+              load) shift; for m in "$@"; do case "$m" in
+                    GCCcore/12.3.0) FAKE_GCCCORE=1 ;;
+                    Python/3.11.5) [ -n "$FAKE_GCCCORE" ] || return 1; PATH="$FAKE_MODULE_PYTHON:$PATH"; LOADEDMODULES=Python/3.11.5; export PATH LOADEDMODULES ;;
+                    *) return 1 ;;
+                  esac; done ;;
+            esac; }""")
+        return new
+
+    def test_python_found_as_a_module(self):
+        new = self.fake_modules()
+        out = self.setup_agents("--work-dir", str(self.work[0]), "--templates", "hello", "me@login.example")
+        self.assertIn("using Python 3.", out)
+        self.assertIn("module GCCcore/12.3.0 Python/3.11.5", out)
+        self.assertNotIn("Traceback", out)
+        launcher = self.rest / "python"
+        self.assertIn("module load GCCcore/12.3.0 Python/3.11.5", launcher.read_text())
+        self.assertEqual(json.loads((self.rest / "python.json").read_text())["modules"], "GCCcore/12.3.0 Python/3.11.5")
+        self.assertIn("module GCCcore/12.3.0 Python/3.11.5", self.profile()["remote_python"])
+        self.assertTrue((self.rest / "config.json").exists())                 # the server ran through it
+        self.assertEqual(self.identify(self.token_file.read_text().strip()).name, self.agent_name)
+        # the launcher saves the environment from before its modules, for the jobs the server starts
+        env = dict(self.env, HOME=str(self.remote_home), PATH=self.env["TEST_REMOTE_PATH"])
+        res = subprocess.run([str(launcher), "-c", textwrap.dedent("""\
+            import os, sys
+            sys.path.insert(0, sys.argv[1])
+            import rest_sandbox
+            child = rest_sandbox.child_env()
+            print(os.environ["PATH"].split(os.pathsep)[0])
+            print(child.get("PATH", "").split(os.pathsep)[0], child.get("LOADEDMODULES"), "HPCLIB_BASE_ENV" in child)
+            """), str(self.remote_home / "hpclib" / "servers")], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        server_path, child_line = res.stdout.splitlines()
+        self.assertEqual(server_path, str(new))                                  # the server has the module ...
+        self.assertEqual(child_line, f"{self.tmp / 'old-python'} None False")     # ... its children don't
+        # a rerun keeps it without searching again
+        out = self.setup_agents("--no-install", "me@login.example")
+        self.assertIn("kept the existing", out)
+
+    def test_python_given_explicitly(self):
+        self.fake_modules()
+        out = self.setup_agents("--work-dir", str(self.work[0]), "--templates", "hello",
+                                "--python-module", "GCCcore/12.3.0", "--python-module", "Python/3.11.5",
+                                "me@login.example")
+        self.assertIn("using Python 3.", out)
+        self.assertEqual(self.profile()["python_spec"], "modules:GCCcore/12.3.0 Python/3.11.5")
+        out = self.setup_agents("--no-install", "--remote-python", sys.executable, "me@login.example")
+        self.assertIn(f"({sys.executable})", out)
+        self.assertIn(f"exec {sys.executable}", (self.rest / "python").read_text())
+        out = self.setup_agents("--no-install", "--remote-python", str(self.tmp / "old-python" / "python3"),
+                                "me@login.example", expect=1)
+        self.assertIn("is not Python 3.9 or newer", out)
+
+    def test_no_python_anywhere(self):
+        self.fake_modules()
+        self.env["BASH_FUNC_module%%"] = "() { return 1; }"
+        out = self.setup_agents("--work-dir", str(self.work[0]), "--templates", "hello", "me@login.example", expect=1)
+        self.assertIn("found no Python 3.9 or newer", out)
+        self.assertIn("--remote-python", out)
+
+    def test_rest_tunnel_runs_the_launcher(self):
+        data = self.tmp / "tunnel-data"
+        (data / "rest").mkdir(parents=True)
+        launcher = data / "rest" / "python"
+        launcher.write_text('#!/bin/sh\necho "launcher $*"\n')
+        launcher.chmod(0o755)
+        tunnel = self.tmp / "tunnel"
+        tunnel.mkdir()
+        (tunnel / "configure_job.sh").write_text("")
+        env = dict(self.env, HPCTUNNELS_DATA_DIR=str(data), TUNNEL_DIR=str(tunnel), HPCSERVERS_DIR="/servers",
+                   PROCESS_PORT="1234")
+        script = REPO / "hpclib" / "tunnels" / "rest" / "sbatch_script.sh"
+        res = subprocess.run(["bash", str(script), "--allow", "/x"], env=env, capture_output=True, text=True)
+        self.assertIn("launcher /servers/rest_server.py --host 127.0.0.1 --port 1234 --allow /x", res.stdout)
+        res = subprocess.run(["bash", str(script)], env=dict(env, HPC_REST_PYTHON="/bin/echo"),
+                             capture_output=True, text=True)
+        self.assertIn("/servers/rest_server.py --host", res.stdout)            # an explicit Python wins
+        self.assertNotIn("launcher", res.stdout.split("\n", 1)[1])
 
     def test_existing_config_gets_a_sandbox(self):
         self.rest.mkdir(parents=True)

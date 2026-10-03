@@ -70,8 +70,10 @@ Then, on the cluster:
 On your machine, install the MCP SDK for the Python your LLM client will use (`python3 -m pip install mcp`). The
 script ends by printing the MCP client entry for this cluster (also saved as `mcp.json` in the profile); add it to
 Claude Desktop's config, or run the `claude mcp add-json` line it prints for Claude Code. `mcp_config.json` here
-shows its shape. Add `--local-root ~/Desktop/scans` to its `args` (or pass `--local-root` to `setup_agents`): it is
-the only local directory the model can read from or write to.
+shows its shape. Adding it is up to you: `setup_agents` doesn't change Claude's config, and the agent has no
+tools for the cluster until you add the entry and restart Claude. By default the entry lets the model read from
+and write to `~/Documents/Claude`, the Claude desktop app's working folder; run `setup_cluster.sh` (or
+`setup_agents`) with `--local-root ~/Desktop/scans` to use your scan directory instead, and paste the new entry.
 
 ## 2. Generate the scan
 

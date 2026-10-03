@@ -49,7 +49,7 @@ for ssh_arg in "$@"; do
   fi
 done
 printf '%s\n' "$*" > "$TEST_SSH_ARGS_FILE"
-cd "$TEST_REMOTE_HOME"
+cd "${TEST_REMOTE_START_DIR:-$TEST_REMOTE_HOME}"   # set it to act like a .bashrc that cds away
 HOME="$TEST_REMOTE_HOME" PATH="$TEST_REMOTE_PATH" exec bash -c "$remote"
 SCRIPT
 chmod +x "$test_dir/bin/ssh"
@@ -179,6 +179,14 @@ done
 [ -z "$(ls -A "$remote_home" | grep '\.trash\.')" ] || fail 'did not delete the moved-aside files'
 set_version "$HPCLIB_DIR/hpclib.sh" "$local_version"
 
+# a .bashrc that changes directory doesn't move relative installs out of the home directory
+mkdir -p "$test_dir/elsewhere"
+set_version "$HPCLIB_DIR/hpclib.sh" 99.4.0
+TEST_REMOTE_START_DIR="$test_dir/elsewhere" install_hpclib --target relocated login.example >/dev/null
+[ -f "$remote_home/relocated/hpclib.sh" ] || fail 'a relative target was not installed under the remote home'
+[ -z "$(ls -A "$test_dir/elsewhere")" ] || fail 'installed into the directory .bashrc moved to'
+set_version "$HPCLIB_DIR/hpclib.sh" "$local_version"
+
 # launch_tunnel runs start_tunnel.sh from HPCLIB_REMOTE_INSTALL_LOCATION
 (
   HPCLIB_REMOTE_INSTALL_LOCATION='~/tools/my hpclib'
@@ -186,7 +194,10 @@ set_version "$HPCLIB_DIR/hpclib.sh" "$local_version"
   pssh() { printf '%s\n' "${@: -1}" > "$test_dir/launch-command"; }
   launch_tunnel -P 5050 login.example flask >/dev/null 2>&1
 )
-eval "set -- $(cat "$test_dir/launch-command")"
-assert_equal "$2" 'tools/my hpclib/tunnels/start_tunnel.sh'
+launch_command=$(cat "$test_dir/launch-command")
+assert_contains "$launch_command" '"$HOME"/tools/my\ hpclib/tunnels/start_tunnel.sh'   # anchored at the remote home
+# as the remote shell sees it, with its own $HOME
+(HOME=/remote-home; eval "set -- $launch_command"; printf '%s\n' "$2") > "$test_dir/launch-script"
+assert_equal "$(cat "$test_dir/launch-script")" '/remote-home/tools/my hpclib/tunnels/start_tunnel.sh'
 
 echo 'install_hpclib tests passed'

@@ -54,6 +54,13 @@ Protections
     (upload, mkdir, delete); they answer 403. Reading files and all
     SLURM routes stay available - note a job submitted through sbatch
     can still write files when it runs.
+  - Template proposals from clients wait for the owner's
+    `--approve-template` unless the server runs with
+    `--auto-approve-templates` (or $HPC_REST_AUTO_APPROVE_TEMPLATES=new|all):
+    then a valid proposal for a new template name is approved at once,
+    and with `=all` one that replaces an existing template too (the old
+    one is kept in templates/.replaced/). Only while template jobs are
+    sandboxed; otherwise proposals still wait.
   - Every request is appended to an audit log (JSON lines).
 
 Endpoints (all responses are JSON unless noted)    scope
@@ -88,7 +95,7 @@ Endpoints (all responses are JSON unless noted)    scope
 
 Usage: rest_server.py [--host H] [--port P] [--allow DIR ...] [--config F]
                       [--token-file F] [--command-timeout S] [--max-upload N]
-                      [--disable-file-changes]
+                      [--disable-file-changes] [--auto-approve-templates[=new|all]]
        rest_server.py --add-token NAME --scopes read,submit --token-allow DIR [...]
        rest_server.py --revoke-token NAME | --revoke-token-hash SHA256 | --lookup-token-hash SHA256
        rest_server.py --list-tokens | --hash-token-file
@@ -96,6 +103,13 @@ Usage: rest_server.py [--host H] [--port P] [--allow DIR ...] [--config F]
        rest_server.py --init-config [--config-base F] [--rebuild] [--no-sandbox] [--sandbox-bind DIR ...]
        rest_server.py --probe-sandbox
 """
+import sys
+
+if sys.version_info < (3, 7):  # http.server.ThreadingHTTPServer and subprocess.run(capture_output=...)
+    sys.exit(f"hpclib's REST server needs Python 3.7 or newer, and {sys.executable} is "
+             f"{sys.version.split()[0]}. On your own machine, `setup_agents ADDRESS --rebuild` finds a newer "
+             f"Python on the cluster (on PATH or as a module) and runs the server with it.")
+
 import abc
 import argparse
 import hashlib
@@ -110,7 +124,6 @@ import signal
 import socket
 import stat
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -712,6 +725,14 @@ class HPCRESTHandler(RESTHandler):
             ("GET", "/files/read"): self.do_read_file,
             ("GET", "/files/tail"): self.do_tail_file,
             ("POST", "/files/mkdir"): self.do_mkdir,
+            # owner only: not in ROUTE_SCOPES, so they need the `*` scope
+            ("GET", "/admin/proposals"): self.do_admin_proposals,
+            ("GET", "/admin/proposals/diff"): self.do_admin_proposal_diff,
+            ("POST", "/admin/proposals/approve"): self.do_admin_approve,
+            ("POST", "/admin/proposals/reject"): self.do_admin_reject,
+            ("GET", "/admin/audit"): self.do_admin_audit,
+            ("GET", "/admin/tokens"): self.do_admin_tokens,
+            ("POST", "/admin/tokens/revoke"): self.do_admin_revoke_token,
         }
         for cmd in self.SLURM_COMMANDS:
             routes[("POST", f"/slurm/{cmd}")] = self._slurm_route(cmd)
@@ -799,6 +820,115 @@ class HPCRESTHandler(RESTHandler):
         job_id = self.query_value("id", required=True)
         self.audit_detail = {"job_id": job_id}
         return 200, self.jobs.cancel(job_id, self.identity.name, self.see_all_jobs)
+
+    # owner review (`*` scope)
+    def do_admin_proposals(self):
+        return 200, self.jobs.review_proposals()
+
+    def do_admin_proposal_diff(self):
+        return 200, self.jobs.proposal_detail(self.query_value("name", required=True))
+
+    def do_admin_approve(self):
+        body = self.read_json()
+        name = body.get("name") or self.query_value("name", required=True)
+        replace = bool(body.get("replace")) or self.query_flag("replace")
+        out = self.jobs.approve_proposal(name, replace=replace, approved_by=self.identity.name)
+        self.audit_detail = {"approved": name, "replace": replace}
+        return 200, out
+
+    def do_admin_reject(self):
+        body = self.read_json()
+        name = body.get("name") or self.query_value("name", required=True)
+        reason = body.get("reason", self.query_value("reason"))
+        out = self.jobs.reject_proposal(name, reason=reason, rejected_by=self.identity.name)
+        self.audit_detail = {"rejected": name}
+        return 200, out
+
+    AUDIT_WINDOW = 8 << 20   # bytes read from the end of the audit log
+
+    def _audit_entries(self):
+        """Entries from the last AUDIT_WINDOW bytes of the audit log, oldest first."""
+        audit = self.server.audit
+        if audit is None:
+            raise RESTError(503, "the audit log is off on this server (set `audit_log` in the config)")
+        try:
+            with open(audit.path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - self.AUDIT_WINDOW))
+                chunk = f.read()
+        except FileNotFoundError:
+            return [], False
+        truncated = size > self.AUDIT_WINDOW
+        if truncated:
+            chunk = chunk.split(b"\n", 1)[-1]  # drop the partial first line
+        entries = []
+        for line in chunk.splitlines():
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                entries.append(entry)
+        return entries, truncated
+
+    def do_admin_audit(self):
+        limit = self.query_int("limit", 200, minimum=1, maximum=5000)
+        since = self.query_value("since")
+        try:
+            since = float(since) if since is not None else None
+        except ValueError:
+            raise RESTError(400, "`since` must be a Unix time in seconds")
+        token, route = self.query_value("token"), self.query_value("route")
+        status = self.query_int("status", None, minimum=100, maximum=599)
+        entries, truncated = self._audit_entries()
+        picked = [e for e in entries
+                  if (since is None or (e.get("time") or 0) > since)
+                  and (token is None or e.get("token") == token)
+                  and (route is None or str(e.get("path", "")).split("?", 1)[0].startswith(route))
+                  and (status is None or e.get("status") == status)]
+        more = len(picked) > limit
+        picked = picked[-limit:]
+        return 200, {"entries": picked, "more": more, "window_truncated": truncated,
+                     "latest": picked[-1]["time"] if picked else since}
+
+    def do_admin_tokens(self):
+        auth = self.server.auth
+        entries = TokenAuth.read_tokens_file(auth.tokens_file) if auth.tokens_file and \
+            os.path.exists(auth.tokens_file) else []
+        try:
+            audit, _ = self._audit_entries()
+        except RESTError:
+            audit = None
+        last_used = {}
+        for e in audit or ():
+            if e.get("token"):
+                last_used[e["token"]] = e.get("time")
+        valid = {e["name"] for e in auth.scoped_tokens()}
+        tokens = [{"name": TokenAuth.OWNER, "scopes": ["*"], "allow": None, "created": None,
+                   "source": "token file" if auth.source and not auth.source.startswith("$") else auth.source,
+                   "active": True, "last_used": last_used.get(TokenAuth.OWNER)}]
+        for e in entries:
+            tokens.append({"name": e.get("name"), "scopes": e.get("scopes"), "allow": e.get("allow"),
+                           "created": e.get("created"), "active": e.get("name") in valid,
+                           "last_used": last_used.get(e.get("name"))})
+        return 200, {"tokens": tokens, "you": self.identity.name,
+                     "last_used_known": audit is not None}
+
+    def do_admin_revoke_token(self):
+        auth = self.server.auth
+        body = self.read_json()
+        name = body.get("name") or self.query_value("name", required=True)
+        if name == TokenAuth.OWNER:
+            raise RESTError(400, "the owner token can't be revoked here; replace its token file instead")
+        if not auth.tokens_file:
+            raise RESTError(503, "this server has no scoped tokens file")
+        try:
+            TokenAuth.revoke_token(auth.tokens_file, name)
+        except ValueError as e:
+            raise RESTError(404, str(e))
+        self.audit_detail = {"revoked": name}
+        return 200, {"revoked": name}
 
     # SLURM
     def _slurm_route(self, command):
@@ -1074,6 +1204,11 @@ def parse_args(argv=None):
                         default=os.environ.get("HPC_REST_DISABLE_FILE_CHANGES", "").lower()
                                 in ("1", "true", "yes", "on"),
                         help="refuse uploads, mkdir, and deletes (also $HPC_REST_DISABLE_FILE_CHANGES=1)")
+    parser.add_argument("--auto-approve-templates", nargs="?", const="new", choices=("new", "all"),
+                        default=os.environ.get("HPC_REST_AUTO_APPROVE_TEMPLATES") or None,
+                        help="approve valid template proposals without review: `new` (the default when given) "
+                             "for new template names, `all` also for replacements; only while jobs are sandboxed "
+                             "(also $HPC_REST_AUTO_APPROVE_TEMPLATES)")
     tokens = parser.add_argument_group("token management (run on the cluster; exits afterwards)")
     tokens.add_argument("--add-token", metavar="NAME", help="mint a scoped token and print it once")
     tokens.add_argument("--scopes", default="read",
@@ -1266,7 +1401,7 @@ def probe_sandbox(config):
         print("  (probed on this node; jobs run on compute nodes, where GET /sandbox reports again)")
     return test is None or test.get("passed", False)
 
-def build_jobs(config, command_timeout):
+def build_jobs(config, command_timeout, auto_approve=None):
     runner = rest_jobs.SlurmRunner(timeout=command_timeout)
     templates = rest_jobs.TemplateStore(config["templates_dir"])
     return rest_jobs.JobManager(
@@ -1279,6 +1414,7 @@ def build_jobs(config, command_timeout):
         cluster_notes=config.get("cluster_notes"),
         poll_interval=config.get("poll_interval", 10),
         sandbox=rest_sandbox.Sandbox(config.get("sandbox"), data_dir=rest_data_dir()),
+        auto_approve=auto_approve,
     )
 
 def protected_paths(config, auth):
@@ -1310,7 +1446,9 @@ def main(argv=None, handler_class=HPCRESTHandler):
     if base_dir is None and opts.allow:
         base_dir = os.path.expanduser(opts.allow[0])
     whitelist = PathWhitelist(opts.allow or None, base_dir=base_dir, deny=protected_paths(config, auth))
-    jobs = build_jobs(config, opts.command_timeout)
+    if opts.auto_approve_templates not in (None, "new", "all"):
+        raise SystemExit("--auto-approve-templates / $HPC_REST_AUTO_APPROVE_TEMPLATES must be new or all")
+    jobs = build_jobs(config, opts.command_timeout, opts.auto_approve_templates)
     audit = AuditLog(config["audit_log"]) if config.get("audit_log") else None
 
     if opts.host not in ("127.0.0.1", "localhost", "::1"):
@@ -1320,6 +1458,9 @@ def main(argv=None, handler_class=HPCRESTHandler):
     print(f"  allowed dirs: {', '.join(whitelist.roots) if whitelist.restricted else 'unrestricted'}")
     print(f"  file changes: {'disabled' if opts.disable_file_changes else 'enabled'}")
     print(f"  templates: {jobs.templates.directory}")
+    policy = jobs.proposal_policy()
+    print(f"  template proposals: {'approved automatically' if policy['review'] == 'automatic' else 'reviewed by you'}"
+          f" ({policy['detail']})")
     print(f"  audit log: {config.get('audit_log') or 'off'}")
     sandbox = jobs.sandbox.describe()
     if sandbox["effective"] == "singularity":
