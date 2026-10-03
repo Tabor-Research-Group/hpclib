@@ -319,6 +319,102 @@ class TestAdmin(WorkflowTestCase):
         self.assertEqual((len(limited["entries"]), limited["more"]), (1, True))
         self.assertEqual(self.owner.audit(route="/admin")["entries"][0]["token"], "owner")
 
+    def config_file(self, content=None):
+        path = self.data / "rest" / "config.json"
+        path.write_text(json.dumps(content if content is not None else
+                                   {"limits": {"max_cpus": 8}, "tokens_file": str(self.tokens_file)}))
+        path.chmod(0o600)
+        self.server.config_path = str(path)
+        return path
+
+    def test_config_read(self):
+        path = self.config_file()
+        out = self.owner.admin_config()
+        self.assertEqual((out["path"], out["config"]["limits"]), (str(path), {"max_cpus": 8}))
+        self.assertIn("environments", out["editable"])
+        self.assertNotIn("tokens_file", out["editable"])
+        self.assertEqual(out["effective"]["limits"]["max_concurrent_jobs"], 4)
+        for client in (self.llm, self.builder):
+            self.expect_error(403, client.admin_config)
+            self.expect_error(403, client.update_config, {"cluster_notes": "x"})
+
+    def test_config_update_applies_now(self):
+        path = self.config_file()
+        out = self.owner.update_config({"environments": {"modules": ["WebProxy"]}, "cluster_notes": "use scratch",
+                                        "limits": {"max_concurrent_jobs": 1, "max_time": "00:30:00"}})
+        self.assertEqual(out["changed"], ["cluster_notes", "environments", "limits"])
+        saved = json.loads(path.read_text())
+        self.assertEqual(saved["environments"], {"modules": ["WebProxy"]})
+        self.assertEqual(saved["tokens_file"], str(self.tokens_file))             # untouched sections stay
+        self.assertTrue(os.path.exists(out["backup"]))
+        self.assertEqual(json.loads(Path(out["backup"]).read_text())["limits"], {"max_cpus": 8})
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        info = self.llm.cluster()                                                    # no restart needed
+        self.assertEqual(info["environments"]["sync_modules"], ["WebProxy"])
+        self.assertEqual(info["notes"], "use scratch")
+        self.assertEqual(info["limits"]["max_concurrent_jobs"], 1)
+        payload = self.expect_error(422, self.llm.submit_job, "hello", resources={"time": "01:00:00"},
+                                    dry_run=True)
+        self.assertIn("time", json.dumps(payload))
+        self.owner.update_config({"limits": None})                                   # back to the defaults
+        self.assertNotIn("limits", json.loads(path.read_text()))
+        self.assertEqual(self.llm.cluster()["limits"]["max_concurrent_jobs"], 4)
+
+    def test_config_update_refuses_bad_values(self):
+        path = self.config_file()
+        before = path.read_text()
+        for changes in ({"tokens_file": "/tmp/x"}, {"limits": {"max_cpus": "lots"}}, {"limits": {"bogus": 1}},
+                        {"limits": {"max_time": "forever"}}, {"environments": {"modules": ["a; rm -rf ~"]}},
+                        {"sandbox": {"method": "chroot"}}, {"poll_interval": 0}, {"cluster_notes": 5}):
+            self.expect_error(422, self.owner.update_config, changes)
+        self.expect_error(400, self.owner.request, "PUT", "/admin/config", body={"limits": {}})
+        self.assertEqual(path.read_text(), before)
+
+    def test_config_environment_variables(self):
+        path = self.config_file()
+        self.owner.update_config({"environment": {"all": {"LM_LICENSE_FILE": "27000@lic.example"},
+                                                  "jobs": {"OMP_STACKSIZE": "512M", "LM_LICENSE_FILE": "1@jobs"},
+                                                  "syncs": {"UV_INDEX_URL": "https://pypi.example/simple"}}})
+        self.assertEqual(json.loads(path.read_text())["environment"]["jobs"]["OMP_STACKSIZE"], "512M")
+        info = self.llm.cluster()
+        self.assertEqual(info["job_environment"], ["LM_LICENSE_FILE", "OMP_STACKSIZE"])    # names only
+        self.assertNotIn("27000@lic.example", json.dumps(info))
+        script = self.llm.submit_job("hello", dry_run=True)["script"]
+        self.assertIn("export LM_LICENSE_FILE=1@jobs", script)                            # jobs wins over all
+        self.assertIn("export OMP_STACKSIZE=512M", script)
+        self.assertNotIn("UV_INDEX_URL", script)                                          # that one is for syncs
+        self.assertEqual(self.jobs.environments.sync_env,
+                         {"LM_LICENSE_FILE": "27000@lic.example", "UV_INDEX_URL": "https://pypi.example/simple"})
+        effective = self.owner.admin_config()["effective"]["environment"]
+        self.assertEqual(effective["jobs"]["LM_LICENSE_FILE"], "1@jobs")
+        # the job body sees them: run the generated (unsandboxed) script
+        res = subprocess.run(["bash", "-c", script.replace("echo", "env | grep -E 'OMP_STACKSIZE|LM_LIC'; echo", 1)],
+                             capture_output=True, text=True, timeout=30, cwd=self.llm_root)
+        self.assertIn("OMP_STACKSIZE=512M", res.stdout)
+        self.owner.update_config({"environment": None})
+        self.assertEqual(self.llm.cluster()["job_environment"], [])
+
+    def test_config_environment_refuses(self):
+        path = self.config_file()
+        before = path.read_text()
+        for env in ({"jobs": {"PATH": "/evil"}}, {"all": {"LD_PRELOAD": "/x.so"}}, {"jobs": {"SINGULARITY_BIND": "/"}},
+                    {"jobs": {"APPTAINERENV_PATH": "/"}}, {"syncs": {"BASH_ENV": "/x"}},
+                    {"jobs": {"HPC_PARAM_INPUT": "x"}}, {"jobs": {"SLURM_JOB_ID": "1"}}, {"jobs": {"1BAD": "x"}},
+                    {"jobs": {"A": "two\nlines"}}, {"jobs": {"A": 5}}, {"everyone": {"A": "x"}}, {"jobs": ["A=x"]}):
+            payload = self.expect_error(422, self.owner.update_config, {"environment": env})
+            self.assertIn("environment", payload["error"])
+        self.assertEqual(path.read_text(), before)
+
+    def test_config_keeps_running_syncs(self):
+        self.config_file()
+        envs = rest_jobs.rest_envs.EnvironmentManager({})
+        envs.syncs["s1"] = {"id": "s1", "token": "owner", "state": "running", "project": "/x"}
+        self.jobs.environments = envs
+        self.owner.update_config({"environments": {"timeout": 60}})
+        self.assertIsNot(self.jobs.environments, envs)
+        self.assertIn("s1", self.jobs.environments.syncs)
+        self.assertEqual(self.jobs.environments.timeout, 60)
+
     def reader_client(self):
         return RESTClient(self.url, token=self.reader_token)
 

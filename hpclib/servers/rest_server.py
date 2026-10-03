@@ -489,8 +489,9 @@ class RESTServer(http.server.ThreadingHTTPServer):
 
     def __init__(self, address, handler_class, auth: TokenAuth, whitelist: PathWhitelist,
                  command_timeout=120, max_upload=1 << 30, disable_file_changes=False,
-                 jobs: 'rest_jobs.JobManager' = None, audit: AuditLog = None):
+                 jobs: 'rest_jobs.JobManager' = None, audit: AuditLog = None, config_path=None):
         self.auth = auth
+        self.config_path = config_path   # for GET/PUT /admin/config
         self.whitelist = whitelist
         self.command_timeout = command_timeout
         self.max_upload = max_upload
@@ -757,6 +758,8 @@ class HPCRESTHandler(RESTHandler):
             ("GET", "/admin/audit"): self.do_admin_audit,
             ("GET", "/admin/tokens"): self.do_admin_tokens,
             ("POST", "/admin/tokens/revoke"): self.do_admin_revoke_token,
+            ("GET", "/admin/config"): self.do_admin_config,
+            ("PUT", "/admin/config"): self.do_admin_update_config,
         }
         for cmd in self.SLURM_COMMANDS:
             routes[("POST", f"/slurm/{cmd}")] = self._slurm_route(cmd)
@@ -970,6 +973,51 @@ class HPCRESTHandler(RESTHandler):
         self.audit_detail = {"revoked": name}
         return 200, {"revoked": name}
 
+    def do_admin_config(self):
+        path = self.server.config_path
+        if not path:
+            raise RESTError(503, "this server was started without a config file path")
+        raw = read_config_file(path)
+        jobs = self.jobs
+        return 200, {
+            "path": path,
+            "config": raw,
+            "editable": list(EDITABLE_CONFIG),
+            "effective": {
+                "limits": jobs.limits.to_json(),
+                "cluster_notes": jobs.cluster_notes,
+                "poll_interval": jobs.poll_interval,
+                "environment": {"jobs": jobs.job_env,
+                                "syncs": jobs.environments.sync_env if jobs.environments is not None else {}},
+                "sandbox": jobs.sandbox.describe(),
+                "environments": jobs.environments.describe() if jobs.environments is not None else None,
+                "template_proposals": jobs.proposal_policy(),
+            },
+        }
+
+    def do_admin_update_config(self):
+        path = self.server.config_path
+        if not path:
+            raise RESTError(503, "this server was started without a config file path")
+        body = self.read_json()
+        changes = body.get("changes")
+        if not isinstance(changes, dict) or not changes:
+            raise RESTError(400, "send {\"changes\": {SECTION: VALUE or null, ...}}; null puts a section back to "
+                                 "its default", editable=list(EDITABLE_CONFIG))
+        with CONFIG_LOCK:
+            raw = read_config_file(path)
+            try:
+                new, built = updated_config(raw, changes)
+            except (ValueError, TypeError) as e:
+                raise RESTError(422, f"invalid config: {e}", editable=list(EDITABLE_CONFIG))
+            backup = write_config_file(path, new)
+            apply_config(self.server, built)
+        self.audit_detail = {"config": sorted(changes)}
+        out = {"changed": sorted(changes), "config": new, "backup": backup, "applied": True}
+        if "sandbox" in changes and built["sandbox"].describe().get("effective") != "singularity":
+            out["warning"] = "template jobs are no longer sandboxed with this config"
+        return 200, out
+
     # SLURM
     def _slurm_route(self, command):
         def route(_cmd=command):
@@ -1175,7 +1223,7 @@ class HPCRESTHandler(RESTHandler):
 ##
 
 CONFIG_KEYS = {"limits", "templates_dir", "jobs_db", "audit_log", "tokens_file", "cluster_notes",
-               "poll_interval", "proposals_dir", "module_command", "sandbox", "environments"}
+               "poll_interval", "proposals_dir", "module_command", "sandbox", "environments", "environment"}
 
 def load_config(path):
     """
@@ -1185,7 +1233,8 @@ def load_config(path):
        "poll_interval": SECONDS, "proposals_dir": DIR,
        "module_command": ["bash", "-lc", "module \"$@\" 2>&1", "hpclib-module"],
        "sandbox": {...rest_sandbox.Sandbox...},
-       "environments": {...rest_envs.EnvironmentManager...}}
+       "environments": {...rest_envs.EnvironmentManager...},
+       "environment": {"all": {VAR: VALUE}, "jobs": {...}, "syncs": {...}}}
     """
     explicit = path is not None
     path = os.path.expanduser(path or os.path.join(rest_data_dir(), "config.json"))
@@ -1213,8 +1262,100 @@ def load_config(path):
     environments = config.get("environments")
     if environments is not None and not isinstance(environments, dict):
         raise ValueError("`environments` must be an object")
+    rest_jobs.check_env_section(config.get("environment"))
     config["path"] = path
     return config
+
+# Sections of config.json the owner may change while the server runs (PUT /admin/config);
+# paths, the module command and tokens stay as setup_agents wrote them.
+EDITABLE_CONFIG = ("limits", "cluster_notes", "environments", "environment", "sandbox", "poll_interval")
+CONFIG_LOCK = threading.Lock()
+
+
+def read_config_file(path):
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise RESTError(500, f"{path} does not hold a JSON object")
+    return data
+
+
+def _check_limits(limits):
+    if not isinstance(limits, dict):
+        raise ValueError("`limits` must be an object")
+    for key, value in limits.items():
+        if key in ("partitions", "accounts", "qos"):
+            if value is not None and (not isinstance(value, list) or not all(isinstance(v, str) for v in value)):
+                raise ValueError(f"limits.{key} must be a list of names, or null for any")
+        elif key in ("max_time", "max_mem"):
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"limits.{key} must be a string such as \"1-00:00:00\" or \"64G\", or null")
+        elif value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise ValueError(f"limits.{key} must be a non-negative integer, or null for no cap")
+    return rest_jobs.ResourceLimits(**limits)
+
+
+def updated_config(raw, changes):
+    """`raw` with `changes` applied (a null value removes the section), validated; returns (new, built)."""
+    not_editable = sorted(set(changes) - set(EDITABLE_CONFIG))
+    if not_editable:
+        raise ValueError(f"{not_editable} can't be changed here (editable: {list(EDITABLE_CONFIG)})")
+    new = dict(raw)
+    for key, value in changes.items():
+        if value is None:
+            new.pop(key, None)
+        else:
+            new[key] = value
+    notes = new.get("cluster_notes")
+    if notes is not None and (not isinstance(notes, str) or len(notes) > 16384):
+        raise ValueError("`cluster_notes` must be text of at most 16384 characters")
+    poll = new.get("poll_interval", 10)
+    if isinstance(poll, bool) or not isinstance(poll, (int, float)) or not 1 <= poll <= 600:
+        raise ValueError("`poll_interval` must be between 1 and 600 seconds")
+    sandbox = rest_sandbox.Sandbox(new.get("sandbox"), data_dir=rest_data_dir())
+    env = rest_jobs.check_env_section(new.get("environment"))
+    built = {
+        "job_env": env["jobs"],
+        "limits": _check_limits(new.get("limits", {})),
+        "cluster_notes": notes,
+        "poll_interval": poll,
+        "sandbox": sandbox,
+        "environments": rest_envs.EnvironmentManager(new.get("environments"), sandbox=sandbox,
+                                                     data_dir=rest_data_dir(), sync_env=env["syncs"]),
+    }
+    return new, built
+
+
+def write_config_file(path, config):
+    """Write `config`, keeping the old file as PATH.replaced-TIME; returns that name (or None)."""
+    backup = None
+    if os.path.exists(path):
+        stamp = time.strftime('%Y%m%dT%H%M%S')
+        backup, n = f"{path}.replaced-{stamp}", 2
+        while os.path.exists(backup):
+            backup, n = f"{path}.replaced-{stamp}-{n}", n + 1
+        shutil.copy2(path, backup)
+    TokenAuth.write_private(path, json.dumps(config, indent=2) + "\n")
+    return backup
+
+
+def apply_config(server, built):
+    """Use a validated config from now on, without restarting."""
+    jobs = server.jobs
+    jobs.limits = built["limits"]
+    jobs.cluster_notes = built["cluster_notes"]
+    jobs.poll_interval = built["poll_interval"]
+    jobs.job_env = built["job_env"]
+    jobs.sandbox = built["sandbox"]
+    if server.sandbox_prober is not None:
+        server.sandbox_prober = rest_sandbox.Prober(jobs.sandbox, server.sandbox_prober.base_dir)
+    envs = built["environments"]
+    if jobs.environments is not None:
+        envs.syncs = jobs.environments.syncs   # keep the sync history and running syncs
+    jobs.environments = envs
+
 
 def parse_size(size):
     size = str(size).strip().upper()
@@ -1454,6 +1595,7 @@ def probe_sandbox(config):
 def build_jobs(config, command_timeout, auto_approve=None):
     runner = rest_jobs.SlurmRunner(timeout=command_timeout)
     sandbox = rest_sandbox.Sandbox(config.get("sandbox"), data_dir=rest_data_dir())
+    env = rest_jobs.check_env_section(config.get("environment"))
     templates = rest_jobs.TemplateStore(config["templates_dir"])
     return rest_jobs.JobManager(
         templates=templates,
@@ -1466,7 +1608,9 @@ def build_jobs(config, command_timeout, auto_approve=None):
         poll_interval=config.get("poll_interval", 10),
         sandbox=sandbox,
         auto_approve=auto_approve,
-        environments=rest_envs.EnvironmentManager(config.get("environments"), sandbox=sandbox, data_dir=rest_data_dir()),
+        environments=rest_envs.EnvironmentManager(config.get("environments"), sandbox=sandbox, data_dir=rest_data_dir(),
+                                                  sync_env=env["syncs"]),
+        job_env=env["jobs"],
     )
 
 def protected_paths(config, auth):
@@ -1533,7 +1677,7 @@ def main(argv=None, handler_class=HPCRESTHandler):
             auth=auth, whitelist=whitelist,
             command_timeout=opts.command_timeout, max_upload=opts.max_upload,
             disable_file_changes=opts.disable_file_changes,
-            jobs=jobs, audit=audit,
+            jobs=jobs, audit=audit, config_path=config["path"],
         )
     except KeyboardInterrupt:
         pass

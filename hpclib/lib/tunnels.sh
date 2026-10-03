@@ -1198,7 +1198,7 @@ function setup_agents {
 # --review-templates holds every proposal. Other options (e.g. --time=2:00:00)
 # go to launch_tunnel.
 function agent_tunnel {
-  local name host port process_port d allow=() launch=() approve=all
+  local name host port process_port d allow=() launch=() approve
   if [ "$#" -lt 1 ]; then
     echo "usage: agent_tunnel NAME|[user@]host [--review-templates|--auto-approve-templates=new] [launch_tunnel options]" >&2
     _hpclib_agent_profiles list >&2
@@ -1213,6 +1213,10 @@ function agent_tunnel {
   port=$(_hpclib_agent_profiles get "$name" port)
   process_port=$(_hpclib_agent_profiles get "$name" process_port)
   while IFS= read -r d; do [ -n "$d" ] && allow+=(--allow "$d"); done < <(_hpclib_agent_lines "$name" work_dirs)
+  # the profile's tunnel settings (the console's settings page); options given here win
+  approve=$(_hpclib_agent_profiles get "$name" auto_approve_templates 2>/dev/null || echo all)
+  [ "$approve" = review ] && approve=''
+  while IFS= read -r d; do [ -n "$d" ] && launch+=("$d"); done < <(_hpclib_agent_lines "$name" tunnel_args)
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --auto-approve-templates|--auto-approve-templates=new) approve=new ;;

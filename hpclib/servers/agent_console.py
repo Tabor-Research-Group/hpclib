@@ -20,6 +20,9 @@ The front end depends only on the routes below; nothing here depends on it.
   GET  /api/clusters                          profiles + tunnel state, no token values
   GET  /api/clusters/NAME
   GET  /api/clusters/NAME/mcp                 the MCP client entry setup_agents wrote
+  GET  /api/clusters/NAME/settings            this machine's tunnel settings for the cluster
+  PUT  /api/clusters/NAME/settings            {"auto_approve_templates": all|new|review,
+                                               "tunnel_args": ["--time=12:00:00", ...]}
   POST /api/clusters/NAME/tunnel/start        runs agent_tunnel NAME ({"auto_approve_templates": all|new|review})
   POST /api/clusters/NAME/tunnel/stop         runs agent_stop NAME
   GET  /api/clusters/NAME/tunnel/log?lines=N  the console's log of that tunnel
@@ -482,6 +485,10 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             rest = parts[2:]
             if not rest and verb == "GET":
                 return 200, dict(c.describe(profile), ok=True)
+            if rest == ["settings"] and verb == "GET":
+                return 200, dict(self.tunnel_settings(profile), ok=True)
+            if rest == ["settings"] and verb == "PUT":
+                return 200, dict(self.save_tunnel_settings(profile, self.json_body()), ok=True)
             if rest == ["mcp"] and verb == "GET":
                 return 200, self.mcp_entry(profile)
             if rest == ["tunnel", "start"] and verb == "POST":
@@ -542,6 +549,32 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         found, status = c.for_live(proposals)
         found.sort(key=lambda p: p.get("proposed") or 0, reverse=True)
         return 200, {"ok": True, "proposals": found, "clusters": status}
+
+    @staticmethod
+    def tunnel_settings(profile):
+        return {"cluster": profile["name"],
+                "auto_approve_templates": profile.get("auto_approve_templates") or "all",
+                "tunnel_args": profile.get("tunnel_args") or [],
+                "modes": list(agent_profiles.APPROVE_MODES),
+                "tunnel_arg_pattern": agent_profiles.TUNNEL_ARG_RE.pattern,
+                "applies": "the next time the tunnel starts"}
+
+    def save_tunnel_settings(self, profile, body):
+        unknown = set(body) - {"auto_approve_templates", "tunnel_args"}
+        if unknown:
+            raise ConsoleError(400, f"unknown settings {sorted(unknown)}")
+        mode = body.get("auto_approve_templates", profile.get("auto_approve_templates") or "all")
+        if mode not in agent_profiles.APPROVE_MODES:
+            raise ConsoleError(422, f"auto_approve_templates must be one of {list(agent_profiles.APPROVE_MODES)}")
+        args = body.get("tunnel_args", profile.get("tunnel_args") or [])
+        if not isinstance(args, list) or not all(isinstance(a, str) and agent_profiles.TUNNEL_ARG_RE.fullmatch(a)
+                                                 for a in args):
+            raise ConsoleError(422, "tunnel_args must be sbatch options like --time=12:00:00 or --mem=2gb "
+                                    "(time, mem, partition, account, qos, cpus-per-task, constraint)")
+        fresh = agent_profiles.load(profile["name"]) or profile
+        fresh.update(auto_approve_templates=mode, tunnel_args=args)
+        agent_profiles.save(fresh)
+        return self.tunnel_settings(fresh)
 
     @staticmethod
     def mcp_entry(profile):

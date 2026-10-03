@@ -282,9 +282,214 @@ async function activityPage() {
   ];
 }
 
+// ---------------------------------------------------------------- settings
+
+const TUNNEL_FIELDS = [
+  ["time", "Time limit", "e.g. 12:00:00 or 1-00:00:00 (default 8:00:00)"],
+  ["mem", "Memory", "e.g. 2gb (default 1gb)"],
+  ["partition", "Partition", "default: the cluster's"],
+];
+const LIMIT_FIELDS = [
+  ["max_time", "Longest job", "text", "1-00:00:00"],
+  ["max_mem", "Most memory per job", "text", "128G"],
+  ["max_cpus", "Most CPUs per job", "int"],
+  ["max_nodes", "Most nodes per job", "int"],
+  ["max_gpus", "Most GPUs per job", "int"],
+  ["max_concurrent_jobs", "Jobs at once", "int"],
+  ["max_array_tasks", "Tasks per array", "int"],
+  ["partitions", "Allowed partitions", "list"],
+];
+
+const ENV_SCOPES = [
+  ["all", "Jobs and syncs", "e.g. a license server"],
+  ["jobs", "Template jobs only", "e.g. OMP_STACKSIZE=512M"],
+  ["syncs", "Environment syncs only", "e.g. UV_INDEX_URL or HTTPS_PROXY"],
+];
+const envText = (vars) => Object.entries(vars || {}).map(([k, v]) => `${k}=${v}`).join("\n");
+function envParse(text, label) {
+  const out = {};
+  for (const line of lines(text)) {
+    if (line.startsWith("#")) continue;
+    const i = line.indexOf("=");
+    if (i < 1) throw new Error(`${label}: "${line}" is not NAME=value`);
+    out[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  }
+  return out;
+}
+
+const words = (text) => text.split(/[\s,]+/).map((w) => w.trim()).filter(Boolean);
+const lines = (text) => text.split("\n").map((w) => w.trim()).filter(Boolean);
+
+function field(label, input, hint) {
+  return el("label", { class: "field" }, el("span", {}, label), input, hint ? el("small", { class: "muted" }, hint) : null);
+}
+
+function saveButton(label, fn, out) {
+  const b = el("button", { class: "primary", type: "button" }, label);
+  b.addEventListener("click", busy(b, async () => {
+    out.replaceChildren();
+    try {
+      out.replaceChildren(el("span", { class: "saved" }, await fn()));
+    } catch (err) {
+      out.replaceChildren(errorBox(err));
+    }
+  }));
+  return b;
+}
+
+async function tunnelSettings(c) {
+  const s = await api(cluster(c.name) + "/settings");
+  const mode = el("select", {}, s.modes.map((m) => el("option", { value: m, selected: m === s.auto_approve_templates },
+    { all: "Approve every valid proposal", new: "Approve new templates; review replacements",
+      review: "Review every proposal" }[m] || m)));
+  const given = Object.fromEntries(s.tunnel_args.map((a) => a.replace(/^--/, "").split(/=(.*)/s).slice(0, 2)));
+  const inputs = Object.fromEntries(TUNNEL_FIELDS.map(([k]) => [k, el("input", { value: given[k] || "", size: 16 })]));
+  const other = s.tunnel_args.filter((a) => !TUNNEL_FIELDS.some(([k]) => a.startsWith(`--${k}=`)));
+  const out = el("div");
+  const save = saveButton("Save tunnel settings", async () => {
+    const args = TUNNEL_FIELDS.filter(([k]) => inputs[k].value.trim()).map(([k]) => `--${k}=${inputs[k].value.trim()}`)
+      .concat(other);
+    await api(cluster(c.name) + "/settings", { method: "PUT", body: { auto_approve_templates: mode.value, tunnel_args: args } });
+    return "Saved. Applies the next time the tunnel starts.";
+  }, out);
+  return el("section", { class: "card" },
+    el("h3", {}, "Tunnel ", el("span", { class: "muted" }, "· kept on this machine")),
+    field("Template proposals", mode, "only while jobs are sandboxed"),
+    el("div", { class: "row" }, TUNNEL_FIELDS.map(([k, label, hint]) => field(`Tunnel job: ${label}`, inputs[k], hint))),
+    other.length ? el("p", { class: "muted" }, `Also: ${other.join(" ")}`) : null,
+    el("div", { class: "actions" }, save), out);
+}
+
+async function serverSettings(c) {
+  const head = el("h3", {}, "Server ", el("span", { class: "muted" }, "· config.json on the cluster"));
+  if (!c.tunnel || c.tunnel.state !== "up") {
+    return el("section", { class: "card" }, head, el("p", { class: "muted" }, "Start the tunnel to see and change the server's settings."));
+  }
+  if (!c.has_owner_token) {
+    return el("section", { class: "card" }, head, el("p", { class: "muted" }, "Needs this cluster's owner token (setup_agents keeps it in the profile)."));
+  }
+  const base = cluster(c.name) + "/rest/admin/config";
+  const conf = await api(base);
+  const raw = conf.config;
+  const eff = conf.effective;
+  const env = raw.environments || {};
+  const sandbox = raw.sandbox || {};
+  const limits = Object.assign({}, eff.limits, raw.limits || {});
+
+  const syncModules = el("input", { value: (env.modules || []).join(" "), size: 40, placeholder: "e.g. WebProxy" });
+  const uvPath = el("input", { value: env.uv === null ? "off" : (env.uv || "auto"), size: 24 });
+  const pixiPath = el("input", { value: env.pixi === null ? "off" : (env.pixi || "auto"), size: 24 });
+  const timeout = el("input", { type: "number", min: 1, value: env.timeout || 1800, size: 8 });
+  const limitInputs = Object.fromEntries(LIMIT_FIELDS.map(([k, , kind, ph]) => {
+    const v = limits[k];
+    const value = v === null || v === undefined ? "" : (kind === "list" ? v.join(" ") : v);
+    return [k, el("input", { value, size: 12, placeholder: kind === "list" ? "any" : (ph || "no cap"),
+                             type: kind === "int" ? "number" : "text", min: kind === "int" ? 0 : null })];
+  }));
+  const binds = el("textarea", { rows: 3 }, (sandbox.binds || []).join("\n"));
+  const writable = el("textarea", { rows: 2 }, (sandbox.writable || []).join("\n"));
+  const notes = el("textarea", { rows: 4 }, raw.cluster_notes || "");
+  const envBoxes = Object.fromEntries(ENV_SCOPES.map(([k]) =>
+    [k, el("textarea", { rows: 3, placeholder: "NAME=value, one per line" }, envText((raw.environment || {})[k]))]));
+
+  const tool = (text) => { const t = text.trim(); return t === "off" ? null : (t || "auto"); };
+  const collect = () => {
+    const lim = {};
+    for (const [k, , kind] of LIMIT_FIELDS) {
+      const v = limitInputs[k].value.trim();
+      if (kind === "list") lim[k] = v ? words(v) : null;
+      else if (v === "") lim[k] = null;
+      else lim[k] = kind === "int" ? Number(v) : v;
+    }
+    // defaults are left out, so the file only records what was chosen
+    const environments = Object.assign({}, env, { modules: words(syncModules.value), uv: tool(uvPath.value),
+                                                  pixi: tool(pixiPath.value), timeout: Number(timeout.value) || 1800 });
+    for (const [k, dflt] of [["uv", "auto"], ["pixi", "auto"], ["timeout", 1800]]) {
+      if (environments[k] === dflt) delete environments[k];
+    }
+    if (!environments.modules.length) delete environments.modules;
+    const environment = {};
+    for (const [k, label] of ENV_SCOPES) {
+      const vars = envParse(envBoxes[k].value, label);
+      if (Object.keys(vars).length) environment[k] = vars;
+    }
+    return {
+      environments,
+      environment: Object.keys(environment).length ? environment : null,
+      limits: lim,
+      sandbox: Object.assign({}, sandbox, { binds: lines(binds.value), writable: lines(writable.value) }),
+      cluster_notes: notes.value.trim() || null,
+    };
+  };
+  const out = el("div");
+  let shown = collect();   // only sections edited since then are sent
+  const save = saveButton("Save server settings", async () => {
+    const wanted = collect();
+    const changes = {};
+    for (const [k, v] of Object.entries(wanted)) {
+      if (JSON.stringify(v) !== JSON.stringify(shown[k])) changes[k] = v;
+    }
+    if (!Object.keys(changes).length) return "Nothing changed.";
+    const res = await api(base, { method: "PUT", body: { changes } });
+    shown = wanted;
+    return `Saved ${res.changed.join(", ")}; in effect now.${res.backup ? ` The previous file is ${res.backup}.` : ""}` +
+      (res.warning ? ` Warning: ${res.warning}.` : "");
+  }, out);
+
+  const jsonBox = el("textarea", { rows: 14, class: "code" },
+    JSON.stringify(Object.fromEntries(conf.editable.filter((k) => k in raw).map((k) => [k, raw[k]])), null, 2));
+  const jsonOut = el("div");
+  const saveJson = saveButton("Save JSON", async () => {
+    let parsed;
+    try { parsed = JSON.parse(jsonBox.value); } catch (e) { throw new Error(`not valid JSON: ${e.message}`); }
+    const changes = Object.fromEntries(conf.editable.map((k) => [k, k in parsed ? parsed[k] : null]));
+    const res = await api(base, { method: "PUT", body: { changes } });
+    return `Saved; in effect now.${res.backup ? ` The previous file is ${res.backup}.` : ""}`;
+  }, jsonOut);
+
+  const managers = (eff.environments || {}).managers || {};
+  const found = Object.entries(managers).map(([m, i]) => `${m} ${i.available ? i.version || "" : "not found"}`).join(" · ");
+  return el("section", { class: "card" }, head,
+    el("p", { class: "muted" }, conf.path),
+    el("h4", {}, "Python environments ", el("span", { class: "muted" }, found)),
+    field("Modules to load before a sync", syncModules, "space-separated, e.g. a web proxy module the node needs for PyPI"),
+    el("div", { class: "row" },
+      field("uv", uvPath, "auto, a path, or off"),
+      field("pixi", pixiPath, "auto, a path, or off"),
+      field("Sync time limit (s)", timeout)),
+    el("h4", {}, "Job limits"),
+    el("div", { class: "row" }, LIMIT_FIELDS.map(([k, label, kind]) =>
+      field(label, limitInputs[k], kind === "list" ? "space-separated; empty for any" : "empty for no cap"))),
+    el("h4", {}, "Sandbox ", el("span", { class: "muted" }, (eff.sandbox || {}).effective || "")),
+    el("div", { class: "row" },
+      field("Extra read-only directories", binds, "one per line, e.g. /software"),
+      field("Extra writable directories", writable, "one per line; besides the token's own")),
+    el("h4", {}, "Environment variables"),
+    el("p", { class: "muted" }, "Set in every template job (after its modules load) and every environment sync. " +
+      "Agents see the names in cluster_info, and a job can print the values; don't put secrets here that " +
+      "agents shouldn't read. PATH, LD_*, SINGULARITY*, SLURM_*, HPC_* and the like are refused."),
+    el("div", { class: "row" }, ENV_SCOPES.map(([k, label, hint]) => field(label, envBoxes[k], hint))),
+    el("h4", {}, "Notes for agents"),
+    field("Cluster notes", notes, "shown to agents in cluster_info"),
+    el("div", { class: "actions" }, save), out,
+    el("details", {}, el("summary", {}, "Edit the editable sections as JSON"), jsonBox,
+      el("div", { class: "actions" }, saveJson), jsonOut));
+}
+
+async function settingsPage() {
+  const { clusters } = await api("clusters");
+  if (!clusters.length) return [el("h2", {}, "Settings"), el("p", { class: "muted" }, "No agent profiles yet; run setup_agents.")];
+  const wanted = decodeURIComponent((location.hash.match(/^#\/settings\/(.+)$/) || [])[1] || "");
+  const c = clusters.find((x) => x.name === wanted) || clusters[0];
+  const pick = el("select", {}, clusters.map((x) => el("option", { value: x.name, selected: x.name === c.name }, x.name)));
+  pick.addEventListener("change", () => { location.hash = "#/settings/" + encodeURIComponent(pick.value); });
+  const sections = await Promise.all([tunnelSettings(c), serverSettings(c).catch(errorBox)]);
+  return [el("h2", {}, "Settings"), el("div", { class: "toolbar" }, pick), sections];
+}
+
 // ---------------------------------------------------------------- shell
 
-const PAGES = { clusters: clustersPage, proposals: proposalsPage, activity: activityPage };
+const PAGES = { clusters: clustersPage, proposals: proposalsPage, activity: activityPage, settings: settingsPage };
 
 function stopFollowing() {
   if (followTimer) clearInterval(followTimer);

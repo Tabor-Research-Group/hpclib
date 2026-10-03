@@ -120,6 +120,7 @@ instead: `agent_console --static agent-console --open` serves the minimal front 
 | `GET /api/health` | the console is up |
 | `GET /api/clusters`, `GET /api/clusters/NAME` | profiles and tunnel state (`down`, `starting`, `up`, `error`); never token values |
 | `GET /api/clusters/NAME/mcp` | the MCP client entry |
+| `GET`/`PUT /api/clusters/NAME/settings` | this machine's tunnel settings for the cluster: `auto_approve_templates` (`all`, `new`, `review`) and `tunnel_args` (sbatch options for the tunnel job, e.g. `--time=12:00:00`); `agent_tunnel` reads them, and its own options win |
 | `POST /api/clusters/NAME/tunnel/start` (`{"auto_approve_templates": "all"\|"new"\|"review"}`, default `all`), `.../tunnel/stop`, `GET .../tunnel/log` | `agent_tunnel` and `agent_stop`, logged to `~/.config/hpclib/console/logs/` |
 | `ANY /api/clusters/NAME/rest/ROUTE` | the cluster's REST route, with the owner token (`?as=agent`: the agent token) |
 | `GET /api/jobs`, `GET /api/proposals` | jobs and pending proposals from every live cluster, with each cluster's `ok`/`error` |
@@ -136,6 +137,7 @@ Owner-only REST routes, which the console uses (they need the owner token; agent
 | `POST /admin/proposals/approve` (`{"name", "replace"}`) | approve; 409 if it would replace a template and `replace` is not set |
 | `POST /admin/proposals/reject` (`{"name", "reason"}`) | set it aside in `proposals/.rejected/` with the reason |
 | `GET /admin/audit?since=&limit=&token=&route=&status=` | audit log entries, oldest first; `latest` is the `since` for the next poll |
+| `GET /admin/config`, `PUT /admin/config` (`{"changes": {SECTION: VALUE or null}}`) | the server's config.json (`~/.local/tunnels/rest/config.json`); the sections `limits`, `cluster_notes`, `environments`, `environment`, `sandbox` and `poll_interval` can be changed, are validated first, take effect at once, and the old file is kept as `config.json.replaced-TIME` |
 | `GET /admin/tokens`, `POST /admin/tokens/revoke` (`{"name"}`) | token names, scopes, directories and last use (no hashes); revoke one |
 
 ## hpclib.sh
@@ -455,7 +457,13 @@ on your machine as MCP tools.
   single binaries you can install in your home directory. The server's config takes an `environments` section:
   `{"uv": "auto"|PATH|null, "pixi": ..., "modules": ["WebProxy"], "timeout": 1800, "max_running": 2}`, where
   `modules` are loaded before a sync (e.g. a cluster's web proxy module, if the node needs one to reach PyPI or
-  conda-forge). Prefer pixi for conda packages (xtb, openmm, rdkit); uv for pure-Python projects.
+  conda-forge). Environment variables go in a separate `environment` section,
+  `{"all": {"NAME": "value"}, "jobs": {...}, "syncs": {...}}`: `jobs` and `syncs` add to (and override) `all`
+  for template jobs (exported after their modules load, so they reach the sandbox) and for syncs (e.g.
+  `UV_INDEX_URL`, `HTTPS_PROXY`). Names that would change `PATH`, the sandbox, hpclib or SLURM (`PATH`, `LD_*`,
+  `SINGULARITY*`, `APPTAINER*`, `BASH_ENV`, `HPC_*`, `SLURM_*`, ...) are refused. Agents see the names in
+  `cluster_info` but not the values, though a job can print them. The console's Settings page edits this section (and the job limits, sandbox directories and
+  notes) without a restart. Prefer pixi for conda packages (xtb, openmm, rdkit); uv for pure-Python projects.
 - **Moving files.** `hpclib/servers/rest_client.py`'s `FileSync` copies files between your machine and the cluster
   through the API. That means the token's scopes and directories apply, and pushing needs `files:write`. With
   `rest_mcp.py --local-root DIR` (repeatable), the MCP server offers `list_local_files`, `push_files` and

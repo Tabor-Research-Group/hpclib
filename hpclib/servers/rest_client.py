@@ -217,6 +217,13 @@ class RESTClient:
     def tokens(self):
         return self.request("GET", "/admin/tokens")
 
+    def admin_config(self):
+        return self.request("GET", "/admin/config")
+
+    def update_config(self, changes):
+        """Replace config.json sections ({SECTION: VALUE}; None restores a default); applied at once."""
+        return self.request("PUT", "/admin/config", body={"changes": changes})
+
     def revoke_token(self, name):
         return self.request("POST", "/admin/tokens/revoke", body={"name": name})
 

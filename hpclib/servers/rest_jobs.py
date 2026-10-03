@@ -84,6 +84,40 @@ class RESTError(Exception):
 
 SECRET_ENV_PREFIXES = rest_sandbox.SECRET_ENV_PREFIXES
 
+# The `environment` section of the server config: variables for template jobs and environment syncs.
+#   {"all": {"NAME": "value"}, "jobs": {...}, "syncs": {...}}   (jobs/syncs add to and override all)
+ENV_SCOPES = ("all", "jobs", "syncs")
+ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+# names that would get around the sandbox, run code before the job, or confuse hpclib and SLURM
+RESERVED_ENV = {"PATH", "HOME", "TMPDIR", "BASH_ENV", "ENV", "SHELL", "USER", "LOGNAME", "PWD", "IFS", "PS4",
+                "PROMPT_COMMAND", "PYTHONHOME", "VIRTUAL_ENV", "CONDA_PREFIX", "MODULEPATH", "LMOD_CMD"}
+RESERVED_ENV_PREFIXES = ("LD_", "SINGULARITY", "APPTAINER", "HPC_REST", "HPC_PARAM_", "HPC_TASK_", "HPCLIB_",
+                         "SLURM_", "SBATCH_", "BASH_FUNC_")
+MAX_ENV_VALUE = 4096
+
+
+def check_env_section(section):
+    """Validate the config's `environment` section; returns {"jobs": {...}, "syncs": {...}} with `all` merged in."""
+    if section is None:
+        return {"jobs": {}, "syncs": {}}
+    if not isinstance(section, dict) or set(section) - set(ENV_SCOPES):
+        raise ValueError(f"`environment` must be an object with keys from {list(ENV_SCOPES)}, each mapping "
+                         f"variable names to values")
+    for scope, values in section.items():
+        if not isinstance(values, dict):
+            raise ValueError(f"environment.{scope} must map variable names to string values")
+        for name, value in values.items():
+            if not ENV_NAME_RE.fullmatch(name):
+                raise ValueError(f"environment.{scope}: {name!r} is not a variable name")
+            if name in RESERVED_ENV or name.startswith(RESERVED_ENV_PREFIXES):
+                raise ValueError(f"environment.{scope}: {name} can't be set here (it would change PATH, the "
+                                 f"sandbox, hpclib or SLURM; use modules, sandbox binds or template resources)")
+            if not isinstance(value, str) or len(value) > MAX_ENV_VALUE or any(c in value for c in "\0\n\r"):
+                raise ValueError(f"environment.{scope}.{name} must be one line of text, at most {MAX_ENV_VALUE} "
+                                 f"characters")
+    common = section.get("all", {})
+    return {"jobs": dict(common, **section.get("jobs", {})), "syncs": dict(common, **section.get("syncs", {}))}
+
 def clean_env(env=None):
     """
     The environment for child processes, minus anything secret: without the
@@ -594,7 +628,7 @@ class JobTemplate:
     )
 
     def render(self, values, tasks=None, sandbox: 'rest_sandbox.Sandbox' = None, writable=(), prelude=None,
-               extra_ro=()):
+               extra_ro=(), env=None):
         """
         The full job script: shebang, exports, module loads, per-task
         values, then the body - which runs in `sandbox`, with `writable`
@@ -624,6 +658,9 @@ class JobTemplate:
                 f"module load {shlex.quote(m)} || {{ echo {shlex.quote(f'hpclib: could not load module {m}; check the template modules with search_modules')} >&2; exit 3; }}"
                 for m in self.spec["modules"]
             ]
+        if env:
+            # the server config's `environment` (after the modules, so it can override what they set)
+            lines += [f"export {k}={shlex.quote(v)}" for k, v in sorted(env.items())]
         if tasks is not None:
             lines.append('case "${SLURM_ARRAY_TASK_ID:-}" in')
             for i, task in enumerate(tasks):
@@ -1316,7 +1353,7 @@ class JobManager:
     def __init__(self, templates: TemplateStore, registry: JobRegistry, limits: ResourceLimits,
                  runner: SlurmRunner, cluster_notes=None, poll_interval=10, proposals: ProposalStore = None,
                  modules: ModuleSystem = None, sandbox: 'rest_sandbox.Sandbox' = None, auto_approve=None,
-                 environments: 'rest_envs.EnvironmentManager' = None):
+                 environments: 'rest_envs.EnvironmentManager' = None, job_env=None):
         self.templates = templates
         self.registry = registry
         self.limits = limits
@@ -1331,6 +1368,7 @@ class JobManager:
             raise ValueError("auto_approve must be None, 'new' or 'all'")
         self.auto_approve = auto_approve
         self.environments = environments
+        self.job_env = dict(job_env or {})   # the config's environment.all + environment.jobs
         self.submit_lock = threading.Lock()
 
     def describe_templates(self):
@@ -1497,6 +1535,7 @@ class JobManager:
             "sandbox": self.sandbox.describe(),
             "template_proposals": self.proposal_policy(),
             "environments": self.environments.describe() if self.environments is not None else None,
+            "job_environment": sorted(self.job_env),   # names only: values may be license keys and the like
         })
         return info
 
@@ -1624,7 +1663,7 @@ class JobManager:
             prelude, extra_ro = self.environments.prelude(environment), self.environments.job_binds(environment)
         try:
             script, sandbox_plan = template.render(values, tasks, sandbox=self.sandbox, writable=writable,
-                                                   prelude=prelude, extra_ro=extra_ro or ())
+                                                   prelude=prelude, extra_ro=extra_ro or (), env=self.job_env)
         except rest_sandbox.SandboxError as e:
             raise RESTError(503, str(e), see="GET /sandbox describes what this node supports")
         args = [

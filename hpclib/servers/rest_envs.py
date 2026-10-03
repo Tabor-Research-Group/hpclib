@@ -73,7 +73,7 @@ def _has_pixi_table(pyproject):
 class EnvironmentManager:
 
     def __init__(self, config=None, sandbox: 'rest_sandbox.Sandbox' = None, data_dir=None, which=None,
-                 environ=None):
+                 environ=None, sync_env=None):
         config = dict(config or {})
         unknown = set(config) - CONFIG_KEYS
         if unknown:
@@ -93,6 +93,7 @@ class EnvironmentManager:
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"`environments.{key}` must be a positive integer")
         self.sandbox = sandbox
+        self.sync_env = dict(sync_env or {})   # the server config's environment.all + environment.syncs
         self.data_dir = os.path.join(data_dir, "envs") if data_dir else None
         self._which = which
         self._environ = environ
@@ -176,6 +177,7 @@ class EnvironmentManager:
             "managers": {m: ({"available": True, "version": tools[m]["version"]} if m in tools else
                              {"available": False}) for m in MANAGERS},
             "sync_modules": self.modules,
+            "sync_environment": sorted(self.sync_env),
             "how": "put pyproject.toml (+ uv.lock) or pixi.toml (+ pixi.lock) in a project directory, sync it "
                    "with POST /envs/sync, then submit a template whose `environment` points at the project "
                    "(python_project, for example). Jobs only activate the environment; they never install.",
@@ -310,6 +312,8 @@ class EnvironmentManager:
         ]) + "\n"
         lines = ["#!/bin/bash", f"# hpclib environment sync for {project}"]
         lines += [f"export {k}={q(v)}" for k, v in sorted(exports.items())]
+        # the server config's variables (e.g. UV_INDEX_URL, HTTPS_PROXY); they may override the defaults above
+        lines += [f"export {k}={q(v)}" for k, v in sorted(self.sync_env.items())]
         if self.modules:
             lines.append(_MODULE_INIT)
             lines += [f"module load {q(m)} || {{ echo 'hpclib: could not load module {m}' >&2; exit 3; }}"

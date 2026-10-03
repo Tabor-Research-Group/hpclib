@@ -26,5 +26,6 @@ Pages:
 | Clusters | every agent profile, its tunnel state, port and token | start or stop the tunnel, view its log |
 | Proposals | templates waiting for review on every live cluster | diff against the current template, approve, reject with a reason |
 | Activity | one cluster's audit log, newest first | filter by token or errors, follow live (every 5 s) |
+| Settings | per cluster: this machine's tunnel settings, and the server's config.json | auto-approve mode and the tunnel job's time/memory/partition; sync modules, uv/pixi, job limits, sandbox directories, environment variables for jobs and syncs, notes for agents (or the editable sections as JSON) |
 
 This folder depends only on the documented `/api` routes; hpclib never imports it.

@@ -187,6 +187,17 @@ class TestSync(EnvTestCase):
         self.expect_error(422, self.agent.sync_environment, str(empty))
         self.expect_error(400, self.agent.request, "POST", "/envs/sync", body={"project": "x", "pip": True})
 
+    def test_config_variables_reach_the_sync(self):
+        self.envs.sync_env = {"UV_INDEX_URL": "https://pypi.example/simple", "UV_LINK_MODE": "hardlink"}
+        info = self.envs.detect(str(self.uv_project))
+        script, _ = self.envs._script(info, self.envs.tools()["uv"], update=False)
+        self.assertIn("export UV_INDEX_URL=https://pypi.example/simple", script)
+        # set after hpclib's defaults, so they win
+        self.assertGreater(script.index("export UV_LINK_MODE=hardlink"), script.index("export UV_LINK_MODE=copy"))
+        out = self.sync(self.uv_project)
+        self.assertIn("UV_LINK_MODE=hardlink", " ".join(out["log_tail"]))
+        self.assertEqual(self.llm.environment()["sync_environment"], ["UV_INDEX_URL", "UV_LINK_MODE"])
+
     def test_runs_in_the_sandbox(self):
         runtime = lambda name: sys.executable if name == "singularity" else None  # noqa: E731
         self.jobs.sandbox = rest_jobs.rest_sandbox.Sandbox({"method": "auto"}, which=runtime,

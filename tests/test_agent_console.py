@@ -213,6 +213,51 @@ class TestClusters(ConsoleTestCase):
                                    {"auto_approve_templates": "yes"})[0], 400)
 
 
+class TestSettings(ConsoleTestCase):
+
+    def test_tunnel_settings(self):
+        status, out = self.call("GET", f"/api/clusters/{self.live}/settings")
+        self.assertEqual((status, out["auto_approve_templates"], out["tunnel_args"]), (200, "all", []))
+        status, out = self.call("PUT", f"/api/clusters/{self.live}/settings",
+                                {"auto_approve_templates": "review", "tunnel_args": ["--time=12:00:00", "--mem=2gb"]})
+        self.assertEqual(status, 200, out)
+        profile = agent_profiles.load(self.live)
+        self.assertEqual((profile["auto_approve_templates"], profile["tunnel_args"]),
+                         ("review", ["--time=12:00:00", "--mem=2gb"]))
+        self.assertEqual(profile["port"], self.server.server_address[1])          # the rest is kept
+        for bad in ({"auto_approve_templates": "yes"}, {"tunnel_args": ["--wrap=rm -rf ~"]},
+                    {"tunnel_args": "--time=1:00:00"}, {"port": 1}):
+            self.assertIn(self.call("PUT", f"/api/clusters/{self.live}/settings", bad)[0], (400, 422), bad)
+        self.assertEqual(agent_profiles.load(self.live)["tunnel_args"], ["--time=12:00:00", "--mem=2gb"])
+
+    def test_agent_tunnel_reads_them(self):
+        repo = Path(__file__).resolve().parents[1]
+        agent_profiles.cmd_set(self.live, "auto_approve_templates=new", "tunnel_args=--time=12:00:00")
+        script = (f'source {repo / "hpclib" / "hpclib.sh"}; launch_tunnel() {{ printf "%s\\n" "$*"; }}; '
+                  f'agent_tunnel {self.live}; agent_tunnel {self.live} --review-templates --time=2:00:00')
+        res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                             env=dict(os.environ, HPCLIB_AGENTS_DIR=str(self.agents)))
+        first, second = res.stdout.splitlines()
+        self.assertIn("--time=12:00:00 --", first)
+        self.assertTrue(first.endswith("--auto-approve-templates=new"), first)
+        self.assertIn("--time=12:00:00 --time=2:00:00 --", second)                # the later one wins in sbatch
+        self.assertNotIn("auto-approve", second)
+
+    def test_server_config_through_the_proxy(self):
+        path = self.data / "rest" / "config.json"
+        path.write_text("{}")
+        path.chmod(0o600)
+        self.server.config_path = str(path)
+        status, out = self.call("GET", f"/api/clusters/{self.live}/rest/admin/config")
+        self.assertEqual((status, out["config"]), (200, {}))
+        status, out = self.call("PUT", f"/api/clusters/{self.live}/rest/admin/config",
+                                {"changes": {"environments": {"modules": ["WebProxy"]}}})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(json.loads(path.read_text()), {"environments": {"modules": ["WebProxy"]}})
+        self.assertEqual(self.call("PUT", f"/api/clusters/{self.live}/rest/admin/config?as=agent",
+                                   {"changes": {"cluster_notes": "x"}})[0], 403)
+
+
 class TestProxy(ConsoleTestCase):
 
     def test_owner_token_by_default(self):

@@ -30,7 +30,12 @@ import time
 # usual development-server ports.
 PORT_RANGE = (20000, 32000)
 NAME_RE = re.compile(r"[^A-Za-z0-9._@-]+")
-LIST_KEYS = ("login", "work_dirs", "binds", "local_roots")
+LIST_KEYS = ("login", "work_dirs", "binds", "local_roots", "tunnel_args")
+# Tunnel settings agent_tunnel reads (the console's settings page writes them):
+#   auto_approve_templates  all (default) | new | review
+#   tunnel_args             sbatch options for the tunnel's own job, e.g. --time=12:00:00
+APPROVE_MODES = ("all", "new", "review")
+TUNNEL_ARG_RE = re.compile(r"--(time|mem|partition|account|qos|cpus-per-task|constraint)=[A-Za-z0-9:._,+-]{1,64}")
 
 
 def root():
@@ -200,6 +205,13 @@ def cmd_set(name, *pairs):
             print(f"agent_profiles: expected KEY=VALUE, not {pair!r}", file=sys.stderr)
             return 2
         key, append, value = m.groups()
+        if key == "tunnel_args" and value and not TUNNEL_ARG_RE.fullmatch(value):
+            print(f"agent_profiles: tunnel_args takes sbatch options like --time=12:00:00, not {value!r}",
+                  file=sys.stderr)
+            return 2
+        if key == "auto_approve_templates" and value not in APPROVE_MODES:
+            print(f"agent_profiles: auto_approve_templates is one of {', '.join(APPROVE_MODES)}", file=sys.stderr)
+            return 2
         if key in LIST_KEYS:
             items = profile.get(key) or [] if append else []
             if value and value not in items:
