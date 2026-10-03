@@ -258,16 +258,23 @@ class Sandbox:
                 self._help_cache[runtime] = out
             return flag in self._help_cache[runtime]
 
-    def plan(self, writable):
-        """What a job would see: the method and the read-only and read-write binds."""
+    def plan(self, writable, extra_ro=()):
+        """
+        What a job would see: the method and the read-only and read-write
+        binds. `extra_ro` adds read-only binds for this job (e.g. a Python
+        environment's interpreter).
+        """
         method, detail = self.resolve()
         if method == "none":
             return {"method": "none", "reason": detail}
         ro, rw, missing = [], [], []
-        for d in ([] if self.image else list(HOST_IMAGE_BINDS)) + self.binds:
-            (ro if os.path.exists(d) else missing).append(d)
-        for d in list(writable) + self.writable:
+        writable = [os.path.normpath(d) for d in list(writable) + self.writable]
+        for d in ([] if self.image else list(HOST_IMAGE_BINDS)) + self.binds + list(extra_ro):
             d = os.path.normpath(d)
+            if d in ro or d in writable:
+                continue
+            (ro if os.path.exists(d) else missing).append(d)
+        for d in writable:
             if d in rw:
                 continue
             (rw if os.path.exists(d) else missing).append(d)
@@ -288,12 +295,15 @@ class Sandbox:
             raise SandboxError(f"a sandboxed template body must be a shell or Python script, not {shebang!r}")
         return words
 
-    def launch(self, shebang, body, writable):
+    def launch(self, shebang, body, writable, prelude=None, extra_ro=()):
         """
         Lines for the end of the job script: start `body` in the
         sandbox and exit with its status. Returns (lines, plan).
+        `prelude` (bash lines) runs inside the sandbox first, in the
+        same shell that then execs the body: e.g. activating a Python
+        environment, whose activation scripts must not run outside.
         """
-        plan = self.plan(writable)
+        plan = self.plan(writable, extra_ro)
         if plan["method"] == "none":
             return None, plan
         runtime, image = plan["runtime"], plan["image"]
@@ -344,9 +354,16 @@ class Sandbox:
             ]
         lines.append("export SINGULARITYENV_TMPDIR=/tmp APPTAINERENV_TMPDIR=/tmp")
         interp = " ".join(shlex.quote(w) for w in self.interpreter(shebang))
+        if prelude:
+            prelude_text = "\n".join(prelude) + '\nexec "$@"'
+            delimiter = "HPC_SANDBOX_PRELUDE_" + secrets.token_hex(8)
+            lines += [f"hpc_sandbox_prelude=$(cat <<'{delimiter}'", prelude_text, delimiter, ")"]
+            start = f'/bin/bash -c "$hpc_sandbox_prelude" hpc-env {interp}'
+        else:
+            start = interp
         lines += [
             f'{quoted} "${{hpc_sandbox_workdir[@]}}" --pwd "$PWD" {shlex.quote(image)} '
-            f'{interp} -c "$hpc_sandbox_body" hpc-job',
+            f'{start} -c "$hpc_sandbox_body" hpc-job',
             "hpc_sandbox_status=$?",
             '[ -n "$hpc_sandbox_tmp" ] && rm -rf "$hpc_sandbox_tmp"',
             'if [ "$hpc_sandbox_status" = 255 ]; then',

@@ -63,6 +63,10 @@ job_status / wait_for_job -> tail_file on the output -> pull_files.
 Array templates run one task per input: pass `tasks`, or `tasks_from` to
 read them from a JSON manifest on the cluster; resubmit only failed
 tasks with tasks_from.select.
+For Python work, keep a uv or pixi project in your directory (push
+pyproject.toml/uv.lock or pixi.toml/pixi.lock), sync_environment it, then
+submit the python_project template (or a template with an `environment`);
+prefer pixi when you need conda packages (xtb, openmm, ...).
 If no template fits, search_modules shows what software the cluster has
 and propose_template drafts a new template. cluster_info's
 template_proposals says whether proposals are approved automatically
@@ -221,6 +225,44 @@ def build_server(client: RESTClient, enable_file_writes=False, local_roots=None)
     async def search_modules(query: Query = "") -> dict[str, Any]:
         return await call(client.modules, query, True)
 
+    Project = Annotated[str, Field(description="the project directory on the cluster (holding pyproject.toml "
+                                               "for uv, or pixi.toml for pixi); " + PATH_DESCRIPTION)]
+
+    @server.tool(annotations=read_only, description=(
+        "Check a Python project directory on the cluster: whether it is a uv project (pyproject.toml, uv.lock "
+        "-> .venv) or a pixi project (pixi.toml, pixi.lock -> .pixi/envs/NAME), whether its environment is set "
+        "up (`ready`), and which managers the cluster has. Without `project`, just the managers."))
+    async def environment_info(project: Optional[Project] = None,
+                               environment: Annotated[str, Field(description="pixi environment name")] = "default"
+                               ) -> dict[str, Any]:
+        return await call(client.environment, project, "auto", environment)
+
+    @server.tool(annotations=changes, description=(
+        "Create or update a project's Python environment on the cluster: `uv sync` or `pixi install`, in the "
+        "job sandbox. Push pyproject.toml (+ uv.lock) or pixi.toml (+ pixi.lock) to the project directory "
+        "first; with a lockfile exactly that is installed, and update=true re-resolves and rewrites the lock. "
+        "Waits up to wait_seconds, then returns the sync's state (running, succeeded, failed, timed_out) and "
+        "the end of its log; check again with sync_status. Jobs from templates with an `environment` (e.g. "
+        "python_project) then run in it; jobs never install packages themselves."))
+    async def sync_environment(
+        project: Project,
+        manager: Annotated[str, Field(pattern="^(auto|uv|pixi)$")] = "auto",
+        environment: Annotated[str, Field(description="pixi environment name")] = "default",
+        update: bool = False,
+        wait_seconds: Annotated[int, Field(ge=0, le=300)] = 120,
+    ) -> dict[str, Any]:
+        started = await call(client.sync_environment, project, manager, environment, update)
+        if wait_seconds == 0 or started.get("state") != "running":
+            return started
+        return await call(client.sync_status, started["id"], wait_seconds)
+
+    @server.tool(annotations=read_only, description=(
+        "The state of an environment sync started by sync_environment, waiting up to wait_seconds for it to "
+        "finish, with the end of its log."))
+    async def sync_status(sync_id: Annotated[str, Field(description="`id` from sync_environment")],
+                          wait_seconds: Annotated[int, Field(ge=0, le=300)] = 60) -> dict[str, Any]:
+        return await call(client.sync_status, sync_id, wait_seconds)
+
     @server.tool(annotations=read_only, description=(
         "Template proposals waiting for the cluster owner's review."))
     async def list_template_proposals() -> dict[str, Any]:
@@ -233,7 +275,9 @@ def build_server(client: RESTClient, enable_file_writes=False, local_roots=None)
         "replaces your own pending proposal. `template` is template.json: description, parameters "
         "(typed: string/integer/number/boolean/path), resources (time, mem, cpus_per_task, ntasks, nodes, "
         "gres, partition, ...), overridable, modules (names from search_modules), and optionally array "
-        "(task_parameters) for one task per input. `script` is the bash job body with no #SBATCH lines; it "
+        "(task_parameters) for one task per input, and environment ({\"manager\": \"auto\", \"project\": "
+        "\"${project}\"}, with a `project` path parameter) to run the body in a synced uv or pixi environment. "
+        "`script` is the bash job body with no #SBATCH lines; it "
         "reads parameters from $HPC_PARAM_<NAME> and task parameters from $HPC_TASK_<NAME>. Read the "
         "`writing_templates` guide first if it exists."))
     async def propose_template(

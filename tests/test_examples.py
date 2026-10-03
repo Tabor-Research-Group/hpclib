@@ -149,7 +149,7 @@ class TestSetupCluster(unittest.TestCase):
         auth = TokenAuth("unused-owner", tokens_file=str(rest / "tokens.json"))
         identity = auth.identify(f"Bearer {token}")
         self.assertEqual((identity.name, sorted(identity.scopes), identity.allow),
-                         ("llm-scan", ["files:write", "propose", "read", "submit"], [str(work)]))
+                         ("llm-scan", ["envs", "files:write", "propose", "read", "submit"], [str(work)]))
         self.assertTrue((rest / "templates" / "writing_templates" / "guide.md").exists())
 
         # the owner token lives on this machine; the cluster gets only its hash, which the server accepts
@@ -258,10 +258,21 @@ class TestSetupAgents(unittest.TestCase):
     def profile(self, name="me@login.example"):
         return json.loads((self.local_home / ".config" / "hpclib" / "agents" / name / "profile.json").read_text())
 
+    def test_older_token_gets_new_scopes(self):
+        args = ["--work-dir", str(self.work[0]), "me@login.example"]
+        self.setup_agents("--scopes", "read,submit", *args)
+        token = self.token_file.read_text().strip()
+        self.assertEqual(sorted(self.identify(token).scopes), ["read", "submit"])
+        out = self.setup_agents(*args)                      # a rerun with the default scopes
+        self.assertEqual(self.token_file.read_text().strip(), token)   # the same token ...
+        self.assertEqual(sorted(self.identify(token).scopes), ["envs", "files:write", "propose", "read", "submit"])
+        self.assertIn("added", out)                         # ... with the scopes added since
+        self.assertNotIn("added", self.setup_agents(*args))
+
     def test_defaults_then_rebuild(self):
         args = ["--work-dir", str(self.work[0]), "--work-dir", str(self.work[1]), "--bind", "/sw", "me@login.example"]
         out = self.setup_agents(*args)
-        for t in ("hello", "orca", "writing_templates"):
+        for t in ("hello", "orca", "python_project", "writing_templates"):
             self.assertTrue((self.rest / "templates" / t).is_dir(), t)
         self.assertNotIn("python_script", os.listdir(self.rest / "templates"))
         config = self.config()
@@ -272,7 +283,7 @@ class TestSetupAgents(unittest.TestCase):
         token = self.token_file.read_text().strip()
         identity = self.identify(token)
         self.assertEqual((identity.name, sorted(identity.allow)), (self.agent_name, sorted(map(str, self.work))))
-        self.assertEqual(sorted(identity.scopes), ["files:write", "propose", "read", "submit"])
+        self.assertEqual(sorted(identity.scopes), ["envs", "files:write", "propose", "read", "submit"])
         owner = self.owner_file.read_text().strip()
         for f in (self.token_file, self.owner_file, self.profile_dir / "profile.json", self.profile_dir / "mcp.json"):
             self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600, f)

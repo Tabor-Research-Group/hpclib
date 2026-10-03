@@ -39,7 +39,7 @@ The script runs hpclib's `setup_agents` (see the main README) with this demo's s
    `~/.config/hpclib/agents/user@login.example/owner_token`, and gives the cluster only its hash, in
    `~/.local/tunnels/rest_token`. Nothing on the cluster, a job included, can read the
    token back;
-5. it mints a token named `llm-scan` with the `read,submit,propose,files:write` scopes, limited to
+5. it mints a token named `llm-scan` with the `read,submit,propose,files:write,envs` scopes, limited to
    `/scratch/user/me/llm`, and saves it in the profile as `agent_token`. With `propose`, the model can suggest
    template changes, such as the right `modules`, for you to approve.
 

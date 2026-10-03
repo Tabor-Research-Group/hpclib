@@ -34,6 +34,9 @@ that is still waiting, propose it again under the same name.
 - Resources can refer to parameters (`"${nprocs}"`). Keep the defaults small, and list in `overridable` only what
   a user should change.
 - Include `array` only when the job runs once per input; the tasks then come from `tasks` or `tasks_from`.
+- For Python packages, don't install anything in the script: add `"environment": {"manager": "auto", "project":
+  "${project}"}` (with a `project` path parameter), and the body runs in that uv or pixi project's environment,
+  which you set up beforehand with `sync_environment`. `python_project` is the general-purpose example.
 
 ## script.sh
 

@@ -20,7 +20,7 @@ The front end depends only on the routes below; nothing here depends on it.
   GET  /api/clusters                          profiles + tunnel state, no token values
   GET  /api/clusters/NAME
   GET  /api/clusters/NAME/mcp                 the MCP client entry setup_agents wrote
-  POST /api/clusters/NAME/tunnel/start        runs agent_tunnel NAME [--auto-approve-templates[=all]]
+  POST /api/clusters/NAME/tunnel/start        runs agent_tunnel NAME ({"auto_approve_templates": all|new|review})
   POST /api/clusters/NAME/tunnel/stop         runs agent_stop NAME
   GET  /api/clusters/NAME/tunnel/log?lines=N  the console's log of that tunnel
   *    /api/clusters/NAME/rest/<route>        proxied to the cluster's REST server
@@ -249,10 +249,12 @@ class Clusters:
                 raise ConsoleError(409, f"something already listens on port {profile['port']} for {name}; "
                                         f"stop it first")
             args = ["agent_tunnel", name]
-            if auto_approve in ("new", "all"):
+            if auto_approve in ("new", "all"):   # all is agent_tunnel's default
                 args.append(f"--auto-approve-templates={auto_approve}")
+            elif auto_approve in ("review", "off"):
+                args.append("--review-templates")
             elif auto_approve not in (None, "", False):
-                raise ConsoleError(400, "`auto_approve_templates` must be new or all")
+                raise ConsoleError(400, "`auto_approve_templates` must be all (the default), new or review")
             args += list(extra)
             log = self._open_log(name, " ".join(args))
             try:

@@ -915,8 +915,8 @@ function setup_agents {
   local work_dirs=() binds=() local_roots=() login_args=() hosts=()
   local name='' token_name='' token_file='' owner_file='' port='' process_port='' mcp_name='' new_ports=no
   local no_local_root=no python_modules=() remote_python=''
-  local scopes="read,submit,propose,files:write"
-  local templates="hello,orca,writing_templates" base_config='' sandbox=yes rebuild=no install=yes
+  local scopes="read,submit,propose,files:write,envs"
+  local templates="hello,orca,python_project,writing_templates" base_config='' sandbox=yes rebuild=no install=yes
   local target="$HPCLIB_REMOTE_INSTALL_LOCATION"
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -1143,6 +1143,16 @@ function setup_agents {
   fi
   if [ -e "$token_file" ] && [ "$rebuild" != yes ]; then
     echo "$token_file already exists; rerun with --rebuild to replace it"
+    # tokens from earlier versions get the scopes added since (e.g. envs); none are taken away
+    local granted
+    granted=$(HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" \
+      "$(_hpclib_remote_python_cmd "$rest_server" --add-token-scopes "$(_hpclib_sha256 "$token_file")" --scopes "$scopes")" \
+      < /dev/null 2>/dev/null | tail -n 1)
+    case "$granted" in
+      *": added "*) echo "$granted" ;;
+      *"already has"*) ;;
+      *) echo "  (could not check its scopes; rerun with --rebuild if the agent lacks one of: $scopes)" ;;
+    esac
   else
     local mint=(--add-token "$token_name" --scopes "$scopes")
     for d in "${work_dirs[@]}"; do
@@ -1181,14 +1191,16 @@ function setup_agents {
 
 # Start the REST tunnel for a cluster set up with setup_agents, with the
 # profile's ports and directories:
-#   agent_tunnel NAME|[user@]host [--auto-approve-templates[=all]] [launch_tunnel options]
-# --auto-approve-templates lets the agent's template proposals be used without
-# your review (new template names only; =all also replacements), while jobs
-# are sandboxed. Other options (e.g. --time=2:00:00) go to launch_tunnel.
+#   agent_tunnel NAME|[user@]host [--review-templates|--auto-approve-templates=new] [launch_tunnel options]
+# Template proposals from the agent are approved automatically, replacements
+# included (the server only does that while jobs are sandboxed);
+# --auto-approve-templates=new still holds replacements for your review, and
+# --review-templates holds every proposal. Other options (e.g. --time=2:00:00)
+# go to launch_tunnel.
 function agent_tunnel {
-  local name host port process_port d allow=() launch=()
+  local name host port process_port d allow=() launch=() approve=all
   if [ "$#" -lt 1 ]; then
-    echo "usage: agent_tunnel NAME|[user@]host [launch_tunnel options]" >&2
+    echo "usage: agent_tunnel NAME|[user@]host [--review-templates|--auto-approve-templates=new] [launch_tunnel options]" >&2
     _hpclib_agent_profiles list >&2
     return 2
   fi
@@ -1203,8 +1215,9 @@ function agent_tunnel {
   while IFS= read -r d; do [ -n "$d" ] && allow+=(--allow "$d"); done < <(_hpclib_agent_lines "$name" work_dirs)
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --auto-approve-templates|--auto-approve-templates=new|--auto-approve-templates=all)
-        allow+=("$1") ;;   # an option for the REST server, not launch_tunnel
+      --auto-approve-templates|--auto-approve-templates=new) approve=new ;;
+      --auto-approve-templates=all) approve=all ;;
+      --review-templates) approve='' ;;
       --auto-approve-templates=*)
         echo "agent_tunnel: --auto-approve-templates takes new or all" >&2
         return 2 ;;
@@ -1212,6 +1225,8 @@ function agent_tunnel {
     esac
     shift
   done
+  # an option for the REST server, not launch_tunnel; it applies only while jobs are sandboxed
+  [ -n "$approve" ] && allow+=("--auto-approve-templates=$approve")
   launch_tunnel -A none -P "$port" "$host" rest "--process-port=$process_port" "${launch[@]}" -- "${allow[@]}"
 }
 

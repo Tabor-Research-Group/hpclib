@@ -184,6 +184,19 @@ class RESTClient:
     def cancel_job(self, job_id):
         return self.request("POST", "/jobs/cancel", query={"id": job_id})
 
+    # Python environments (uv, pixi)
+    def environment(self, project=None, manager="auto", environment="default"):
+        query = {"project": project, "manager": manager, "environment": environment} if project else None
+        return self.request("GET", "/envs", query)
+
+    def sync_environment(self, project, manager="auto", environment="default", update=False):
+        return self.request("POST", "/envs/sync", body={"project": project, "manager": manager,
+                                                        "environment": environment, "update": update})
+
+    def sync_status(self, sync_id, wait=0):
+        return self.request("GET", "/envs/sync", {"id": sync_id, "wait": wait},
+                            timeout=max(self.timeout, wait + 30))
+
     # owner only (the `*` scope)
     def admin_proposals(self):
         return self.request("GET", "/admin/proposals")

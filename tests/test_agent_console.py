@@ -153,6 +153,15 @@ class TestSecurity(ConsoleTestCase):
         self.assertIn(b"<title>console", self.call("GET", "/jobs/123", key=None, raw=True)[1])  # SPA fallback
         self.assertNotIn(b"secret", self.call("GET", "/../agents/x", key=None, raw=True)[1])
 
+    def test_serves_the_bundled_front_end(self):
+        ui = Path(__file__).resolve().parents[1] / "agent-console"
+        self.console_server.static_dir = str(ui)
+        status, content, _ = self.call("GET", "/", key=None, raw=True)
+        self.assertIn(b'src="app.js"', content)
+        status, content, headers = self.call("GET", "/app.js", key=None, raw=True)
+        self.assertEqual(status, 200)
+        self.assertIn("javascript", headers.get("Content-Type"))  # module scripts need a JS type
+
     def test_bad_names_and_routes(self):
         self.assertEqual(self.call("GET", "/api/clusters/..%2Fetc")[0], 400)
         self.assertEqual(self.call("GET", "/api/clusters/nobody@nowhere")[0], 404)

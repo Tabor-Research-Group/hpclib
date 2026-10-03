@@ -1,0 +1,13 @@
+{
+  "description": "Run a Python script in a uv or pixi project's environment (synced first with sync_environment). The project directory holds pyproject.toml (+ uv.lock) or pixi.toml (+ pixi.lock); the job runs there.",
+  "parameters": {
+    "project": {"type": "path", "kind": "directory", "description": "the project directory, synced with sync_environment"},
+    "script": {"type": "path", "kind": "file", "description": "the .py file to run (usually inside the project)"},
+    "args": {"type": "string", "max_length": 1000, "pattern": "[A-Za-z0-9_./=:,+@%-]*( [A-Za-z0-9_./=:,+@%-]+)*", "default": "", "description": "arguments for the script, separated by single spaces (no quotes or shell characters)"},
+    "cpus": {"type": "integer", "description": "CPU cores for the job", "minimum": 1, "maximum": 16, "default": 1}
+  },
+  "resources": {"time": "01:00:00", "mem": "4G", "cpus_per_task": "${cpus}"},
+  "overridable": ["time", "mem"],
+  "workdir": "${project}",
+  "environment": {"manager": "auto", "project": "${project}"}
+}

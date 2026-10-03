@@ -1,0 +1,1 @@
+{"template": "python_project", "params": {"project": "projects/scan-analysis", "script": "projects/scan-analysis/analyze.py", "args": "--input results.json"}, "dry_run": true}

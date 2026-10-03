@@ -40,12 +40,13 @@ agent_stop user@login.example
 agent_list                                                          # every cluster set up on this machine
 ```
 
-`setup_agents` runs `install_hpclib`, copies the bundled `hello` and `orca` templates and the `writing_templates`
-guide (`--templates LIST` or `all`), and writes the REST server's `config.json` with a job sandbox: template jobs
+`setup_agents` runs `install_hpclib`, copies the bundled `hello`, `orca` and `python_project` templates and the
+`writing_templates` guide (`--templates LIST` or `all`), and writes the REST server's `config.json` with a job sandbox: template jobs
 run in Singularity/Apptainer and can write only to the `--work-dir` directories (see *Sandboxed jobs* below).
 Module trees on the cluster's `MODULEPATH` and any `--bind` directories are made readable to jobs, and a test
 container is run on the login node. It then creates the owner token, giving the cluster only its hash, and mints
-an agent token limited to the `--work-dir` directories (`--scopes`, default `read,submit,propose,files:write`).
+an agent token limited to the `--work-dir` directories (`--scopes`, default `read,submit,propose,files:write,envs`;
+a later run adds any of these an existing token lacks, and never removes one).
 It ends with a getting-started summary (in colour on a terminal; `NO_COLOR` or `HPCLIB_COLOR=never` turns that
 off): how to start the tunnel, the MCP client entry for Claude Desktop as JSON, the `claude mcp add-json` line for
 Claude Code, and a `curl` check. **`setup_agents` never edits your LLM client's config**: add the printed entry
@@ -111,14 +112,15 @@ It listens on 127.0.0.1 only, refuses other `Host` headers, and needs the sessio
 (`Authorization: Bearer KEY`) on every `/api` call; the key is new at each launch and is written to
 `~/.config/hpclib/console/session` (mode 600). Browsers on other origins are refused unless you name one with
 `--allow-origin http://127.0.0.1:5173`; `--static DIR [--open]` serves a built front end from the same origin
-instead. Routes (all JSON; the module docstring of `hpclib/servers/agent_console.py` is the reference):
+instead: `agent_console --static agent-console --open` serves the minimal front end in this repository's
+`agent-console/` folder (see its README). Routes (all JSON; the module docstring of `hpclib/servers/agent_console.py` is the reference):
 
 | Route | What |
 | --- | --- |
 | `GET /api/health` | the console is up |
 | `GET /api/clusters`, `GET /api/clusters/NAME` | profiles and tunnel state (`down`, `starting`, `up`, `error`); never token values |
 | `GET /api/clusters/NAME/mcp` | the MCP client entry |
-| `POST /api/clusters/NAME/tunnel/start` (`{"auto_approve_templates": "new"}`), `.../tunnel/stop`, `GET .../tunnel/log` | `agent_tunnel` and `agent_stop`, logged to `~/.config/hpclib/console/logs/` |
+| `POST /api/clusters/NAME/tunnel/start` (`{"auto_approve_templates": "all"\|"new"\|"review"}`, default `all`), `.../tunnel/stop`, `GET .../tunnel/log` | `agent_tunnel` and `agent_stop`, logged to `~/.config/hpclib/console/logs/` |
 | `ANY /api/clusters/NAME/rest/ROUTE` | the cluster's REST route, with the owner token (`?as=agent`: the agent token) |
 | `GET /api/jobs`, `GET /api/proposals` | jobs and pending proposals from every live cluster, with each cluster's `ok`/`error` |
 
@@ -424,19 +426,41 @@ on your machine as MCP tools.
   kept in `proposals/.superseded/`). Approved templates keep a record of who proposed and approved them in
   `templates/NAME/.proposal.json`, and a template that was replaced goes to `templates/.replaced/`.
 
-  To skip the review, start the tunnel with `--auto-approve-templates`: `agent_tunnel user@login.example
-  --auto-approve-templates`, or `rest_server.py --auto-approve-templates` (`$HPC_REST_AUTO_APPROVE_TEMPLATES`).
-  A valid proposal for a new template name then becomes a template at once; with `--auto-approve-templates=all`,
-  so does one that replaces an existing template. This only applies while template jobs are sandboxed
+  `agent_tunnel` skips the review by default: it starts the server with `--auto-approve-templates=all`, so a
+  valid proposal becomes a template at once, including one that replaces an existing template.
+  `agent_tunnel ... --auto-approve-templates=new` still holds replacements for you, and `--review-templates`
+  holds every proposal. `rest_server.py` started by hand reviews everything unless given
+  `--auto-approve-templates[=all]` (`$HPC_REST_AUTO_APPROVE_TEMPLATES`). Either way, this only applies while template jobs are sandboxed
   (*Sandboxed jobs* above), so an auto-approved template still writes only to the token's directories; on a
   server without a sandbox, proposals keep waiting for you. `cluster_info` tells clients which policy applies,
   and the server prints it at startup.
 
+- **Python environments (uv and pixi).** A token with the `envs` scope (`setup_agents` gives agents one) can set
+  up a project's environment in its directories: put `pyproject.toml` (and `uv.lock`) or `pixi.toml` (and
+  `pixi.lock`) in a project directory, then `POST /envs/sync {"project": DIR}` (MCP `sync_environment`) runs
+  `uv sync` or `pixi install` in the background, `--locked` when there is a lockfile (`"update": true`
+  re-resolves). `GET /envs/sync?id=&wait=` reports its state and log, and `GET /envs?project=`
+  (`environment_info`) says what a directory holds and whether its environment is ready. A template with
+  `"environment": {"manager": "auto", "project": "${project}"}` runs its body in that environment; the bundled
+  `python_project` template runs a script that way:
+
+  ```json
+  {"template": "python_project", "params": {"project": "projects/analysis", "script": "projects/analysis/analyze.py"}}
+  ```
+
+  Jobs only activate an environment, inside their sandbox (pixi's activation scripts included); they never
+  install, so compute nodes need no network. The sync itself runs where the REST server runs, also in the
+  sandbox, with only the project, the tool's cache and uv's Python directory writable, and the tool binary
+  read-only. uv and pixi are found on `PATH` or in `~/.local/bin`, `~/.cargo/bin` and `~/.pixi/bin`; both are
+  single binaries you can install in your home directory. The server's config takes an `environments` section:
+  `{"uv": "auto"|PATH|null, "pixi": ..., "modules": ["WebProxy"], "timeout": 1800, "max_running": 2}`, where
+  `modules` are loaded before a sync (e.g. a cluster's web proxy module, if the node needs one to reach PyPI or
+  conda-forge). Prefer pixi for conda packages (xtb, openmm, rdkit); uv for pure-Python projects.
 - **Moving files.** `hpclib/servers/rest_client.py`'s `FileSync` copies files between your machine and the cluster
   through the API. That means the token's scopes and directories apply, and pushing needs `files:write`. With
   `rest_mcp.py --local-root DIR` (repeatable), the MCP server offers `list_local_files`, `push_files` and
   `pull_files`, limited to those local directories.
-- **New MCP tools.** `read_guide`, `list_modules`, `search_modules`, `list_template_proposals` and
+- **New MCP tools.** `read_guide`, `list_modules`, `search_modules`, `list_template_proposals`, `environment_info`, `sync_environment`, `sync_status` and
   `propose_template`. `submit_job` takes `tasks`, `tasks_from`, `throttle` and `label`, and `job_status` takes
   `include_tasks`.
 

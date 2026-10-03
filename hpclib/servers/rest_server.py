@@ -131,8 +131,9 @@ import traceback
 import urllib.parse
 
 try:
-    from . import rest_jobs, rest_sandbox
+    from . import rest_envs, rest_jobs, rest_sandbox
 except ImportError:  # run as a script from the servers directory
+    import rest_envs
     import rest_jobs
     import rest_sandbox
 RESTError = rest_jobs.RESTError  # re-exported
@@ -266,7 +267,7 @@ class TokenAuth:
     TOKEN_BYTES = 32
     HASH_PREFIX = "sha256:"
     OWNER = "owner"
-    SCOPES = ("read", "submit", "propose", "files:write", "slurm", "*")
+    SCOPES = ("read", "submit", "propose", "files:write", "envs", "slurm", "*")
     NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
     def __init__(self, token, source=None, tokens_file=None):
@@ -427,6 +428,22 @@ class TokenAuth:
         cls.write_private(tokens_file, json.dumps({"tokens": [e for e in entries if e.get("name") not in names]},
                                                   indent=2) + "\n")
         return names[0]
+
+    @classmethod
+    def add_scopes_by_hash(cls, tokens_file, digest, scopes):
+        """Add `scopes` to the token whose sha256 is `digest`; returns (name, scopes added)."""
+        bad = [s for s in scopes if s not in cls.SCOPES]
+        if not scopes or bad or "*" in scopes:
+            raise ValueError(f"scopes must come from {[s for s in cls.SCOPES if s != '*']}")
+        entries = cls.read_tokens_file(tokens_file) if os.path.exists(tokens_file) else []
+        for e in entries:
+            if hmac.compare_digest(str(e.get("sha256", "")), digest):
+                added = [s for s in scopes if s not in e.get("scopes", [])]
+                if added:
+                    e["scopes"] = list(e.get("scopes", [])) + added
+                    cls.write_private(tokens_file, json.dumps({"tokens": entries}, indent=2) + "\n")
+                return e.get("name"), added
+        raise ValueError("no token has that hash")
 
     @classmethod
     def hash_token_file(cls, token_file):
@@ -668,6 +685,7 @@ class HPCRESTHandler(RESTHandler):
     SLURM_COMMANDS = ('sbatch', 'squeue', 'sacct', 'scontrol', 'scancel')
     READ_ONLY_COMMANDS = ('squeue', 'sacct')  # also exposed over GET
     FILE_CHANGE_ROUTES = (
+        ("POST", "/envs/sync"),
         ("PUT", "/files/content"),
         ("POST", "/files/mkdir"),
         ("DELETE", "/files"),
@@ -695,6 +713,9 @@ class HPCRESTHandler(RESTHandler):
             ("PUT", "/files/content"): "files:write",
             ("POST", "/files/mkdir"): "files:write",
             ("DELETE", "/files"): "files:write",
+            ("GET", "/envs"): "read",
+            ("POST", "/envs/sync"): "envs",
+            ("GET", "/envs/sync"): "read",
         },
         **{("POST", f"/slurm/{c}"): "slurm" for c in SLURM_COMMANDS},
         **{("GET", f"/slurm/{c}"): "slurm" for c in READ_ONLY_COMMANDS},
@@ -725,6 +746,9 @@ class HPCRESTHandler(RESTHandler):
             ("GET", "/files/read"): self.do_read_file,
             ("GET", "/files/tail"): self.do_tail_file,
             ("POST", "/files/mkdir"): self.do_mkdir,
+            ("GET", "/envs"): self.do_environment_info,
+            ("POST", "/envs/sync"): self.do_sync_environment,
+            ("GET", "/envs/sync"): self.do_sync_status,
             # owner only: not in ROUTE_SCOPES, so they need the `*` scope
             ("GET", "/admin/proposals"): self.do_admin_proposals,
             ("GET", "/admin/proposals/diff"): self.do_admin_proposal_diff,
@@ -820,6 +844,22 @@ class HPCRESTHandler(RESTHandler):
         job_id = self.query_value("id", required=True)
         self.audit_detail = {"job_id": job_id}
         return 200, self.jobs.cancel(job_id, self.identity.name, self.see_all_jobs)
+
+    # Python environments
+    def do_environment_info(self):
+        return 200, self.jobs.environment_info(self.query_value("project"), self.whitelist,
+                                               self.query_value("manager", "auto"),
+                                               self.query_value("environment", "default"))
+
+    def do_sync_environment(self):
+        out = self.jobs.sync_environment(self.identity.name, self.read_json(), self.whitelist)
+        self.audit_detail = {"sync": out.get("id"), "project": out.get("project"), "manager": out.get("manager")}
+        return 202, out
+
+    def do_sync_status(self):
+        wait = self.query_int("wait", 0, minimum=0, maximum=300)
+        return 200, self.jobs.sync_status(self.query_value("id", required=True), self.identity.name,
+                                          self.see_all_jobs, wait=wait)
 
     # owner review (`*` scope)
     def do_admin_proposals(self):
@@ -1135,7 +1175,7 @@ class HPCRESTHandler(RESTHandler):
 ##
 
 CONFIG_KEYS = {"limits", "templates_dir", "jobs_db", "audit_log", "tokens_file", "cluster_notes",
-               "poll_interval", "proposals_dir", "module_command", "sandbox"}
+               "poll_interval", "proposals_dir", "module_command", "sandbox", "environments"}
 
 def load_config(path):
     """
@@ -1144,7 +1184,8 @@ def load_config(path):
        "audit_log": FILE or null, "tokens_file": FILE, "cluster_notes": TEXT,
        "poll_interval": SECONDS, "proposals_dir": DIR,
        "module_command": ["bash", "-lc", "module \"$@\" 2>&1", "hpclib-module"],
-       "sandbox": {...rest_sandbox.Sandbox...}}
+       "sandbox": {...rest_sandbox.Sandbox...},
+       "environments": {...rest_envs.EnvironmentManager...}}
     """
     explicit = path is not None
     path = os.path.expanduser(path or os.path.join(rest_data_dir(), "config.json"))
@@ -1169,6 +1210,9 @@ def load_config(path):
     sandbox = config.get("sandbox")
     if sandbox is not None and not isinstance(sandbox, dict):
         raise ValueError("`sandbox` must be an object")
+    environments = config.get("environments")
+    if environments is not None and not isinstance(environments, dict):
+        raise ValueError("`environments` must be an object")
     config["path"] = path
     return config
 
@@ -1220,6 +1264,8 @@ def parse_args(argv=None):
                         help="revoke the token with this sha256 (for a token file you have but whose name you don't)")
     tokens.add_argument("--lookup-token-hash", metavar="SHA256",
                         help="print the name of the token with this sha256 (exit 1 if there is none)")
+    tokens.add_argument("--add-token-scopes", metavar="SHA256",
+                        help="add --scopes to the token with this sha256 (scopes it has are kept)")
     tokens.add_argument("--list-tokens", action="store_true")
     tokens.add_argument("--hash-token-file", action="store_true",
                         help="replace the owner token file's contents with a hash of the token")
@@ -1260,6 +1306,10 @@ def manage_tokens(opts, config):
         if found is None:
             sys.exit(1)
         print(found)
+    elif opts.add_token_scopes:
+        scopes = [s.strip() for s in opts.scopes.split(",") if s.strip()]
+        name, added = TokenAuth.add_scopes_by_hash(tokens_file, opts.add_token_scopes.strip().lower(), scopes)
+        print(f"token {name!r}: added {', '.join(added)}" if added else f"token {name!r}: already has those scopes")
     elif opts.revoke_token_hash:
         print(f"revoked {TokenAuth.revoke_token_hash(tokens_file, opts.revoke_token_hash.strip().lower())!r}")
     elif opts.list_tokens:
@@ -1403,6 +1453,7 @@ def probe_sandbox(config):
 
 def build_jobs(config, command_timeout, auto_approve=None):
     runner = rest_jobs.SlurmRunner(timeout=command_timeout)
+    sandbox = rest_sandbox.Sandbox(config.get("sandbox"), data_dir=rest_data_dir())
     templates = rest_jobs.TemplateStore(config["templates_dir"])
     return rest_jobs.JobManager(
         templates=templates,
@@ -1413,8 +1464,9 @@ def build_jobs(config, command_timeout, auto_approve=None):
         runner=runner,
         cluster_notes=config.get("cluster_notes"),
         poll_interval=config.get("poll_interval", 10),
-        sandbox=rest_sandbox.Sandbox(config.get("sandbox"), data_dir=rest_data_dir()),
+        sandbox=sandbox,
         auto_approve=auto_approve,
+        environments=rest_envs.EnvironmentManager(config.get("environments"), sandbox=sandbox, data_dir=rest_data_dir()),
     )
 
 def protected_paths(config, auth):
@@ -1462,6 +1514,9 @@ def main(argv=None, handler_class=HPCRESTHandler):
     print(f"  template proposals: {'approved automatically' if policy['review'] == 'automatic' else 'reviewed by you'}"
           f" ({policy['detail']})")
     print(f"  audit log: {config.get('audit_log') or 'off'}")
+    managers = jobs.environments.describe()["managers"]
+    print("  python environments: " + ", ".join(
+        f"{m} {info['version'] or ''}".strip() if info["available"] else f"{m} not found" for m, info in managers.items()))
     sandbox = jobs.sandbox.describe()
     if sandbox["effective"] == "singularity":
         print(f"  job sandbox: {sandbox['runtime_path']}")

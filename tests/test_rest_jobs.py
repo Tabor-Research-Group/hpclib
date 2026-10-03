@@ -251,7 +251,7 @@ class TestTemplates(JobServerTestCase):
     def test_list_templates_with_schemas(self):
         out = self.llm.templates()
         by_name = {t["name"]: t for t in out["templates"]}
-        self.assertEqual(sorted(by_name), ["hello", "orca", "python_script"])
+        self.assertEqual(sorted(by_name), ["hello", "orca", "python_project", "python_script"])
         self.assertEqual([g["name"] for g in out["guides"]], ["writing_templates"])
         schema = by_name["python_script"]["parameters"]
         self.assertEqual(schema["required"], ["script"])
@@ -501,7 +501,7 @@ class TestCluster(JobServerTestCase):
         self.assertEqual(info["associations"], [{"account": "myacct", "partition": "short", "qos": "normal"}])
         self.assertEqual(info["limits"]["max_time"], "02:00:00")
         self.assertEqual(info["allowed_dirs"], [str(self.llm_root)])
-        self.assertEqual(sorted(t["name"] for t in info["templates"]), ["hello", "orca", "python_script"])
+        self.assertEqual(sorted(t["name"] for t in info["templates"]), ["hello", "orca", "python_project", "python_script"])
         self.assertEqual([g["name"] for g in info["guides"]], ["writing_templates"])
         self.assertIn("module load", info["notes"])
 
@@ -642,7 +642,8 @@ class TestMCP(JobServerTestCase):
         self.assertEqual(sorted(by_name), sorted([
             "cluster_info", "sandbox_info", "list_templates", "submit_job", "list_jobs", "job_status", "wait_for_job",
             "cancel_job", "list_files", "read_file", "tail_file", "read_guide", "list_modules",
-            "search_modules", "list_template_proposals", "propose_template"]))
+            "search_modules", "list_template_proposals", "propose_template", "environment_info",
+            "sync_environment", "sync_status"]))
         self.assertTrue(field(by_name["cluster_info"].annotations, "readOnlyHint"))
         self.assertTrue(field(by_name["cancel_job"].annotations, "destructiveHint"))
         schema = field(by_name["submit_job"], "inputSchema")

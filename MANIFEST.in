@@ -5,4 +5,5 @@
 include README.md
 recursive-include hpclib *.sh *.py *.json *.md *.txt
 recursive-include tests *.sh *.py *.md
+recursive-include agent-console *.html *.js *.css *.md
 global-exclude __pycache__ *.py[cod] .DS_Store

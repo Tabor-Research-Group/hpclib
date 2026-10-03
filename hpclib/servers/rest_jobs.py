@@ -51,8 +51,9 @@ import time
 from contextlib import closing
 
 try:
-    from . import rest_sandbox
+    from . import rest_envs, rest_sandbox
 except ImportError:  # run as a script from the servers directory
+    import rest_envs
     import rest_sandbox
 
 __all__ = [
@@ -261,7 +262,9 @@ class JobTemplate:
         "boolean": set(),
         "path": {"must_exist", "kind"},
     }
-    SPEC_KEYS = {"description", "parameters", "resources", "overridable", "workdir", "modules", "array"}
+    SPEC_KEYS = {"description", "parameters", "resources", "overridable", "workdir", "modules", "array",
+                 "environment"}
+    ENVIRONMENT_KEYS = {"manager", "project", "name", "required"}
     ARRAY_KEYS = {"task_parameters", "max_tasks"}
     DEFAULT_OVERRIDABLE = ("time", "mem")
     ENV_PREFIX = "HPC_PARAM_"
@@ -343,6 +346,23 @@ class JobTemplate:
             max_tasks = array.get("max_tasks")
             if max_tasks is not None and (not isinstance(max_tasks, int) or max_tasks < 1):
                 raise ValueError("`array.max_tasks` must be a positive integer")
+        environment = spec.get("environment")
+        if environment is not None:
+            if not isinstance(environment, dict) or set(environment) - self.ENVIRONMENT_KEYS:
+                raise ValueError(f"`environment` must be an object with keys from {sorted(self.ENVIRONMENT_KEYS)}")
+            if environment.setdefault("manager", "auto") not in ("auto",) + rest_envs.MANAGERS:
+                raise ValueError("`environment.manager` must be auto, uv or pixi")
+            if not isinstance(environment.get("project"), str) or not environment["project"]:
+                raise ValueError("`environment.project` is required: the project directory, e.g. \"${project}\"")
+            if not isinstance(environment.setdefault("name", "default"), str):
+                raise ValueError("`environment.name` must be a string")
+            if not isinstance(environment.setdefault("required", True), bool):
+                raise ValueError("`environment.required` must be true or false")
+            for key in ("project", "name"):
+                refs = set(re.findall(r"\$\{(\w+)\}", environment[key]))
+                unknown_refs = refs - set(spec["parameters"])
+                if unknown_refs:
+                    raise ValueError(f"`environment.{key}` refers to unknown parameters {sorted(unknown_refs)}")
         if len(self.script) > self.MAX_SCRIPT:
             raise ValueError(f"script.sh is larger than {self.MAX_SCRIPT} bytes")
         if re.search(r"^\s*#SBATCH", self.script, re.M):
@@ -367,6 +387,7 @@ class JobTemplate:
             "resources": self.spec["resources"],
             "overridable_resources": self.spec["overridable"],
             "modules": self.spec["modules"],
+            "environment": self.spec.get("environment"),
             "array": None,
             "has_guide": self.guide_path is not None,
         }
@@ -542,6 +563,18 @@ class JobTemplate:
         except (KeyError, ValueError) as e:
             raise RESTError(500, f"template {self.name} has a bad workdir reference {e}")
 
+    def environment(self, values):
+        """The template's `environment` with parameter references filled in, or None."""
+        spec = self.spec.get("environment")
+        if spec is None:
+            return None
+        str_values = {k: self._env_value(v) for k, v in values.items()}
+        try:
+            return dict(spec, project=string.Template(spec["project"]).substitute(str_values),
+                        name=string.Template(spec["name"]).substitute(str_values))
+        except (KeyError, ValueError) as e:
+            raise RESTError(500, f"template {self.name} has a bad environment reference {e}")
+
     @staticmethod
     def _env_value(value):
         if isinstance(value, bool):
@@ -560,11 +593,14 @@ class JobTemplate:
         "fi"
     )
 
-    def render(self, values, tasks=None, sandbox: 'rest_sandbox.Sandbox' = None, writable=()):
+    def render(self, values, tasks=None, sandbox: 'rest_sandbox.Sandbox' = None, writable=(), prelude=None,
+               extra_ro=()):
         """
         The full job script: shebang, exports, module loads, per-task
         values, then the body - which runs in `sandbox`, with `writable`
-        directories, when one is configured. Returns (script, sandbox plan).
+        directories, when one is configured. `prelude` (bash lines, e.g.
+        activating a Python environment) runs just before the body, inside
+        the sandbox. Returns (script, sandbox plan).
         """
         body = self.script
         shebang = "#!/bin/bash"
@@ -602,11 +638,16 @@ class JobTemplate:
             ]
         plan = {"method": "none", "reason": "not sandboxed"}
         if sandbox is not None:
-            launch, plan = sandbox.launch(shebang, body, writable)
+            launch, plan = sandbox.launch(shebang, body, writable, prelude=prelude, extra_ro=extra_ro)
             if launch is not None:
                 if lines[0].strip() == shebang.strip() and not lines[0].startswith("#!/bin/bash"):
                     lines[0] = "#!/bin/bash"   # the launcher is bash, whatever the body is
                 return "\n".join(lines) + "\n\n" + "\n".join(launch) + "\n", plan
+        if prelude:
+            if not re.match(r"#!\s*(/bin/bash|/usr/bin/env\s+bash)\b", lines[0]):
+                raise RESTError(422, f"template {self.name} uses a Python environment, which needs a bash "
+                                     f"script.sh when jobs aren't sandboxed")
+            lines += prelude
         return "\n".join(lines) + "\n\n" + body, plan
 
 
@@ -1274,7 +1315,8 @@ class JobManager:
 
     def __init__(self, templates: TemplateStore, registry: JobRegistry, limits: ResourceLimits,
                  runner: SlurmRunner, cluster_notes=None, poll_interval=10, proposals: ProposalStore = None,
-                 modules: ModuleSystem = None, sandbox: 'rest_sandbox.Sandbox' = None, auto_approve=None):
+                 modules: ModuleSystem = None, sandbox: 'rest_sandbox.Sandbox' = None, auto_approve=None,
+                 environments: 'rest_envs.EnvironmentManager' = None):
         self.templates = templates
         self.registry = registry
         self.limits = limits
@@ -1288,6 +1330,7 @@ class JobManager:
         if auto_approve not in (None, "new", "all"):
             raise ValueError("auto_approve must be None, 'new' or 'all'")
         self.auto_approve = auto_approve
+        self.environments = environments
         self.submit_lock = threading.Lock()
 
     def describe_templates(self):
@@ -1326,6 +1369,76 @@ class JobManager:
                                                            f"can be used now (try a dry run first)")
         return status, dict(out, approved=False, status=f"waiting for the cluster owner to review and approve it "
                                                          f"({policy['detail']})")
+
+    # Python environments (uv, pixi)
+    @property
+    def _envs(self) -> 'rest_envs.EnvironmentManager':
+        if self.environments is None:
+            raise RESTError(503, "Python environments are not configured on this server")
+        self.environments.sandbox = self.sandbox
+        return self.environments
+
+    def _env_call(self, fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except rest_envs.EnvironmentError_ as e:
+            raise RESTError(e.status, str(e), **e.extra)
+
+    def _project(self, request_project, whitelist):
+        if not isinstance(request_project, str) or not request_project:
+            raise RESTError(400, "`project` (the project directory) is required")
+        try:
+            _, real = whitelist.resolve(request_project)
+        except PermissionError as e:
+            raise RESTError(403, str(e))
+        return real
+
+    def environment_info(self, project, whitelist, manager="auto", name="default"):
+        envs = self._envs
+        if project is None:
+            return envs.describe()
+        info = self._env_call(envs.detect, self._project(project, whitelist), manager or "auto", name or "default")
+        return dict(info, tools=envs.describe()["managers"])
+
+    def sync_environment(self, token_name, request, whitelist):
+        if not isinstance(request, dict):
+            raise RESTError(400, "request body must be an object")
+        unknown = set(request) - {"project", "manager", "environment", "update"}
+        if unknown:
+            raise RESTError(400, f"unknown fields {sorted(unknown)}")
+        update = request.get("update", False)
+        if not isinstance(update, bool):
+            raise RESTError(400, "`update` must be true or false")
+        envs = self._envs
+        info = self._env_call(envs.detect, self._project(request.get("project"), whitelist),
+                              request.get("manager") or "auto", request.get("environment") or "default")
+        return self._env_call(envs.sync, token_name, info, update=update)
+
+    def sync_status(self, sync_id, token_name, see_all, wait=0):
+        return self._env_call(self._envs.status, sync_id, token_name, see_all, wait=wait)
+
+    def _job_environment(self, template, values, whitelist):
+        """The detected environment a job should run in, or None."""
+        spec = template.environment(values)
+        if spec is None:
+            return None
+        if self.environments is None:
+            if spec["required"]:
+                raise RESTError(503, f"template {template.name} needs a Python environment, and environments "
+                                     f"are not configured on this server")
+            return None
+        try:
+            project = self._project(spec["project"], whitelist)
+        except RESTError as e:
+            raise RESTError(e.status, f"environment project: {e}")
+        info = self._env_call(self.environments.detect, project, spec["manager"], spec["name"])
+        if not info["ready"]:
+            if not spec["required"]:
+                return None
+            raise RESTError(422, f"the Python environment for {project} isn't set up yet"
+                                 f"{': ' + info['problem'] if info.get('problem') else ''}; sync it first with "
+                                 f"sync_environment (POST /envs/sync {{\"project\": ...}})", environment=info)
+        return info
 
     def list_proposals(self):
         if self.proposals is None:
@@ -1383,6 +1496,7 @@ class JobManager:
             "notes": self.cluster_notes,
             "sandbox": self.sandbox.describe(),
             "template_proposals": self.proposal_policy(),
+            "environments": self.environments.describe() if self.environments is not None else None,
         })
         return info
 
@@ -1504,8 +1618,13 @@ class JobManager:
         # A sandboxed job may write where its token may: the token's directories (narrowed
         # by the server's --allow list), or just the workdir if neither restricts it.
         writable = list(whitelist.roots) if whitelist.restricted else [workdir]
+        environment = self._job_environment(template, values, whitelist)
+        prelude = extra_ro = None
+        if environment is not None:
+            prelude, extra_ro = self.environments.prelude(environment), self.environments.job_binds(environment)
         try:
-            script, sandbox_plan = template.render(values, tasks, sandbox=self.sandbox, writable=writable)
+            script, sandbox_plan = template.render(values, tasks, sandbox=self.sandbox, writable=writable,
+                                                   prelude=prelude, extra_ro=extra_ro or ())
         except rest_sandbox.SandboxError as e:
             raise RESTError(503, str(e), see="GET /sandbox describes what this node supports")
         args = [
@@ -1522,6 +1641,8 @@ class JobManager:
 
         plan = {"template": template.name, "params": values, "resources": resources, "workdir": workdir,
                 "sbatch_args": args[1:], "script": script, "sandbox": sandbox_plan}
+        if environment is not None:
+            plan["environment"] = {k: environment.get(k) for k in ("manager", "project", "environment", "path")}
         if tasks is not None:
             plan.update(array_size=len(tasks), throttle=throttle, tasks=tasks, task_source=task_source)
         if dry_run:
