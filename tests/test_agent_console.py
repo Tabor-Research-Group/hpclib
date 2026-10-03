@@ -10,6 +10,8 @@ import os
 import socket
 import subprocess
 import sys
+import textwrap
+import time
 import threading
 import unittest
 import urllib.error
@@ -232,12 +234,17 @@ class TestSettings(ConsoleTestCase):
 
     def test_agent_tunnel_reads_them(self):
         repo = Path(__file__).resolve().parents[1]
-        agent_profiles.cmd_set(self.live, "auto_approve_templates=new", "tunnel_args=--time=12:00:00")
-        script = (f'source {repo / "hpclib" / "hpclib.sh"}; launch_tunnel() {{ printf "%s\\n" "$*"; }}; '
-                  f'agent_tunnel {self.live}; agent_tunnel {self.live} --review-templates --time=2:00:00')
+        agent_profiles.cmd_set(self.live, "auto_approve_templates=new", "tunnel_args=--time=12:00:00",
+                               "connection_hours=6")
+        script = (f'source {repo / "hpclib" / "hpclib.sh"}; '
+                  f'launch_tunnel() {{ printf "%s %s\\n" "$HPCLIB_SSH_PERSIST" "$*"; }}; '
+                  f'agent_tunnel {self.live}; agent_tunnel {self.live} --review-templates --time=2:00:00; '
+                  f'echo "after: $HPCLIB_SSH_PERSIST"')
         res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
                              env=dict(os.environ, HPCLIB_AGENTS_DIR=str(self.agents)))
-        first, second = res.stdout.splitlines()
+        first, second, after = res.stdout.splitlines()
+        self.assertTrue(first.startswith("6h "), first)                            # the login hours, for pssh
+        self.assertEqual(after, "after: 12h")                                      # only for that call
         self.assertIn("--time=12:00:00 --", first)
         self.assertTrue(first.endswith("--auto-approve-templates=new"), first)
         self.assertIn("--time=12:00:00 --time=2:00:00 --", second)                # the later one wins in sbatch
@@ -256,6 +263,213 @@ class TestSettings(ConsoleTestCase):
         self.assertEqual(json.loads(path.read_text()), {"environments": {"modules": ["WebProxy"]}})
         self.assertEqual(self.call("PUT", f"/api/clusters/{self.live}/rest/admin/config?as=agent",
                                    {"changes": {"cluster_notes": "x"}})[0], 403)
+
+
+FAKE_SSH_LOGIN = textwrap.dedent("""\
+    #!/usr/bin/env python3
+    # Stands in for ssh: -O check/exit on the master, or a login that asks through SSH_ASKPASS.
+    import os, subprocess, sys, time
+    args = sys.argv[1:]
+    state = os.environ["FAKE_SSH_DIR"]
+    host = args[-1]
+    master = os.path.join(state, "master-" + host)
+    if "-O" in args:
+        op = args[args.index("-O") + 1]
+        if op == "check":
+            sys.exit(0 if os.path.exists(master) else 255)
+        if op == "exit" and os.path.exists(master):
+            os.remove(master)
+            sys.exit(0)
+        sys.exit(255)
+    with open(os.path.join(state, "args"), "w") as f:
+        f.write(" ".join(args))
+    def ask(prompt):
+        res = subprocess.run([os.environ["SSH_ASKPASS"], prompt], capture_output=True, text=True)
+        return res.returncode, res.stdout.rstrip("\\n")
+    mode = os.environ.get("FAKE_SSH_MODE", "duo")
+    if mode == "hostkey":
+        ask("Are you sure you want to continue connecting (yes/no/[fingerprint])? ")
+        sys.exit(255)
+    if mode == "odd":
+        ask("Favourite colour: ")
+        sys.exit(255)
+    if mode == "duo":
+        code, answer = ask("(me@" + host + ") Password: ")
+        if code or answer != os.environ["FAKE_SSH_PASSWORD"]:
+            ask("(me@" + host + ") Password: ")
+            print("Permission denied (keyboard-interactive).", file=sys.stderr)
+            sys.exit(255)
+        code, answer = ask("Duo two-factor login for me\\n\\nEnter a passcode or select one of the following "
+                           "options:\\n\\n 1. Duo Push to XXX-XXX-1234\\n\\nPasscode or option (1-1): ")
+        if code or answer != "1":
+            sys.exit(255)
+        time.sleep(float(os.environ.get("FAKE_PUSH_SECONDS", "0.6")))   # the phone
+    open(master, "w").close()
+    sys.exit(0)
+""")
+
+
+class TestLogin(ConsoleTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.ssh_dir = self.tmp / "fake-ssh"
+        self.ssh_dir.mkdir()
+        fake = self.tmp / "bin" / "fake-ssh"
+        fake.write_text(FAKE_SSH_LOGIN)
+        fake.chmod(0o755)
+        env = mock.patch.dict(os.environ, {"FAKE_SSH_DIR": str(self.ssh_dir), "FAKE_SSH_PASSWORD": "hunter2",
+                                           "HOME": str(self.tmp / "home")})
+        env.start()
+        self.addCleanup(env.stop)
+        self.clusters.logins = agent_console.Logins(ssh=str(fake))
+        self.host = agent_profiles.load(self.dead)["host"]
+
+    def login(self, body, until=("connected", "failed", "expired")):
+        status, out = self.call("POST", f"/api/clusters/{self.dead}/login", body)
+        self.assertIn(status, (202, 409), out)
+        seen = [out.get("state")]
+        for _ in range(60):
+            out = self.call("GET", f"/api/clusters/{self.dead}/login")[1]
+            seen.append(out.get("state"))
+            if out.get("state") in until:
+                break
+            time.sleep(0.1)
+        return out, seen
+
+    def test_password_then_push(self):
+        out, seen = self.login({"password": "hunter2"})
+        self.assertEqual((out["state"], out["connected"]), ("connected", True), out)
+        self.assertIn("push_sent", seen)
+        args = (self.ssh_dir / "args").read_text()
+        self.assertIn("-M -N -f -o ControlPersist=12h", args)
+        self.assertIn("ControlPath=~/.ssh/connections/%r@%h:%p", args)     # the socket pssh reuses
+        self.assertTrue((self.tmp / "home" / ".ssh" / "connections").is_dir())
+        listed = {c["name"]: c for c in self.call("GET", "/api/clusters")[1]["clusters"]}
+        self.assertEqual(listed[self.dead]["login"]["state"], "connected")
+        # the password is nowhere it shouldn't be
+        for path in (self.console / "logs").iterdir():
+            self.assertNotIn("hunter2", path.read_text())
+        self.assertNotIn("hunter2", json.dumps(out))
+        self.assertFalse(any(a.get("password") for a in self.clusters.logins.attempts.values()))
+        self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/logout")[1]["logged_out"], True)
+        self.assertEqual(self.call("GET", f"/api/clusters/{self.dead}/login")[1]["state"], "none")
+
+    def test_wrong_or_missing_password(self):
+        out, _ = self.login({"password": "wrong"})
+        self.assertEqual((out["state"], out["message"]), ("failed", "the password was not accepted"))
+        out, _ = self.login({})
+        self.assertEqual(out["state"], "failed")
+        self.assertIn("asks for a password", out["message"])
+        self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/login", {"password": "a\nb"})[0], 400)
+
+    def test_prompts_it_does_not_answer(self):
+        with mock.patch.dict(os.environ, {"FAKE_SSH_MODE": "hostkey"}):
+            out, _ = self.login({"password": "hunter2"})
+        self.assertIn("connect once in a terminal", out["message"])
+        with mock.patch.dict(os.environ, {"FAKE_SSH_MODE": "odd"}):
+            out, _ = self.login({"password": "hunter2"})
+        self.assertEqual((out["state"], out["prompt"]), ("failed", "Favourite colour:"))
+
+    def test_keys_and_existing_login(self):
+        with mock.patch.dict(os.environ, {"FAKE_SSH_MODE": "keys"}):
+            out, _ = self.login({})
+        self.assertEqual(out["state"], "connected")
+        (self.ssh_dir / "args").unlink()
+        status, out = self.call("POST", f"/api/clusters/{self.dead}/login", {"password": "hunter2"})
+        self.assertEqual(out["state"], "connected")
+        self.assertFalse((self.ssh_dir / "args").exists())                  # no second ssh
+
+    def test_stored_login_includes_the_host(self):
+        # setup_agents stores its whole login, the host included
+        agent_profiles.cmd_set(self.dead, "login=-p", "login+=2222", f"login+={self.host}")
+        out, _ = self.login({"password": "hunter2"})
+        self.assertEqual(out["state"], "connected", out)
+        args = (self.ssh_dir / "args").read_text().split()
+        self.assertEqual(args.count(self.host), 1)
+        self.assertEqual(args[:2], ["-p", "2222"])
+        self.assertEqual(args[-1], self.host)
+
+    def test_login_hours_setting(self):
+        self.call("PUT", f"/api/clusters/{self.dead}/settings", {"connection_hours": 6})
+        self.assertEqual(self.call("PUT", f"/api/clusters/{self.dead}/settings", {"connection_hours": 0})[0], 422)
+        self.login({"password": "hunter2"})
+        self.assertIn("ControlPersist=6h", (self.ssh_dir / "args").read_text())
+
+    def test_askpass_needs_the_attempts_nonce(self):
+        logins = self.clusters.logins
+        self.assertEqual(logins.handle_prompt("made-up", "Password:"), {"error": "no login in progress"})
+        self.assertEqual(logins.handle_prompt(None, "Password:"), {"error": "no login in progress"})
+
+
+class TestManage(TestLogin):
+    """Adding clusters, and install_hpclib / setup_agents over the console's login."""
+
+    def wait_op(self, name):
+        for _ in range(50):
+            out = self.call("GET", f"/api/clusters/{name}/operation")[1]
+            if out["state"] != "running":
+                return out
+            time.sleep(0.1)
+        return out
+
+    def test_add_cluster(self):
+        status, out = self.call("POST", "/api/clusters", {"host": "me@grace.example.edu", "port": 2222,
+                                                         "jump": "me@gateway.example.edu"})
+        self.assertEqual(status, 201, out)
+        profile = agent_profiles.load(out["name"])
+        self.assertEqual(profile["login"], ["-p", "2222", "-J", "me@gateway.example.edu", "me@grace.example.edu"])
+        self.assertFalse(out["set_up"])
+        self.assertEqual(agent_console.ssh_options(profile), ["-p", "2222", "-J", "me@gateway.example.edu"])
+        self.assertEqual(self.call("POST", "/api/clusters", {"host": "me@grace.example.edu"})[0], 409)
+        for bad in ({"host": "grace"}, {"host": "me@grace; rm -rf ~"}, {"host": "me@x.edu", "port": 0},
+                    {"host": "me@x.edu", "jump": "-oProxyCommand=evil"}, {"host": "me@x.edu", "user": "x"}):
+            self.assertIn(self.call("POST", "/api/clusters", bad)[0], (400, 422), bad)
+
+    def test_needs_a_login(self):
+        status, out = self.call("POST", f"/api/clusters/{self.dead}/install", {})
+        self.assertEqual(status, 409)
+        self.assertIn("log in", out["error"])
+        self.assertEqual(self.shell.calls, [])
+
+    def test_install(self):
+        agent_profiles.cmd_set(self.dead, "login=-p", "login+=2222", f"login+={self.host}")
+        self.login({"password": "hunter2"})
+        status, out = self.call("POST", f"/api/clusters/{self.dead}/install", {"force": True})
+        self.assertEqual((status, out["kind"]), (202, "install"), out)
+        self.assertEqual(self.shell.calls[-1], ["install_hpclib", "--force", "-p", "2222", self.host])
+        done = self.wait_op(self.dead)
+        self.assertEqual((done["state"], done["exit_code"]), ("succeeded", 0))
+        self.assertTrue(any("ran install_hpclib" in line for line in done["log"]))
+        listed = {c["name"]: c for c in self.call("GET", "/api/clusters")[1]["clusters"]}
+        self.assertEqual(listed[self.dead]["operation"]["state"], "succeeded")
+        self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/install", {"force": "yes"})[0], 400)
+
+    def test_setup(self):
+        status, out = self.call("POST", "/api/clusters", {"host": "me@new.example.edu"})
+        name = out["name"]
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.assertEqual(self.call("POST", f"/api/clusters/{name}/setup", {})[0], 422)   # needs a work dir
+            for bad in ({"work_dirs": ["relative/dir"]}, {"work_dirs": ["/ok"], "templates": "a b"},
+                        {"work_dirs": ["/ok"], "rebuild": "yes"}, {"work_dirs": ["/ok"], "scopes": "*"}):
+                self.assertIn(self.call("POST", f"/api/clusters/{name}/setup", bad)[0], (400, 422), bad)
+            status, out = self.call("POST", f"/api/clusters/{name}/setup",
+                                    {"work_dirs": ["/scratch/me/llm"], "binds": ["/software"],
+                                     "templates": "hello,python_project", "rebuild": True})
+            self.assertEqual(status, 202, out)
+            self.assertEqual(self.shell.calls[-1], ["setup_agents", "--work-dir", "/scratch/me/llm", "--bind",
+                                                    "/software", "--templates", "hello,python_project",
+                                                    "--rebuild", name])
+            self.wait_op(name)
+            self.clusters.ops[name]["state"] = "running"                 # one at a time
+            self.assertEqual(self.call("POST", f"/api/clusters/{name}/install", {})[0], 409)
+
+    def test_versions(self):
+        local = agent_console.local_hpclib_version()
+        self.assertRegex(local, r"^\d+\.\d+\.\d+$")
+        self.assertEqual(self.call("GET", "/api/health")[1]["hpclib_version"], local)
+        tunnel = self.call("GET", f"/api/clusters/{self.live}")[1]["tunnel"]
+        self.assertEqual(tunnel["hpclib_version"], local)                # the test server runs from this repo
 
 
 class TestProxy(ConsoleTestCase):

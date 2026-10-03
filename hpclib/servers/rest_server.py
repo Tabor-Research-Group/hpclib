@@ -167,6 +167,17 @@ def setup_parent_terminated_listener(PARENT_PID):
     thread.start()
     return thread
 
+def hpclib_version():
+    """HPCLIB_VERSION from the hpclib.sh this server was installed with (None if it can't be read)."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hpclib.sh")
+    try:
+        with open(path) as f:
+            m = re.search(r'^HPCLIB_VERSION="([^"]+)"', f.read(), re.M)
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
 def tunnels_data_dir():
     return os.path.expanduser(os.environ.get("HPCTUNNELS_DATA_DIR", "~/.local/tunnels"))
 
@@ -772,6 +783,7 @@ class HPCRESTHandler(RESTHandler):
         return 200, {
             "status": "ok",
             "server": self.server_version,
+            "hpclib_version": hpclib_version(),
             "hostname": socket.gethostname(),
             "pid": os.getpid(),
             "slurm_job_id": os.environ.get("SLURM_JOB_ID"),

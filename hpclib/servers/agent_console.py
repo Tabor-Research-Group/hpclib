@@ -20,9 +20,20 @@ The front end depends only on the routes below; nothing here depends on it.
   GET  /api/clusters                          profiles + tunnel state, no token values
   GET  /api/clusters/NAME
   GET  /api/clusters/NAME/mcp                 the MCP client entry setup_agents wrote
+  GET  /api/clusters/NAME/login               the cluster login: state (none, starting, password_sent,
+                                              push_sent, connected, expired, failed) and message
+  POST /api/clusters/NAME/login               {"password": ...}: log in (password, then a Duo push), keeping
+                                              the ssh connection pssh and agent_tunnel reuse
+  POST /api/clusters/NAME/logout              close that connection
+  POST /api/clusters                          {"host": "user@host", "port"?, "jump"?}: a profile for a new cluster
+  POST /api/clusters/NAME/install             install_hpclib over the login ({"force": true} reinstalls)
+  POST /api/clusters/NAME/setup               setup_agents ({"work_dirs": [...], "binds": [...],
+                                              "templates": "...", "rebuild": false})
+  GET  /api/clusters/NAME/operation           the running or last install/setup, with its log
   GET  /api/clusters/NAME/settings            this machine's tunnel settings for the cluster
   PUT  /api/clusters/NAME/settings            {"auto_approve_templates": all|new|review,
-                                               "tunnel_args": ["--time=12:00:00", ...]}
+                                               "tunnel_args": ["--time=12:00:00", ...],
+                                               "connection_hours": 12}
   POST /api/clusters/NAME/tunnel/start        runs agent_tunnel NAME ({"auto_approve_templates": all|new|review})
   POST /api/clusters/NAME/tunnel/stop         runs agent_stop NAME
   GET  /api/clusters/NAME/tunnel/log?lines=N  the console's log of that tunnel
@@ -44,6 +55,8 @@ if sys.version_info < (3, 7):
 
 import argparse
 import concurrent.futures
+import contextlib
+import io
 import hmac
 import http.server
 import json
@@ -51,6 +64,7 @@ import mimetypes
 import os
 import re
 import secrets
+import shlex
 import signal
 import socket
 import subprocess
@@ -69,6 +83,20 @@ import agent_profiles  # noqa: E402
 VERSION = "0.1"
 DEFAULT_PORT = 27180
 CLUSTER_NAME_RE = re.compile(r"[A-Za-z0-9._@-]{1,120}")
+LOGIN_HOST_RE = re.compile(r"[A-Za-z0-9._-]{1,64}@[A-Za-z0-9.-]{1,253}")
+JUMP_HOST_RE = re.compile(r"([A-Za-z0-9._-]{1,64}@)?[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?")
+CLUSTER_PATH_RE = re.compile(r"/[^\0\n\r]{0,1023}")
+TEMPLATES_RE = re.compile(r"all|[A-Za-z0-9][A-Za-z0-9_.-]{0,63}(,[A-Za-z0-9][A-Za-z0-9_.-]{0,63})*")
+
+
+def local_hpclib_version():
+    """HPCLIB_VERSION of the hpclib this console runs from: what install_hpclib would install."""
+    try:
+        with open(os.path.join(HPCLIB_DIR, "hpclib.sh")) as f:
+            m = re.search(r'^HPCLIB_VERSION="([^"]+)"', f.read(), re.M)
+    except OSError:
+        return None
+    return m.group(1) if m else None
 REST_ROUTE_RE = re.compile(r"[A-Za-z0-9_./-]{1,256}")
 PROFILE_KEYS = ("name", "host", "port", "process_port", "work_dirs", "binds", "local_roots", "token_name",
                 "mcp_name", "created", "updated")
@@ -110,14 +138,269 @@ def read_private(path):
 ##  Clusters: profiles, tokens, tunnels
 ##
 
+def ssh_options(profile):
+    """
+    The ssh options from a profile's `login`. setup_agents stores its whole
+    login (`[options...] user@host`), so the host itself is dropped here.
+    """
+    login = list(profile.get("login") or [])
+    while login and login[-1] == profile.get("host"):
+        login.pop()
+    return login
+
+
+class Logins:
+    """
+    Cluster logins: an ssh master connection on the socket pssh uses
+    (~/.ssh/connections/%r@%h:%p), so agent_tunnel and pssh reuse it with no
+    prompts until it has been idle for the cluster's `connection_hours`.
+
+    ssh asks for the password and the second factor through SSH_ASKPASS
+    (console_askpass.py), which relays each prompt here. For now the console
+    answers a password prompt with the password given to `connect` and a Duo
+    prompt with "1" (a push to the phone); any other prompt ends the attempt
+    with its text, so it can be handled later. The password is kept in memory
+    only until ssh has used it.
+    """
+
+    PASSWORD_RE = re.compile(r"pass(word|phrase)", re.I)
+    PUSH_RE = re.compile(r"passcode|option|duo|two-factor|second factor", re.I)
+    HOST_KEY_RE = re.compile(r"yes/no|fingerprint|authenticity", re.I)
+    CONTROL_PATH = "~/.ssh/connections/%r@%h:%p"
+    TIMEOUT = 150
+    DEFAULT_HOURS = 12
+
+    def __init__(self, ssh="ssh"):
+        self.ssh = ssh
+        self.attempts = {}      # cluster name -> the latest attempt
+        self.by_nonce = {}
+        self.lock = threading.Lock()
+        self.socket_path = None
+
+    # -- the askpass side ----------------------------------------------------
+
+    def _serve(self):
+        """Start the socket console_askpass.py talks to (once)."""
+        with self.lock:
+            if self.socket_path is not None:
+                return self.socket_path
+            d = console_dir()
+            os.makedirs(d, mode=0o700, exist_ok=True)
+            os.chmod(d, 0o700)
+            path = os.path.join(d, f"askpass-{os.getpid()}.sock")
+            if os.path.exists(path):
+                os.remove(path)
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(path)
+            os.chmod(path, 0o600)
+            server.listen(8)
+            threading.Thread(target=self._accept, args=(server,), daemon=True).start()
+            self.socket_path = path
+            return path
+
+    def _accept(self, server):
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._answer, args=(conn,), daemon=True).start()
+
+    def _answer(self, conn):
+        with conn:
+            try:
+                conn.settimeout(10)
+                data = b""
+                while not data.endswith(b"\n") and len(data) < 65536:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                request = json.loads(data or b"{}")
+                reply = self.handle_prompt(request.get("nonce"), str(request.get("prompt", "")))
+                conn.sendall(json.dumps(reply).encode() + b"\n")
+            except (OSError, ValueError):
+                pass
+
+    def handle_prompt(self, nonce, prompt):
+        """What to tell ssh for one prompt: {"answer": ...} or {"error": ...}."""
+        with self.lock:
+            attempt = self.by_nonce.get(nonce) if isinstance(nonce, str) else None
+            if attempt is None or attempt["state"] in ("connected", "failed"):
+                return {"error": "no login in progress"}
+            shown = " ".join(prompt.split())[-300:]
+            attempt["prompts"].append(shown)
+            if self.HOST_KEY_RE.search(prompt):
+                return self._fail(attempt, "ssh doesn't know this host's key yet; connect once in a terminal "
+                                           "(ssh " + attempt["host"] + ") to accept it, then try again", shown)
+            if self.PASSWORD_RE.search(prompt):
+                if attempt["password_used"]:
+                    return self._fail(attempt, "the password was not accepted", shown)
+                if not attempt["password"]:
+                    return self._fail(attempt, "the cluster asks for a password; enter it and connect again", shown)
+                answer, attempt["password"], attempt["password_used"] = attempt["password"], None, True
+                attempt.update(state="password_sent", message="password sent")
+                return {"answer": answer}
+            if self.PUSH_RE.search(prompt):
+                if attempt["push_sent"]:
+                    return self._fail(attempt, "the push was not approved", shown)
+                attempt.update(push_sent=True, state="push_sent",
+                               message="Duo push sent: approve it on your phone")
+                return {"answer": "1"}
+            return self._fail(attempt, "the cluster asked something the console doesn't answer yet", shown)
+
+    def _fail(self, attempt, message, prompt=None):
+        attempt.update(state="failed", message=message, password=None)
+        if prompt:
+            attempt["prompt"] = prompt
+        return {"error": message}
+
+    # -- ssh -----------------------------------------------------------------
+
+    def _askpass_program(self):
+        """A tiny wrapper ssh can run as SSH_ASKPASS (it must be one executable path)."""
+        path = os.path.join(console_dir(), "askpass")
+        helper = os.path.join(HERE, "console_askpass.py")
+        text = f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(helper)} \"$@\"\n"
+        try:
+            with open(path) as f:
+                if f.read() == text:
+                    return path
+        except OSError:
+            pass
+        write_private(path, text)
+        os.chmod(path, 0o700)
+        return path
+
+    def _base(self, profile):
+        return [self.ssh] + ssh_options(profile) + ["-o", f"ControlPath={self.CONTROL_PATH}"]
+
+    def alive(self, profile):
+        try:
+            res = subprocess.run(self._base(profile) + ["-O", "check", profile["host"]], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return res.returncode == 0
+
+    def status(self, profile, check=True):
+        with self.lock:
+            attempt = dict(self.attempts.get(profile["name"]) or {})
+        hours = profile.get("connection_hours") or self.DEFAULT_HOURS
+        out = {"cluster": profile["name"], "connection_hours": hours}
+        if attempt:
+            out.update({k: attempt.get(k) for k in ("state", "message", "started", "finished", "prompt")})
+        if attempt.get("state") in ("starting", "password_sent", "push_sent"):
+            return out
+        if check:
+            connected = self.alive(profile)
+            out["connected"] = connected
+            if connected and out.get("state") != "connected":
+                out.update(state="connected", message="logged in (outside the console, or before it started)")
+            elif not connected and out.get("state") == "connected":
+                out.update(state="expired", message=f"the login has ended (idle for {hours} h, or the network "
+                                                    f"changed); log in again")
+            elif not connected and not attempt:
+                out.update(state="none", message="not logged in")
+        return out
+
+    def connect(self, profile, password=None):
+        if password is not None and (not isinstance(password, str) or len(password) > 1024 or "\n" in password):
+            raise ConsoleError(400, "`password` must be one line of text")
+        name = profile["name"]
+        with self.lock:
+            current = self.attempts.get(name)
+            if current and current["state"] in ("starting", "password_sent", "push_sent"):
+                raise ConsoleError(409, f"a login to {name} is already in progress")
+        if self.alive(profile):
+            with self.lock:
+                self.attempts[name] = {"state": "connected", "message": "already logged in", "started": time.time(),
+                                       "finished": time.time(), "prompts": [], "password": None}
+            return self.status(profile, check=False)
+        hours = int(profile.get("connection_hours") or self.DEFAULT_HOURS)
+        socket_path = self._serve()
+        nonce = secrets.token_urlsafe(24)
+        attempt = {"state": "starting", "message": "connecting", "started": time.time(), "finished": None,
+                   "prompts": [], "password": password or None, "password_used": False, "push_sent": False,
+                   "host": profile["host"]}
+        with self.lock:
+            old = self.attempts.get(name)
+            if old is not None:
+                self.by_nonce = {k: v for k, v in self.by_nonce.items() if v is not old}
+            self.attempts[name] = attempt
+            self.by_nonce[nonce] = attempt
+        os.makedirs(os.path.expanduser("~/.ssh/connections"), mode=0o700, exist_ok=True)
+        env = dict(os.environ, SSH_ASKPASS=self._askpass_program(), SSH_ASKPASS_REQUIRE="force",
+                   HPCLIB_ASKPASS_SOCKET=socket_path, HPCLIB_ASKPASS_NONCE=nonce)
+        env.setdefault("DISPLAY", ":0")   # older ssh only uses SSH_ASKPASS with a DISPLAY
+        command = self._base(profile) + [
+            "-M", "-N", "-f", "-o", f"ControlPersist={hours}h", "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=4", "-o", "NumberOfPasswordPrompts=1", profile["host"]]
+        log_path = os.path.join(console_dir(), "logs", f"{name}.login.log")
+        os.makedirs(os.path.dirname(log_path), mode=0o700, exist_ok=True)
+        log = open(log_path, "wb")
+        os.chmod(log_path, 0o600)
+        try:
+            # with -f, ssh goes to the background once logged in and this process exits 0
+            proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env,
+                                    start_new_session=True)
+        except OSError as e:
+            log.close()
+            with self.lock:
+                self._fail(attempt, f"could not run ssh: {e}")
+            return self.status(profile, check=False)
+        threading.Thread(target=self._wait, args=(profile, attempt, proc, log, log_path, nonce), daemon=True).start()
+        return self.status(profile, check=False)
+
+    def _wait(self, profile, attempt, proc, log, log_path, nonce):
+        try:
+            code = proc.wait(self.TIMEOUT)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            code = None
+        log.close()
+        with self.lock:
+            self.by_nonce.pop(nonce, None)
+            attempt["password"] = None
+            attempt["finished"] = time.time()
+            if attempt["state"] == "failed":
+                return
+            if code == 0:
+                attempt.update(state="connected", message="logged in")
+                return
+        try:
+            with open(log_path, errors="replace") as f:
+                said = [line.strip() for line in f.read().splitlines() if line.strip()][-3:]
+        except OSError:
+            said = []
+        with self.lock:
+            reason = "timed out waiting for the login" if code is None else f"ssh exited with status {code}"
+            self._fail(attempt, reason + (": " + " / ".join(said) if said else ""))
+
+    def disconnect(self, profile):
+        try:
+            res = subprocess.run(self._base(profile) + ["-O", "exit", profile["host"]], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise ConsoleError(502, f"could not run ssh: {e}")
+        with self.lock:
+            self.attempts.pop(profile["name"], None)
+        return {"logged_out": res.returncode == 0, "detail": (res.stderr or res.stdout).strip()}
+
+
 class Clusters:
     """The agent profiles, plus the tunnels this console started."""
 
-    def __init__(self, shell_runner=None, timeout=20):
+    def __init__(self, shell_runner=None, timeout=20, logins: Logins = None):
         self.timeout = timeout
         self.shell_runner = shell_runner or self.run_hpclib
         self.procs = {}
         self.lock = threading.Lock()
+        self.logins = logins or Logins()
+        self.ops = {}
 
     # profiles
     def names(self):
@@ -217,14 +500,21 @@ class Clusters:
         if status >= 400:
             return dict(out, state="error", error=health.get("error", f"HTTP {status}"))
         return dict(out, state="up", server=health.get("server"), hostname=health.get("hostname"),
-                    slurm_job_id=health.get("slurm_job_id"), token=(health.get("token") or {}).get("name"))
+                    slurm_job_id=health.get("slurm_job_id"), token=(health.get("token") or {}).get("name"),
+                    hpclib_version=health.get("hpclib_version"))
 
     def describe(self, profile, tunnel=True):
         out = {k: profile.get(k) for k in PROFILE_KEYS}
         out["has_owner_token"] = read_private(profile.get("owner_token_file") or "") is not None
         out["has_agent_token"] = read_private(profile.get("token_file") or "") is not None
+        out["connection_hours"] = profile.get("connection_hours") or Logins.DEFAULT_HOURS
+        out["set_up"] = bool(profile.get("work_dirs")) and out["has_agent_token"]
+        with self.lock:
+            op = self.ops.get(profile["name"])
+            out["operation"] = {k: op[k] for k in ("kind", "state", "exit_code", "started", "finished")} if op else None
         if tunnel:
             out["tunnel"] = self.tunnel_state(profile)
+            out["login"] = self.logins.status(profile)
         return out
 
     def run_hpclib(self, args, log):
@@ -232,15 +522,123 @@ class Clusters:
         script = 'HPCLIB_DIR="$1"; . "$1/hpclib.sh" > /dev/null 2>&1 || exit 97; shift; "$@"'
         return subprocess.Popen(["bash", "-c", script, "agent_console", HPCLIB_DIR] + list(args),
                                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                start_new_session=True, env=dict(os.environ, HPCLIB_ECHO_COMMANDS=""))
+                                start_new_session=True,
+                                env=dict(os.environ, HPCLIB_ECHO_COMMANDS="", NO_COLOR="1", HPCLIB_COLOR="never"))
 
-    def _open_log(self, name, title):
-        path = self.log_path(name)
+    def _open_log(self, name, title, path=None):
+        path = path or self.log_path(name)
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         log = open(path, "ab", buffering=0)
         os.chmod(path, 0o600)
         log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {title} ===\n".encode())
         return log
+
+    # -- installing and setting up ------------------------------------------
+
+    OPERATIONS = ("install", "setup")
+
+    def ops_log_path(self, name):
+        return os.path.join(console_dir(), "logs", f"{name}.ops.log")
+
+    def run_operation(self, profile, kind, args):
+        """Run install_hpclib or setup_agents for a cluster in the background, over its ssh login."""
+        name = profile["name"]
+        with self.lock:
+            current = self.ops.get(name)
+            if current and current["state"] == "running":
+                raise ConsoleError(409, f"{current['kind']} is already running for {name}")
+        if not self.logins.alive(profile):
+            raise ConsoleError(409, f"log in to {name} first: {kind} runs over the console's ssh login, which "
+                                    f"can't answer a password or 2FA prompt by itself")
+        log = self._open_log(name, " ".join(args), self.ops_log_path(name))
+        try:
+            proc = self.shell_runner(args, log)
+        finally:
+            log.close()
+        record = {"kind": kind, "command": args, "state": "running", "started": time.time(), "finished": None,
+                  "exit_code": None, "pid": proc.pid}
+        with self.lock:
+            self.ops[name] = record
+        threading.Thread(target=self._wait_operation, args=(record, proc), daemon=True).start()
+        return dict(record)
+
+    def _wait_operation(self, record, proc):
+        code = proc.wait()
+        with self.lock:
+            record.update(state="succeeded" if code == 0 else "failed", exit_code=code, finished=time.time())
+
+    def operation(self, name, lines=200):
+        with self.lock:
+            record = dict(self.ops.get(name) or {"state": "none"})
+        try:
+            with open(self.ops_log_path(name), "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - (256 << 10)))
+                text = f.read().decode(errors="replace")
+            record["log"] = text.splitlines()[-lines:]
+        except FileNotFoundError:
+            record["log"] = []
+        return record
+
+    def install(self, profile, body):
+        force = body.get("force", False)
+        if not isinstance(force, bool) or set(body) - {"force"}:
+            raise ConsoleError(400, "install takes {\"force\": true|false}")
+        login = list(profile.get("login") or [])
+        if profile.get("host") not in login:
+            login.append(profile["host"])
+        return self.run_operation(profile, "install", ["install_hpclib"] + (["--force"] if force else []) + login)
+
+    def setup(self, profile, body):
+        unknown = set(body) - {"work_dirs", "binds", "templates", "rebuild"}
+        if unknown:
+            raise ConsoleError(400, f"unknown setup options {sorted(unknown)}")
+        args = ["setup_agents"]
+        for key, flag in (("work_dirs", "--work-dir"), ("binds", "--bind")):
+            values = body.get(key) or []
+            if not isinstance(values, list) or not all(isinstance(v, str) and CLUSTER_PATH_RE.fullmatch(v)
+                                                       for v in values):
+                raise ConsoleError(422, f"{key} must be absolute paths on the cluster")
+            for v in values:
+                args += [flag, v]
+        if not profile.get("work_dirs") and not body.get("work_dirs"):
+            raise ConsoleError(422, "a new cluster needs at least one work directory (where agents may write)")
+        templates = body.get("templates")
+        if templates is not None:
+            if not isinstance(templates, str) or not TEMPLATES_RE.fullmatch(templates):
+                raise ConsoleError(422, "templates is `all` or a comma-separated list of template names")
+            args += ["--templates", templates]
+        rebuild = body.get("rebuild", False)
+        if not isinstance(rebuild, bool):
+            raise ConsoleError(400, "rebuild must be true or false")
+        if rebuild:
+            args.append("--rebuild")
+        return self.run_operation(profile, "setup", args + [profile["name"]])
+
+    def add(self, body):
+        """A profile for a new cluster, so it can be logged in to and set up."""
+        unknown = set(body) - {"host", "port", "jump"}
+        if unknown:
+            raise ConsoleError(400, f"unknown fields {sorted(unknown)}")
+        host, port, jump = body.get("host"), body.get("port"), body.get("jump")
+        if not isinstance(host, str) or not LOGIN_HOST_RE.fullmatch(host):
+            raise ConsoleError(422, "host must be user@host, e.g. maboyer@grace.hprc.tamu.edu")
+        login = []
+        if port not in (None, "", 22):
+            if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+                raise ConsoleError(422, "port must be a number from 1 to 65535")
+            login += ["-p", str(port)]
+        if jump:
+            if not isinstance(jump, str) or not JUMP_HOST_RE.fullmatch(jump):
+                raise ConsoleError(422, "jump must be [user@]host[:port]")
+            login += ["-J", jump]
+        name = agent_profiles.name_for(host)
+        if agent_profiles.load(name) is not None:
+            raise ConsoleError(409, f"there is already a profile {name}")
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent_profiles.cmd_init(name, host)
+        agent_profiles.cmd_set(name, "login=", *[f"login+={a}" for a in login + [host]])
+        return self.describe(agent_profiles.load(name), tunnel=False)
 
     def start_tunnel(self, profile, auto_approve=None, extra=()):
         name = profile["name"]
@@ -470,7 +868,10 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         parts = [urllib.parse.unquote(p) for p in path.strip("/").split("/")[1:]]  # without "api"
         c = self.server.clusters
         if parts == ["health"] and verb == "GET":
-            return 200, {"ok": True, "console": VERSION, "clusters": len(c.names()), "pid": os.getpid()}
+            return 200, {"ok": True, "console": VERSION, "clusters": len(c.names()), "pid": os.getpid(),
+                         "hpclib_version": local_hpclib_version()}
+        if parts == ["clusters"] and verb == "POST":
+            return 201, dict(c.add(self.json_body()), ok=True)
         if parts == ["clusters"] and verb == "GET":
             profiles = agent_profiles.all_profiles()
             with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(profiles)))) as pool:
@@ -485,6 +886,18 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             rest = parts[2:]
             if not rest and verb == "GET":
                 return 200, dict(c.describe(profile), ok=True)
+            if rest == ["install"] and verb == "POST":
+                return 202, dict(c.install(profile, self.json_body()), ok=True)
+            if rest == ["setup"] and verb == "POST":
+                return 202, dict(c.setup(profile, self.json_body()), ok=True)
+            if rest == ["operation"] and verb == "GET":
+                return 200, dict(c.operation(profile["name"], self.int_arg("lines", 200, 1, 5000)), ok=True)
+            if rest == ["login"] and verb == "GET":
+                return 200, dict(c.logins.status(profile), ok=True)
+            if rest == ["login"] and verb == "POST":
+                return 202, dict(c.logins.connect(profile, self.json_body().get("password")), ok=True)
+            if rest == ["logout"] and verb == "POST":
+                return 200, dict(c.logins.disconnect(profile), ok=True)
             if rest == ["settings"] and verb == "GET":
                 return 200, dict(self.tunnel_settings(profile), ok=True)
             if rest == ["settings"] and verb == "PUT":
@@ -555,12 +968,13 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         return {"cluster": profile["name"],
                 "auto_approve_templates": profile.get("auto_approve_templates") or "all",
                 "tunnel_args": profile.get("tunnel_args") or [],
+                "connection_hours": profile.get("connection_hours") or Logins.DEFAULT_HOURS,
                 "modes": list(agent_profiles.APPROVE_MODES),
                 "tunnel_arg_pattern": agent_profiles.TUNNEL_ARG_RE.pattern,
                 "applies": "the next time the tunnel starts"}
 
     def save_tunnel_settings(self, profile, body):
-        unknown = set(body) - {"auto_approve_templates", "tunnel_args"}
+        unknown = set(body) - {"auto_approve_templates", "tunnel_args", "connection_hours"}
         if unknown:
             raise ConsoleError(400, f"unknown settings {sorted(unknown)}")
         mode = body.get("auto_approve_templates", profile.get("auto_approve_templates") or "all")
@@ -571,8 +985,11 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                                                  for a in args):
             raise ConsoleError(422, "tunnel_args must be sbatch options like --time=12:00:00 or --mem=2gb "
                                     "(time, mem, partition, account, qos, cpus-per-task, constraint)")
+        hours = body.get("connection_hours", profile.get("connection_hours") or Logins.DEFAULT_HOURS)
+        if isinstance(hours, bool) or not isinstance(hours, int) or not 1 <= hours <= 168:
+            raise ConsoleError(422, "connection_hours must be a whole number of hours from 1 to 168")
         fresh = agent_profiles.load(profile["name"]) or profile
-        fresh.update(auto_approve_templates=mode, tunnel_args=args)
+        fresh.update(auto_approve_templates=mode, tunnel_args=args, connection_hours=hours)
         agent_profiles.save(fresh)
         return self.tunnel_settings(fresh)
 

@@ -114,20 +114,179 @@ function diffView(text) {
 
 // ---------------------------------------------------------------- pages
 
+// ---------------------------------------------------------------- cluster login
+
+const LOGIN_BUSY = ["starting", "password_sent", "push_sent"];
+const LOGIN_LABEL = { connected: "logged in", none: "not logged in", expired: "login ended", failed: "login failed",
+                      starting: "connecting", password_sent: "password sent", push_sent: "approve the push" };
+
+function loginDialog(c, onConnected) {
+  const password = el("input", { type: "password", autocomplete: "current-password", placeholder: "cluster password" });
+  const status = el("p", { class: "muted" },
+    `Logs in to ${c.host} once; the tunnel and other ssh commands reuse the login until it has been idle for ` +
+    `${c.connection_hours} h. After the password, a Duo push goes to your phone.`);
+  const go = el("button", { class: "primary", type: "submit" }, "Log in");
+  const close = el("button", { type: "button" }, "Close");
+  const form = el("form", {}, el("h3", {}, `Log in to ${c.name}`), status, password,
+                  el("div", { class: "actions" }, go, close));
+  const dialog = el("dialog", { class: "login" }, form);
+  let timer = null;
+  let connected = false;
+  const finish = async () => {
+    clearInterval(timer);
+    dialog.close();
+    dialog.remove();
+    if (connected && onConnected) {
+      try { await onConnected(); } catch (err) { alertError(err); }
+    }
+    render();
+  };
+  close.addEventListener("click", finish);
+  const show = (st) => {
+    status.className = st.state === "failed" ? "error-box" : (st.state === "connected" ? "saved" : "muted");
+    status.textContent = (st.message || LOGIN_LABEL[st.state] || st.state) + (st.prompt ? ` (asked: "${st.prompt}")` : "");
+  };
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    go.disabled = password.disabled = true;
+    try {
+      const value = password.value;
+      password.value = "";                          // don't keep it in the page
+      show(await api(cluster(c.name) + "/login", { method: "POST", body: value ? { password: value } : {} }));
+    } catch (err) {
+      show({ state: "failed", message: err.message });
+      go.disabled = password.disabled = false;
+      return;
+    }
+    timer = setInterval(async () => {
+      let st;
+      try { st = await api(cluster(c.name) + "/login"); } catch (err) { st = { state: "failed", message: err.message }; }
+      show(st);
+      if (!LOGIN_BUSY.includes(st.state)) {
+        clearInterval(timer);
+        if (st.state === "connected") { connected = true; setTimeout(finish, 1200); }
+        else go.disabled = password.disabled = false;
+      }
+    }, 1000);
+  });
+  document.body.append(dialog);
+  dialog.showModal();
+  password.focus();
+}
+
+function watchOperation(c, row) {
+  // show the cluster's install/setup with its log, refreshing while it runs
+  const box = row.firstChild;
+  let timer = null;
+  const draw = async () => {
+    let op;
+    try { op = await api(cluster(c.name) + "/operation?lines=400"); } catch (err) { box.replaceChildren(errorBox(err)); return; }
+    const label = { running: "running…", succeeded: "finished", failed: `failed (exit ${op.exit_code})` }[op.state] || op.state;
+    const pre = el("pre", {}, op.log.join("\n") || "(no output yet)");
+    box.replaceChildren(el("div", { class: op.state === "failed" ? "error-box" : "muted" },
+      `${op.kind === "install" ? "install_hpclib" : "setup_agents"}: ${label}`), pre);
+    pre.scrollTop = pre.scrollHeight;
+    row.hidden = false;
+    if (op.state !== "running") {
+      clearInterval(timer);
+      if (row.dataset.wasRunning) { delete row.dataset.wasRunning; setTimeout(render, 1500); }
+    } else {
+      row.dataset.wasRunning = "1";
+    }
+  };
+  draw();
+  timer = setInterval(() => {
+    if (!document.body.contains(row)) return clearInterval(timer);
+    draw();
+  }, 2000);
+}
+
+function setupForm(c, row, onDone) {
+  const workDirs = el("textarea", { rows: 2, placeholder: "/scratch/user/me/llm" }, (c.work_dirs || []).join("\n"));
+  const binds = el("textarea", { rows: 2, placeholder: "/software" }, (c.binds || []).join("\n"));
+  const rebuild = el("input", { type: "checkbox" });
+  const out = el("div");
+  const run = saveButton(c.set_up ? "Run setup_agents again" : "Set up", async () => {
+    const body = { work_dirs: lines(workDirs.value), binds: lines(binds.value), rebuild: rebuild.checked };
+    await api(cluster(c.name) + "/setup", { method: "POST", body });
+    onDone();
+    return "Started.";
+  }, out);
+  row.firstChild.replaceChildren(el("div", { class: "card" },
+    el("h3", {}, `${c.set_up ? "Set up again" : "Set up"}: ${c.name}`),
+    el("p", { class: "muted" }, "Installs hpclib, the job templates and the sandboxed REST server config on the " +
+      "cluster, and the agent's token and MCP entry here. Reruns keep templates, config and tokens, and add what's new."),
+    el("div", { class: "row" },
+      field("Work directories (agents may write here)", workDirs, "absolute paths on the cluster, one per line"),
+      field("Extra read-only directories for jobs", binds, "e.g. a software tree, one per line")),
+    el("label", {}, rebuild, " Rebuild: regenerate templates and config and replace the agent token (old copies are kept)"),
+    el("div", { class: "actions" }, run), out));
+  row.hidden = false;
+}
+
+function addClusterForm(onAdded) {
+  const host = el("input", { placeholder: "user@login.cluster.edu", size: 32 });
+  const port = el("input", { type: "number", min: 1, max: 65535, placeholder: "22", size: 6 });
+  const jump = el("input", { placeholder: "optional: [user@]jumphost", size: 24 });
+  const work = el("input", { placeholder: "/scratch/user/me/llm", size: 32 });
+  const binds = el("input", { placeholder: "optional: /software", size: 24 });
+  const out = el("div");
+  const add = saveButton("Add, then log in and set up", async () => {
+    if (!work.value.trim()) throw new Error("give a work directory on the cluster");
+    const c = await api("clusters", { method: "POST", body: { host: host.value.trim(),
+      port: port.value ? Number(port.value) : null, jump: jump.value.trim() || null } });
+    const setup = { work_dirs: [work.value.trim()], binds: words(binds.value) };
+    loginDialog(c, async () => {
+      await api(cluster(c.name) + "/setup", { method: "POST", body: setup });
+    });
+    onAdded();
+    return `Added ${c.name}.`;
+  }, out);
+  return el("section", { class: "card" },
+    el("h3", {}, "Add a cluster"),
+    el("p", { class: "muted" }, "The console logs in (password, then a Duo push) and runs setup_agents over that login."),
+    el("div", { class: "row" }, field("Login", host), field("Port", port), field("Jump host", jump)),
+    el("div", { class: "row" }, field("Work directory for agents", work, "absolute path on the cluster"),
+      field("Extra read-only directories", binds, "space-separated")),
+    el("div", { class: "actions" }, add), out);
+}
+
 async function clustersPage() {
-  const { clusters } = await api("clusters");
+  const [{ clusters }, health] = await Promise.all([api("clusters"), api("health")]);
+  const local = health.hpclib_version;
+  const addArea = el("div");
+  const addBtn = el("button", { type: "button" }, "Add cluster");
+  addBtn.addEventListener("click", () => {
+    addArea.replaceChildren(addArea.firstChild ? "" : addClusterForm(() => {}));
+  });
   const rows = clusters.map((c) => {
     const t = c.tunnel || {};
-    const logRow = el("tr", { hidden: true }, el("td", { colspan: 5 }));
+    const logRow = el("tr", { hidden: true }, el("td", { colspan: 6 }));
+    const opRow = el("tr", { hidden: true }, el("td", { colspan: 6 }));
     const showLog = async () => {
       if (!logRow.hidden) { logRow.hidden = true; return; }
-      const { lines } = await api(cluster(c.name) + "/tunnel/log?lines=200");
-      logRow.firstChild.replaceChildren(el("pre", {}, lines.join("\n") || "(no log yet)"));
+      const { lines: text } = await api(cluster(c.name) + "/tunnel/log?lines=200");
+      logRow.firstChild.replaceChildren(el("pre", {}, text.join("\n") || "(no log yet)"));
       logRow.hidden = false;
     };
     const start = el("button", {}, "Start");
     const stop = el("button", {}, "Stop");
     const log = el("button", {}, "Log");
+    const install = el("button", {}, "Update hpclib");
+    const setup = el("button", {}, c.set_up ? "Setup…" : "Set up…");
+    const lg = c.login || {};
+    const loggedIn = lg.state === "connected";
+    const op = c.operation;
+    const loginBtn = el("button", {}, loggedIn ? "Log out" : "Log in");
+    loginBtn.addEventListener("click", busy(loginBtn, async () => {
+      if (loggedIn) {
+        await api(cluster(c.name) + "/logout", { method: "POST" });
+        render();
+      } else {
+        loginDialog(c);
+      }
+    }));
+    loginBtn.disabled = LOGIN_BUSY.includes(lg.state);
     start.addEventListener("click", busy(start, async () => {
       await api(cluster(c.name) + "/tunnel/start", { method: "POST", body: {} });
       setTimeout(render, 3000);
@@ -137,8 +296,20 @@ async function clustersPage() {
       render();
     }));
     log.addEventListener("click", busy(log, showLog));
-    start.disabled = t.state === "up" || t.state === "starting";
+    install.addEventListener("click", busy(install, async () => {
+      await api(cluster(c.name) + "/install", { method: "POST", body: {} });
+      watchOperation(c, opRow);
+    }));
+    setup.addEventListener("click", () => setupForm(c, opRow, () => watchOperation(c, opRow)));
+    const running = op && op.state === "running";
+    start.disabled = t.state === "up" || t.state === "starting" || !c.set_up;
     stop.disabled = t.state === "down" && !t.started_here;
+    for (const b of [install, setup]) {
+      b.disabled = !loggedIn || running;
+      b.title = loggedIn ? "" : "log in first";
+    }
+    if (op) watchOperation(c, opRow);
+    const behind = t.hpclib_version && local && t.hpclib_version !== local;
     return [
       el("tr", {},
         el("td", {}, c.name, el("div", { class: "muted" }, c.mcp_name || "")),
@@ -146,19 +317,31 @@ async function clustersPage() {
           el("span", { class: `state ${t.state}` }, t.state),
           t.state === "up" ? el("div", { class: "muted" },
             `${t.hostname || ""}${t.slurm_job_id ? ` · job ${t.slurm_job_id}` : ""}`) : null,
+          t.hpclib_version ? el("div", { class: behind ? "state starting" : "muted" },
+            `hpclib ${t.hpclib_version}${behind ? ` · ${local} here` : ""}`) : null,
           t.error ? el("div", { class: "muted" }, t.error) : null),
+        el("td", {},
+          el("span", { class: `state ${loggedIn ? "up" : (lg.state === "failed" ? "error" : "down")}` },
+            LOGIN_LABEL[lg.state] || lg.state || ""),
+          lg.state === "failed" ? el("div", { class: "muted" }, lg.message) : null,
+          el("div", {}, loginBtn)),
         el("td", { class: "num" }, c.port),
-        el("td", {}, c.has_owner_token ? "owner" : el("span", { class: "muted" }, "agent only")),
-        el("td", {}, el("div", { class: "actions" }, start, stop, log))),
+        el("td", {}, !c.set_up ? el("span", { class: "muted" }, "not set up") :
+          (c.has_owner_token ? "owner" : el("span", { class: "muted" }, "agent only"))),
+        el("td", {}, el("div", { class: "actions" }, start, stop, log),
+          el("div", { class: "actions second" }, install, setup))),
       logRow,
+      opRow,
     ];
   });
   return [
-    el("h2", {}, "Clusters"),
+    el("div", { class: "toolbar" }, el("h2", {}, "Clusters"), addBtn,
+      el("span", { class: "muted" }, local ? `hpclib ${local} on this machine` : "")),
+    addArea,
     clusters.length ? el("table", {},
-      el("thead", {}, el("tr", {}, ["Cluster", "Tunnel", "Port", "Token", ""].map((h) => el("th", {}, h)))),
+      el("thead", {}, el("tr", {}, ["Cluster", "Tunnel", "Login", "Port", "Token", ""].map((h) => el("th", {}, h)))),
       el("tbody", {}, rows.flat()))
-      : el("p", { class: "muted" }, "No agent profiles yet; run setup_agents."),
+      : el("p", { class: "muted" }, "No clusters yet; add one."),
   ];
 }
 
@@ -345,16 +528,19 @@ async function tunnelSettings(c) {
   const given = Object.fromEntries(s.tunnel_args.map((a) => a.replace(/^--/, "").split(/=(.*)/s).slice(0, 2)));
   const inputs = Object.fromEntries(TUNNEL_FIELDS.map(([k]) => [k, el("input", { value: given[k] || "", size: 16 })]));
   const other = s.tunnel_args.filter((a) => !TUNNEL_FIELDS.some(([k]) => a.startsWith(`--${k}=`)));
+  const hours = el("input", { type: "number", min: 1, max: 168, value: s.connection_hours, size: 6 });
   const out = el("div");
   const save = saveButton("Save tunnel settings", async () => {
     const args = TUNNEL_FIELDS.filter(([k]) => inputs[k].value.trim()).map(([k]) => `--${k}=${inputs[k].value.trim()}`)
       .concat(other);
-    await api(cluster(c.name) + "/settings", { method: "PUT", body: { auto_approve_templates: mode.value, tunnel_args: args } });
-    return "Saved. Applies the next time the tunnel starts.";
+    await api(cluster(c.name) + "/settings", { method: "PUT", body: {
+      auto_approve_templates: mode.value, tunnel_args: args, connection_hours: Number(hours.value) } });
+    return "Saved. Applies the next time the tunnel starts (the login hours: the next time you log in).";
   }, out);
   return el("section", { class: "card" },
     el("h3", {}, "Tunnel ", el("span", { class: "muted" }, "· kept on this machine")),
     field("Template proposals", mode, "only while jobs are sandboxed"),
+    field("Keep the ssh login for (hours)", hours, "after it was last used; 1 to 168, default 12"),
     el("div", { class: "row" }, TUNNEL_FIELDS.map(([k, label, hint]) => field(`Tunnel job: ${label}`, inputs[k], hint))),
     other.length ? el("p", { class: "muted" }, `Also: ${other.join(" ")}`) : null,
     el("div", { class: "actions" }, save), out);

@@ -137,3 +137,7 @@ details { margin-top: 12px; }
 summary { cursor: pointer; color: var(--muted); }
 .field select, .field input:not([size]) { align-self: flex-start; }
 .badge[hidden] { display: none; }
+dialog.login { width: 420px; }
+dialog.login .actions { margin-top: 8px; }
+.actions.second { margin-top: 4px; }
+.toolbar h2 { margin: 0; }

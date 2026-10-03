@@ -34,6 +34,7 @@ LIST_KEYS = ("login", "work_dirs", "binds", "local_roots", "tunnel_args")
 # Tunnel settings agent_tunnel reads (the console's settings page writes them):
 #   auto_approve_templates  all (default) | new | review
 #   tunnel_args             sbatch options for the tunnel's own job, e.g. --time=12:00:00
+#   connection_hours        how long an ssh login is kept for reuse once idle (default 12)
 APPROVE_MODES = ("all", "new", "review")
 TUNNEL_ARG_RE = re.compile(r"--(time|mem|partition|account|qos|cpus-per-task|constraint)=[A-Za-z0-9:._,+-]{1,64}")
 
@@ -218,6 +219,11 @@ def cmd_set(name, *pairs):
                 items.append(value)
             profile[key] = items
         elif key in ("port", "process_port"):
+            profile[key] = int(value)
+        elif key == "connection_hours":
+            if not value.isdigit() or not 1 <= int(value) <= 168:
+                print("agent_profiles: connection_hours is a whole number of hours from 1 to 168", file=sys.stderr)
+                return 2
             profile[key] = int(value)
         else:
             profile[key] = value

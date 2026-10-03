@@ -17,6 +17,8 @@ function _ssh_connected {
 SSH_FLAGS="46AaCfgKkMNnqPRTtVvXxYy:b:c:D:E:e:F:f:i:I:J:L:l:m:O:o:p:Q:S:W:w:";
 # a dead connection (sleep, VPN change) errors out in ~2 minutes instead of hanging
 HPCLIB_SSH_KEEPALIVE="${HPCLIB_SSH_KEEPALIVE--o ServerAliveInterval=30 -o ServerAliveCountMax=4}"
+# how long a login (password, 2FA) is reused once nothing is using it; the console sets it per cluster
+HPCLIB_SSH_PERSIST="${HPCLIB_SSH_PERSIST:-12h}"
 SSH_LONG_FLAGS=""
 function _ssh_like {
   local cmd="$1";
@@ -56,9 +58,9 @@ function _ssh_like {
   # echo "$cmd $base_opts -o $conn_opt ${args[@]}"
   mkdir -p ~/.ssh/connections
   if [ "$HPCLIB_ECHO_COMMANDS" ]; then
-    echo $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h' $HPCLIB_SSH_KEEPALIVE ${args[@]}
+    echo $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o "ControlPersist=$HPCLIB_SSH_PERSIST" $HPCLIB_SSH_KEEPALIVE ${args[@]}
   fi
-  $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h' $HPCLIB_SSH_KEEPALIVE ${args[@]}
+  $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o "ControlPersist=$HPCLIB_SSH_PERSIST" $HPCLIB_SSH_KEEPALIVE ${args[@]}
 
 }
 
@@ -101,9 +103,9 @@ function _scp_like {
 
   mkdir -p ~/.ssh/connections
   if [ "$HPCLIB_ECHO_COMMANDS" ]; then
-    echo $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h' $HPCLIB_SSH_KEEPALIVE ${args[@]}
+    echo $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o "ControlPersist=$HPCLIB_SSH_PERSIST" $HPCLIB_SSH_KEEPALIVE ${args[@]}
   fi
-  $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h' $HPCLIB_SSH_KEEPALIVE ${args[@]}
+  $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o "ControlPersist=$HPCLIB_SSH_PERSIST" $HPCLIB_SSH_KEEPALIVE ${args[@]}
 
 }
 
@@ -145,9 +147,9 @@ function _rsync_like {
   # fi
     mkdir -p ~/.ssh/connections
   if [ "$HPCLIB_ECHO_COMMANDS" ]; then
-    echo $cmd $base_opts -e "ssh -o \'ControlMaster=auto\' -o \'ControlPath=~/.ssh/connections/%r@%h:%p\' -o \'ControlPersist=4h\'" ${args[@]}
+    echo $cmd $base_opts -e "ssh -o \'ControlMaster=auto\' -o \'ControlPath=~/.ssh/connections/%r@%h:%p\' -o \'ControlPersist=$HPCLIB_SSH_PERSIST\'" ${args[@]}
   fi
-  $cmd $base_opts -e "ssh -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=4h'" ${args[@]}
+  $cmd $base_opts -e "ssh -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o 'ControlPersist=$HPCLIB_SSH_PERSIST'" ${args[@]}
 
 }
 

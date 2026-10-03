@@ -120,13 +120,33 @@ instead: `agent_console --static agent-console --open` serves the minimal front 
 | `GET /api/health` | the console is up |
 | `GET /api/clusters`, `GET /api/clusters/NAME` | profiles and tunnel state (`down`, `starting`, `up`, `error`); never token values |
 | `GET /api/clusters/NAME/mcp` | the MCP client entry |
-| `GET`/`PUT /api/clusters/NAME/settings` | this machine's tunnel settings for the cluster: `auto_approve_templates` (`all`, `new`, `review`) and `tunnel_args` (sbatch options for the tunnel job, e.g. `--time=12:00:00`); `agent_tunnel` reads them, and its own options win |
+| `GET`/`PUT /api/clusters/NAME/settings` | this machine's tunnel settings for the cluster: `auto_approve_templates` (`all`, `new`, `review`) and `tunnel_args` (sbatch options for the tunnel job, e.g. `--time=12:00:00`), and `connection_hours` (how long the ssh login is kept, default 12); `agent_tunnel` reads them, and its own options win |
 | `POST /api/clusters/NAME/tunnel/start` (`{"auto_approve_templates": "all"\|"new"\|"review"}`, default `all`), `.../tunnel/stop`, `GET .../tunnel/log` | `agent_tunnel` and `agent_stop`, logged to `~/.config/hpclib/console/logs/` |
 | `ANY /api/clusters/NAME/rest/ROUTE` | the cluster's REST route, with the owner token (`?as=agent`: the agent token) |
 | `GET /api/jobs`, `GET /api/proposals` | jobs and pending proposals from every live cluster, with each cluster's `ok`/`error` |
 
-The console starts tunnels without a terminal, so the ssh login has to work without prompting (keys, or an open
-ssh ControlMaster); otherwise start the tunnel with `agent_tunnel` and the console finds it on its port.
+The console starts tunnels without a terminal, so it first needs an ssh login it can reuse. `pssh` (and so
+`agent_tunnel`) shares one ssh connection per host (`~/.ssh/connections/`), kept for 12 hours after it was last
+used (`$HPCLIB_SSH_PERSIST`, e.g. `4h`; per cluster, the profile's `connection_hours`). The console's **Log in**
+button opens that connection: it asks for your cluster password, ssh sends it (through `SSH_ASKPASS`, to
+`hpclib/servers/console_askpass.py`, which asks the console over a private socket), and the Duo prompt that
+follows is answered with a push to your phone. The password is kept in memory only until ssh has used it and is
+never written anywhere. Then **Start** runs `agent_tunnel` over that login with no prompts. Other prompts (an
+unknown host key, a passcode menu without a push) end the attempt with the prompt shown; accept a new host key
+once in a terminal. With ssh keys and no second factor, **Log in** works without a password.
+
+| Route | What |
+| --- | --- |
+| `GET /api/clusters/NAME/login` | the login's state: `none`, `starting`, `password_sent`, `push_sent`, `connected`, `expired`, `failed` |
+| `POST /api/clusters/NAME/login` (`{"password": ...}`), `POST .../logout` | log in, log out (`ssh -O exit`) |
+| `POST /api/clusters` (`{"host": "user@host", "port"?, "jump"?}`) | a profile for a new cluster, to log in to and set up |
+| `POST /api/clusters/NAME/install` (`{"force"?}`), `POST .../setup` (`{"work_dirs", "binds", "templates", "rebuild"}`), `GET .../operation` | `install_hpclib` or `setup_agents` over the console's login, in the background, with its log; the cluster must be logged in |
+
+The Clusters page puts these together: **Add cluster** takes the login and a work directory, logs in, and runs
+`setup_agents`; **Update hpclib** copies this machine's hpclib to a cluster (`install_hpclib`), and **Setup** reruns
+`setup_agents` (it adds templates, scopes and config that new versions bring, keeping what is there). Each cluster
+shows the hpclib version its REST server runs (`GET /health`'s `hpclib_version`) next to this machine's. After a
+first setup, add the MCP entry `setup_agents` printed (in the operation's log) to your LLM client.
 
 Owner-only REST routes, which the console uses (they need the owner token; agent tokens get 403):
 

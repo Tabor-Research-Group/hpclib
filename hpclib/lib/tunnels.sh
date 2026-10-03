@@ -1231,7 +1231,10 @@ function agent_tunnel {
   done
   # an option for the REST server, not launch_tunnel; it applies only while jobs are sandboxed
   [ -n "$approve" ] && allow+=("--auto-approve-templates=$approve")
-  launch_tunnel -A none -P "$port" "$host" rest "--process-port=$process_port" "${launch[@]}" -- "${allow[@]}"
+  # if this ssh is the one that logs in, keep the login as long as the profile says (default 12h)
+  local hours
+  hours=$(_hpclib_agent_profiles get "$name" connection_hours 2>/dev/null) || hours="${HPCLIB_SSH_PERSIST%h}"
+  HPCLIB_SSH_PERSIST="${hours:-12}h" launch_tunnel -A none -P "$port" "$host" rest "--process-port=$process_port" "${launch[@]}" -- "${allow[@]}"
 }
 
 # Stop a cluster's agent tunnel:  agent_stop NAME|[user@]host
