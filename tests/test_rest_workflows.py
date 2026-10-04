@@ -333,6 +333,9 @@ class TestAdmin(WorkflowTestCase):
         self.assertEqual((out["path"], out["config"]["limits"]), (str(path), {"max_cpus": 8}))
         self.assertIn("environments", out["editable"])
         self.assertNotIn("tokens_file", out["editable"])
+        rules = out["rules"]["environment"]
+        self.assertIn("PATH", rules["reserved"])
+        self.assertIn("SLURM_", rules["reserved_prefixes"])
         self.assertEqual(out["effective"]["limits"]["max_concurrent_jobs"], 4)
         for client in (self.llm, self.builder):
             self.expect_error(403, client.admin_config)

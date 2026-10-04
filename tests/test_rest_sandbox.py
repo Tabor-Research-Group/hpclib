@@ -95,6 +95,72 @@ class TestSandboxConfig(unittest.TestCase):
             self.assertFalse((image / str(tmp / "data").lstrip("/")).exists())
 
 
+class TestAccountFiles(unittest.TestCase):
+    """The passwd/group/nsswitch.conf the job writes for the container: your account, which SSSD gives on the host."""
+
+    def test_directory_account(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        # an account only the directory service knows, in a big directory group
+        (bin_dir / "id").write_text(textwrap.dedent("""\
+            #!/bin/sh
+            case "$1" in -u|-g) echo 54321 ;; -un) echo maboyer ;; -G) echo "54321 9000 0" ;; esac
+            """))
+        (bin_dir / "getent").write_text(textwrap.dedent("""\
+            #!/bin/sh
+            case "$1 $2" in
+              "passwd 54321") echo "maboyer:*:54321:54321:Mark Boyer:/home/maboyer:/bin/bash" ;;
+              "group 54321") echo "maboyer:*:54321:" ;;
+              "group 9000") echo "chem:*:9000:a,b,c,d,e,f,g,h" ;;
+              *) exit 2 ;;
+            esac
+            """))
+        for f in bin_dir.iterdir():
+            f.chmod(0o755)
+        script = "\n".join(rest_sandbox.Sandbox.account_lines() + [
+            'cat "$hpc_sandbox_etc/passwd"; echo ---; cat "$hpc_sandbox_etc/group"; echo ---',
+            'cat "$hpc_sandbox_etc/nsswitch.conf" 2>/dev/null; echo ---; printf "%s\\n" "${hpc_sandbox_account[@]}"',
+            'rm -rf "$hpc_sandbox_etc"'])
+        res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30,
+                             env=dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", TMPDIR=str(tmp)))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        passwd, group, nsswitch, binds = res.stdout.split("---\n")
+        self.assertIn("maboyer:*:54321:54321:Mark Boyer:/home/maboyer:/bin/bash", passwd.splitlines())
+        self.assertEqual([line.split(":")[2] for line in passwd.splitlines()].count("54321"), 1)
+        self.assertIn("chem:*:9000:maboyer", group.splitlines())          # without the other members
+        self.assertIn("maboyer:*:54321:maboyer", group.splitlines())
+        self.assertEqual(sum(line.split(":")[2] == "0" for line in group.splitlines() if line.count(":") >= 3),
+                         sum(line.split(":")[2] == "0" for line in Path("/etc/group").read_text().splitlines()
+                             if line.count(":") >= 3))                     # local groups are not repeated
+        if Path("/etc/nsswitch.conf").exists():
+            self.assertIn("passwd: files", nsswitch)
+            self.assertNotIn("sss", " ".join(l for l in nsswitch.splitlines() if l.startswith(("passwd", "group"))))
+        binds = binds.split()
+        self.assertEqual(binds[:2], ["--bind", binds[1]])
+        self.assertTrue(binds[1].endswith("/passwd:/etc/passwd:ro"))
+        self.assertTrue(binds[3].endswith("/group:/etc/group:ro"))
+        self.assertEqual(list(tmp.glob("hpc-sandbox-etc.*")), [])
+
+    def test_unknown_account(self):
+        # no directory answer either: a made-up entry still lets the uid be looked up
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "id").write_text('#!/bin/sh\ncase "$1" in -u|-g) echo 777 ;; -un) exit 1 ;; -G) echo 777 ;; esac\n')
+        (bin_dir / "getent").write_text("#!/bin/sh\nexit 2\n")
+        for f in bin_dir.iterdir():
+            f.chmod(0o755)
+        script = "\n".join(rest_sandbox.Sandbox.account_lines() + ['cat "$hpc_sandbox_etc/passwd" "$hpc_sandbox_etc/group"'])
+        res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30,
+                             env=dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", TMPDIR=str(tmp)))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("user777:x:777:777::/nonexistent:/bin/bash", res.stdout.splitlines())
+        self.assertIn("group777:x:777:user777", res.stdout.splitlines())
+
+
 class SandboxServerTestCase(JobServerTestCase):
 
     def use_sandbox(self, config, runtime=True):
@@ -137,6 +203,12 @@ class TestSandboxedJobs(SandboxServerTestCase):
         self.assertIn(f"{self.llm_root}:{self.llm_root}", pairs)
         self.assertIn("/usr:/usr:ro", pairs)
         self.assertIn("/etc:/etc:ro", pairs)
+        # your account, over the host's /etc (so after its bind), from files the job wrote and removed
+        etc = pairs.index("/etc:/etc:ro")
+        account = [p for p in pairs if p.endswith(("/etc/passwd:ro", "/etc/group:ro", "/etc/nsswitch.conf:ro"))]
+        self.assertGreaterEqual(len(account), 2)
+        self.assertTrue(all(pairs.index(p) > etc for p in account))
+        self.assertEqual(list(self.tmp.glob("hpc-sandbox-etc.*")), [])
         self.assertNotIn(str(self.root), [p.split(":")[0] for p in pairs])   # only the token's directory
         self.assertEqual(list(self.tmp.glob("hpc-sandbox.*")), [])         # scratch removed
 
@@ -255,6 +327,14 @@ class TestRealSingularity(unittest.TestCase):
         self.assertEqual(out["home_writable"], "no")         # ... nothing else that would vanish is
         self.assertEqual(out["root_writable"], "no")
         self.assertEqual((self.allowed / "written").read_text(), "ok\n")
+
+    def test_your_account_is_known(self):
+        """Programs that look up their uid (Postgres refuses to start otherwise) find it, even from SSSD."""
+        res = self.run_body("id -un; python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_name)'\n"
+                            "(: > /etc/passwd) 2>/dev/null && echo passwd_writable || echo passwd_read_only")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        name = subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()
+        self.assertEqual(res.stdout.split(), [name, name, "passwd_read_only"])
 
     def test_python_body_and_host_programs(self):
         res = self.run_body("import os, sys\nprint('py', sys.version_info[0], os.getcwd())\n",

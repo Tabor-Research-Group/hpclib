@@ -96,6 +96,12 @@ RESERVED_ENV_PREFIXES = ("LD_", "SINGULARITY", "APPTAINER", "HPC_REST", "HPC_PAR
 MAX_ENV_VALUE = 4096
 
 
+def env_rules():
+    """The `environment` section's rules, for editors that check names before saving (check_env_section decides)."""
+    return {"name_pattern": ENV_NAME_RE.pattern, "reserved": sorted(RESERVED_ENV),
+            "reserved_prefixes": list(RESERVED_ENV_PREFIXES), "max_value": MAX_ENV_VALUE}
+
+
 def check_env_section(section):
     """Validate the config's `environment` section; returns {"jobs": {...}, "syncs": {...}} with `all` merged in."""
     if section is None:

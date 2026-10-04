@@ -131,7 +131,14 @@ used (`$HPCLIB_SSH_PERSIST`, e.g. `4h`; per cluster, the profile's `connection_h
 button opens that connection: it asks for your cluster password, ssh sends it (through `SSH_ASKPASS`, to
 `hpclib/servers/console_askpass.py`, which asks the console over a private socket), and the Duo prompt that
 follows is answered with a push to your phone. The password is kept in memory only until ssh has used it and is
-never written anywhere. Then **Start** runs `agent_tunnel` over that login with no prompts. Other prompts (an
+never written anywhere. Then **Start** runs `agent_tunnel` over that login. The tunnel runs in a pseudo-terminal, as in a terminal: on a
+cluster whose login node needs your password again to reach the compute node the job got (the tunnel's second
+hop), the console notices the prompt and asks you for it in the page (`"prompt"` in the tunnel's state;
+`POST .../tunnel/answer`; `GET /api/prompts` lists every tunnel and app session waiting for one, which the page
+asks every few seconds, so the dialog opens on any page); the password goes straight to that ssh and is not
+stored or logged. While that hop waits, the tunnel reads `starting`, not `error`. Where a cluster
+allows it, ssh keys between its nodes skip that step (on the cluster: `ssh-keygen -t ed25519`, then add
+`~/.ssh/id_ed25519.pub` to `~/.ssh/authorized_keys`). Other prompts (an
 unknown host key, a passcode menu without a push) end the attempt with the prompt shown; accept a new host key
 once in a terminal. With ssh keys and no second factor, **Log in** works without a password.
 
@@ -139,6 +146,8 @@ once in a terminal. With ssh keys and no second factor, **Log in** works without
 | --- | --- |
 | `GET /api/clusters/NAME/login` | the login's state: `none`, `starting`, `password_sent`, `push_sent`, `connected`, `expired`, `failed` |
 | `POST /api/clusters/NAME/login` (`{"password": ...}`), `POST .../logout` | log in, log out (`ssh -O exit`) |
+| `GET /api/apps`, `GET /api/apps/APP`, `POST /api/apps/APP/NAME/start` / `stop`, `GET .../log`, `GET`/`PUT .../settings` | tunnel apps besides the agents' (JupyterLab, VS Code, PAI): each cluster's session (`down`, `starting`, `queued` with the job's queue status, `up` with the URL to open, token included, or VS Code's password), started with `launch_tunnel` over the console's login on ports of its own; settings are the job's sbatch options, where `jupyter` comes from (`conda_env`, `modules`, a uv/pixi `project`), and the tunnel's own `settings` (e.g. `VSCODE_CONTAINER`), saved on the cluster with the next check, install or start. PAI's state names the job serving the shared database (`instance`) |
+| `POST /api/apps/APP/NAME/check`, `POST .../install` (`{"force"?}`) | whether the tunnel is installed on the cluster (`install`: `installed`, `missing`, `unknown`, `nothing`), and its `install.sh` as the cluster's operation (`GET /api/clusters/NAME/operation`), through `tunnels/setup_tunnel.sh`; Start is refused while it is known to be missing |
 | `POST /api/clusters` (`{"host": "user@host", "port"?, "jump"?}`) | a profile for a new cluster, to log in to and set up |
 | `POST /api/clusters/NAME/install` (`{"force"?}`), `POST .../setup` (`{"work_dirs", "binds", "templates", "rebuild"}`), `GET .../operation` | `install_hpclib` or `setup_agents` over the console's login, in the background, with its log; the cluster must be logged in |
 
@@ -235,6 +244,32 @@ install_tunnel --target /another/tunnel/root ./my-tunnel
 includes `install.sh`, it runs during installation; if that script fails, the
 tunnel folder is not installed. A custom target must be included in
 `HPCLIB_TUNNEL_PATH` to be found by name in future sessions.
+
+**Setting up a tunnel on a cluster.** What a tunnel needs there (VS Code's container image, PAI's checkout,
+JupyterLab in a uv/pixi project) is installed by its `install.sh`, which `tunnels/setup_tunnel.sh` runs on the
+login node; from your own machine:
+
+```bash
+tunnel_setup user@grace.hprc.tamu.edu vscode --set VSCODE_CONTAINER=/scratch/user/me/images/vscode.sif \
+  --save --install --check
+```
+
+`--set NAME=VALUE` gives one of the tunnel's settings, the names in `TUNNEL_SETTINGS` in its
+`tunnel_config.sh` (install paths and the like); `--save` keeps them in `~/.local/tunnels/settings/TUNNEL.sh`
+on the cluster, which `start_tunnel.sh` reads, so the job and `install.sh` use the same paths. `--install` runs
+`install.sh` (`--force`: e.g. pull the image again); `--check` ends with a line
+`HPCLIB_TUNNEL_STATUS installed|missing|unknown|nothing MESSAGE`. An `install.sh` that can check says so in a
+comment, `# hpclib-install: --check` (and `--force` if it takes it), and then answers `install.sh --check`
+with exit 0 when installed and 1 when not; one without that line is never run for a check. The console's
+tunnel apps use this for their **Check** and **Install** buttons and their settings.
+
+**Shared instances.** A tunnel whose `tunnel_config.sh` sets `SHARED_INSTANCE=true` first looks for a running
+instance of its service that another job serves, and connects to that job instead of submitting one (it never
+cancels a job it only attached to). The job registers itself with `tunnel_register_instance TUNNEL PORT` (from
+`tunnels/instances.sh`, which `configure_job.sh` loads) in `~/.local/tunnels/instances/TUNNEL/`; entries of
+jobs that have left the queue are dropped. `PROCESS_PORT_FROM_JOB=true` lets the job pick its port
+(`tunnel_pick_port PREFERRED`: that one if free on its node, else another) and the tunnel waits for the port the
+job registers; `KEEP_INSTANCE=true` leaves the job running when the tunnel closes. PAI uses all three.
 
 The Jupyter and VS Code tunnels require some level of configuration to get the resources installed on the HPC system.
 
@@ -343,6 +378,10 @@ on your machine as MCP tools.
   projects or `~/.local/tunnels`. Its `/tmp`, `/var/tmp` and `/dev/shm` are private scratch, deleted with the
   job; its home directory is not writable, so a program that writes to `~` fails rather than losing its output. The default image is a "host image", an empty directory whose system
   directories are the host's own, so host programs and modules work unchanged and nothing has to be built.
+  Your account usually comes from LDAP through SSSD, which the container can't reach, so the job writes
+  `passwd` and `group` files with the host's local entries plus your own account and groups (and an
+  `nsswitch.conf` that reads only those), bound read-only over the host's: programs that look up their uid,
+  such as Postgres, work, and nothing beyond your own account information enters the sandbox.
   Set `image` to a `.sif` or sandbox directory to use an image of your own, `flags` for runtime options
   such as `--nv`, and `scratch` for where the container's `/tmp` lives (by default a per-job directory under
   `$TMPDIR`). With `"method": "auto"`, jobs are refused if neither runtime is on the server's PATH, unless
@@ -507,8 +546,16 @@ For example, a Psience scan, with a token that has `read,submit,files:write` on 
 bundled tunnel with `install_tunnel /path/to/hpclib/tunnels/vscode` runs its
 `install.sh`, which pulls the image with Singularity to the path the tunnel uses:
 `/scratch/user/<username>/vscode.sif` by default. Set `VSCODE_CONTAINER` before
-installation and tunnel launch to use another path. Singularity must be available
-on the login node.
+installation and tunnel launch to use another path, or save it with `tunnel_setup ... vscode --set
+VSCODE_CONTAINER=... --save` (as the console's VS Code settings do). Singularity (or Apptainer) must be
+available on the login node. code-server asks for the password in `VSCODE_ROOT_DIR/.config/code-server/config.yaml`,
+which the tunnel prints (and the console offers to copy).
+
+**PAI**: the proto-auto-interface database, run with `singularity-compose` from
+`PAI_ROOT_DIR/proto-auto-interface` (default `/scratch/user/<username>/pai`; `install.sh` clones `PAI_REPO` there).
+It is shared: a PAI tunnel connects to the database another job already runs, if one does, and otherwise starts
+one, on port 3100 or another free one on its node, that keeps running after the tunnel closes (end it with
+`scancel`).
 
 **Jupyter**: this requires jupyter lab to be installed in whatever `conda` environment one uses by default, and requires
 that `conda` is set up when loading the environment from `~/.bashrc`

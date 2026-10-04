@@ -5,6 +5,9 @@
 // or from elsewhere with   agent_console --allow-origin http://127.0.0.1:8000
 // and open   http://127.0.0.1:8000/?api=http://127.0.0.1:27180
 
+// The page's building blocks are custom elements, in components.js (see its header).
+import { configure, el, action, LOGIN_BUSY, LOGIN_LABEL, HpcClusterPicker } from "./components.js";
+
 const params = new URLSearchParams(location.search);
 const API = (params.get("api") || "").replace(/\/$/, "");
 const main = document.getElementById("main");
@@ -14,12 +17,15 @@ let followTimer = null;
 
 // ---------------------------------------------------------------- session key
 
+// Kept in localStorage, so links opened in new tabs (e.g. #/files?cluster=...&path=...) work too. Only pages
+// from this console's own address can read it, and it only works while that console runs: a restart makes a
+// new key, and the page asks again.
 function storedKey() {
-  try { return sessionStorage.getItem(KEY_ITEM); } catch { return null; }
+  try { return localStorage.getItem(KEY_ITEM) || sessionStorage.getItem(KEY_ITEM); } catch { return null; }
 }
 function storeKey(value) {
   key = value;
-  try { sessionStorage.setItem(KEY_ITEM, value); } catch { /* memory only */ }
+  try { localStorage.setItem(KEY_ITEM, value); } catch { /* memory only */ }
 }
 function takeKeyFromHash() {
   const m = location.hash.match(/^#key=([^&]+)/);
@@ -35,7 +41,7 @@ document.getElementById("key-form").addEventListener("submit", (e) => {
   e.preventDefault();
   storeKey(document.getElementById("key-input").value.trim());
   document.getElementById("key-dialog").close();
-  render();
+  loadApps().then(render);
 });
 
 // ---------------------------------------------------------------- API
@@ -57,29 +63,16 @@ async function api(path, { method = "GET", body } = {}) {
   });
   let payload = {};
   try { payload = await res.json(); } catch { /* empty or not JSON */ }
-  if (res.status === 401) askForKey();
+  if (res.status === 401 && !payload.cluster_status) askForKey();
   if (!res.ok) throw new ApiError(res.status, payload);
   return payload;
 }
 
+configure({ api });
+
 const cluster = (name) => "clusters/" + encodeURIComponent(name);
 
 // ---------------------------------------------------------------- DOM helpers
-
-function el(tag, attrs = {}, ...children) {
-  const node = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs)) {
-    if (v === undefined || v === null || v === false) continue;
-    if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
-    else if (k === "class") node.className = v;
-    else node.setAttribute(k, v === true ? "" : v);
-  }
-  for (const c of children.flat(Infinity)) {
-    if (c === null || c === undefined || c === false) continue;
-    node.append(c instanceof Node ? c : document.createTextNode(String(c)));
-  }
-  return node;
-}
 
 function errorBox(err) {
   return el("div", { class: "error-box" }, err.message || String(err));
@@ -95,15 +88,8 @@ function when(t) {
   return d.toLocaleString();
 }
 
-function busy(button, fn) {
-  return async () => {
-    button.disabled = true;
-    try { await fn(); } catch (err) { alertError(err); } finally { button.disabled = false; }
-  };
-}
-
 function alertError(err) {
-  main.prepend(errorBox(err));
+  main.prepend(el("hpc-panel", { dismissible: true }, errorBox(err)));
 }
 
 function diffView(text) {
@@ -116,31 +102,25 @@ function diffView(text) {
 
 // ---------------------------------------------------------------- cluster login
 
-const LOGIN_BUSY = ["starting", "password_sent", "push_sent"];
-const LOGIN_LABEL = { connected: "logged in", none: "not logged in", expired: "login ended", failed: "login failed",
-                      starting: "connecting", password_sent: "password sent", push_sent: "approve the push" };
-
-function loginDialog(c, onConnected) {
+function loginDialog(c, { onConnected = null, onClosed = render } = {}) {
   const password = el("input", { type: "password", autocomplete: "current-password", placeholder: "cluster password" });
   const status = el("p", { class: "muted" },
     `Logs in to ${c.host} once; the tunnel and other ssh commands reuse the login until it has been idle for ` +
     `${c.connection_hours} h. After the password, a Duo push goes to your phone.`);
   const go = el("button", { class: "primary", type: "submit" }, "Log in");
   const close = el("button", { type: "button" }, "Close");
-  const form = el("form", {}, el("h3", {}, `Log in to ${c.name}`), status, password,
-                  el("div", { class: "actions" }, go, close));
-  const dialog = el("dialog", { class: "login" }, form);
+  const form = el("form", {}, status, password, el("div", { class: "actions" }, go, close));
+  const dialog = el("hpc-dialog", { heading: `Log in to ${c.name}`, transient: true }, form);
   let timer = null;
   let connected = false;
-  const finish = async () => {
+  const finish = () => dialog.close();
+  dialog.addEventListener("close", async () => {   // Close, ×, Escape, or logged in
     clearInterval(timer);
-    dialog.close();
-    dialog.remove();
     if (connected && onConnected) {
       try { await onConnected(); } catch (err) { alertError(err); }
     }
-    render();
-  };
+    onClosed();
+  });
   close.addEventListener("click", finish);
   const show = (st) => {
     status.className = st.state === "failed" ? "error-box" : (st.state === "connected" ? "saved" : "muted");
@@ -169,59 +149,27 @@ function loginDialog(c, onConnected) {
       }
     }, 1000);
   });
-  document.body.append(dialog);
   dialog.showModal();
-  password.focus();
 }
 
-function watchOperation(c, row) {
-  // show the cluster's install/setup with its log, refreshing while it runs
-  const box = row.firstChild;
-  let timer = null;
-  const draw = async () => {
-    let op;
-    try { op = await api(cluster(c.name) + "/operation?lines=400"); } catch (err) { box.replaceChildren(errorBox(err)); return; }
-    const label = { running: "running…", succeeded: "finished", failed: `failed (exit ${op.exit_code})` }[op.state] || op.state;
-    const pre = el("pre", {}, op.log.join("\n") || "(no output yet)");
-    box.replaceChildren(el("div", { class: op.state === "failed" ? "error-box" : "muted" },
-      `${op.kind === "install" ? "install_hpclib" : "setup_agents"}: ${label}`), pre);
-    pre.scrollTop = pre.scrollHeight;
-    row.hidden = false;
-    if (op.state !== "running") {
-      clearInterval(timer);
-      if (row.dataset.wasRunning) { delete row.dataset.wasRunning; setTimeout(render, 1500); }
-    } else {
-      row.dataset.wasRunning = "1";
-    }
-  };
-  draw();
-  timer = setInterval(() => {
-    if (!document.body.contains(row)) return clearInterval(timer);
-    draw();
-  }, 2000);
-}
-
-function setupForm(c, row, onDone) {
+function setupForm(c, row) {
+  // setup_agents' options, in the cluster's detail row; once started, the row shows its output
   const workDirs = el("textarea", { rows: 2, placeholder: "/scratch/user/me/llm" }, (c.work_dirs || []).join("\n"));
   const binds = el("textarea", { rows: 2, placeholder: "/software" }, (c.binds || []).join("\n"));
   const rebuild = el("input", { type: "checkbox" });
-  const out = el("div");
-  const run = saveButton(c.set_up ? "Run setup_agents again" : "Set up", async () => {
+  const run = action(c.set_up ? "Run setup_agents again" : "Set up", async () => {
     const body = { work_dirs: lines(workDirs.value), binds: lines(binds.value), rebuild: rebuild.checked };
     await api(cluster(c.name) + "/setup", { method: "POST", body });
-    onDone();
-    return "Started.";
-  }, out);
-  row.firstChild.replaceChildren(el("div", { class: "card" },
-    el("h3", {}, `${c.set_up ? "Set up again" : "Set up"}: ${c.name}`),
+    await row.refresh();
+  }, { primary: true });
+  row.showDetail("setup", el("hpc-panel", { heading: `${c.set_up ? "Set up again" : "Set up"}: ${c.name}`, dismissible: true },
     el("p", { class: "muted" }, "Installs hpclib, the job templates and the sandboxed REST server config on the " +
       "cluster, and the agent's token and MCP entry here. Reruns keep templates, config and tokens, and add what's new."),
     el("div", { class: "row" },
       field("Work directories (agents may write here)", workDirs, "absolute paths on the cluster, one per line"),
       field("Extra read-only directories for jobs", binds, "e.g. a software tree, one per line")),
     el("label", {}, rebuild, " Rebuild: regenerate templates and config and replace the agent token (old copies are kept)"),
-    el("div", { class: "actions" }, run), out));
-  row.hidden = false;
+    el("div", { class: "actions" }, run)));
 }
 
 function addClusterForm(onAdded) {
@@ -230,25 +178,69 @@ function addClusterForm(onAdded) {
   const jump = el("input", { placeholder: "optional: [user@]jumphost", size: 24 });
   const work = el("input", { placeholder: "/scratch/user/me/llm", size: 32 });
   const binds = el("input", { placeholder: "optional: /software", size: 24 });
-  const out = el("div");
-  const add = saveButton("Add, then log in and set up", async () => {
+  const add = action("Add, then log in and set up", async () => {
     if (!work.value.trim()) throw new Error("give a work directory on the cluster");
     const c = await api("clusters", { method: "POST", body: { host: host.value.trim(),
       port: port.value ? Number(port.value) : null, jump: jump.value.trim() || null } });
     const setup = { work_dirs: [work.value.trim()], binds: words(binds.value) };
-    loginDialog(c, async () => {
-      await api(cluster(c.name) + "/setup", { method: "POST", body: setup });
-    });
+    loginDialog(c, { onConnected: () => api(cluster(c.name) + "/setup", { method: "POST", body: setup }) });
     onAdded();
     return `Added ${c.name}.`;
-  }, out);
+  }, { primary: true, result: true });
   return el("section", { class: "card" },
     el("h3", {}, "Add a cluster"),
     el("p", { class: "muted" }, "The console logs in (password, then a Duo push) and runs setup_agents over that login."),
     el("div", { class: "row" }, field("Login", host), field("Port", port), field("Jump host", jump)),
     el("div", { class: "row" }, field("Work directory for agents", work, "absolute path on the cluster"),
       field("Extra read-only directories", binds, "space-separated")),
-    el("div", { class: "actions" }, add), out);
+    el("div", { class: "actions" }, add));
+}
+
+// ---------------------------------------------------------------- a tunnel asking for a password
+
+let promptDialogOpen = false;
+
+function promptDialog(label, answerPath, prompt, { onCancel = null } = {}) {
+  // the tunnel's ssh (usually the login node's ssh to the compute node) waits for a password
+  if (promptDialogOpen) return;
+  promptDialogOpen = true;
+  const input = el("input", { type: "password", autocomplete: "off", placeholder: "password" });
+  const status = el("p", { class: prompt.retry ? "error-box" : "muted" },
+    prompt.retry ? "That password was refused; try again." :
+      `${prompt.host ? `The cluster's login node is connecting to ${prompt.host.split("@")[1]}, the compute node ` +
+        "your job got, and it" : "The tunnel's ssh"} asks for your password again.`);
+  const go = el("button", { class: "primary", type: "submit" }, "Send");
+  const cancel = el("button", { type: "button" }, "Not now");
+  const form = el("form", {}, status,
+    el("p", {}, el("code", {}, prompt.text)), input, el("div", { class: "actions" }, go, cancel),
+    el("p", { class: "muted small" }, "Tip: if your cluster allows it, ssh keys between its nodes skip this step: " +
+      "on the cluster, ssh-keygen -t ed25519 (press Enter for no passphrase), then add ~/.ssh/id_ed25519.pub " +
+      "to ~/.ssh/authorized_keys. Some clusters don't allow it; then this prompt is the way."));
+  const dialog = el("hpc-dialog", { heading: `Second login: ${label}`, transient: true }, form);
+  let answered = false;
+  const close = () => dialog.close();
+  dialog.addEventListener("close", () => {
+    promptDialogOpen = false;
+    if (!answered && onCancel) onCancel();
+  });
+  cancel.addEventListener("click", close);
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const value = input.value;
+    input.value = "";
+    go.disabled = true;
+    try {
+      await api(answerPath, { method: "POST", body: { answer: value } });
+      answered = true;
+      close();
+      checkPrompts(1500);            // a refused password asks again
+    } catch (err) {
+      status.className = "error-box";
+      status.textContent = err.message;
+      go.disabled = false;
+    }
+  });
+  dialog.showModal();
 }
 
 async function clustersPage() {
@@ -259,88 +251,19 @@ async function clustersPage() {
   addBtn.addEventListener("click", () => {
     addArea.replaceChildren(addArea.firstChild ? "" : addClusterForm(() => {}));
   });
+  // each cluster's rows refresh themselves (components.js), so this page is drawn once
   const rows = clusters.map((c) => {
-    const t = c.tunnel || {};
-    const logRow = el("tr", { hidden: true }, el("td", { colspan: 6 }));
-    const opRow = el("tr", { hidden: true }, el("td", { colspan: 6 }));
-    const showLog = async () => {
-      if (!logRow.hidden) { logRow.hidden = true; return; }
-      const { lines: text } = await api(cluster(c.name) + "/tunnel/log?lines=200");
-      logRow.firstChild.replaceChildren(el("pre", {}, text.join("\n") || "(no log yet)"));
-      logRow.hidden = false;
-    };
-    const start = el("button", {}, "Start");
-    const stop = el("button", {}, "Stop");
-    const log = el("button", {}, "Log");
-    const install = el("button", {}, "Update hpclib");
-    const setup = el("button", {}, c.set_up ? "Setup…" : "Set up…");
-    const lg = c.login || {};
-    const loggedIn = lg.state === "connected";
-    const op = c.operation;
-    const loginBtn = el("button", {}, loggedIn ? "Log out" : "Log in");
-    loginBtn.addEventListener("click", busy(loginBtn, async () => {
-      if (loggedIn) {
-        await api(cluster(c.name) + "/logout", { method: "POST" });
-        render();
-      } else {
-        loginDialog(c);
-      }
-    }));
-    loginBtn.disabled = LOGIN_BUSY.includes(lg.state);
-    start.addEventListener("click", busy(start, async () => {
-      await api(cluster(c.name) + "/tunnel/start", { method: "POST", body: {} });
-      setTimeout(render, 3000);
-    }));
-    stop.addEventListener("click", busy(stop, async () => {
-      await api(cluster(c.name) + "/tunnel/stop", { method: "POST" });
-      render();
-    }));
-    log.addEventListener("click", busy(log, showLog));
-    install.addEventListener("click", busy(install, async () => {
-      await api(cluster(c.name) + "/install", { method: "POST", body: {} });
-      watchOperation(c, opRow);
-    }));
-    setup.addEventListener("click", () => setupForm(c, opRow, () => watchOperation(c, opRow)));
-    const running = op && op.state === "running";
-    start.disabled = t.state === "up" || t.state === "starting" || !c.set_up;
-    stop.disabled = t.state === "down" && !t.started_here;
-    for (const b of [install, setup]) {
-      b.disabled = !loggedIn || running;
-      b.title = loggedIn ? "" : "log in first";
-    }
-    if (op) watchOperation(c, opRow);
-    const behind = t.hpclib_version && local && t.hpclib_version !== local;
-    return [
-      el("tr", {},
-        el("td", {}, c.name, el("div", { class: "muted" }, c.mcp_name || "")),
-        el("td", {},
-          el("span", { class: `state ${t.state}` }, t.state),
-          t.state === "up" ? el("div", { class: "muted" },
-            `${t.hostname || ""}${t.slurm_job_id ? ` · job ${t.slurm_job_id}` : ""}`) : null,
-          t.hpclib_version ? el("div", { class: behind ? "state starting" : "muted" },
-            `hpclib ${t.hpclib_version}${behind ? ` · ${local} here` : ""}`) : null,
-          t.error ? el("div", { class: "muted" }, t.error) : null),
-        el("td", {},
-          el("span", { class: `state ${loggedIn ? "up" : (lg.state === "failed" ? "error" : "down")}` },
-            LOGIN_LABEL[lg.state] || lg.state || ""),
-          lg.state === "failed" ? el("div", { class: "muted" }, lg.message) : null,
-          el("div", {}, loginBtn)),
-        el("td", { class: "num" }, c.port),
-        el("td", {}, !c.set_up ? el("span", { class: "muted" }, "not set up") :
-          (c.has_owner_token ? "owner" : el("span", { class: "muted" }, "agent only"))),
-        el("td", {}, el("div", { class: "actions" }, start, stop, log),
-          el("div", { class: "actions second" }, install, setup))),
-      logRow,
-      opRow,
-    ];
+    const row = el("hpc-cluster-row", { cluster: c.name, local });
+    row.data = c;
+    return row;
   });
   return [
     el("div", { class: "toolbar" }, el("h2", {}, "Clusters"), addBtn,
       el("span", { class: "muted" }, local ? `hpclib ${local} on this machine` : "")),
     addArea,
-    clusters.length ? el("table", {},
+    clusters.length ? el("table", { class: "rows" },
       el("thead", {}, el("tr", {}, ["Cluster", "Tunnel", "Login", "Port", "Token", ""].map((h) => el("th", {}, h)))),
-      el("tbody", {}, rows.flat()))
+      rows)
       : el("p", { class: "muted" }, "No clusters yet; add one."),
   ];
 }
@@ -353,10 +276,7 @@ async function proposalsPage() {
   const rows = proposals.map((p) => {
     const base = cluster(p.cluster) + "/rest/admin/proposals";
     const detailRow = el("tr", { hidden: true }, el("td", { colspan: 6 }));
-    const diff = el("button", {}, "Diff");
-    const approve = el("button", { class: "primary" }, p.replaces_existing ? "Approve, replacing" : "Approve");
-    const reject = el("button", {}, "Reject");
-    diff.addEventListener("click", busy(diff, async () => {
+    const diff = action("Diff", async () => {
       if (!detailRow.hidden) { detailRow.hidden = true; return; }
       const d = await api(base + "/diff?name=" + encodeURIComponent(p.name));
       const files = Object.entries(d.diff);
@@ -365,17 +285,17 @@ async function proposalsPage() {
         files.length ? files.map(([f, text]) => [el("div", { class: "muted" }, f), diffView(text)])
           : el("p", { class: "muted" }, "Identical to the current template.")));
       detailRow.hidden = false;
-    }));
-    approve.addEventListener("click", busy(approve, async () => {
+    });
+    const approve = action(p.replaces_existing ? "Approve, replacing" : "Approve", async () => {
       await api(base + "/approve", { method: "POST", body: { name: p.name, replace: !!p.replaces_existing } });
       render();
-    }));
-    reject.addEventListener("click", busy(reject, async () => {
+    }, { primary: true });
+    const reject = action("Reject", async () => {
       const reason = prompt(`Reject ${p.name}? Reason (shown in the cluster's record):`, "");
       if (reason === null) return;
       await api(base + "/reject", { method: "POST", body: { name: p.name, reason } });
       render();
-    }));
+    });
     return [
       el("tr", {},
         el("td", {}, p.cluster),
@@ -400,11 +320,11 @@ async function proposalsPage() {
 
 async function activityPage() {
   const { clusters } = await api("clusters");
-  const live = clusters.filter((c) => c.tunnel && c.tunnel.state === "up" && c.has_owner_token);
-  if (!live.length) {
+  const pick = el("hpc-cluster-picker", { live: true });
+  pick.clusters = clusters;
+  if (!pick.options.length) {
     return [el("h2", {}, "Activity"), el("p", { class: "muted" }, "No cluster with a live tunnel and an owner token.")];
   }
-  const pick = el("select", {}, live.map((c) => el("option", { value: c.name }, c.name)));
   const token = el("input", { placeholder: "token name", size: 14 });
   const errorsOnly = el("input", { type: "checkbox" });
   const follow = el("input", { type: "checkbox" });
@@ -419,7 +339,7 @@ async function activityPage() {
       el("td", { class: "num" }, new Date(e.time * 1000).toLocaleString()),
       el("td", {}, e.token || ""),
       el("td", {}, `${e.verb} ${e.path}`),
-      el("td", { class: "num" }, el("span", { class: (e.status || 0) >= 400 ? "state error" : "" }, e.status ?? "")),
+      el("td", { class: "num" }, (e.status || 0) >= 400 ? el("hpc-state", { tone: "error", label: e.status }) : (e.status ?? "")),
       el("td", { class: "muted" }, e.detail ? JSON.stringify(e.detail) : ""))));
     status.textContent = `${shown.length} entries`;
   };
@@ -473,7 +393,20 @@ const VIEW_LIMIT = 25 * MB;      // images, SVG and HTML shown up to this
 const DOWNLOAD_WARN = 25 * MB;   // downloads pass through the browser's memory; ask above this
 const IMAGE_TYPES = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp",
                       bmp: "image/bmp", svg: "image/svg+xml" };
-let filesState = { cluster: null, path: null, base: null };
+const filesBase = {};   // each cluster's top directory (its base_dir)
+
+// The Files page's state lives in the address, so it can be linked to:
+//   #/files?cluster=NAME&path=/a/directory   that directory
+//   #/files?cluster=NAME&path=/a/file.log    its directory, with the file open in the viewer
+// NAME is the profile name, the login host or the MCP name.
+function filesQuery() {
+  return new URLSearchParams(location.hash.split("?")[1] || "");
+}
+function filesHash(clusterName, path) {
+  const q = new URLSearchParams({ cluster: clusterName });
+  if (path) q.set("path", path);
+  return "#/files?" + q.toString();
+}
 
 const ext = (name) => (name.match(/\.([^.]+)$/) || [])[1]?.toLowerCase() || "";
 const kindOf = (name) => ext(name) === "svg" ? "image" : (IMAGE_TYPES[ext(name)] ? "image" :
@@ -516,15 +449,18 @@ async function downloadFile(c, entry) {
 }
 
 async function viewFile(c, entry, box) {
-  const download = el("button", {}, "Download");
-  download.addEventListener("click", busy(download, () => downloadFile(c, entry)));
-  const close = el("button", {}, "Close");
-  close.addEventListener("click", () => box.replaceChildren());
-  const head = el("div", { class: "toolbar" }, el("strong", {}, entry.name),
-    el("span", { class: "muted" }, `${size(entry.size)} · ${when(entry.mtime)}`), download, close);
-  box.replaceChildren(el("section", { class: "card viewer" }, head, el("p", { class: "muted" }, "Loading…")));
-  const card = box.firstChild;
-  const body = (...nodes) => card.replaceChildren(head, ...nodes);
+  const download = action("Download", () => downloadFile(c, entry), { slot: "actions" });
+  history.replaceState(null, "", filesHash(c, entry.path));   // a link to this file
+  const card = el("hpc-panel", { class: "viewer", heading: entry.name, dismissible: true,
+                                 status: `${size(entry.size)} · ${when(entry.mtime)}` },
+    download, el("p", { class: "muted" }, "Loading…"));
+  card.addEventListener("dismiss", (e) => {   // × closes the file and links to its folder again
+    e.preventDefault();
+    box.replaceChildren();
+    history.replaceState(null, "", filesHash(c, entry.path.replace(/\/[^/]+$/, "") || "/"));
+  });
+  box.replaceChildren(card);
+  const body = (...nodes) => card.replaceChildren(download, ...nodes);
   const kind = kindOf(entry.name);
   try {
     if (kind !== "text" && entry.size > VIEW_LIMIT) {
@@ -569,44 +505,60 @@ async function viewFile(c, entry, box) {
 
 async function filesPage() {
   const { clusters } = await api("clusters");
-  const live = clusters.filter((x) => x.tunnel && x.tunnel.state === "up" && x.has_owner_token);
-  if (!live.length) {
+  const q = filesQuery();
+  const legacy = decodeURIComponent((location.hash.match(/^#\/files\/([^?]+)/) || [])[1] || "");
+  const wanted = q.get("cluster") || legacy;
+  const pick = el("hpc-cluster-picker", { live: true, value: wanted || null });
+  pick.clusters = clusters;
+  pick.addEventListener("change", () => { location.hash = filesHash(pick.value); });
+  const matches = (x) => HpcClusterPicker.matches(x, wanted);
+  if (wanted && !pick.options.some(matches)) {
+    const known = clusters.find(matches);
+    return [el("h2", {}, "Files"), errorBox(new Error(known
+      ? `${known.name}: start its tunnel (and log in) on the Clusters page to browse its files.`
+      : `No cluster called ${wanted}.`))];
+  }
+  const c = pick.selected;
+  if (!c) {
     return [el("h2", {}, "Files"), el("p", { class: "muted" }, "No cluster with a running tunnel and an owner token.")];
   }
-  const wanted = decodeURIComponent((location.hash.match(/^#\/files\/(.+)$/) || [])[1] || "");
-  const c = live.find((x) => x.name === wanted) || live.find((x) => x.name === filesState.cluster) || live[0];
-  if (filesState.cluster !== c.name) filesState = { cluster: c.name, path: null, base: null };
-  const listing = await api(`${cluster(c.name)}/rest/files?path=${encodeURIComponent(filesState.path || ".")}`);
-  if (!filesState.base) filesState.base = listing.path;
-  filesState.path = listing.path;
+  const files = (path) => api(`${cluster(c.name)}/rest/files?path=${encodeURIComponent(path)}`);
+  if (!filesBase[c.name]) filesBase[c.name] = (await files(".")).path;
+  const base = filesBase[c.name];
 
-  const pick = el("select", {}, live.map((x) => el("option", { value: x.name, selected: x.name === c.name }, x.name)));
-  pick.addEventListener("change", () => { location.hash = "#/files/" + encodeURIComponent(pick.value); });
-  const go = (path) => { filesState.path = path; render(); };
-  const atBase = listing.path === filesState.base;
+  // a path to a file: show its directory and open the file
+  let listing = await files(q.get("path") || base);
+  let open = null;
+  if (listing.type !== "directory") {
+    open = listing;
+    listing = await files(listing.path.replace(/\/[^/]+$/, "") || "/");
+  }
+  history.replaceState(null, "", filesHash(c.name, open ? open.path : listing.path));
+
+  const go = (path) => { location.hash = filesHash(c.name, path); };
+  const atBase = listing.path === base;
   const up = el("button", { type: "button", disabled: atBase }, "Up");
   up.addEventListener("click", () => go(listing.path.replace(/\/[^/]+\/?$/, "") || "/"));
   const home = el("button", { type: "button", disabled: atBase }, "Top");
-  home.addEventListener("click", () => go(filesState.base));
+  home.addEventListener("click", () => go(base));
   const viewer = el("div");
 
   const entries = listing.entries.slice().sort((a, b) =>
     (a.type === "directory" ? 0 : 1) - (b.type === "directory" ? 0 : 1) || a.name.localeCompare(b.name));
   const rows = entries.map((e) => {
     const isDir = e.type === "directory";
-    const name = isDir ? el("a", { href: "javascript:void 0", class: "dir" }, e.name + "/") : el("span", {}, e.name);
-    if (isDir) name.addEventListener("click", () => go(e.path));
+    const name = isDir ? el("a", { href: filesHash(c.name, e.path), class: "dir" }, e.name + "/")
+                       : el("span", {}, e.name);
     const actions = el("div", { class: "actions" });
     if (e.type === "file") {
       const view = el("button", {}, "View");
       view.addEventListener("click", () => viewFile(c.name, e, viewer));
-      const dl = el("button", {}, "Download");
-      dl.addEventListener("click", busy(dl, () => downloadFile(c.name, e)));
-      actions.append(view, dl);
+      actions.append(view, action("Download", () => downloadFile(c.name, e)));
     }
     return el("tr", {}, el("td", {}, name), el("td", { class: "num" }, isDir ? "" : size(e.size)),
       el("td", { class: "num" }, when(e.mtime)), el("td", {}, actions));
   });
+  if (open) viewFile(c.name, open, viewer);   // same size rules as View: large files aren't loaded
   return [
     el("h2", {}, "Files"),
     el("div", { class: "toolbar" }, pick, home, up, el("code", {}, listing.path)),
@@ -640,36 +592,16 @@ const ENV_SCOPES = [
   ["jobs", "Template jobs only", "e.g. OMP_STACKSIZE=512M"],
   ["syncs", "Environment syncs only", "e.g. UV_INDEX_URL or HTTPS_PROXY"],
 ];
-const envText = (vars) => Object.entries(vars || {}).map(([k, v]) => `${k}=${v}`).join("\n");
-function envParse(text, label) {
-  const out = {};
-  for (const line of lines(text)) {
-    if (line.startsWith("#")) continue;
-    const i = line.indexOf("=");
-    if (i < 1) throw new Error(`${label}: "${line}" is not NAME=value`);
-    out[line.slice(0, i).trim()] = line.slice(i + 1).trim();
-  }
-  return out;
-}
-
 const words = (text) => text.split(/[\s,]+/).map((w) => w.trim()).filter(Boolean);
 const lines = (text) => text.split("\n").map((w) => w.trim()).filter(Boolean);
 
 function field(label, input, hint) {
-  return el("label", { class: "field" }, el("span", {}, label), input, hint ? el("small", { class: "muted" }, hint) : null);
+  return el("hpc-field", { label, hint }, input);
 }
 
-function saveButton(label, fn, out) {
-  const b = el("button", { class: "primary", type: "button" }, label);
-  b.addEventListener("click", busy(b, async () => {
-    out.replaceChildren();
-    try {
-      out.replaceChildren(el("span", { class: "saved" }, await fn()));
-    } catch (err) {
-      out.replaceChildren(errorBox(err));
-    }
-  }));
-  return b;
+function saveButton(label, fn) {
+  // a primary button whose action's message ("Saved.") or error shows beside it
+  return action(label, fn, { primary: true, result: true });
 }
 
 async function tunnelSettings(c) {
@@ -681,21 +613,20 @@ async function tunnelSettings(c) {
   const inputs = Object.fromEntries(TUNNEL_FIELDS.map(([k]) => [k, el("input", { value: given[k] || "", size: 16 })]));
   const other = s.tunnel_args.filter((a) => !TUNNEL_FIELDS.some(([k]) => a.startsWith(`--${k}=`)));
   const hours = el("input", { type: "number", min: 1, max: 168, value: s.connection_hours, size: 6 });
-  const out = el("div");
   const save = saveButton("Save tunnel settings", async () => {
     const args = TUNNEL_FIELDS.filter(([k]) => inputs[k].value.trim()).map(([k]) => `--${k}=${inputs[k].value.trim()}`)
       .concat(other);
     await api(cluster(c.name) + "/settings", { method: "PUT", body: {
       auto_approve_templates: mode.value, tunnel_args: args, connection_hours: Number(hours.value) } });
     return "Saved. Applies the next time the tunnel starts (the login hours: the next time you log in).";
-  }, out);
+  });
   return el("section", { class: "card" },
     el("h3", {}, "Tunnel ", el("span", { class: "muted" }, "· kept on this machine")),
     field("Template proposals", mode, "only while jobs are sandboxed"),
     field("Keep the ssh login for (hours)", hours, "after it was last used; 1 to 168, default 12"),
     el("div", { class: "row" }, TUNNEL_FIELDS.map(([k, label, hint]) => field(`Tunnel job: ${label}`, inputs[k], hint))),
     other.length ? el("p", { class: "muted" }, `Also: ${other.join(" ")}`) : null,
-    el("div", { class: "actions" }, save), out);
+    el("div", { class: "actions" }, save));
 }
 
 async function serverSettings(c) {
@@ -727,8 +658,12 @@ async function serverSettings(c) {
   const binds = el("textarea", { rows: 3 }, (sandbox.binds || []).join("\n"));
   const writable = el("textarea", { rows: 2 }, (sandbox.writable || []).join("\n"));
   const notes = el("textarea", { rows: 4 }, raw.cluster_notes || "");
-  const envBoxes = Object.fromEntries(ENV_SCOPES.map(([k]) =>
-    [k, el("textarea", { rows: 3, placeholder: "NAME=value, one per line" }, envText((raw.environment || {})[k]))]));
+  const envBoxes = Object.fromEntries(ENV_SCOPES.map(([k, label]) => {
+    const box = el("hpc-env-editor", { label });
+    box.rules = (conf.rules || {}).environment || null;   // older servers don't send them; they still check on save
+    box.value = (raw.environment || {})[k];
+    return [k, box];
+  }));
 
   const tool = (text) => { const t = text.trim(); return t === "off" ? null : (t || "auto"); };
   const collect = () => {
@@ -747,8 +682,8 @@ async function serverSettings(c) {
     }
     if (!environments.modules.length) delete environments.modules;
     const environment = {};
-    for (const [k, label] of ENV_SCOPES) {
-      const vars = envParse(envBoxes[k].value, label);
+    for (const [k] of ENV_SCOPES) {
+      const vars = envBoxes[k].value;          // throws, naming the box and line, if one is wrong
       if (Object.keys(vars).length) environment[k] = vars;
     }
     return {
@@ -759,7 +694,6 @@ async function serverSettings(c) {
       cluster_notes: notes.value.trim() || null,
     };
   };
-  const out = el("div");
   let shown = collect();   // only sections edited since then are sent
   const save = saveButton("Save server settings", async () => {
     const wanted = collect();
@@ -772,18 +706,17 @@ async function serverSettings(c) {
     shown = wanted;
     return `Saved ${res.changed.join(", ")}; in effect now.${res.backup ? ` The previous file is ${res.backup}.` : ""}` +
       (res.warning ? ` Warning: ${res.warning}.` : "");
-  }, out);
+  });
 
   const jsonBox = el("textarea", { rows: 14, class: "code" },
     JSON.stringify(Object.fromEntries(conf.editable.filter((k) => k in raw).map((k) => [k, raw[k]])), null, 2));
-  const jsonOut = el("div");
   const saveJson = saveButton("Save JSON", async () => {
     let parsed;
     try { parsed = JSON.parse(jsonBox.value); } catch (e) { throw new Error(`not valid JSON: ${e.message}`); }
     const changes = Object.fromEntries(conf.editable.map((k) => [k, k in parsed ? parsed[k] : null]));
     const res = await api(base, { method: "PUT", body: { changes } });
     return `Saved; in effect now.${res.backup ? ` The previous file is ${res.backup}.` : ""}`;
-  }, jsonOut);
+  });
 
   const managers = (eff.environments || {}).managers || {};
   const found = Object.entries(managers).map(([m, i]) => `${m} ${i.available ? i.version || "" : "not found"}`).join(" · ");
@@ -809,9 +742,9 @@ async function serverSettings(c) {
     el("div", { class: "row" }, ENV_SCOPES.map(([k, label, hint]) => field(label, envBoxes[k], hint))),
     el("h4", {}, "Notes for agents"),
     field("Cluster notes", notes, "shown to agents in cluster_info"),
-    el("div", { class: "actions" }, save), out,
+    el("div", { class: "actions" }, save),
     el("details", {}, el("summary", {}, "Edit the editable sections as JSON"), jsonBox,
-      el("div", { class: "actions" }, saveJson), jsonOut));
+      el("div", { class: "actions" }, saveJson)));
 }
 
 async function settingsPage() {
@@ -819,16 +752,135 @@ async function settingsPage() {
   if (!clusters.length) return [el("h2", {}, "Settings"), el("p", { class: "muted" }, "No agent profiles yet; run setup_agents.")];
   const wanted = decodeURIComponent((location.hash.match(/^#\/settings\/(.+)$/) || [])[1] || "");
   const c = clusters.find((x) => x.name === wanted) || clusters[0];
-  const pick = el("select", {}, clusters.map((x) => el("option", { value: x.name, selected: x.name === c.name }, x.name)));
+  const pick = el("hpc-cluster-picker", { value: c.name });
+  pick.clusters = clusters;
   pick.addEventListener("change", () => { location.hash = "#/settings/" + encodeURIComponent(pick.value); });
   const sections = await Promise.all([tunnelSettings(c), serverSettings(c).catch(errorBox)]);
   return [el("h2", {}, "Settings"), el("div", { class: "toolbar" }, pick), sections];
 }
 
+// ---------------------------------------------------------------- JupyterLab
+
+// sbatch options for the tunnel's job; empty: what its tunnel_config.sh asks for
+const APP_TUNNEL_FIELDS = [["time", "Time limit", "e.g. 12:00:00"], ["mem", "Memory", "e.g. 16gb"],
+                           ["cpus-per-task", "CPUs", "e.g. 4"], ["partition", "Partition", ""]];
+
+async function appSettingsForm(app, s, row) {
+  // the tunnel job's sbatch options, JupyterLab's environment fields, and the tunnel's own settings (paths and the
+  // like, saved on the cluster for its job and install.sh)
+  const path = `apps/${app}/${encodeURIComponent(s.cluster)}/settings`;
+  const conf = await api(path);
+  const given = Object.fromEntries(conf.tunnel_args.map((a) => a.replace(/^--/, "").split(/=(.*)/s).slice(0, 2)));
+  const inputs = Object.fromEntries(APP_TUNNEL_FIELDS.map(([k]) => [k, el("input", { value: given[k] || "", size: 12 })]));
+  const other = conf.tunnel_args.filter((a) => !APP_TUNNEL_FIELDS.some(([k]) => a.startsWith(`--${k}=`)));
+  const conda = el("input", { value: conf.conda_env === null ? "" : (conf.conda_env === "" ? "none" : conf.conda_env),
+                              placeholder: "default", size: 16 });
+  const modules = el("input", { value: conf.modules.join(" "), placeholder: "e.g. JupyterLab/4.2.0", size: 32 });
+  const project = el("input", { value: conf.project, placeholder: "/scratch/user/me/llm/my-project", size: 40 });
+  const own = Object.fromEntries(conf.fields.map((f) =>
+    [f.name, el("input", { value: conf.settings[f.name] || "", placeholder: "the tunnel's default", size: 44 })]));
+  const save = saveButton("Save", async () => {
+    const tunnel_args = APP_TUNNEL_FIELDS.filter(([k]) => inputs[k].value.trim())
+      .map(([k]) => `--${k}=${inputs[k].value.trim()}`).concat(other);
+    const body = { tunnel_args };
+    if (conf.python_env) {
+      const c = conda.value.trim();
+      Object.assign(body, { conda_env: c === "" ? null : (c === "none" ? "" : c), modules: words(modules.value),
+                            project: project.value.trim() });
+    }
+    if (conf.fields.length) body.settings = Object.fromEntries(conf.fields.map((f) => [f.name, own[f.name].value.trim()]));
+    await api(path, { method: "PUT", body });
+    return conf.fields.length || conf.installable
+      ? "Saved. They go to the cluster with the next Check, Install or Start."
+      : "Saved. Applies the next time it starts.";
+  });
+  row.showDetail("settings", el("hpc-panel", { heading: `${APPS_UI[app].title} on ${s.cluster}`, dismissible: true },
+    el("p", { class: "muted" }, "The tunnel's job (empty: its defaults):"),
+    el("div", { class: "row" }, APP_TUNNEL_FIELDS.map(([k, label, hint]) => field(`Job: ${label}`, inputs[k], hint))),
+    conf.python_env ? [
+      el("p", { class: "muted" }, "Where jupyter comes from (any of these; it needs jupyterlab installed):"),
+      el("div", { class: "row" },
+        field("Conda environment", conda, "empty: the tunnel's default; none: no conda"),
+        field("Modules", modules, "loaded in the job, space-separated"),
+        field("uv or pixi project", project, "its .venv or .pixi/envs/default; Install puts jupyterlab there"))] : null,
+    conf.fields.length ? [
+      el("p", { class: "muted" }, "On the cluster (empty: the tunnel's default). Install and the job both use these."),
+      el("div", { class: "row" }, conf.fields.map((f) => field(f.label, own[f.name], f.hint)))] : null,
+    el("div", { class: "actions" }, save)));
+}
+
+async function appPage(app) {
+  const { sessions, title } = await api(`apps/${app}`);
+  // each session's rows refresh themselves (components.js), so this page is drawn once
+  const rows = sessions.map((s) => {
+    const row = el("hpc-app-session", { app, "app-title": title, cluster: s.cluster });
+    row.data = s;
+    return row;
+  });
+  return [
+    el("h2", {}, title),
+    el("p", { class: "muted" }, `A ${title} session per cluster, in a SLURM job reached through its own tunnel. ` +
+      "It runs as you, with your full permissions on the cluster (it is not the agents' sandbox). " +
+      "What it needs on the cluster is checked once you're logged in, and Install sets it up there."),
+    sessions.length ? el("table", { class: "rows" },
+      el("thead", {}, el("tr", {}, ["Cluster", "Login", title, ""].map((h) => el("th", {}, h)))),
+      rows)
+      : el("p", { class: "muted" }, "No clusters yet; add one under Agents → Clusters."),
+  ];
+}
+
 // ---------------------------------------------------------------- shell
 
-const PAGES = { clusters: clustersPage, proposals: proposalsPage, activity: activityPage, files: filesPage,
-                settings: settingsPage };
+// The apps in the top bar, each with its own header and pages. Agents keeps its old addresses (#/clusters, ...);
+// the others live under #/APP/PAGE.
+const APPS_UI = {
+  agents: {
+    title: "Agents",
+    default: "clusters",
+    pages: { clusters: ["Clusters", clustersPage], proposals: ["Proposals", proposalsPage],
+             activity: ["Activity", activityPage], files: ["Files", filesPage], settings: ["Settings", settingsPage] },
+  },
+  // the tunnel apps (JupyterLab, VS Code, PAI, ...) come from GET /api/apps, each with a Sessions page
+};
+
+function addApp(id, title) {
+  APPS_UI[id] = { title, default: "sessions", pages: { sessions: ["Sessions", () => appPage(id)] } };
+}
+addApp("jupyter", "JupyterLab");     // until the console says which it has
+
+async function loadApps() {
+  if (!key) return;
+  try {
+    const { apps } = await api("apps");
+    for (const a of apps) if (a.id !== "agents" && !APPS_UI[a.id]) addApp(a.id, a.title);
+  } catch { /* an older console: JupyterLab only */ }
+}
+
+function pageHref(app, page) {
+  return app === "agents" ? `#/${page}` : `#/${app}/${page}`;
+}
+
+function route() {
+  const segs = location.hash.replace(/^#\/?/, "").split("?")[0].split("/");
+  if (segs[0] in APPS_UI && segs[0] !== "agents") {
+    const app = APPS_UI[segs[0]];
+    return { app: segs[0], page: segs[1] in app.pages ? segs[1] : app.default };
+  }
+  if (segs[0] === "agents") segs.shift();
+  return { app: "agents", page: segs[0] in APPS_UI.agents.pages ? segs[0] : "clusters" };
+}
+
+const badge = el("span", { id: "badge", class: "badge", hidden: true });
+
+function drawChrome({ app, page }) {
+  document.getElementById("apps").replaceChildren(...Object.entries(APPS_UI).map(([id, a]) =>
+    el("a", { href: pageHref(id, a.default), class: id === app ? "active" : null }, a.title)));
+  document.getElementById("app-title").textContent = APPS_UI[app].title;
+  document.getElementById("pages").replaceChildren(...Object.entries(APPS_UI[app].pages).map(([id, [label]]) =>
+    el("a", { href: pageHref(app, id), class: id === page ? "active" : null }, label,
+       app === "agents" && id === "proposals" ? [" ", badge] : null)));
+  document.title = `${APPS_UI[app].title} · hpclib console`;
+}
 
 function stopFollowing() {
   if (followTimer) clearInterval(followTimer);
@@ -836,7 +888,6 @@ function stopFollowing() {
 }
 
 function setBadge(n) {
-  const badge = document.getElementById("badge");
   badge.hidden = !n;
   badge.textContent = n || "";
 }
@@ -845,16 +896,54 @@ async function refreshBadge() {
   try { setBadge((await api("proposals")).proposals.length); } catch { /* shown on the page */ }
 }
 
+// ---------------------------------------------------------------- what rows ask of the page
+
+document.addEventListener("hpc-login", ({ detail }) => loginDialog(detail.cluster, { onClosed: detail.then }));
+document.addEventListener("hpc-prompt", ({ detail }) => promptDialog(detail.label, detail.answer, detail.prompt));
+document.addEventListener("hpc-setup", ({ detail }) => setupForm(detail.cluster, detail.row));
+document.addEventListener("hpc-app-settings", ({ detail }) =>
+  appSettingsForm(detail.app, detail.session, detail.row).catch(alertError));
+
+// ---------------------------------------------------------------- passwords a tunnel asks for
+
+// A tunnel's ssh (usually the login node's to the compute node) can ask for a password minutes after Start, once
+// the job runs. GET /api/prompts is local and cheap, so it is asked every 2 s while anything started here runs
+// (every 5 s otherwise), from every page: the dialog opens wherever you are. "Not now" leaves that prompt to its
+// row's "Enter password…" button until it asks again.
+const snoozed = new Set();
+const promptKey = (p) => `${p.answer}|${p.prompt.text}|${p.prompt.retry}`;
+let promptTimer = null;
+
+async function checkPrompts(delay = 0) {
+  clearTimeout(promptTimer);
+  if (delay) { promptTimer = setTimeout(() => checkPrompts(), delay); return; }
+  let next = 5000;
+  if (key) {
+    try {
+      const { prompts, running } = await api("prompts");
+      next = running ? 2000 : 5000;
+      const waiting = new Set(prompts.map(promptKey));
+      for (const k of [...snoozed]) if (!waiting.has(k)) snoozed.delete(k);
+      const p = prompts.find((x) => !snoozed.has(promptKey(x)));
+      if (p && !promptDialogOpen) {
+        promptDialog(p.app ? `${p.title} on ${p.cluster}` : p.cluster, p.answer, p.prompt,
+                     { onCancel: () => snoozed.add(promptKey(p)) });
+      }
+    } catch { /* an older console, or not connected: the rows still show the prompt */ }
+  }
+  promptTimer = setTimeout(() => checkPrompts(), next);
+}
+
 let renderCount = 0;
 async function render() {
   stopFollowing();
-  const page = (location.hash.match(/^#\/(\w+)/) || [])[1] || "clusters";
-  document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("active", a.dataset.page === page));
+  const where = route();
+  drawChrome(where);
   const mine = ++renderCount;
   main.replaceChildren(el("p", { class: "muted" }, "Loading…"));
   let content;
   try {
-    content = await (PAGES[page] || clustersPage)();
+    content = await APPS_UI[where.app].pages[where.page][1]();
   } catch (err) {
     content = errorBox(err);
   }
@@ -865,6 +954,7 @@ takeKeyFromHash();
 key = key || storedKey();
 window.addEventListener("hashchange", () => { takeKeyFromHash(); render(); });
 document.getElementById("refresh").addEventListener("click", render);
-render();
+loadApps().then(render);
+checkPrompts();
 refreshBadge();
 setInterval(refreshBadge, 60000);

@@ -995,6 +995,7 @@ class HPCRESTHandler(RESTHandler):
             "path": path,
             "config": raw,
             "editable": list(EDITABLE_CONFIG),
+            "rules": {"environment": rest_jobs.env_rules()},
             "effective": {
                 "limits": jobs.limits.to_json(),
                 "cluster_notes": jobs.cluster_notes,

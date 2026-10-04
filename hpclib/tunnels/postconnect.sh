@@ -3,7 +3,7 @@
 # port forward. Shows the session log while the job is in the queue, then
 # returns, so that ssh session (and the forward the login node holds for
 # it) ends with the job instead of outliving it. Hanging up here cancels
-# the job, as before.
+# the job, as before, unless the tunnel only attached to it or keeps it.
 
 job_active() {  # in the queue? transient squeue failures count as yes
   local out
@@ -18,7 +18,10 @@ tail -f -n +1 "$SESSION_FILE" &
 tail_pid=$!
 finish() {
   kill "$tail_pid" 2>/dev/null
-  scancel "$SESSION_ID" 2>/dev/null
+  # a job this tunnel attached to, or one kept for others (KEEP_INSTANCE), outlives the tunnel
+  if [ "${TUNNEL_ATTACHED:-false}" != true ] && [ "${KEEP_INSTANCE:-false}" != true ]; then
+    scancel "$SESSION_ID" 2>/dev/null
+  fi
 }
 trap finish EXIT
 trap 'exit 130' HUP INT TERM

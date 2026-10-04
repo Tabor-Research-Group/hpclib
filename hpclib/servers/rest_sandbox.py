@@ -26,6 +26,17 @@ host therefore work unchanged; nothing has to be built to match the
 host. Give `image` (a .sif file or a sandbox directory) to run in an
 image of your own instead; then only `binds` are added.
 
+Your account: on clusters it usually comes from a directory service
+(LDAP, through SSSD), which the container can't reach, so the host's
+/etc/passwd alone doesn't know your uid and programs that look it up
+(Postgres, ssh, some MPI and Python libraries) fail. The job therefore
+writes, before the container starts, a passwd and a group file: the
+host's local entries plus your own account and groups (as `getent` gives
+them on the host), and an nsswitch.conf that reads only those files. They
+are bound read-only over the host's in the container. They hold nothing
+the job couldn't already learn as you, and add no host directory or
+socket to the sandbox.
+
 Config, the `sandbox` key of the server's config.json:
 
   {"method": "auto",          # auto | singularity | none
@@ -287,6 +298,43 @@ class Sandbox:
     # -- the job script -----------------------------------------------------
 
     @staticmethod
+    def account_lines():
+        """
+        Bash for the job script, on the host: passwd, group and nsswitch.conf files that know your account,
+        for the container's /etc (the host image binds the host's /etc, whose passwd usually doesn't: the
+        account comes from SSSD, which the container can't reach). Sets hpc_sandbox_account to their binds,
+        which come after the /etc bind so they cover the host's files.
+        """
+        return [
+            'hpc_sandbox_etc=$(mktemp -d "${TMPDIR:-/tmp}/hpc-sandbox-etc.XXXXXX") || '
+            '{ echo "hpclib: could not make the sandbox account files" >&2; exit 125; }',
+            'hpc_sandbox_uid=$(id -u); hpc_sandbox_user=$(id -un 2>/dev/null || echo "user$hpc_sandbox_uid")',
+            '{ grep -v "^[^:]*:[^:]*:$hpc_sandbox_uid:" /etc/passwd 2>/dev/null',
+            '  getent passwd "$hpc_sandbox_uid" | head -n 1 | grep . ||',
+            "    printf '%s:x:%s:%s::/nonexistent:/bin/bash\\n' \"$hpc_sandbox_user\" \"$hpc_sandbox_uid\" \"$(id -g)\"",
+            '} > "$hpc_sandbox_etc/passwd"',
+            '{ cat /etc/group 2>/dev/null',
+            '  for hpc_sandbox_gid in $(id -G); do',
+            '    grep -q "^[^:]*:[^:]*:$hpc_sandbox_gid:" /etc/group 2>/dev/null && continue',
+            '    # the group with only you as a member: a directory group can list thousands',
+            '    hpc_sandbox_g=$(getent group "$hpc_sandbox_gid" | head -n 1 | cut -d: -f1-3) || hpc_sandbox_g=',
+            '    [ -n "$hpc_sandbox_g" ] || hpc_sandbox_g="group$hpc_sandbox_gid:x:$hpc_sandbox_gid"',
+            "    printf '%s:%s\\n' \"$hpc_sandbox_g\" \"$hpc_sandbox_user\"",
+            '  done',
+            '} > "$hpc_sandbox_etc/group"',
+            'chmod 644 "$hpc_sandbox_etc/passwd" "$hpc_sandbox_etc/group"',
+            'hpc_sandbox_account=(--bind "$hpc_sandbox_etc/passwd:/etc/passwd:ro" '
+            '--bind "$hpc_sandbox_etc/group:/etc/group:ro")',
+            'if [ -f /etc/nsswitch.conf ]; then',
+            '  # look users and groups up in those files only: the directory service is out of reach in there',
+            "  sed -E 's/^[[:space:]]*(passwd|group|shadow|gshadow|initgroups)[[:space:]]*:.*/\\1: files/' "
+            '/etc/nsswitch.conf > "$hpc_sandbox_etc/nsswitch.conf"',
+            '  chmod 644 "$hpc_sandbox_etc/nsswitch.conf"',
+            '  hpc_sandbox_account+=(--bind "$hpc_sandbox_etc/nsswitch.conf:/etc/nsswitch.conf:ro")',
+            'fi',
+        ]
+
+    @staticmethod
     def interpreter(shebang):
         """The template body's interpreter, as an argument list for `-c`."""
         words = shlex.split(shebang[2:]) if shebang.startswith("#!") else ["/bin/bash"]
@@ -319,6 +367,7 @@ class Sandbox:
             args += ["--bind", f"{path}:{path}"]
         args += self.flags
         quoted = " ".join(shlex.quote(a) for a in args)
+        own_account = plan["host_image"] and "/etc" in plan["read_only"]
 
         delimiter = "HPC_SANDBOX_BODY_" + secrets.token_hex(8)
         while delimiter in body:
@@ -353,6 +402,10 @@ class Sandbox:
                 'hpc_sandbox_workdir=(--workdir "$hpc_sandbox_tmp")',
             ]
         lines.append("export SINGULARITYENV_TMPDIR=/tmp APPTAINERENV_TMPDIR=/tmp")
+        if own_account:
+            lines += self.account_lines()
+        else:
+            lines += ["hpc_sandbox_etc=", "hpc_sandbox_account=()"]
         interp = " ".join(shlex.quote(w) for w in self.interpreter(shebang))
         if prelude:
             prelude_text = "\n".join(prelude) + '\nexec "$@"'
@@ -362,10 +415,11 @@ class Sandbox:
         else:
             start = interp
         lines += [
-            f'{quoted} "${{hpc_sandbox_workdir[@]}}" --pwd "$PWD" {shlex.quote(image)} '
+            f'{quoted} "${{hpc_sandbox_account[@]}}" "${{hpc_sandbox_workdir[@]}}" --pwd "$PWD" {shlex.quote(image)} '
             f'{start} -c "$hpc_sandbox_body" hpc-job',
             "hpc_sandbox_status=$?",
             '[ -n "$hpc_sandbox_tmp" ] && rm -rf "$hpc_sandbox_tmp"',
+            '[ -n "$hpc_sandbox_etc" ] && rm -rf "$hpc_sandbox_etc"',
             'if [ "$hpc_sandbox_status" = 255 ]; then',
             '  echo "hpclib: the job sandbox may have failed to start (exit 255); see the messages above" >&2',
             "fi",
@@ -505,6 +559,7 @@ def self_test(sandbox: Sandbox, base_dir):
         '|| echo "tmp_writable=no"',
         'echo "pid_one=$(cat /proc/1/comm 2>/dev/null)"',
         'echo "programs=$(command -v bash >/dev/null && echo yes || echo no)"',
+        'id -un >/dev/null 2>&1 && echo "user_known=yes" || echo "user_known=no"',
     ])
     try:
         lines, plan = sandbox.launch("#!/bin/bash", body, [allowed])
@@ -520,7 +575,7 @@ def self_test(sandbox: Sandbox, base_dir):
         results = dict(line.split("=", 1) for line in res.stdout.splitlines() if "=" in line)
         checks = {k: results.get(k) == "yes"
                   for k in ("write_allowed", "outside_hidden", "usr_read_only", "home_read_only", "tmp_writable",
-                            "programs")}
+                            "programs", "user_known")}
         return {"ran": True, "exit_code": res.returncode, "seconds": round(time.time() - start, 2),
                 "passed": res.returncode == 0 and all(checks.values()), "checks": checks,
                 "pid_one": results.get("pid_one"), "stderr": res.stderr[-2000:]}

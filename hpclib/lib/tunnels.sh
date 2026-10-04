@@ -253,6 +253,36 @@ function install_tunnel {
   printf '%s\n' "$destination"
 }
 
+# From your own machine: check or install what a tunnel needs on a cluster, and save its settings there,
+# with the cluster's tunnels/setup_tunnel.sh (see it for the options), e.g.
+#   tunnel_setup user@grace.hprc.tamu.edu vscode --set VSCODE_CONTAINER=/scratch/user/me/vscode.sif --save --install --check
+function tunnel_setup {
+  local usage='usage: tunnel_setup [ssh options] [user@]host TUNNEL [--set NAME=VALUE]... [--save] [--install [--force]] [--check]'
+  local login_args=() host='' tunnel='' rest=() remote_hpclib remote_command
+  while [ "$#" -gt 0 ]; do
+    if [ -n "$tunnel" ]; then
+      rest=("$@")
+      break
+    fi
+    case "$1" in
+      -h|--help) echo "$usage"; return 0 ;;
+      -?)
+        login_args+=("$1")
+        if [[ "$SSH_FLAGS" == *"${1#-}:"* ]] && [ "$#" -ge 2 ]; then login_args+=("$2"); shift; fi
+        shift ;;
+      -*) login_args+=("$1"); shift ;;
+      *) if [ -z "$host" ]; then host="$1"; else tunnel="$1"; fi; shift ;;
+    esac
+  done
+  if [ -z "$host" ] || [ -z "$tunnel" ] || ! _hpclib_valid_tunnel_name "$tunnel"; then
+    echo "$usage" >&2
+    return 2
+  fi
+  remote_hpclib=$(_hpclib_remote_path "$HPCLIB_REMOTE_INSTALL_LOCATION")
+  remote_command=$(_hpclib_remote_script_cmd /bin/bash "$remote_hpclib/tunnels/setup_tunnel.sh" "$tunnel" "${rest[@]}")
+  HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$host" "$remote_command"
+}
+
 ################################################################################
 ##
 ##  Installing hpclib itself on a remote (SLURM) system

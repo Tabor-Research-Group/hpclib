@@ -347,4 +347,118 @@ if run_configure CONDA_ENVIRONMENT=myenv REQUIRE_CONDA=true > /dev/null 2>&1; th
   fail 'REQUIRE_CONDA=true accepted a missing conda'
 fi
 
+################################################################################
+# Shared instances (pai): a job registers its service and port; a tunnel attaches to a running one.
+mkdir -p "$test_dir/share-bin" "$test_dir/share-home" "$test_dir/share-data"
+: > "$test_dir/share-home/.bashrc"
+printf 'JOB_INITIALIZATION_PAUSE=0\nJOB_CONNECT_RETRY_WAIT_TIME=0\n' > "$test_dir/share-data/config.sh"
+cat > "$test_dir/share-bin/squeue" <<'SCRIPT'
+#!/usr/bin/env bash
+# jobs in $TEST_RUNNING run (on node9); others have ended
+job=''; fmt=''
+while [ "$#" -gt 0 ]; do case "$1" in -j) job="$2"; shift ;; -o|--format) fmt="$2"; shift ;; --format=*) fmt="${1#*=}" ;; esac; shift; done
+case " $TEST_RUNNING " in
+  *" $job "*) case "$fmt" in *%T*) echo RUNNING ;; *%N*) echo node9 ;; *) echo "$job" ;; esac ;;
+  *) [ -n "$job" ] && { echo "slurm_load_jobs error: Invalid job id specified" >&2; exit 1; } ;;
+esac
+exit 0
+SCRIPT
+cat > "$test_dir/share-bin/sbatch" <<'SCRIPT'
+#!/usr/bin/env bash
+echo submitted >> "$TEST_SHARE_LOG"; echo 5151
+SCRIPT
+cat > "$test_dir/share-bin/scancel" <<'SCRIPT'
+#!/usr/bin/env bash
+echo "scancel $*" >> "$TEST_SHARE_LOG"
+SCRIPT
+cat > "$test_dir/share-bin/ssh" <<'SCRIPT'
+#!/usr/bin/env bash
+echo "ssh $*" >> "$TEST_SHARE_LOG"
+SCRIPT
+chmod +x "$test_dir/share-bin/"*
+share_env=(HOME="$test_dir/share-home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PATH="$HPCLIB_DIR/tunnels"
+           HPCTUNNELS_DATA_DIR="$test_dir/share-data" HPCSESSIONS_DIR="$test_dir/share-data/sessions"
+           HPCSERVERS_DIR="$test_dir" TEST_SHARE_LOG="$test_dir/share.log" PATH="$test_dir/share-bin:$CLEAN_PATH")
+(
+  export "${share_env[@]}"
+  source "$HPCLIB_DIR/tunnels/instances.sh"
+  # a job registers itself; another finds it while it runs, and forgets it once it has ended
+  SLURM_JOB_ID=4000 tunnel_register_instance pai 3100
+  sleep 1
+  SLURM_JOB_ID=4001 tunnel_register_instance pai 3999      # newer, and its job has ended
+  assert_equal "$(tunnel_instance_port pai 4001)" 3999
+  assert_equal "$(TEST_RUNNING=4000 tunnel_find_instance pai)" "4000 $(hostname -s) 3100"
+  [ ! -e "$test_dir/share-data/instances/pai/4001" ] || fail 'kept the instance of an ended job'
+  if TEST_RUNNING= tunnel_find_instance pai > /dev/null; then fail 'found an instance whose job ended'; fi
+  # a taken port isn't picked
+  port=$(free_port); listen_as "$port" python3 -m held
+  picked=$(tunnel_pick_port "$port")
+  [ -n "$picked" ] && [ "$picked" != "$port" ] || fail "picked a busy port ($picked)"
+  assert_equal "$(tunnel_pick_port "$picked")" "$picked"
+  kill %% 2>/dev/null || true
+)
+# start_tunnel attaches to the running instance: no new job, its port, and it isn't cancelled afterwards
+(
+  export "${share_env[@]}"
+  SLURM_JOB_ID=6000 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance pai 3777"
+  TEST_RUNNING=6000 timeout 60 bash "$HPCLIB_DIR/tunnels/start_tunnel.sh" pai -P "$(free_port)" > "$test_dir/attach.log" 2>&1 ||
+    fail "attaching failed: $(cat "$test_dir/attach.log")"
+)
+grep -q 'attaching to the running pai instance: job 6000' "$test_dir/attach.log" || fail "no attach message: $(cat "$test_dir/attach.log")"
+grep -q submitted "$test_dir/share.log" && fail 'submitted a job although one runs'
+grep -q -- '127.0.0.1:[0-9]*:127.0.0.1:3777' "$test_dir/share.log" || fail "not forwarded to the instance's port: $(cat "$test_dir/share.log")"
+grep -q scancel "$test_dir/share.log" && fail 'cancelled a job it only attached to'
+rm -f "$test_dir/share.log" "$test_dir/share-data/instances/pai/"*
+# with none running it submits a job and forwards to the port that job reports (PROCESS_PORT_FROM_JOB)
+(
+  export "${share_env[@]}"
+  ( sleep 1; SLURM_JOB_ID=5151 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance pai 3888" ) &
+  TEST_RUNNING=5151 timeout 60 bash "$HPCLIB_DIR/tunnels/start_tunnel.sh" pai -P "$(free_port)" > "$test_dir/own.log" 2>&1 ||
+    fail "starting its own instance failed: $(cat "$test_dir/own.log")"
+)
+grep -q submitted "$test_dir/share.log" || fail 'no job submitted'
+grep -q 'job 5151 serves pai on node9, port 3888' "$test_dir/own.log" || fail "port not taken from the job: $(cat "$test_dir/own.log")"
+grep -q -- '127.0.0.1:[0-9]*:127.0.0.1:3888' "$test_dir/share.log" || fail "not forwarded to the reported port"
+grep -q scancel "$test_dir/share.log" && fail 'cancelled the job pai keeps for others (KEEP_INSTANCE)'
+# postconnect leaves an attached job alone
+printf '%s\n' ended > "$test_dir/pc-replies"
+(
+  PATH="$test_dir/clear-bin:$CLEAN_PATH" TEST_SQUEUE_STATE="$test_dir/pc-replies" TEST_SCANCEL_LOG="$test_dir/pc-scancel.log" \
+    SESSION_FILE="$test_dir/session.log" SESSION_ID=6000 TUNNEL_ATTACHED=true TUNNEL_POLL_INTERVAL=0.1 \
+    timeout 20 bash "$HPCLIB_DIR/tunnels/postconnect.sh" > /dev/null
+)
+[ ! -e "$test_dir/pc-scancel.log" ] || fail 'postconnect cancelled an attached job'
+
+################################################################################
+# setup_tunnel.sh: settings, check, install (the console's Install and Check)
+mkdir -p "$test_dir/setup-home"
+: > "$test_dir/setup-home/.bashrc"
+setup() {
+  env HOME="$test_dir/setup-home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PATH="$HPCLIB_DIR/tunnels" \
+    HPCTUNNELS_DATA_DIR="$test_dir/setup-data" PATH="$test_dir/bin:$CLEAN_PATH" \
+    bash "$HPCLIB_DIR/tunnels/setup_tunnel.sh" "$@"
+}
+image="$test_dir/my images/code server.sif"
+out=$(setup vscode --set "VSCODE_CONTAINER=$image" --save --check)
+case "$out" in *"HPCLIB_TUNNEL_STATUS missing not installed: no image at $image"*) ;; *) fail "check before install: $out" ;; esac
+grep -q 'VSCODE_CONTAINER=' "$test_dir/setup-data/settings/vscode.sh" || fail 'settings not saved'
+out=$(setup vscode --install --check) || fail "install failed: $out"
+[ -f "$image" ] || fail 'the image was not pulled to the saved path'
+case "$out" in *"HPCLIB_TUNNEL_STATUS installed installed: $image"*) ;; *) fail "check after install: $out" ;; esac
+if setup vscode --set PATH=/evil --save > /dev/null 2>&1; then fail 'accepted a setting the tunnel does not have'; fi
+grep -q "VSCODE_CONTAINER=" "$test_dir/setup-data/settings/vscode.sh" || fail 'a refused setting replaced the saved ones'
+case "$(setup flask --check)" in *"HPCLIB_TUNNEL_STATUS nothing"*) ;; *) fail 'flask has nothing to install' ;; esac
+case "$(setup pai --set "PAI_ROOT_DIR=$test_dir/pai" --check)" in *"HPCLIB_TUNNEL_STATUS missing"*) ;; *) fail 'pai check' ;; esac
+# start_tunnel reads the saved settings
+grep -q 'TUNNEL_SETTINGS_FILE="$HPCTUNNELS_DATA_DIR/settings/$TUNNEL_NAME.sh"' "$HPCLIB_DIR/tunnels/start_tunnel.sh" ||
+  fail 'start_tunnel does not read the settings file'
+# tunnel_setup runs it on the cluster with the options quoted
+(
+  pssh() { printf '%s\n' "$@" > "$test_dir/setup-remote"; }
+  tunnel_setup -p 2222 me@login.example vscode --set "VSCODE_CONTAINER=/a b/c.sif" --save --check
+)
+assert_equal "$(sed -n 1,3p "$test_dir/setup-remote" | tr '\n' ' ')" '-p 2222 me@login.example '
+grep -q 'tunnels/setup_tunnel.sh vscode --set VSCODE_CONTAINER=/a\\ b/c.sif --save --check' "$test_dir/setup-remote" ||
+  fail "remote command: $(cat "$test_dir/setup-remote")"
+
 echo 'Tunnel management tests passed'

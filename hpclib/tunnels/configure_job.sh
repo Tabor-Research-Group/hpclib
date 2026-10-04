@@ -1,6 +1,10 @@
 #! /bin/bash
 
 . ~/.bashrc
+# tunnel_register_instance, tunnel_pick_port, ... (for jobs that share their service or pick their port)
+if [ -f "${BASH_SOURCE[0]%/*}/instances.sh" ]; then
+  . "${BASH_SOURCE[0]%/*}/instances.sh"
+fi
 
 if [ "$ENABLE_WEB_PROXY" = "true" ]; then
   module load WebProxy

@@ -4,6 +4,7 @@
 Run with:  python -m unittest tests.test_agent_console -v
 """
 import contextlib
+import http.server
 import io
 import json
 import os
@@ -40,11 +41,17 @@ class FakeShell:
     """Stands in for `bash -c '. hpclib.sh; agent_tunnel ...'`."""
     def __init__(self):
         self.calls = []
+        self.setup_status = "missing not installed: no image at /x/vscode.sif"   # what tunnel_setup --check says
 
     def __call__(self, args, log):
         self.calls.append(list(args))
         log.write(f"ran {' '.join(args)}\n".encode())
-        return subprocess.Popen(["sleep", "30" if args[0] == "agent_tunnel" else "0"], start_new_session=True)
+        if args[0] == "tunnel_setup":   # like tunnels/setup_tunnel.sh
+            if "--save" in args:
+                log.write(f"saved {args.count('--set')} setting(s) for the tunnel\n".encode())
+            if "--check" in args:
+                log.write(f"HPCLIB_TUNNEL_STATUS {self.setup_status}\n".encode())
+        return subprocess.Popen(["sleep", "30" if args[0] in ("agent_tunnel", "launch_tunnel") else "0"], start_new_session=True)
 
 
 class ConsoleTestCase(JobServerTestCase):
@@ -196,6 +203,8 @@ class TestClusters(ConsoleTestCase):
                          {"command": "python3"})
 
     def test_tunnel_start_stop_log(self):
+        self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/tunnel/start")[0], 409)   # no login yet
+        self.clusters.logins.alive = lambda profile: True
         status, out = self.call("POST", f"/api/clusters/{self.dead}/tunnel/start",
                                 {"auto_approve_templates": "new"})
         self.assertEqual(status, 202, out)
@@ -470,6 +479,326 @@ class TestManage(TestLogin):
         self.assertEqual(self.call("GET", "/api/health")[1]["hpclib_version"], local)
         tunnel = self.call("GET", f"/api/clusters/{self.live}")[1]["tunnel"]
         self.assertEqual(tunnel["hpclib_version"], local)                # the test server runs from this repo
+
+
+class FakeApp(http.server.BaseHTTPRequestHandler):
+    """Stands in for JupyterLab (JSON at /api) or for the tunnel's waiting page while the job is queued."""
+    waiting = False
+
+    def do_GET(self):
+        if self.waiting:
+            body, ctype = (b"<html><h2>Waiting for jupyter&hellip;</h2>\n<p>job 123 queued (Priority) - poll #4</p>"
+                           b"</html>", "text/html")
+        else:
+            body, ctype = b'{"version": "4.2.5"}', "application/json"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+class TestApps(ConsoleTestCase):
+
+    def serve(self, port, waiting=False):
+        handler = type("H", (FakeApp,), {"waiting": waiting})
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def port(self, name=None):
+        return agent_profiles.load(name or self.dead)["apps"]["jupyter"]["port"]
+
+    def test_listing_and_ports(self):
+        out = self.call("GET", "/api/apps")[1]
+        self.assertEqual([a["id"] for a in out["apps"]], ["agents", "jupyter", "vscode", "pai"])
+        status, out = self.call("GET", "/api/apps/jupyter")
+        self.assertEqual(status, 200)
+        by_name = {x["cluster"]: x for x in out["sessions"]}
+        self.assertEqual(by_name[self.dead]["state"], "down")
+        apps = agent_profiles.load(self.dead)["apps"]["jupyter"]
+        profile = agent_profiles.load(self.dead)
+        self.assertNotIn(apps["port"], (profile["port"], profile["process_port"], apps["process_port"]))
+        self.assertEqual(self.call("GET", "/api/apps/nope")[0], 404)
+
+    def test_settings(self):
+        base = f"/api/apps/jupyter/{self.dead}/settings"
+        status, out = self.call("PUT", base, {"tunnel_args": ["--time=4:00:00", "--mem=16gb"], "conda_env": "",
+                                              "modules": ["GCCcore/13.2.0", "JupyterLab/4.2.0"],
+                                              "project": "/scratch/me/llm/analysis"})
+        self.assertEqual(status, 200, out)
+        self.assertEqual((out["conda_env"], out["modules"][1]), ("", "JupyterLab/4.2.0"))
+        for bad in ({"tunnel_args": ["--wrap=x"]}, {"conda_env": "a b"}, {"modules": ["a;b"]},
+                    {"project": "relative"}, {"project": "/a b"}, {"project": "/a,b"}, {"port": 1}):
+            self.assertIn(self.call("PUT", base, bad)[0], (400, 422), bad)
+
+    def test_start_needs_login_then_launches(self):
+        self.assertEqual(self.call("POST", f"/api/apps/jupyter/{self.dead}/start")[0], 409)
+        self.call("PUT", f"/api/apps/jupyter/{self.dead}/settings",
+                  {"tunnel_args": ["--time=4:00:00"], "conda_env": "jl", "modules": ["JupyterLab/4.2.0"],
+                   "project": "/scratch/me/p"})
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            status, out = self.call("POST", f"/api/apps/jupyter/{self.dead}/start")
+        self.assertEqual(status, 202, out)
+        conf = agent_profiles.load(self.dead)["apps"]["jupyter"]
+        host = agent_profiles.load(self.dead)["host"]
+        self.assertEqual(self.shell.calls[-1], [
+            "launch_tunnel", "-A", "none", "-P", str(conf["port"]), host, "jupyter",
+            f"--process-port={conf['process_port']}", "--time=4:00:00",
+            "--env=CONDA_ENVIRONMENT=jl,HPCLIB_JUPYTER_MODULES=JupyterLab/4.2.0,HPCLIB_JUPYTER_PROJECT=/scratch/me/p"])
+        state = self.call("GET", f"/api/apps/jupyter/{self.dead}")[1]
+        self.assertEqual((state["state"], state["started_here"]), ("starting", True))
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.assertEqual(self.call("POST", f"/api/apps/jupyter/{self.dead}/start")[0], 409)
+        out = self.call("POST", f"/api/apps/jupyter/{self.dead}/stop")[1]
+        self.assertEqual(self.shell.calls[-1], ["stop_tunnel", "-P", str(conf["port"]), host])
+        self.assertEqual(self.call("GET", f"/api/apps/jupyter/{self.dead}")[1]["state"], "down")
+
+    def test_queued_then_up_with_token(self):
+        self.call("GET", f"/api/apps/jupyter/{self.dead}")              # picks the ports
+        port = self.port()
+        waiting = self.serve(port, waiting=True)
+        state = self.call("GET", f"/api/apps/jupyter/{self.dead}")[1]
+        self.assertEqual((state["state"], state["status"]), ("queued", "job 123 queued (Priority) - poll #4"))
+        waiting.shutdown()
+        waiting.server_close()
+        self.serve(port)
+        log = self.console / "logs" / f"{self.dead}.jupyter.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("\n=== 2026-10-01 launch_tunnel ... ===\n    http://c1:8888/lab?token=oldoldoldoldoldoldold\n"
+                       "\n=== 2026-10-04 launch_tunnel ... ===\nLaunching Jupyter on 8888\n"
+                       "    http://c2:8888/lab?token=0123456789abcdef0123456789abcdef\n")
+        state = self.call("GET", f"/api/apps/jupyter/{self.dead}")[1]
+        self.assertEqual((state["state"], state["version"]), ("up", "4.2.5"))
+        self.assertEqual(state["url"], f"http://127.0.0.1:{port}/lab?token=0123456789abcdef0123456789abcdef")
+        lines = self.call("GET", f"/api/apps/jupyter/{self.dead}/log")[1]["lines"]
+        self.assertIn("Launching Jupyter on 8888", lines)
+
+
+FAKE_TUNNEL = textwrap.dedent("""\
+    #!/bin/bash
+    # Like start_tunnel.sh reaching the compute node: the login node's ssh asks for the password on the terminal.
+    echo "Submitted batch job 152373"
+    echo "ssh -L 127.0.0.1:20523:127.0.0.1:24665 -t chem-entr-c01 source env.sh"
+    for try in 1 2 3; do
+      printf "maboyer@chem-entr-c01's password: "
+      IFS= read -rs pw < /dev/tty
+      echo
+      if [ "$pw" = "$FAKE_NODE_PASSWORD" ]; then
+        echo "connected to chem-entr-c01"
+        sleep 30
+        exit 0
+      fi
+      echo "Permission denied, please try again."
+    done
+    echo "maboyer@chem-entr-c01: Permission denied (publickey,password)."
+    exit 255
+""")
+
+
+class TestTunnelInstall(ConsoleTestCase):
+    """vscode and pai: tunnel settings saved on the cluster, Check and Install with install.sh, shared instances."""
+    serve = TestApps.serve
+
+    def wait_op(self, name):
+        for _ in range(50):
+            out = self.call("GET", f"/api/clusters/{name}/operation")[1]
+            if out.get("state") != "running":
+                return out
+            time.sleep(0.1)
+        return out
+
+    def test_settings_check_install_start(self):
+        base = f"/api/apps/vscode/{self.dead}"
+        status, out = self.call("PUT", base + "/settings", {"settings": {"VSCODE_CONTAINER": "/x/vscode.sif",
+                                                                        "VSCODE_ROOT_DIR": " "}})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["settings"], {"VSCODE_CONTAINER": "/x/vscode.sif"})      # blank: the tunnel's default
+        self.assertEqual([f["name"] for f in out["fields"]], ["VSCODE_CONTAINER", "VSCODE_ROOT_DIR", "VSCODE_BIND_PATHS"])
+        self.assertTrue(out["installable"])
+        self.assertFalse(out["python_env"])
+        for bad in ({"settings": {"PATH": "/evil"}}, {"settings": {"VSCODE_CONTAINER": "a\nb"}}, {"settings": []}):
+            self.assertEqual(self.call("PUT", base + "/settings", bad)[0], 422, bad)
+        self.assertEqual(self.call("GET", base)[1]["install"]["state"], "unchecked")
+        self.assertEqual(self.call("POST", base + "/check")[0], 409)                     # needs the login
+        host = agent_profiles.load(self.dead)["host"]
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            status, out = self.call("POST", base + "/check")
+            self.assertEqual((status, out["install"]["state"]), (200, "missing"), out)
+            self.assertEqual(self.shell.calls[-1], ["tunnel_setup", host, "vscode", "--set",
+                                                    "VSCODE_CONTAINER=/x/vscode.sif", "--save", "--check"])
+            status, out = self.call("POST", base + "/start")
+            self.assertEqual(status, 409)
+            self.assertIn("isn't installed", out["error"])
+            # Install: an operation of the cluster's, which records what the check after it found
+            self.shell.setup_status = "installed installed: /x/vscode.sif"
+            status, out = self.call("POST", base + "/install", {"force": True})
+            self.assertEqual((status, out["kind"], out["title"]), (202, "tunnel_install", "install VS Code"), out)
+            self.assertEqual(self.shell.calls[-1][-3:], ["--install", "--force", "--check"])
+            self.assertEqual(self.wait_op(self.dead)["state"], "succeeded")
+            time.sleep(0.2)
+            state = self.call("GET", base)[1]
+            self.assertEqual(state["install"]["state"], "installed", state)
+            self.assertEqual(state["operation"]["app"], "vscode")
+            listed = {c["name"]: c for c in self.call("GET", "/api/clusters")[1]["clusters"]}
+            self.assertEqual(listed[self.dead]["operation"]["title"], "install VS Code")
+            # the settings went with it, so Start launches straight away
+            status, out = self.call("POST", base + "/start")
+            self.assertEqual(status, 202, out)
+            self.assertEqual(self.shell.calls[-1][:7], ["launch_tunnel", "-A", "none", "-P",
+                str(agent_profiles.load(self.dead)["apps"]["vscode"]["port"]), host, "vscode"])
+            self.call("POST", base + "/stop")
+            # a later change is sent before the next start
+            self.call("PUT", base + "/settings", {"settings": {"VSCODE_CONTAINER": "/y/vscode.sif"}})
+            self.call("POST", base + "/start")
+            self.assertEqual(self.shell.calls[-2][:2], ["tunnel_setup", host])
+            self.assertIn("VSCODE_CONTAINER=/y/vscode.sif", self.shell.calls[-2])
+            self.assertEqual(self.shell.calls[-1][0], "launch_tunnel")
+        self.assertEqual(self.call("POST", f"/api/apps/jupyter/{self.dead}/install", {"force": "x"})[0], 400)
+
+    def test_old_cluster_without_setup_tunnel(self):
+        # an older hpclib on the cluster: no setup_tunnel.sh, so no status line
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.clusters.shell_runner = lambda args, log: (log.write(b"tunnel_setup: command not found\n"),
+                                                            subprocess.Popen(["false"]))[1]
+            status, out = self.call("POST", f"/api/apps/vscode/{self.dead}/check")
+        self.assertEqual(status, 502)
+        self.assertIn("update hpclib", out["error"])
+
+    def test_vscode_password_and_shared_pai(self):
+        self.call("GET", f"/api/apps/vscode/{self.dead}")
+        self.call("GET", f"/api/apps/pai/{self.dead}")
+        apps = agent_profiles.load(self.dead)["apps"]
+        logs = self.console / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / f"{self.dead}.vscode.log").write_text("\n=== launch ===\nbind-addr: 127.0.0.1:8080\n"
+                                                      "auth: password\npassword: 1f2e3d4c5b6a\ncert: false\n")
+        (logs / f"{self.dead}.pai.log").write_text("\n=== launch ===\nhpclib: attaching to the running pai instance: "
+                                                   "job 152400 on chem-entr-c04, port 3104\n")
+        self.serve(apps["vscode"]["port"])
+        self.serve(apps["pai"]["port"])
+        vs = self.call("GET", f"/api/apps/vscode/{self.dead}")[1]
+        self.assertEqual((vs["state"], vs["password"], vs["token_known"]), ("up", "1f2e3d4c5b6a", True))
+        self.assertTrue(vs["url"].endswith("/"))
+        pai = self.call("GET", f"/api/apps/pai/{self.dead}")[1]
+        self.assertEqual((pai["state"], pai["shared"]), ("up", True))
+        self.assertEqual(pai["instance"], {"job": "152400", "node": "chem-entr-c04", "port": 3104, "how": "attached"})
+        self.assertNotIn("password", pai)
+
+
+class TestSecondLogin(ConsoleTestCase):
+    """Tunnels run in a pseudo-terminal, so the compute node's password prompt can be answered from the page."""
+
+    def setUp(self):
+        super().setUp()
+        script = self.tmp / "fake-tunnel"
+        script.write_text(FAKE_TUNNEL)
+        script.chmod(0o755)
+        env = dict(os.environ, FAKE_NODE_PASSWORD="node-pass")
+        self.clusters.tunnel_runner = lambda args, log_path: agent_console.PtySession([str(script)], log_path, env)
+        self.clusters.logins.alive = lambda profile: True
+        self.addCleanup(self.kill_tunnels)
+
+    def kill_tunnels(self):
+        for proc in list(self.clusters.procs.values()) + list(self.clusters.app_procs.values()):
+            if proc.poll() is None:
+                os.killpg(proc.pid, 15)
+                proc.wait(5)
+
+    def prompt(self, route):
+        for _ in range(50):
+            out = self.call("GET", route)[1]
+            prompt = (out.get("tunnel") or out).get("prompt")
+            if prompt:
+                return prompt
+            time.sleep(0.1)
+        self.fail(f"no prompt: {out}")
+
+    def log_text(self, name):
+        return (self.console / "logs" / f"{name}.log").read_text(errors="replace")
+
+    def test_agent_tunnel_second_password(self):
+        self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/tunnel/start")[0], 202)
+        prompt = self.prompt(f"/api/clusters/{self.dead}")
+        self.assertEqual((prompt["host"], prompt["retry"]), ("maboyer@chem-entr-c01", False))
+        self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/tunnel/answer", {"answer": "wrong"})[0], 200)
+        prompt = self.prompt(f"/api/clusters/{self.dead}")
+        self.assertTrue(prompt["retry"])                                      # refused: asked again
+        self.call("POST", f"/api/clusters/{self.dead}/tunnel/answer", {"answer": "node-pass"})
+        for _ in range(50):
+            if "connected to chem-entr-c01" in self.log_text(self.dead):
+                break
+            time.sleep(0.1)
+        log = self.log_text(self.dead)
+        self.assertIn("connected to chem-entr-c01", log)
+        self.assertNotIn("node-pass", log)                                    # echo was off: not in the log
+        self.assertNotIn("wrong", log)
+        self.assertIsNone(self.call("GET", f"/api/clusters/{self.dead}")[1]["tunnel"]["prompt"])
+        self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/tunnel/answer", {"answer": "x"})[0], 409)
+
+    def test_gives_up_after_three(self):
+        self.call("POST", f"/api/clusters/{self.dead}/tunnel/start")
+        for _ in range(3):
+            self.prompt(f"/api/clusters/{self.dead}")
+            self.call("POST", f"/api/clusters/{self.dead}/tunnel/answer", {"answer": "nope"})
+        for _ in range(50):
+            if self.clusters.procs[self.dead].poll() is not None:
+                break
+            time.sleep(0.1)
+        self.assertEqual(self.clusters.procs[self.dead].returncode, 255)
+        self.assertIsNone(self.call("GET", f"/api/clusters/{self.dead}")[1]["tunnel"]["prompt"])
+        self.assertIn("Permission denied (publickey,password)", self.log_text(self.dead))
+
+    def test_jupyter_second_password(self):
+        self.assertEqual(self.call("POST", f"/api/apps/jupyter/{self.dead}/start")[0], 202)
+        prompt = self.prompt(f"/api/apps/jupyter/{self.dead}")
+        self.assertEqual(prompt["kind"], "password")
+        self.assertEqual(self.call("POST", f"/api/apps/jupyter/{self.dead}/answer", {"answer": "node-pass"})[0], 200)
+        self.assertEqual(self.call("POST", f"/api/apps/jupyter/{self.dead}/answer", {"answer": "a\nb"})[0], 400)
+
+    def test_connecting_is_not_an_error(self):
+        # while the login node's ssh to the compute node waits, the forwarded port is open but nothing answers:
+        # a tunnel started here is still starting (the page keeps watching it), not in error
+        port = agent_profiles.load(self.dead)["port"]
+        self.call("POST", f"/api/clusters/{self.dead}/tunnel/start")
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", port))
+        srv.listen()
+        self.addCleanup(srv.close)
+
+        def close_all():
+            with contextlib.suppress(OSError):
+                while True:
+                    srv.accept()[0].close()
+        threading.Thread(target=close_all, daemon=True).start()
+        tunnel = self.call("GET", f"/api/clusters/{self.dead}")[1]["tunnel"]
+        self.assertEqual(tunnel["state"], "starting", tunnel)
+        self.assertIn("connecting", tunnel["error"])
+
+    def test_prompts_everywhere(self):
+        # one local route lists every waiting prompt, so the page can ask from wherever it is
+        self.assertEqual(self.call("GET", "/api/prompts")[1], {"ok": True, "prompts": [], "running": 0})
+        self.call("POST", f"/api/clusters/{self.dead}/tunnel/start")
+        self.call("POST", f"/api/apps/jupyter/{self.dead}/start")
+        for _ in range(50):
+            out = self.call("GET", "/api/prompts")[1]
+            if len(out["prompts"]) == 2:
+                break
+            time.sleep(0.1)
+        self.assertEqual(out["running"], 2)
+        by_app = {p["app"]: p for p in out["prompts"]}
+        self.assertEqual(set(by_app), {None, "jupyter"})
+        self.assertEqual(by_app[None]["title"], "agent tunnel")
+        self.assertEqual(by_app[None]["prompt"]["host"], "maboyer@chem-entr-c01")
+        for p in out["prompts"]:
+            self.assertEqual(self.call("POST", "/api/" + p["answer"], {"answer": "node-pass"})[0], 200, p)
+        self.assertEqual(self.call("GET", "/api/prompts")[1]["prompts"], [])
 
 
 class TestProxy(ConsoleTestCase):

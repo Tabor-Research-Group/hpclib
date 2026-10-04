@@ -30,6 +30,18 @@ The front end depends only on the routes below; nothing here depends on it.
   POST /api/clusters/NAME/setup               setup_agents ({"work_dirs": [...], "binds": [...],
                                               "templates": "...", "rebuild": false})
   GET  /api/clusters/NAME/operation           the running or last install/setup, with its log
+  GET  /api/apps                              the console's apps: agents, and tunnel apps (JupyterLab)
+  GET  /api/apps/APP                          that app's session on every cluster: state (down, starting,
+                                              queued, up), the job's queue status, and the URL to open
+  POST /api/apps/APP/NAME/start|stop          launch_tunnel / stop_tunnel for it, over the login
+  GET  /api/apps/APP/NAME/log                 its tunnel's output
+  GET  /api/apps/APP/NAME/settings, PUT ...   {"tunnel_args": [...], "conda_env": ..., "modules": [...],
+                                              "project": "/path/to/uv-or-pixi-project",
+                                              "settings": {"VSCODE_CONTAINER": "/path/...", ...}}: the tunnel's
+                                              settings, saved on the cluster with the next check/install/start
+  POST /api/apps/APP/NAME/check               is the tunnel installed? (its install.sh --check, on the cluster)
+  POST /api/apps/APP/NAME/install             its install.sh ({"force": true}: e.g. pull the image again), as
+                                              the cluster's operation (GET /api/clusters/NAME/operation)
   GET  /api/clusters/NAME/settings            this machine's tunnel settings for the cluster
   PUT  /api/clusters/NAME/settings            {"auto_approve_templates": all|new|review,
                                                "tunnel_args": ["--time=12:00:00", ...],
@@ -37,6 +49,12 @@ The front end depends only on the routes below; nothing here depends on it.
   POST /api/clusters/NAME/tunnel/start        runs agent_tunnel NAME ({"auto_approve_templates": all|new|review})
   POST /api/clusters/NAME/tunnel/stop         runs agent_stop NAME
   GET  /api/clusters/NAME/tunnel/log?lines=N  the console's log of that tunnel
+  POST /api/clusters/NAME/tunnel/answer       {"answer": ...}: a password the tunnel's ssh asks for (its
+                                              "prompt" in the tunnel state), e.g. the login node's ssh to
+                                              the compute node; POST /api/apps/APP/NAME/answer likewise
+  GET  /api/prompts                           every tunnel or app session started here that waits for a
+                                              password now ({"prompts": [{"cluster", "app", "title", "answer":
+                                              its answer route, "prompt"}], "running": N}); local only
   *    /api/clusters/NAME/rest/<route>        proxied to the cluster's REST server
   GET  /api/jobs?active=1&limit=N             GET /jobs on every live cluster
   GET  /api/proposals                         GET /admin/proposals on every live cluster
@@ -54,6 +72,7 @@ if sys.version_info < (3, 7):
     sys.exit("agent_console needs Python 3.7 or newer")
 
 import argparse
+from html import unescape as html_unescape
 import concurrent.futures
 import contextlib
 import io
@@ -84,6 +103,67 @@ VERSION = "0.1"
 DEFAULT_PORT = 27180
 CLUSTER_NAME_RE = re.compile(r"[A-Za-z0-9._@-]{1,120}")
 STREAMED_ROUTES = ("files/content",)   # passed through in chunks rather than read whole
+
+# Tunnel apps the console runs besides the agents' REST tunnel, one panel each in the front end. Each is an
+# hpclib tunnel (hpclib/tunnels/NAME) started with launch_tunnel over the cluster's ssh login, on ports of its
+# own kept in the profile's "apps" section.
+# The console's tunnel apps. Each runs `launch_tunnel ... TUNNEL` over the console's login and is reached on a
+# port of its own. Optional parts:
+#   token_re      the app's access token in the job's log (streamed back over ssh), added to the URL to open
+#   password_re   a password it prints there instead, shown next to Open
+#   env_settings  JupyterLab's conda environment, modules and uv/pixi project fields
+#   settings      [(NAME, label, hint)]: the tunnel's TUNNEL_SETTINGS (tunnel_config.sh) the page edits; they
+#                 are saved on the cluster (tunnels/setup_tunnel.sh --save) for its job and install.sh
+#   shared        the tunnel attaches to a running instance another job serves (SHARED_INSTANCE), and keeps
+#                 the one it starts running after Stop (KEEP_INSTANCE)
+# A tunnel with an install.sh can be checked and installed from the page (tunnels/setup_tunnel.sh).
+APPS = {
+    "jupyter": {
+        "title": "JupyterLab",
+        "tunnel": "jupyter",
+        "open_path": "/lab",
+        "health_path": "/api",   # Jupyter answers {"version": ...} here without a token once it runs
+        # Jupyter prints its URL with the token into the job's log, which the tunnel streams back over ssh
+        "token_re": re.compile(r"[?&]token=([0-9A-Za-z]{16,})"),
+        "env_settings": {"modules": "HPCLIB_JUPYTER_MODULES", "project": "HPCLIB_JUPYTER_PROJECT"},
+        "settings": [],
+    },
+    "vscode": {
+        "title": "VS Code",
+        "tunnel": "vscode",
+        "open_path": "/",
+        "health_path": "/healthz",   # code-server: {"status": "alive", ...}
+        # postconnect.sh prints code-server's config.yaml (its login password) into the session log
+        "password_re": re.compile(r"^password:\s*(\S+)\s*$", re.M),
+        "settings": [
+            ("VSCODE_CONTAINER", "Container image", "where the code-server image is pulled to and run from; "
+                                                    "default /scratch/user/USER/vscode.sif"),
+            ("VSCODE_ROOT_DIR", "Start directory", "where VS Code opens and keeps its config; default /scratch/user/USER"),
+            ("VSCODE_BIND_PATHS", "Directories in the container", "singularity --bind list, e.g. "
+                                                                 "/scratch/user/me:/scratch/user/me,/home/me:/home/me"),
+        ],
+    },
+    "pai": {
+        "title": "PAI",
+        "tunnel": "pai",
+        "open_path": "/",
+        "health_path": "/",
+        "shared": True,
+        "settings": [
+            ("PAI_ROOT_DIR", "Install directory", "holds proto-auto-interface/; default /scratch/user/USER/pai"),
+            ("PAI_REPO", "Repository", "git URL Install clones proto-auto-interface from"),
+            ("INCLUDE_DEV_ENDPOINTS", "Development endpoints", "true or false; default true"),
+        ],
+    },
+}
+SETTING_VALUE_RE = re.compile(r"[^\0\n\r]{0,1024}")
+TUNNEL_STATUS_RE = re.compile(r"^HPCLIB_TUNNEL_STATUS (installed|missing|unknown|nothing) ?(.*)$", re.M)
+ATTACHED_RE = re.compile(r"attaching to the running \S+ instance: job (\d+) on (\S+), port (\d+)")
+OWN_INSTANCE_RE = re.compile(r"job (\d+) serves \S+ on (\S+), port (\d+)")
+APP_PROJECT_RE = re.compile(r"/[A-Za-z0-9_./@+-]{1,1023}")
+APP_MODULE_RE = re.compile(r"[A-Za-z0-9_.+-][A-Za-z0-9_.+/-]{0,127}")
+CONDA_ENV_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+SHIM_STATUS_RE = re.compile(r"<h2>Waiting for[^<]*</h2>\s*<p>(.*?)</p>", re.S)
 LOGIN_HOST_RE = re.compile(r"[A-Za-z0-9._-]{1,64}@[A-Za-z0-9.-]{1,253}")
 JUMP_HOST_RE = re.compile(r"([A-Za-z0-9._-]{1,64}@)?[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?")
 CLUSTER_PATH_RE = re.compile(r"/[^\0\n\r]{0,1023}")
@@ -138,6 +218,112 @@ def read_private(path):
 ##
 ##  Clusters: profiles, tokens, tunnels
 ##
+
+class PtySession:
+    """
+    A tunnel launcher (agent_tunnel, launch_tunnel) run in a pseudo-terminal, as in a terminal: its ssh, and
+    the ssh the login node then makes to the compute node, can ask for a password there. Its output goes to
+    the log; a prompt waiting for input is noticed (`prompt`) so the console can ask you, and the answer is
+    written to the terminal, where ssh has turned echo off, so it never reaches the log. A Duo prompt gets
+    "1" (a push), as at login. Has the parts of Popen the console uses (pid, poll, wait, returncode).
+    """
+
+    PROMPT_RE = re.compile(r"(pass(word|phrase|code)|option \(\d|verification code|one-time)[^\n]*:\s*$", re.I)
+    PUSH_RE = re.compile(r"passcode|option|duo|two-factor|second factor", re.I)
+    DENIED_RE = re.compile(r"permission denied|incorrect|authentication failed", re.I)
+
+    def __init__(self, argv, log_path, env=None):
+        import pty
+        import termios
+        import fcntl
+        import struct
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 200, 0, 0))   # no wrapped lines
+
+        def controlling_terminal():   # what a terminal gives: a session whose terminal is this pty
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        try:
+            self.proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True,
+                                         preexec_fn=controlling_terminal)
+        finally:
+            os.close(slave)
+        self.master = master
+        self.log_path = log_path
+        self.prompt = None
+        self.tail = ""
+        self.lock = threading.Lock()
+        self.pushes = 0
+        threading.Thread(target=self._read, daemon=True).start()
+
+    # Popen's interface, for the console
+    pid = property(lambda self: self.proc.pid)
+    returncode = property(lambda self: self.proc.returncode)
+
+    def poll(self):
+        return self.proc.poll()
+
+    def wait(self, timeout=None):
+        return self.proc.wait(timeout)
+
+    def kill(self):
+        self.proc.kill()
+
+    def _read(self):
+        with open(self.log_path, "ab", buffering=0) as log:
+            while True:
+                try:
+                    data = os.read(self.master, 4096)
+                except OSError:      # the launcher, and everything holding the terminal, has exited
+                    break
+                if not data:
+                    break
+                log.write(data)
+                text = data.decode(errors="replace").replace("\r", "")
+                with self.lock:
+                    self.tail = (self.tail + text)[-2000:]
+                    self._check_prompt()
+        with self.lock:
+            self.prompt = None
+        try:
+            os.close(self.master)
+        except OSError:
+            pass
+
+    def _check_prompt(self):
+        last = self.tail.rsplit("\n", 1)[-1]
+        if not self.PROMPT_RE.search(last):
+            self.prompt = None          # new output after a prompt: ssh has moved on (or gave up)
+            return
+        before = self.tail[:-len(last)] if last else self.tail
+        if self.PUSH_RE.search(last) and not re.search(r"password", last, re.I):
+            # a Duo menu: ask for a push, once per prompt
+            self.pushes += 1
+            self.prompt = None
+            self._write("1")
+            return
+        host = re.search(r"([\w.-]+@[\w.-]+)'s password", last)
+        self.prompt = {"text": last.strip()[-200:], "kind": "password",
+                       "host": host.group(1) if host else None,
+                       "retry": bool(self.DENIED_RE.search(before[-400:]))}
+
+    def _write(self, text):
+        os.write(self.master, (text + "\n").encode())
+
+    def answer(self, text):
+        if not isinstance(text, str) or len(text) > 1024 or "\n" in text or "\r" in text:
+            raise ConsoleError(400, "the answer must be one line of text")
+        with self.lock:
+            if self.prompt is None:
+                raise ConsoleError(409, "nothing is waiting for an answer")
+            self._write(text)
+            self.prompt = None
+        return {"answered": True}
+
+    def waiting(self):
+        with self.lock:
+            return None if self.prompt is None else {k: self.prompt[k] for k in ("text", "kind", "host", "retry")}
+
 
 def ssh_options(profile):
     """
@@ -395,13 +581,19 @@ class Logins:
 class Clusters:
     """The agent profiles, plus the tunnels this console started."""
 
-    def __init__(self, shell_runner=None, timeout=20, logins: Logins = None):
+    def __init__(self, shell_runner=None, timeout=20, logins: Logins = None, tunnel_runner=None):
         self.timeout = timeout
         self.shell_runner = shell_runner or self.run_hpclib
+        # tunnels run in a pseudo-terminal (PtySession), so a second login can be answered; a given
+        # shell_runner (tests) is used as it is
+        if tunnel_runner is None:
+            tunnel_runner = self.run_hpclib_pty if shell_runner is None else self._plain_tunnel_runner
+        self.tunnel_runner = tunnel_runner
         self.procs = {}
         self.lock = threading.Lock()
         self.logins = logins or Logins()
         self.ops = {}
+        self.app_procs = {}
 
     # profiles
     def names(self):
@@ -492,12 +684,15 @@ class Clusters:
         return payload
 
     def tunnel_state(self, profile):
-        """'down' (nothing on the port), 'starting' (the waiting page), 'up', or 'error'."""
+        """
+        'down' (nothing on the port), 'starting' (the waiting page, or a tunnel started here that nothing answers
+        behind yet), 'up', or 'error'.
+        """
         name = profile["name"]
         with self.lock:
             proc = self.procs.get(name)
         out = {"port": profile["port"], "started_here": proc is not None and proc.poll() is None,
-               "log": os.path.exists(self.log_path(name))}
+               "log": os.path.exists(self.log_path(name)), "prompt": self.prompt_of(proc)}
         if proc is not None and proc.poll() is not None:
             out["last_exit"] = proc.returncode
         if not self.port_open(profile["port"]):
@@ -506,6 +701,10 @@ class Clusters:
         try:
             status, ctype, content = self.call(profile, "GET", "/health", timeout=5)
         except ConsoleError as e:
+            if out["started_here"]:
+                # the forward is open but nothing answers behind it yet: the job is starting, or the login
+                # node's ssh to the compute node waits (perhaps for a password)
+                return dict(out, state="starting", error="connecting: nothing answers behind the port yet")
             return dict(out, state="error", error=e.payload["error"])
         if "text/html" in ctype:
             return dict(out, state="starting")
@@ -527,7 +726,8 @@ class Clusters:
         out["set_up"] = bool(profile.get("work_dirs")) and out["has_agent_token"]
         with self.lock:
             op = self.ops.get(profile["name"])
-            out["operation"] = {k: op[k] for k in ("kind", "state", "exit_code", "started", "finished")} if op else None
+            out["operation"] = ({k: op.get(k) for k in ("kind", "title", "app", "state", "exit_code", "started",
+                                                         "finished")} if op else None)
         if tunnel:
             out["tunnel"] = self.tunnel_state(profile)
             out["login"] = self.logins.status(profile)
@@ -540,6 +740,51 @@ class Clusters:
                                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                                 start_new_session=True,
                                 env=dict(os.environ, HPCLIB_ECHO_COMMANDS="", NO_COLOR="1", HPCLIB_COLOR="never"))
+
+    HPCLIB_ENV = {"HPCLIB_ECHO_COMMANDS": "", "NO_COLOR": "1", "HPCLIB_COLOR": "never"}
+
+    def hpclib_argv(self, args):
+        script = 'HPCLIB_DIR="$1"; . "$1/hpclib.sh" > /dev/null 2>&1 || exit 97; shift; "$@"'
+        return ["bash", "-c", script, "agent_console", HPCLIB_DIR] + list(args)
+
+    def run_hpclib_pty(self, args, log_path):
+        return PtySession(self.hpclib_argv(args), log_path, env=dict(os.environ, TERM="dumb", **self.HPCLIB_ENV))
+
+    def _plain_tunnel_runner(self, args, log_path):
+        with open(log_path, "ab", buffering=0) as log:
+            return self.shell_runner(args, log)
+
+    def answer_prompt(self, proc, text):
+        if not isinstance(proc, PtySession) or proc.poll() is not None:
+            raise ConsoleError(409, "nothing is waiting for an answer")
+        return proc.answer(text)
+
+    @staticmethod
+    def prompt_of(proc):
+        return proc.waiting() if isinstance(proc, PtySession) and proc.poll() is None else None
+
+    def prompts(self):
+        """
+        Tunnels and app sessions started here that wait for a password now, and how many are still running.
+        Local only (no calls to the clusters), so the page can ask often wherever it is.
+        """
+        with self.lock:
+            procs = [(name, None, proc) for name, proc in self.procs.items()]
+            procs += [(name, app, proc) for (name, app), proc in self.app_procs.items()]
+        waiting, running = [], 0
+        for name, app, proc in procs:
+            if proc.poll() is not None:
+                continue
+            running += 1
+            prompt = self.prompt_of(proc)
+            if prompt:
+                quoted = urllib.parse.quote(name, safe="")
+                waiting.append({"cluster": name, "app": app,
+                                "title": "agent tunnel" if app is None else APPS[app]["title"],
+                                "answer": f"clusters/{quoted}/tunnel/answer" if app is None
+                                          else f"apps/{app}/{quoted}/answer",
+                                "prompt": prompt})
+        return {"prompts": waiting, "running": running}
 
     def _open_log(self, name, title, path=None):
         path = path or self.log_path(name)
@@ -556,7 +801,7 @@ class Clusters:
     def ops_log_path(self, name):
         return os.path.join(console_dir(), "logs", f"{name}.ops.log")
 
-    def run_operation(self, profile, kind, args):
+    def run_operation(self, profile, kind, args, title=None, app=None):
         """Run install_hpclib or setup_agents for a cluster in the background, over its ssh login."""
         name = profile["name"]
         with self.lock:
@@ -571,15 +816,22 @@ class Clusters:
             proc = self.shell_runner(args, log)
         finally:
             log.close()
-        record = {"kind": kind, "command": args, "state": "running", "started": time.time(), "finished": None,
+        record = {"kind": kind, "title": title or {"install": "install_hpclib", "setup": "setup_agents"}.get(kind, kind),
+                  "app": app, "command": args, "state": "running", "started": time.time(), "finished": None,
                   "exit_code": None, "pid": proc.pid}
         with self.lock:
             self.ops[name] = record
-        threading.Thread(target=self._wait_operation, args=(record, proc), daemon=True).start()
+        threading.Thread(target=self._wait_operation, args=(record, proc, profile), daemon=True).start()
         return dict(record)
 
-    def _wait_operation(self, record, proc):
+    def _wait_operation(self, record, proc, profile=None):
         code = proc.wait()
+        if record.get("app") and profile is not None:
+            # what the install found, from the end of its log
+            try:
+                self._record_setup(profile, record["app"], "\n".join(self.operation(profile["name"], 400)["log"]))
+            except Exception:    # the log or the profile is gone: the next Check says
+                pass
         with self.lock:
             record.update(state="succeeded" if code == 0 else "failed", exit_code=code, finished=time.time())
 
@@ -656,6 +908,315 @@ class Clusters:
         agent_profiles.cmd_set(name, "login=", *[f"login+={a}" for a in login + [host]])
         return self.describe(agent_profiles.load(name), tunnel=False)
 
+    # -- tunnel apps (JupyterLab, ...) ----------------------------------------
+
+    @staticmethod
+    def app_spec(app):
+        spec = APPS.get(app)
+        if spec is None:
+            raise ConsoleError(404, f"no app {app!r}; the console has {sorted(APPS)}")
+        return spec
+
+    def app_config(self, profile, app, save=True):
+        """The profile's settings for an app, with its own two ports picked the first time."""
+        fresh = agent_profiles.load(profile["name"]) or profile
+        apps = fresh.setdefault("apps", {})
+        conf = apps.setdefault(app, {})
+        if not conf.get("port") or not conf.get("process_port"):
+            taken = [fresh.get("port"), fresh.get("process_port")]
+            taken += [v for c in apps.values() for v in (c.get("port"), c.get("process_port"))]
+            conf["port"] = agent_profiles.random_port(taken=taken)
+            conf["process_port"] = agent_profiles.random_port(taken=taken + [conf["port"]])
+            if save:
+                agent_profiles.save(fresh)
+        return fresh, conf
+
+    def app_settings(self, profile, app):
+        spec = self.app_spec(app)
+        _, conf = self.app_config(profile, app)
+        return {"app": app, "cluster": profile["name"], "port": conf["port"],
+                "tunnel_args": conf.get("tunnel_args") or [],
+                "python_env": "env_settings" in spec,       # JupyterLab's conda environment, modules and project
+                "conda_env": conf.get("conda_env"),        # None: the tunnel's default ("default"); "": none
+                "modules": conf.get("modules") or [],
+                "project": conf.get("project") or "",
+                "fields": [{"name": n, "label": label, "hint": hint} for n, label, hint in spec.get("settings", [])],
+                "settings": dict(conf.get("settings") or {}),
+                "installable": self.app_installable(app),
+                "applies": "the next time it starts; settings go to the cluster with the next Check, Install or Start"}
+
+    def save_app_settings(self, profile, app, body):
+        spec = self.app_spec(app)
+        unknown = set(body) - {"tunnel_args", "conda_env", "modules", "project", "settings"}
+        if unknown:
+            raise ConsoleError(400, f"unknown settings {sorted(unknown)}")
+        fresh, conf = self.app_config(profile, app, save=False)
+        if "tunnel_args" in body:
+            args = body["tunnel_args"]
+            if not isinstance(args, list) or not all(isinstance(a, str) and agent_profiles.TUNNEL_ARG_RE.fullmatch(a)
+                                                     for a in args):
+                raise ConsoleError(422, "tunnel_args must be sbatch options like --time=8:00:00 or --mem=16gb "
+                                        "(time, mem, partition, account, qos, cpus-per-task, constraint)")
+            conf["tunnel_args"] = args
+        if "conda_env" in body:
+            env = body["conda_env"]
+            if env is not None and (not isinstance(env, str) or (env and not CONDA_ENV_RE.fullmatch(env))):
+                raise ConsoleError(422, "conda_env is an environment name, \"\" for none, or null for the default")
+            conf["conda_env"] = env
+        if "modules" in body:
+            mods = body["modules"]
+            if not isinstance(mods, list) or not all(isinstance(m, str) and APP_MODULE_RE.fullmatch(m) for m in mods):
+                raise ConsoleError(422, "modules must be module names like JupyterLab/4.2.0")
+            conf["modules"] = mods
+        if "project" in body:
+            project = body["project"] or ""
+            if project and (not isinstance(project, str) or not APP_PROJECT_RE.fullmatch(project)):
+                raise ConsoleError(422, "project is an absolute path on the cluster (letters, digits, _ . / @ + -)")
+            conf["project"] = project
+        if "settings" in body:
+            values = body["settings"]
+            names = {n for n, _, _ in spec.get("settings", [])}
+            if not isinstance(values, dict) or set(values) - names:
+                raise ConsoleError(422, f"settings must be an object with keys from {sorted(names)}")
+            for k, v in values.items():
+                if not isinstance(v, str) or not SETTING_VALUE_RE.fullmatch(v):
+                    raise ConsoleError(422, f"{k} must be one line of text (at most 1024 characters)")
+            conf["settings"] = {k: v.strip() for k, v in values.items() if v.strip()}
+        conf["pushed"] = None              # the cluster's copy is out of date until the next Check, Install or Start
+        agent_profiles.save(fresh)
+        return self.app_settings(fresh, app)
+
+    # -- what a tunnel needs on the cluster (its settings, and its install.sh) -----------------
+
+    @staticmethod
+    def app_installable(app):
+        """Whether the app's tunnel has an install.sh (in this machine's hpclib, which install_hpclib copies)."""
+        return os.path.isfile(os.path.join(HPCLIB_DIR, "tunnels", APPS[app]["tunnel"], "install.sh"))
+
+    @staticmethod
+    def app_vars(spec, conf):
+        """The tunnel's settings as environment variables, as saved on the cluster."""
+        out = dict(conf.get("settings") or {})
+        if "env_settings" in spec:
+            if conf.get("conda_env") is not None:
+                out["CONDA_ENVIRONMENT"] = conf["conda_env"]
+            if conf.get("modules"):
+                out[spec["env_settings"]["modules"]] = ":".join(conf["modules"])
+            if conf.get("project"):
+                out[spec["env_settings"]["project"]] = conf["project"]
+        return out
+
+    def setup_args(self, profile, app, *actions):
+        """tunnel_setup over the console's login, saving the app's settings on the cluster first."""
+        spec = self.app_spec(app)
+        _, conf = self.app_config(profile, app)
+        args = ["tunnel_setup"] + ssh_options(profile) + [profile["host"], spec["tunnel"]]
+        for k, v in sorted(self.app_vars(spec, conf).items()):
+            args += ["--set", f"{k}={v}"]
+        return args + ["--save"] + list(actions)
+
+    def _record_setup(self, profile, app, text):
+        """Note what a tunnel_setup run said: the settings it saved, and the install status it found."""
+        fresh, conf = self.app_config(profile, app, save=False)
+        if "setting(s) for" in text:
+            conf["pushed"] = time.time()
+        found = TUNNEL_STATUS_RE.findall(text)
+        if found:
+            state, message = found[-1]
+            conf["install"] = {"state": state, "message": message.strip(), "checked": time.time()}
+        agent_profiles.save(fresh)
+        return conf.get("install")
+
+    def app_check(self, profile, app, wait=180):
+        """Ask the cluster whether the app's tunnel is installed (saving its settings there on the way)."""
+        spec = self.app_spec(app)
+        if not self.logins.alive(profile):
+            raise ConsoleError(409, f"log in to {profile['name']} first: the check runs over the console's ssh login")
+        args = self.setup_args(profile, app, "--check")
+        with tempfile.TemporaryFile() as out:
+            proc = self.shell_runner(args, out)
+            try:
+                code = proc.wait(wait)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGTERM)
+                raise ConsoleError(504, f"checking {spec['title']} on {profile['name']} took over {wait} s")
+            out.seek(0)
+            text = out.read().decode(errors="replace")
+        status = self._record_setup(profile, app, text)
+        if not status:
+            tail = " ".join(text.strip().splitlines()[-3:])
+            raise ConsoleError(502, f"no answer from the cluster's setup_tunnel.sh (exit {code}); update hpclib there "
+                                    f"(Agents → Clusters → Update hpclib) if it is older than this console: {tail}")
+        return status
+
+    def app_install(self, profile, app, body):
+        """The tunnel's install.sh on the cluster, as an operation with its log (like install_hpclib)."""
+        spec = self.app_spec(app)
+        force = body.get("force", False)
+        if not isinstance(force, bool) or set(body) - {"force"}:
+            raise ConsoleError(400, "install takes {\"force\": true|false}")
+        if not self.app_installable(app):
+            raise ConsoleError(409, f"{spec['title']} has nothing to install")
+        args = self.setup_args(profile, app, "--install", *(["--force"] if force else []), "--check")
+        record = self.run_operation(profile, "tunnel_install", args, title=f"install {spec['title']}", app=app)
+        return record
+
+    def app_log_path(self, name, app):
+        return os.path.join(console_dir(), "logs", f"{name}.{app}.log")
+
+    def _last_launch(self, name, app):
+        """The app's log since its newest launch."""
+        try:
+            with open(self.app_log_path(name, app), "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - (512 << 10)))
+                text = f.read().decode(errors="replace")
+        except FileNotFoundError:
+            return ""
+        return text.rsplit("\n=== ", 1)[-1].replace("\r", "")
+
+    def _app_token(self, name, app, key="token_re"):
+        """The token (or password) from the newest launch in the app's log, if the app printed one yet."""
+        pattern = APPS[app].get(key)
+        if pattern is None:
+            return None
+        found = pattern.findall(self._last_launch(name, app))
+        return found[-1] if found else None
+
+    def _app_instance(self, name, app):
+        """For a shared app: the job serving it, and whether this tunnel attached to it or started it."""
+        text = self._last_launch(name, app)
+        for pattern, how in ((ATTACHED_RE, "attached"), (OWN_INSTANCE_RE, "started")):
+            found = pattern.findall(text)
+            if found:
+                job, node, port = found[-1]
+                return {"job": job, "node": node, "port": int(port), "how": how}
+        return None
+
+    def app_state(self, profile, app):
+        spec = self.app_spec(app)
+        name = profile["name"]
+        _, conf = self.app_config(profile, app)
+        port = conf["port"]
+        with self.lock:
+            proc = self.app_procs.get((name, app))
+        out = {"app": app, "cluster": name, "host": profile.get("host"), "port": port,
+               "started_here": proc is not None and proc.poll() is None, "url": None, "prompt": self.prompt_of(proc),
+               "install": (conf.get("install") or {"state": "unchecked"}) if self.app_installable(app)
+                          else {"state": "nothing"},
+               "shared": bool(spec.get("shared"))}
+        with self.lock:
+            op = self.ops.get(name)
+            if op and op.get("app") == app:
+                out["operation"] = {k: op.get(k) for k in ("kind", "title", "app", "state", "exit_code", "started",
+                                                           "finished")}
+        if spec.get("shared") and (out["started_here"] or self.port_open(port)):
+            out["instance"] = self._app_instance(name, app)
+        if not self.port_open(port):
+            return dict(out, state="starting" if out["started_here"] else "down")
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}{spec['health_path']}", timeout=5) as res:
+                ctype, body = res.headers.get("Content-Type", ""), res.read(65536)
+        except urllib.error.HTTPError as e:
+            ctype, body = e.headers.get("Content-Type", ""), e.read(65536)
+        except (urllib.error.URLError, ConnectionError, TimeoutError, socket.timeout) as e:
+            if out["started_here"]:   # still connecting (see tunnel_state)
+                return dict(out, state="starting", error="connecting: nothing answers behind the port yet")
+            return dict(out, state="error", error=str(getattr(e, "reason", e)))
+        if "text/html" in ctype and b"Waiting for" in body:
+            m = SHIM_STATUS_RE.search(body.decode(errors="replace"))
+            return dict(out, state="queued", status=html_unescape(m.group(1)) if m else "queued")
+        try:
+            info = json.loads(body)
+        except ValueError:
+            info = {}
+        token = self._app_token(name, app)
+        url = f"http://127.0.0.1:{port}{spec['open_path']}" + (f"?token={token}" if token else "")
+        extra = {}
+        if spec.get("password_re") is not None:
+            extra["password"] = self._app_token(name, app, "password_re")
+        return dict(out, state="up", version=info.get("version"), url=url,
+                    token_known=token is not None or "token_re" not in spec, **extra)
+
+    def app_sessions(self, app):
+        self.app_spec(app)
+        profiles = agent_profiles.all_profiles()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(profiles)))) as pool:
+            states = list(pool.map(lambda p: dict(self.app_state(p, app), login=self.logins.status(p)), profiles))
+        return states
+
+    def app_start(self, profile, app):
+        spec = self.app_spec(app)
+        name = profile["name"]
+        _, conf = self.app_config(profile, app)
+        with self.lock:
+            proc = self.app_procs.get((name, app))
+            if proc is not None and proc.poll() is None:
+                raise ConsoleError(409, f"{spec['title']} on {name} is already starting or running")
+        if self.port_open(conf["port"]):
+            raise ConsoleError(409, f"something already listens on port {conf['port']} for {spec['title']} on {name}")
+        if not self.logins.alive(profile):
+            raise ConsoleError(409, f"log in to {name} first: the tunnel runs over the console's ssh login")
+        if (conf.get("install") or {}).get("state") == "missing" and self.app_installable(app):
+            raise ConsoleError(409, f"{spec['title']} isn't installed on {name} ({conf['install'].get('message')}); "
+                                    f"install it, or Check again if you installed it yourself")
+        if spec.get("settings") and not conf.get("pushed"):
+            self.app_check(profile, app)       # sends the settings, so the job sees them
+            _, conf = self.app_config(profile, app)
+            if (conf.get("install") or {}).get("state") == "missing" and self.app_installable(app):
+                raise ConsoleError(409, f"{spec['title']} isn't installed on {name} ({conf['install'].get('message')})")
+        env = []
+        if conf.get("conda_env") is not None:
+            env.append(f"CONDA_ENVIRONMENT={conf['conda_env']}")
+        if conf.get("modules"):
+            env.append(f"{spec['env_settings']['modules']}={':'.join(conf['modules'])}")
+        if conf.get("project"):
+            env.append(f"{spec['env_settings']['project']}={conf['project']}")
+        args = ["launch_tunnel", "-A", "none", "-P", str(conf["port"]), profile["host"], spec["tunnel"],
+                f"--process-port={conf['process_port']}"] + list(conf.get("tunnel_args") or [])
+        if env:
+            args.append("--env=" + ",".join(env))
+        self._open_log(name, " ".join(args), self.app_log_path(name, app)).close()
+        proc = self.tunnel_runner(args, self.app_log_path(name, app))
+        with self.lock:
+            self.app_procs[(name, app)] = proc
+        return {"started": name, "app": app, "pid": proc.pid, "command": args}
+
+    def app_stop(self, profile, app, wait=30):
+        self.app_spec(app)
+        name = profile["name"]
+        _, conf = self.app_config(profile, app)
+        log = self._open_log(name, f"stop_tunnel -P {conf['port']} {profile['host']}", self.app_log_path(name, app))
+        try:
+            stopper = self.shell_runner(["stop_tunnel", "-P", str(conf["port"]), profile["host"]], log)
+            try:
+                code = stopper.wait(wait)
+            except subprocess.TimeoutExpired:
+                os.killpg(stopper.pid, signal.SIGTERM)
+                code = None
+        finally:
+            log.close()
+        with self.lock:
+            proc = self.app_procs.pop((name, app), None)
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.wait(10)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
+        return {"stopped": name, "app": app, "stop_exit": code}
+
+    def app_log(self, name, app, lines=200):
+        self.app_spec(app)
+        try:
+            with open(self.app_log_path(name, app), "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - (256 << 10)))
+                text = f.read().decode(errors="replace")
+        except FileNotFoundError:
+            return {"lines": []}
+        return {"lines": text.splitlines()[-lines:]}
+
     def start_tunnel(self, profile, auto_approve=None, extra=()):
         name = profile["name"]
         with self.lock:
@@ -673,11 +1234,10 @@ class Clusters:
             elif auto_approve not in (None, "", False):
                 raise ConsoleError(400, "`auto_approve_templates` must be all (the default), new or review")
             args += list(extra)
-            log = self._open_log(name, " ".join(args))
-            try:
-                proc = self.shell_runner(args, log)
-            finally:
-                log.close()
+            if not self.logins.alive(profile):
+                raise ConsoleError(409, f"log in to {name} first: the tunnel runs over the console's ssh login")
+            self._open_log(name, " ".join(args)).close()
+            proc = self.tunnel_runner(args, self.log_path(name))
             self.procs[name] = proc
         return {"started": name, "pid": proc.pid, "command": args}
 
@@ -886,6 +1446,11 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         if parts == ["health"] and verb == "GET":
             return 200, {"ok": True, "console": VERSION, "clusters": len(c.names()), "pid": os.getpid(),
                          "hpclib_version": local_hpclib_version()}
+        if parts == ["apps"] and verb == "GET":
+            return 200, {"ok": True, "apps": [{"id": "agents", "title": "Agents"}] +
+                         [{"id": k, "title": v["title"]} for k, v in APPS.items()]}
+        if len(parts) >= 2 and parts[0] == "apps":
+            return self.app_route(verb, parts[1], parts[2:])
         if parts == ["clusters"] and verb == "POST":
             return 201, dict(c.add(self.json_body()), ok=True)
         if parts == ["clusters"] and verb == "GET":
@@ -893,6 +1458,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(profiles)))) as pool:
                 described = list(pool.map(c.describe, profiles))
             return 200, {"ok": True, "clusters": described}
+        if parts == ["prompts"] and verb == "GET":
+            return 200, dict(c.prompts(), ok=True)
         if parts == ["jobs"] and verb == "GET":
             return self.all_jobs()
         if parts == ["proposals"] and verb == "GET":
@@ -923,6 +1490,10 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             if rest == ["tunnel", "start"] and verb == "POST":
                 body = self.json_body()
                 return 202, dict(c.start_tunnel(profile, body.get("auto_approve_templates")), ok=True)
+            if rest == ["tunnel", "answer"] and verb == "POST":
+                with c.lock:
+                    proc = c.procs.get(profile["name"])
+                return 200, dict(c.answer_prompt(proc, self.json_body().get("answer")), ok=True)
             if rest == ["tunnel", "stop"] and verb == "POST":
                 return 200, dict(c.stop_tunnel(profile), ok=True)
             if rest == ["tunnel", "log"] and verb == "GET":
@@ -930,6 +1501,35 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             if rest[:1] == ["rest"] and len(rest) > 1:
                 return self.proxy(verb, profile, "/".join(rest[1:]))
         raise ConsoleError(404 if verb in ("GET", "POST", "PUT", "DELETE") else 405, f"no route {verb} {path}")
+
+    def app_route(self, verb, app, rest):
+        c = self.server.clusters
+        c.app_spec(app)
+        if not rest and verb == "GET":
+            return 200, {"ok": True, "app": app, "title": APPS[app]["title"], "sessions": c.app_sessions(app)}
+        profile = c.profile(rest[0])
+        action = rest[1:]
+        if not action and verb == "GET":
+            return 200, dict(c.app_state(profile, app), login=c.logins.status(profile), ok=True)
+        if action == ["start"] and verb == "POST":
+            return 202, dict(c.app_start(profile, app), ok=True)
+        if action == ["stop"] and verb == "POST":
+            return 200, dict(c.app_stop(profile, app), ok=True)
+        if action == ["answer"] and verb == "POST":
+            with c.lock:
+                proc = c.app_procs.get((profile["name"], app))
+            return 200, dict(c.answer_prompt(proc, self.json_body().get("answer")), ok=True)
+        if action == ["log"] and verb == "GET":
+            return 200, dict(c.app_log(profile["name"], app, self.int_arg("lines", 200, 1, 5000)), ok=True)
+        if action == ["check"] and verb == "POST":
+            return 200, dict(install=c.app_check(profile, app), ok=True)
+        if action == ["install"] and verb == "POST":
+            return 202, dict(c.app_install(profile, app, self.json_body()), ok=True)
+        if action == ["settings"] and verb == "GET":
+            return 200, dict(c.app_settings(profile, app), ok=True)
+        if action == ["settings"] and verb == "PUT":
+            return 200, dict(c.save_app_settings(profile, app, self.json_body()), ok=True)
+        raise ConsoleError(404, f"no route {verb} /api/apps/{app}/{'/'.join(rest)}")
 
     def proxy(self, verb, profile, route):
         if not REST_ROUTE_RE.fullmatch(route) or ".." in route.split("/"):

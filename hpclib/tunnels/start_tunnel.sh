@@ -34,6 +34,7 @@ if [ "$HPCLIB_DIR" = "" ]; then
   unset _src _dir
 fi
 source "$HPCLIB_DIR/hpclib.sh"
+source "$HPCLIB_DIR/tunnels/instances.sh"
 if [ "$HPCSERVERS_DIR" = "" ]; then
   HPCSERVERS_DIR="$HPCLIB_DIR/servers"
 fi
@@ -119,8 +120,19 @@ ENABLE_WEB_PROXY=true
 START_GIT_SERVER=true
 START_SLURM_SERVER=true
 
+SHARED_INSTANCE=false        # true: attach to a running instance another job serves, if there is one
+PROCESS_PORT_FROM_JOB=false  # true: the job picks its port and registers it (see instances.sh)
+KEEP_INSTANCE=false          # true: closing the tunnel leaves the job running (for others to attach to)
+
 if tunnel_config_path=$(resolve_tunnel_file tunnel_config.sh); then
   source "$tunnel_config_path"
+fi
+
+# This tunnel's settings on this cluster (install paths and the like), written by setup_tunnel.sh --set or
+# the console's tunnel settings: environment variables its install.sh and its job read.
+TUNNEL_SETTINGS_FILE="$HPCTUNNELS_DATA_DIR/settings/$TUNNEL_NAME.sh"
+if [ -f "$TUNNEL_SETTINGS_FILE" ]; then
+  source "$TUNNEL_SETTINGS_FILE"
 fi
 
 ################################################################################
@@ -170,21 +182,33 @@ _hpclib_record_port "$HOST_PORT" "$$"
 STATUS_FILE="$SESSIONS_DIR/status-$job_uuid.txt"
 echo "submitting job..." > "$STATUS_FILE"
 
+# A shared service (a database, say) that another job already runs: connect to it rather than starting
+# another. The tunnel then never cancels that job.
+TUNNEL_ATTACHED=false
+if [ "$SHARED_INSTANCE" = "true" ] && instance=$(tunnel_find_instance "$TUNNEL_NAME"); then
+  read -r SESSION_ID job_node PROCESS_PORT <<< "$instance"
+  TUNNEL_ATTACHED=true
+  echo "hpclib: attaching to the running $TUNNEL_NAME instance: job $SESSION_ID on $job_node, port $PROCESS_PORT"
+fi
+cancels_job() { [ "$TUNNEL_ATTACHED" != "true" ] && [ "$KEEP_INSTANCE" != "true" ]; }
+
 # Bind the forwarded port to a "please wait" page RIGHT NOW, before
 # sbatch is even called. The local `ssh -L` connects to this login
 # node the moment the SSH session opens and needs SOMETHING listening
 # on this port immediately, or the browser just sees
 # connection-refused while SLURM queues the real job. Killed below the
 # instant the real compute node is reachable.
-python3 "$HPCSERVERS_DIR/waiting_shim.py" "$HOST_PORT" "$STATUS_FILE" "$TUNNEL_NAME" > "$STATUS_FILE" &
-SHIM_PID=$!
+if [ "$TUNNEL_ATTACHED" != "true" ]; then
+  python3 "$HPCSERVERS_DIR/waiting_shim.py" "$HOST_PORT" "$STATUS_FILE" "$TUNNEL_NAME" > "$STATUS_FILE" &
+  SHIM_PID=$!
 
-# --parsable: the job id comes straight from sbatch, whatever else the site's
-# job_submit plugin or squeue defaults print
-submit_out=$(sbatch --parsable --job-name=$job_name --open-mode=append --out="$SESSIONS_DIR/session-%j.log" \
-  --export="$export_spec" $sbatch_args "$SBATCH_SCRIPT" "${TUNNEL_SCRIPT_ARGS[@]}")
-SUBMITTED_ID=$(printf '%s\n' "$submit_out" | grep -Eo '^[0-9]+' | tail -n 1)
-[ -n "$SUBMITTED_ID" ] && echo "Submitted batch job $SUBMITTED_ID"
+  # --parsable: the job id comes straight from sbatch, whatever else the site's
+  # job_submit plugin or squeue defaults print
+  submit_out=$(sbatch --parsable --job-name=$job_name --open-mode=append --out="$SESSIONS_DIR/session-%j.log" \
+    --export="$export_spec" $sbatch_args "$SBATCH_SCRIPT" "${TUNNEL_SCRIPT_ARGS[@]}")
+  SUBMITTED_ID=$(printf '%s\n' "$submit_out" | grep -Eo '^[0-9]+' | tail -n 1)
+  [ -n "$SUBMITTED_ID" ] && echo "Submitted batch job $SUBMITTED_ID"
+fi
 
 function stop_git_server() {
   if [ "$GIT_SERVER_JOB" != "" ]; then
@@ -198,7 +222,7 @@ function stop_shim() {
   fi
 }
 function cleanup() {
-  scancel $SESSION_ID 2>/dev/null
+  if cancels_job; then scancel $SESSION_ID 2>/dev/null; fi
   stop_git_server
   stop_shim
   pkill -TERM -P $$ 2>/dev/null   # e.g. the forward to the compute node
@@ -206,8 +230,10 @@ function cleanup() {
 }
 trap cleanup 0 1 2 3   # Ctrl+C locally now also cleans up the shim
 
-SESSION_ID="$SUBMITTED_ID"
-[ -n "$SESSION_ID" ] || SESSION_ID=$(get_job_id_by_name $job_name)
+if [ "$TUNNEL_ATTACHED" != "true" ]; then
+  SESSION_ID="$SUBMITTED_ID"
+  [ -n "$SESSION_ID" ] || SESSION_ID=$(get_job_id_by_name $job_name)
+fi
 if [ "$SESSION_ID" = "" ]
     then
       echo "job seems to have failed to submit; check 'squeue -u <username>'" > "$STATUS_FILE"
@@ -216,7 +242,8 @@ if [ "$SESSION_ID" = "" ]
     else
 
       SESSION_FILE="$SESSIONS_DIR/session-$SESSION_ID.log"
-      _hpclib_record_port "$HOST_PORT" "$$" "$SESSION_ID"
+      # stop_tunnel cancels the recorded job: only one this tunnel owns
+      if cancels_job; then _hpclib_record_port "$HOST_PORT" "$$" "$SESSION_ID"; fi
       echo "job $SESSION_ID submitted, waiting for a node..." > "$STATUS_FILE"
 
       if [ "$START_GIT_SERVER" = "true" ]; then
@@ -255,6 +282,26 @@ if [ "$SESSION_ID" = "" ]
           sleep "$JOB_CONNECT_RETRY_WAIT_TIME"
         fi
       done
+      # A job that picks its own port (PROCESS_PORT_FROM_JOB) registers it once its service listens.
+      if [ "$TUNNEL_ATTACHED" != "true" ] && [ "$PROCESS_PORT_FROM_JOB" = "true" ]; then
+        waited=0
+        until reported=$(tunnel_instance_port "$TUNNEL_NAME" "$SESSION_ID"); do
+          if [ -z "$(squeue -j "$SESSION_ID" -h -o "%T" 2>/dev/null)" ]; then
+            echo "job $SESSION_ID ended before it reported its port" > "$STATUS_FILE"
+            echo "Job $SESSION_ID ended before it reported its port; see $SESSION_FILE" >&2
+            exit 1
+          fi
+          if [ "$waited" -ge "${PROCESS_PORT_WAIT:-900}" ]; then
+            echo "Job $SESSION_ID did not report its port within ${PROCESS_PORT_WAIT:-900} s; see $SESSION_FILE" >&2
+            exit 1
+          fi
+          echo "job $SESSION_ID is on $job_node, starting its service..." > "$STATUS_FILE"
+          sleep "$JOB_CONNECT_RETRY_WAIT_TIME"
+          waited=$((waited + JOB_CONNECT_RETRY_WAIT_TIME))
+        done
+        PROCESS_PORT="$reported"
+        echo "hpclib: job $SESSION_ID serves $TUNNEL_NAME on $job_node, port $PROCESS_PORT"
+      fi
       echo "node $job_node is up, connecting..." > "$STATUS_FILE"
 
       # Free the port so the real forward below can bind it.
