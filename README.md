@@ -557,6 +557,9 @@ which the tunnel prints (and the console offers to copy).
 
 **PAI**: the proto-auto-interface database, run with `singularity-compose` from
 `PAI_ROOT_DIR/proto-auto-interface` (default `/scratch/user/<username>/pai`; `install.sh` clones `PAI_REPO` there).
+`PAI_BIND_SOURCE` (default `1`) has `singularity-compose.sh` bind that checkout's source into the containers, so
+your changes run; `0` runs the images' own. It is one of PAI's settings (console: PAI → Settings → Bind source)
+and applies to the next database job, not one already running.
 It is shared: a PAI tunnel connects to the database another job already runs, if one does, and otherwise starts
 one, on port 3100 or another free one on its node, that keeps running after the tunnel closes. End it with the
 console's **End database job**, `tunnel_setup HOST pai --stop-instance JOB` (only a registered PAI job of yours;

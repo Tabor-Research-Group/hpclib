@@ -7,4 +7,4 @@ SHARED_INSTANCE=true        # connect to the database another job already runs, 
 PROCESS_PORT_FROM_JOB=true  # the job takes PROCESS_PORT if it is free on its node, else another, and reports it
 KEEP_INSTANCE=true          # closing the tunnel leaves the database running for the next one
 # settings (setup_tunnel.sh --set, the console's tunnel settings) its install.sh and job read
-TUNNEL_SETTINGS="PAI_ROOT_DIR PAI_REPO INCLUDE_DEV_ENDPOINTS"
+TUNNEL_SETTINGS="PAI_ROOT_DIR PAI_REPO INCLUDE_DEV_ENDPOINTS PAI_BIND_SOURCE"

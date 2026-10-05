@@ -115,8 +115,9 @@ STREAMED_ROUTES = ("files/content",)   # passed through in chunks rather than re
 #   token_re      the app's access token in the job's log (streamed back over ssh), added to the URL to open
 #   password_re   a password it prints there instead, shown next to Open
 #   env_settings  JupyterLab's conda environment, modules and uv/pixi project fields
-#   settings      [(NAME, label, hint)]: the tunnel's TUNNEL_SETTINGS (tunnel_config.sh) the page edits; they
-#                 are saved on the cluster (tunnels/setup_tunnel.sh --save) for its job and install.sh
+#   settings      [(NAME, label, hint[, choices])]: the tunnel's TUNNEL_SETTINGS (tunnel_config.sh) the page
+#                 edits (with choices: a select of those values); they are saved on the cluster
+#                 (tunnels/setup_tunnel.sh --save) for its job and install.sh
 #   shared        the tunnel attaches to a running instance another job serves (SHARED_INSTANCE), and keeps
 #                 the one it starts running after Stop (KEEP_INSTANCE); `instance_label` names that service,
 #                 and its row gets a toolbar tool describing the job and a control that ends it
@@ -161,6 +162,9 @@ APPS = {
             ("PAI_ROOT_DIR", "Install directory", "holds proto-auto-interface/; default /scratch/user/USER/pai"),
             ("PAI_REPO", "Repository", "git URL Install clones proto-auto-interface from"),
             ("INCLUDE_DEV_ENDPOINTS", "Development endpoints", "true or false; default true"),
+            ("PAI_BIND_SOURCE", "Bind source", "1: singularity-compose.sh binds your proto-auto-interface "
+                                               "source into the containers, so your changes run; 0: the images' "
+                                               "own; default 1. Applies to the next database job", ("1", "0")),
         ],
     },
 }
@@ -967,7 +971,8 @@ class Clusters:
                 "conda_env": conf.get("conda_env"),        # None: the tunnel's default ("default"); "": none
                 "modules": conf.get("modules") or [],
                 "project": conf.get("project") or "",
-                "fields": [{"name": n, "label": label, "hint": hint} for n, label, hint in spec.get("settings", [])],
+                "fields": [{"name": f[0], "label": f[1], "hint": f[2], "choices": list(f[3]) if len(f) > 3 else None}
+                           for f in spec.get("settings", [])],
                 "settings": dict(conf.get("settings") or {}),
                 "installable": self.app_installable(app),
                 "applies": "the next time it starts; settings go to the cluster with the next Check, Install or Start"}
@@ -1002,12 +1007,15 @@ class Clusters:
             conf["project"] = project
         if "settings" in body:
             values = body["settings"]
-            names = {n for n, _, _ in spec.get("settings", [])}
-            if not isinstance(values, dict) or set(values) - names:
-                raise ConsoleError(422, f"settings must be an object with keys from {sorted(names)}")
+            fields = {f[0]: f for f in spec.get("settings", [])}
+            if not isinstance(values, dict) or set(values) - set(fields):
+                raise ConsoleError(422, f"settings must be an object with keys from {sorted(fields)}")
             for k, v in values.items():
                 if not isinstance(v, str) or not SETTING_VALUE_RE.fullmatch(v):
                     raise ConsoleError(422, f"{k} must be one line of text (at most 1024 characters)")
+                choices = fields[k][3] if len(fields[k]) > 3 else None
+                if choices and v.strip() and v.strip() not in choices:
+                    raise ConsoleError(422, f"{k} is one of {', '.join(choices)} (or empty for the default)")
             conf["settings"] = {k: v.strip() for k, v in values.items() if v.strip()}
         conf["pushed"] = None              # the cluster's copy is out of date until the next Check, Install or Start
         agent_profiles.save(fresh)

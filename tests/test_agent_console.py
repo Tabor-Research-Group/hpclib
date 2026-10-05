@@ -630,6 +630,15 @@ class TestTunnelInstall(ConsoleTestCase):
         self.assertFalse(out["python_env"])
         for bad in ({"settings": {"PATH": "/evil"}}, {"settings": {"VSCODE_CONTAINER": "a\nb"}}, {"settings": []}):
             self.assertEqual(self.call("PUT", base + "/settings", bad)[0], 422, bad)
+        # a setting with choices (PAI's source bind): one of them, or empty for the tunnel's default
+        pai = f"/api/apps/pai/{self.dead}/settings"
+        bind = {f["name"]: f for f in self.call("GET", pai)[1]["fields"]}["PAI_BIND_SOURCE"]
+        self.assertEqual(bind["choices"], ["1", "0"])
+        self.assertEqual(self.call("PUT", pai, {"settings": {"PAI_BIND_SOURCE": "yes"}})[0], 422)
+        self.assertEqual(self.call("PUT", pai, {"settings": {"PAI_BIND_SOURCE": "0"}})[1]["settings"], {"PAI_BIND_SOURCE": "0"})
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.call("POST", f"/api/apps/pai/{self.dead}/check")
+        self.assertIn("PAI_BIND_SOURCE=0", self.shell.calls[-1])
         self.assertEqual(self.call("GET", base)[1]["install"]["state"], "unchecked")
         self.assertEqual(self.call("POST", base + "/check")[0], 409)                     # needs the login
         host = agent_profiles.load(self.dead)["host"]

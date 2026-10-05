@@ -18,6 +18,7 @@ export PAI_PORT=$PROCESS_PORT
 tunnel_register_instance pai "$PROCESS_PORT"
 trap 'tunnel_unregister_instance pai' EXIT
 
-echo "Launching the PAI database on port $PROCESS_PORT ($(hostname -s), job $SLURM_JOB_ID)"
+echo "Launching the PAI database on port $PROCESS_PORT ($(hostname -s), job $SLURM_JOB_ID;" \
+  "source $([ "$PAI_BIND_SOURCE" = 0 ] && echo "from the images" || echo "bound from $PAI_ROOT_DIR/proto-auto-interface"))"
 cd "$PAI_ROOT_DIR/proto-auto-interface" && \
   bash singularity-compose.sh

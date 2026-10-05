@@ -491,4 +491,17 @@ grep -q 'tunnels/setup_tunnel.sh vscode --set VSCODE_CONTAINER=/a\\ b/c.sif --sa
   assert_equal "$(TEST_RUNNING= stop --stop-instance 7300)" 'HPCLIB_TUNNEL_INSTANCE_GONE 7300'
 )
 
+# the PAI job passes PAI_BIND_SOURCE (default 1) to singularity-compose.sh, and registers its port
+mkdir -p "$test_dir/pai-common" "$test_dir/pai-root/proto-auto-interface"
+printf '. %q\n' "$HPCLIB_DIR/tunnels/instances.sh" > "$test_dir/pai-common/configure_job.sh"
+printf 'echo "bind=$PAI_BIND_SOURCE port=$PAI_PORT"\n' > "$test_dir/pai-root/proto-auto-interface/singularity-compose.sh"
+pai_job() {
+  env TUNNEL_DIR="$HPCLIB_DIR/tunnels/pai" HPCTUNNELS_DIR="$test_dir/pai-common" PAI_ROOT_DIR="$test_dir/pai-root" \
+    HPCTUNNELS_DATA_DIR="$test_dir/pai-data" SLURM_JOB_ID=8100 PROCESS_PORT="$(free_port)" PATH="$CLEAN_PATH" "$@" \
+    bash "$HPCLIB_DIR/tunnels/pai/sbatch_script.sh"
+}
+case "$(pai_job)" in *"bind=1 port="[0-9]*) ;; *) fail "PAI_BIND_SOURCE did not default to 1: $(pai_job)" ;; esac
+case "$(pai_job PAI_BIND_SOURCE=0)" in *"from the images"*"bind=0 "*) ;; *) fail "PAI_BIND_SOURCE=0 not passed on" ;; esac
+[ ! -e "$test_dir/pai-data/instances/pai/8100" ] || fail 'the PAI job left its registration behind'
+
 echo 'Tunnel management tests passed'

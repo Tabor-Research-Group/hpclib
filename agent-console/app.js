@@ -819,8 +819,10 @@ async function appSettingsForm(app, s, row) {
                               placeholder: "default", size: 16 });
   const modules = el("input", { value: conf.modules.join(" "), placeholder: "e.g. JupyterLab/4.2.0", size: 32 });
   const project = el("input", { value: conf.project, placeholder: "/scratch/user/me/llm/my-project", size: 40 });
-  const own = Object.fromEntries(conf.fields.map((f) =>
-    [f.name, el("input", { value: conf.settings[f.name] || "", placeholder: "the tunnel's default", size: 44 })]));
+  const own = Object.fromEntries(conf.fields.map((f) => [f.name, f.choices
+    ? el("select", {}, el("option", { value: "" }, "the tunnel's default"),
+        f.choices.map((c) => el("option", { value: c, selected: conf.settings[f.name] === c }, c)))
+    : el("input", { value: conf.settings[f.name] || "", placeholder: "the tunnel's default", size: 44 })]));
   const save = saveButton("Save", async () => {
     const tunnel_args = APP_TUNNEL_FIELDS.filter(([k]) => inputs[k].value.trim())
       .map(([k]) => `--${k}=${inputs[k].value.trim()}`).concat(other);
