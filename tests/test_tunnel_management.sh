@@ -262,6 +262,14 @@ chmod +x "$test_dir/clear-bin/"*
 grep -qx 'ExitOnForwardFailure=yes' "$test_dir/connect-args" || fail 'connect_to_job without ExitOnForwardFailure'
 grep -qx 'ServerAliveInterval=30' "$test_dir/connect-args" || fail 'connect_to_job without keepalives'
 grep -qx '127.0.0.1:5999:127.0.0.1:5000' "$test_dir/connect-args" || fail 'connect_to_job lost its forward'
+grep -q 'StrictHostKeyChecking' "$test_dir/connect-args" && fail 'accepted host keys without being asked to'
+(
+  HOME="$test_dir/home"; HPCLIB_COMPUTE_HOST_KEYS=accept-new
+  wait_for_job_node() { echo node7; }
+  ssh() { printf '%s\n' "$@" > "$test_dir/connect-args"; }
+  connect_to_job -P 5999:5000 -R 1 -S 0 -I 0 123 "echo hi" >/dev/null
+)
+grep -qx 'StrictHostKeyChecking=accept-new' "$test_dir/connect-args" || fail 'HPCLIB_COMPUTE_HOST_KEYS=accept-new ignored'
 
 # stop_tunnel clears the login node over ssh and cancels the local forward
 mkdir -p "$test_dir/stop-bin"
@@ -358,7 +366,10 @@ cat > "$test_dir/share-bin/squeue" <<'SCRIPT'
 job=''; fmt=''
 while [ "$#" -gt 0 ]; do case "$1" in -j) job="$2"; shift ;; -o|--format) fmt="$2"; shift ;; --format=*) fmt="${1#*=}" ;; esac; shift; done
 case " $TEST_RUNNING " in
-  *" $job "*) case "$fmt" in *%T*) echo RUNNING ;; *%N*) echo node9 ;; *) echo "$job" ;; esac ;;
+  *" $job "*)
+    case "$fmt" in *%T*) out=RUNNING ;; *%N*) out=node9 ;; *%u*) out='' ;; *) out="$job" ;; esac
+    case "$fmt" in *%u*) out="$out${out:+ }${TEST_OWNER:-$(id -un)}" ;; esac
+    echo "$out" ;;
   *) [ -n "$job" ] && { echo "slurm_load_jobs error: Invalid job id specified" >&2; exit 1; } ;;
 esac
 exit 0
@@ -460,5 +471,24 @@ grep -q 'TUNNEL_SETTINGS_FILE="$HPCTUNNELS_DATA_DIR/settings/$TUNNEL_NAME.sh"' "
 assert_equal "$(sed -n 1,3p "$test_dir/setup-remote" | tr '\n' ' ')" '-p 2222 me@login.example '
 grep -q 'tunnels/setup_tunnel.sh vscode --set VSCODE_CONTAINER=/a\\ b/c.sif --save --check' "$test_dir/setup-remote" ||
   fail "remote command: $(cat "$test_dir/setup-remote")"
+
+# setup_tunnel.sh lists a tunnel's running instances and ends one you own (PAI's "Stop database job")
+(
+  export "${share_env[@]}"
+  stop() { bash "$HPCLIB_DIR/tunnels/setup_tunnel.sh" pai "$@"; }
+  SLURM_JOB_ID=7100 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance pai 3101"
+  SLURM_JOB_ID=7200 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance pai 3102"
+  out=$(TEST_RUNNING=7100 stop --instances)
+  assert_equal "$out" "HPCLIB_TUNNEL_INSTANCE 7100 $(hostname -s) 3101 RUNNING $(id -un)"
+  [ ! -e "$test_dir/share-data/instances/pai/7200" ] || fail 'listed (kept) an ended instance'
+  if TEST_RUNNING=7100 stop --stop-instance 9999 2>/dev/null; then fail 'cancelled a job that is not a pai instance'; fi
+  if TEST_RUNNING=7100 TEST_OWNER=someone stop --stop-instance 7100 2>/dev/null; then fail "cancelled someone else's job"; fi
+  grep -q 'scancel' "$TEST_SHARE_LOG" 2>/dev/null && fail 'scancel ran for a refused stop'
+  assert_equal "$(TEST_RUNNING=7100 stop --stop-instance 7100)" 'HPCLIB_TUNNEL_INSTANCE_STOPPED 7100'
+  grep -q 'scancel 7100' "$TEST_SHARE_LOG" || fail 'the job was not cancelled'
+  [ ! -e "$test_dir/share-data/instances/pai/7100" ] || fail 'the stopped instance is still registered'
+  SLURM_JOB_ID=7300 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance pai 3103"
+  assert_equal "$(TEST_RUNNING= stop --stop-instance 7300)" 'HPCLIB_TUNNEL_INSTANCE_GONE 7300'
+)
 
 echo 'Tunnel management tests passed'

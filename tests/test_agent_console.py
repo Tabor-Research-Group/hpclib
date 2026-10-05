@@ -42,6 +42,7 @@ class FakeShell:
     def __init__(self):
         self.calls = []
         self.setup_status = "missing not installed: no image at /x/vscode.sif"   # what tunnel_setup --check says
+        self.stop_answer = None                                                  # what --stop-instance says
 
     def __call__(self, args, log):
         self.calls.append(list(args))
@@ -51,6 +52,11 @@ class FakeShell:
                 log.write(f"saved {args.count('--set')} setting(s) for the tunnel\n".encode())
             if "--check" in args:
                 log.write(f"HPCLIB_TUNNEL_STATUS {self.setup_status}\n".encode())
+            if "--instances" in args:
+                log.write(b"HPCLIB_TUNNEL_INSTANCE 152400 chem-entr-c04 3104 RUNNING maboyer\n")
+            if "--stop-instance" in args:
+                job = args[args.index("--stop-instance") + 1]
+                log.write((self.stop_answer or f"HPCLIB_TUNNEL_INSTANCE_STOPPED {job}").encode() + b"\n")
         return subprocess.Popen(["sleep", "30" if args[0] in ("agent_tunnel", "launch_tunnel") else "0"], start_new_session=True)
 
 
@@ -689,6 +695,38 @@ class TestTunnelInstall(ConsoleTestCase):
         self.assertEqual((pai["state"], pai["shared"]), ("up", True))
         self.assertEqual(pai["instance"], {"job": "152400", "node": "chem-entr-c04", "port": 3104, "how": "attached"})
         self.assertNotIn("password", pai)
+        # its toolbar says which job serves the database, and a control ends that job
+        self.assertEqual([t["id"] for t in pai["tools"]], ["instance"])
+        self.assertIn("job 152400 on chem-entr-c04", pai["tools"][0]["text"])
+        self.assertEqual(pai["controls"][0]["id"], "stop_instance")
+        self.assertEqual(pai["controls"][0]["args"], {"job": "152400"})
+        self.assertEqual((vs["tools"], vs["controls"]), ([], []))
+
+    def test_stop_shared_instance(self):
+        self.test_vscode_password_and_shared_pai()
+        base = f"/api/apps/pai/{self.dead}"
+        self.assertEqual(self.call("POST", base + "/control/stop_instance", {"job": "152400"})[0], 409)   # login
+        host = agent_profiles.load(self.dead)["host"]
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            out = self.call("GET", base + "/instances")[1]
+            self.assertEqual(out["instances"], [{"job": "152400", "node": "chem-entr-c04", "port": 3104,
+                                                 "state": "RUNNING", "owner": "maboyer"}])
+            for bad in ({"job": "1; rm"}, {}, {"job": "1", "x": 2}):
+                self.assertEqual(self.call("POST", base + "/control/stop_instance", bad)[0], 400, bad)
+            self.assertEqual(self.call("POST", base + "/control/nope", {})[0], 404)
+            self.assertEqual(self.call("POST", f"/api/apps/vscode/{self.dead}/control/stop_instance", {"job": "1"})[0], 404)
+            self.shell.stop_answer = "setup_tunnel: job 152400 belongs to someone, not you; not cancelling it"
+            status, out = self.call("POST", base + "/control/stop_instance", {"job": "152400"})
+            self.assertEqual(status, 409)
+            self.assertIn("belongs to someone", out["error"])
+            self.shell.stop_answer = None
+            status, out = self.call("POST", base + "/control/stop_instance", {"job": "152400"})
+            self.assertEqual((status, out["result"]), (200, "stopped"), out)
+        self.assertIn(["tunnel_setup", host, "pai", "--stop-instance", "152400"], self.shell.calls)
+        self.assertEqual(self.shell.calls[-1][0], "stop_tunnel")                 # and this tunnel stops
+        pai = self.call("GET", base)[1]
+        self.assertNotIn("stop_instance", [c["id"] for c in pai["controls"]])
+        self.assertIn("none seen yet", pai["tools"][0]["text"])
 
 
 class TestSecondLogin(ConsoleTestCase):
@@ -760,6 +798,62 @@ class TestSecondLogin(ConsoleTestCase):
         self.assertEqual(prompt["kind"], "password")
         self.assertEqual(self.call("POST", f"/api/apps/jupyter/{self.dead}/answer", {"answer": "node-pass"})[0], 200)
         self.assertEqual(self.call("POST", f"/api/apps/jupyter/{self.dead}/answer", {"answer": "a\nb"})[0], 400)
+
+    def use_tunnel(self, text):
+        script = self.tmp / "fake-tunnel-2"
+        script.write_text(text)
+        script.chmod(0o755)
+        env = dict(os.environ, FAKE_NODE_PASSWORD="node-pass")
+        self.clusters.tunnel_runner = lambda args, log_path: agent_console.PtySession([str(script)], log_path, env)
+
+    def test_new_compute_node_host_key(self):
+        # the login node's first ssh to a compute node asks whether to trust its key, then for the password
+        self.use_tunnel(FAKE_TUNNEL.replace('echo "ssh -L', textwrap.dedent("""\
+            echo "The authenticity of host 'chem-entr-c04 (192.168.10.104)' can't be established."
+            echo "ED25519 key fingerprint is SHA256:dhRCX7/vDiAVXre6VZpF8szOoDB93/b/5ePukPSfyEI."
+            echo "This key is not known by any other names."
+            printf "Are you sure you want to continue connecting (yes/no/[fingerprint])? "
+            IFS= read -r ans < /dev/tty
+            [ "$ans" = yes ] || { echo "Host key verification failed."; exit 255; }
+            echo "Warning: Permanently added 'chem-entr-c04' (ED25519) to the list of known hosts."
+            echo "ssh -L""")))
+        self.call("POST", f"/api/clusters/{self.dead}/tunnel/start")
+        prompt = self.prompt(f"/api/clusters/{self.dead}")
+        self.assertEqual((prompt["kind"], prompt["host"], prompt["address"], prompt["key_type"], prompt["fingerprint"]),
+                         ("hostkey", "chem-entr-c04", "192.168.10.104", "ED25519",
+                          "SHA256:dhRCX7/vDiAVXre6VZpF8szOoDB93/b/5ePukPSfyEI"))
+        listed = self.call("GET", "/api/prompts")[1]["prompts"]
+        self.assertEqual(listed[0]["prompt"]["kind"], "hostkey")
+        self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/tunnel/answer", {"answer": "sure"})[0], 400)
+        self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/tunnel/answer", {"answer": "yes"})[0], 200)
+        for _ in range(50):
+            prompt = self.call("GET", f"/api/clusters/{self.dead}")[1]["tunnel"]["prompt"]
+            if prompt and prompt["kind"] == "password":
+                break
+            time.sleep(0.1)
+        self.assertEqual(prompt["kind"], "password")                         # then the password, as before
+        self.call("POST", f"/api/clusters/{self.dead}/tunnel/answer", {"answer": "node-pass"})
+        for _ in range(50):
+            if "connected to chem-entr-c01" in self.log_text(self.dead):
+                break
+            time.sleep(0.1)
+        self.assertIn("Permanently added 'chem-entr-c04'", self.log_text(self.dead))
+        self.assertIn("connected to chem-entr-c01", self.log_text(self.dead))
+
+    def test_host_key_refused(self):
+        self.use_tunnel("#!/bin/bash\necho \"The authenticity of host 'c9' can't be established.\"\n"
+                        "printf 'Are you sure you want to continue connecting (yes/no)? '\n"
+                        "IFS= read -r ans < /dev/tty\n[ \"$ans\" = yes ] || { echo 'Host key verification failed.'; exit 255; }\n")
+        self.call("POST", f"/api/clusters/{self.dead}/tunnel/start")
+        prompt = self.prompt(f"/api/clusters/{self.dead}")
+        self.assertEqual((prompt["kind"], prompt["host"], prompt["fingerprint"]), ("hostkey", "c9", None))
+        self.call("POST", f"/api/clusters/{self.dead}/tunnel/answer", {"answer": "no"})
+        for _ in range(50):
+            if self.clusters.procs[self.dead].poll() is not None:
+                break
+            time.sleep(0.1)
+        self.assertEqual(self.clusters.procs[self.dead].returncode, 255)
+        self.assertIn("Host key verification failed", self.log_text(self.dead))
 
     def test_connecting_is_not_an_error(self):
         # while the login node's ssh to the compute node waits, the forwarded port is open but nothing answers:

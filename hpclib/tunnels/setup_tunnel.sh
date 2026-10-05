@@ -3,6 +3,7 @@
 # saves a tunnel's settings, and checks or installs what the tunnel needs with its install.sh.
 #
 #   setup_tunnel.sh TUNNEL [--set NAME=VALUE]... [--save] [--install [--force]] [--check]
+#                   [--instances] [--stop-instance JOB]
 #
 #   --set NAME=VALUE  a setting: one of the names in the tunnel's TUNNEL_SETTINGS (tunnel_config.sh), e.g.
 #                     VSCODE_CONTAINER=/scratch/user/me/images/vscode.sif. With --save, all of them replace the
@@ -12,6 +13,13 @@
 #   --check           report whether it is installed, on a last line
 #                       HPCLIB_TUNNEL_STATUS installed|missing|unknown|nothing MESSAGE
 #                     (unknown: its install.sh can't check; nothing: it has nothing to install)
+#
+#   --instances       the tunnel's registered running instances (see instances.sh), one line each:
+#                       HPCLIB_TUNNEL_INSTANCE JOB NODE PORT STATE OWNER
+#   --stop-instance JOB
+#                     end the job serving an instance (a shared database, say): only a job registered for this
+#                     tunnel, and only if you own it. Ends with HPCLIB_TUNNEL_INSTANCE_STOPPED JOB, or
+#                     HPCLIB_TUNNEL_INSTANCE_GONE JOB if it had already ended.
 #
 # An install.sh that can check says so on a line "# hpclib-install: --check" (and "--force" if it takes it);
 # one that doesn't is never run for a check, since it would install instead.
@@ -27,7 +35,8 @@ HPCTUNNELS_DATA_DIR="${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}"
 usage='usage: setup_tunnel.sh TUNNEL [--set NAME=VALUE]... [--save] [--install [--force]] [--check]'
 TUNNEL_NAME="$1"
 shift || true
-sets=() save=false install=false force=false check=false
+sets=() save=false install=false force=false check=false instances=false stop_job=''
+source "$HPCLIB_DIR/tunnels/instances.sh"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --set) sets+=("$2"); shift 2 ;;
@@ -36,6 +45,9 @@ while [ "$#" -gt 0 ]; do
     --install) install=true; shift ;;
     --force) force=true; shift ;;
     --check) check=true; shift ;;
+    --instances) instances=true; shift ;;
+    --stop-instance) stop_job="$2"; shift 2 ;;
+    --stop-instance=*) stop_job="${1#--stop-instance=}"; shift ;;
     *) echo "$usage" >&2; exit 2 ;;
   esac
 done
@@ -105,4 +117,37 @@ if [ "$check" = true ]; then
   else
     status missing "$(printf '%s\n' "$out" | tail -n 1)"
   fi
+fi
+
+if [ "$instances" = true ]; then
+  dir=$(_tunnel_instances_dir "$TUNNEL_NAME")
+  for file in $(ls -t "$dir" 2>/dev/null); do
+    case "$file" in ''|*[!0-9]*) continue ;; esac
+    line=$(squeue -h -j "$file" -o "%T %u" 2>/dev/null | head -n 1)
+    if [ -z "$line" ]; then rm -f "$dir/$file"; continue; fi
+    read -r node port < "$dir/$file"
+    printf 'HPCLIB_TUNNEL_INSTANCE %s %s %s %s\n' "$file" "$node" "$port" "$line"
+  done
+fi
+
+if [ -n "$stop_job" ]; then
+  case "$stop_job" in *[!0-9]*|'') echo "setup_tunnel: --stop-instance takes a job id" >&2; exit 2 ;; esac
+  dir=$(_tunnel_instances_dir "$TUNNEL_NAME")
+  if [ ! -f "$dir/$stop_job" ]; then
+    echo "setup_tunnel: job $stop_job is not a registered $TUNNEL_NAME instance; not cancelling it" >&2
+    exit 1
+  fi
+  owner=$(squeue -h -j "$stop_job" -o %u 2>/dev/null | head -n 1)
+  if [ -z "$owner" ]; then
+    rm -f "$dir/$stop_job"
+    echo "HPCLIB_TUNNEL_INSTANCE_GONE $stop_job"
+    exit 0
+  fi
+  if [ "$owner" != "$(id -un)" ]; then
+    echo "setup_tunnel: job $stop_job belongs to $owner, not you; not cancelling it" >&2
+    exit 1
+  fi
+  scancel "$stop_job" || exit 1
+  rm -f "$dir/$stop_job"
+  echo "HPCLIB_TUNNEL_INSTANCE_STOPPED $stop_job"
 fi

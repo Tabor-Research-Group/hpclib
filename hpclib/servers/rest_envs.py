@@ -294,13 +294,13 @@ class EnvironmentManager:
         if info["manager"] == "uv":
             command = [tool["path"], "sync"] + ([] if update or not info["locked"] else ["--locked"])
             exports = {"UV_CACHE_DIR": tool["dirs"]["cache"], "UV_PYTHON_INSTALL_DIR": tool["dirs"]["python"],
-                       "UV_LINK_MODE": "copy", "UV_NO_PROGRESS": "1"}
+                       "UV_LINK_MODE": "copy", "UV_NO_PROGRESS": "true"}
             writable = [project, tool["dirs"]["cache"], tool["dirs"]["python"]]
         else:
             command = [tool["path"], "install", "--manifest-path", info["manifest"], "-e", info["environment"]]
             if info["locked"] and not update:
                 command.append("--locked")
-            exports = {"PIXI_CACHE_DIR": tool["dirs"]["cache"], "PIXI_NO_PROGRESS": "1", "NO_COLOR": "1"}
+            exports = {"PIXI_CACHE_DIR": tool["dirs"]["cache"], "PIXI_NO_PROGRESS": "true", "NO_COLOR": "1"}
             writable = [project, tool["dirs"]["cache"]]
         for d in writable[1:]:
             os.makedirs(d, exist_ok=True)

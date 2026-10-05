@@ -214,6 +214,11 @@ function connect_to_job {
             # fail rather than run without the forward (e.g. the port is
             # taken), and notice a dead connection instead of hanging
             ssh_args=$(_build_argstr "$ssh_args" "$CONNECT_TO_JOB_SSH_OPTS")
+            # HPCLIB_COMPUTE_HOST_KEYS=accept-new (e.g. in ~/.local/tunnels/config.sh): take the key of a compute
+            # node seen for the first time without asking; a changed key is still refused
+            if [ "${HPCLIB_COMPUTE_HOST_KEYS:-ask}" = accept-new ]; then
+              ssh_args=$(_build_argstr "$ssh_args" "-o StrictHostKeyChecking=accept-new")
+            fi
             printf "%s\n" "ssh $ssh_args $job_node $post_args"
             ssh $ssh_args $job_node "$post_args"
       fi

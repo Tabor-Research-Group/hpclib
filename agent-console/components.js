@@ -16,6 +16,12 @@
 //   <hpc-cluster-row cluster="…" local="0.2.24">           an agent profile's rows in a table: refreshes itself
 //   <hpc-app-session app="jupyter" app-title="…" cluster="…">   a tunnel app's session on one cluster, likewise
 //
+//   <hpclib-toolbar>                                      a row of tools under a cluster/tunnel row
+//     <hpclib-toolbar-tool label="…">…text, a select…</hpclib-toolbar-tool>
+//   <hpclib-extra-controls>                               controls under a row's buttons, on the right
+//     <hpclib-control>…a button…</hpclib-control>
+//   confirmDialog(heading, text, ok): a themed yes/no question, resolving to true or false
+//
 // Rows ask the page for what only it can do with events that bubble to document: "hpc-login" {cluster, then},
 // "hpc-prompt" {label, answer, prompt}, "hpc-setup" {cluster, row} and "hpc-app-settings" {app, session, row}.
 
@@ -487,6 +493,82 @@ export class HpcEnvEditor extends HTMLElement {
   }
 }
 
+// ------------------------------------------------------------------ <hpclib-toolbar>, <hpclib-extra-controls>
+
+export class HpclibToolbar extends HTMLElement {
+  // A row of <hpclib-toolbar-tool>s that wraps when narrow; hidden while it holds none.
+  connectedCallback() { this._sync(); }
+  _sync() { this.hidden = !this.querySelector(":scope > hpclib-toolbar-tool"); }
+  /** Replace its tools. */
+  setTools(tools) {
+    this.replaceChildren(...tools);
+    this._sync();
+  }
+}
+
+export class HpclibToolbarTool extends HTMLElement {
+  // label: a small caption above its content (text, a select, a few inputs: anything wider than a button)
+  static observedAttributes = ["label"];
+  constructor() {
+    super();
+    this._caption = el("span", { class: "tool-label" });
+    this._body = el("div", { class: "tool-body" });
+  }
+  connectedCallback() {
+    if (!this._caption.isConnected) {
+      this._body.append(...this.childNodes);
+      this.append(this._caption, this._body);
+    }
+    this._render();
+  }
+  attributeChangedCallback() { this._render(); }
+  _render() {
+    this._caption.textContent = this.getAttribute("label") || "";
+    this._caption.hidden = !this._caption.textContent;
+  }
+  /** Its content, replaced. */
+  set content(nodes) { this._body.replaceChildren(...[nodes].flat()); }
+}
+
+export class HpclibExtraControls extends HTMLElement {
+  // A column of <hpclib-control>s under a row's main buttons; hidden while it holds none.
+  connectedCallback() { this._sync(); }
+  _sync() { this.hidden = !this.querySelector(":scope > hpclib-control"); }
+  setControls(controls) {
+    this.replaceChildren(...controls);
+    this._sync();
+  }
+}
+
+export class HpclibControl extends HTMLElement {
+  // Wraps one control, usually an <hpc-action-button>; hint: a line of small text under it.
+  static observedAttributes = ["hint"];
+  connectedCallback() { this._render(); }
+  attributeChangedCallback() { this._render(); }
+  _render() {
+    let hint = this.querySelector(":scope > .control-hint");
+    const text = this.getAttribute("hint") || "";
+    if (!text) { if (hint) hint.remove(); return; }
+    if (!hint) { hint = el("div", { class: "control-hint muted small" }); this.append(hint); }
+    hint.textContent = text;
+  }
+}
+
+/** A yes/no question in an <hpc-dialog>; resolves true for `ok`, false for Cancel, Escape or ×. */
+export function confirmDialog(heading, text, ok = "OK") {
+  return new Promise((resolve) => {
+    const yes = el("button", { class: "primary", type: "button" }, ok);
+    const no = el("button", { type: "button" }, "Cancel");
+    const dialog = el("hpc-dialog", { heading, transient: true }, el("p", {}, text), el("div", { class: "actions" }, yes, no));
+    let answer = false;
+    yes.addEventListener("click", () => { answer = true; dialog.close(); });
+    no.addEventListener("click", () => dialog.close());
+    dialog.addEventListener("close", () => resolve(answer));
+    dialog.showModal();
+    no.focus();
+  });
+}
+
 // ------------------------------------------------------------------ rows: <hpc-cluster-row>, <hpc-app-session>
 
 export const LOGIN_BUSY = ["starting", "password_sent", "push_sent"];
@@ -516,12 +598,16 @@ class TunnelRow extends HTMLElement {
     this.main = el("tr");
     this.detailCell = el("td");
     this.detailRow = el("tr", { class: "detail-row", hidden: true }, this.detailCell);
+    // tunnel-specific tools, under the row (see HpcAppSession)
+    this.toolbar = el("hpclib-toolbar", { hidden: true });
+    this.toolbarCell = el("td", {}, this.toolbar);
+    this.toolbarRow = el("tr", { class: "toolbar-row", hidden: true }, this.toolbarCell);
     this.detailKind = "";
     this.buttons = null;
   }
 
   connectedCallback() {
-    if (!this.main.isConnected) this.append(this.main, this.detailRow);
+    if (!this.main.isConnected) this.append(this.main, this.toolbarRow, this.detailRow);
     if (this._data) { this._draw(); this._schedule(); } else this.refresh();
   }
   disconnectedCallback() { clearTimeout(this._timer); }
@@ -588,7 +674,8 @@ class TunnelRow extends HTMLElement {
     const cells = this.cells();
     if (this._error) cells[0] = [cells[0], el("div", { class: "error-box small" }, `not refreshed: ${this._error.message}`)];
     this.main.replaceChildren(...cells.map((c) => el("td", {}, c)));
-    this.detailCell.colSpan = cells.length;
+    this.detailCell.colSpan = this.toolbarCell.colSpan = cells.length;
+    this.toolbarRow.hidden = this.toolbar.hidden;
   }
 
   // the detail row
@@ -628,9 +715,11 @@ class TunnelRow extends HTMLElement {
   }
   promptLine(label, answer, prompt) {
     if (!prompt) return null;
-    const b = el("button", { class: "primary", type: "button" }, "Enter password…");
+    const hostkey = prompt.kind === "hostkey";
+    const b = el("button", { class: "primary", type: "button" }, hostkey ? "Review host key…" : "Enter password…");
     b.addEventListener("click", () => ask(this, "hpc-prompt", { label, answer, prompt }));
-    return el("div", {}, el("hpc-state", { tone: "starting", label: "asks for your password" }), " ", b);
+    return el("div", {}, el("hpc-state", { tone: "starting",
+      label: hostkey ? `asks to trust ${prompt.host || "a node"}'s host key` : "asks for your password" }), " ", b);
   }
 }
 
@@ -777,16 +866,60 @@ export class HpcAppSession extends TunnelRow {
          inst.state === "installed" ? b.install : null));
   }
 
-  instanceLine(s) {
-    if (!s.shared || !s.instance) return null;
-    const i = s.instance;
-    return el("div", { class: "muted small" }, i.how === "attached"
-      ? `connected to job ${i.job} on ${i.node} (port ${i.port}), which another tunnel started; Stop only disconnects`
-      : `job ${i.job} on ${i.node} (port ${i.port}); it keeps running after Stop, for others to connect to`);
+  // The state's `tools` (toolbar, under the row) and `controls` (under the buttons): kinds the console sends
+  // ("info": a line of text; "select": options whose change runs a control), each kept by id so a control's
+  // error survives the refreshes
+  drawTools(tools) {
+    this._tools = this._tools || {};
+    const made = (tools || []).map((t) => {
+      const tool = this._tools[t.id] || (this._tools[t.id] = el("hpclib-toolbar-tool"));
+      tool.setAttribute("label", t.label || "");
+      if (t.kind === "select") {
+        const pick = tool._select || (tool._select = el("select"));
+        const opts = (t.options || []).map((o) => el("option", { value: o.value, selected: o.value === t.value }, o.label));
+        pick.replaceChildren(...opts);
+        pick.onchange = () => this.runControl({ id: t.control, args: { value: pick.value } })
+          .catch((err) => { tool.content = [pick, el("span", { class: "error-box small" }, ` ${err.message}`)]; });
+        tool.content = [pick, t.text ? el("span", { class: "muted small" }, ` ${t.text}`) : null].filter(Boolean);
+      } else {
+        tool.content = el("span", {}, t.text || "");
+      }
+      return tool;
+    });
+    this.toolbar.setTools(made);
+    this.toolbarRow.hidden = this.toolbar.hidden;
+  }
+
+  drawControls(controls) {
+    this._controls = this._controls || {};
+    const made = (controls || []).map((c) => {
+      let wrap = this._controls[c.id];
+      if (!wrap) {
+        const button = action(c.label, () => this.runControl(this._controls[c.id].spec), { result: true });
+        wrap = this._controls[c.id] = el("hpclib-control", {}, button);
+        wrap.button = button;
+      }
+      wrap.spec = c;
+      wrap.button.setAttribute("label", c.label);
+      wrap.button.title = c.title || "";
+      wrap.button.disabled = !!c.disabled;
+      return wrap;
+    });
+    this.extras = this.extras || el("hpclib-extra-controls");
+    this.extras.setControls(made);
+  }
+
+  async runControl(c) {
+    if (c.confirm && !(await confirmDialog(c.label, c.confirm, c.label))) return null;
+    const out = await fetcher(`${this.base}/control/${enc(c.id)}`, { method: "POST", body: c.args || {} });
+    await this.refresh();
+    return out.message || "Done.";
   }
 
   cells() {
     const s = this._data;
+    this.drawControls(s.controls);
+    this.drawTools(s.tools);
     const lg = s.login || {};
     const loggedIn = lg.state === "connected";
     const missing = s.install && s.install.state === "missing";
@@ -808,13 +941,13 @@ export class HpcAppSession extends TunnelRow {
        up && !s.token_known ? el("div", { class: "muted" }, "token not seen yet; see Log") : null,
        up && "password" in s ? el("div", { class: "muted" }, s.password ? ["password ready ", b.copy]
                                                                       : "password not seen yet; see Log") : null,
-       this.instanceLine(s),
        s.error ? el("div", { class: "muted" }, s.error) : null,
        this.promptLine(`${this.appTitle} on ${s.cluster}`, this.base + "/answer", s.prompt),
        this.installLine(s, loggedIn)],
-      el("div", { class: "actions" }, open, b.start, b.stop, b.log, b.settings),
+      [el("div", { class: "actions" }, open, b.start, b.stop, b.log, b.settings), this.extras],
     ];
   }
+
 }
 
 customElements.define("hpc-panel", HpcPanel);
@@ -827,3 +960,7 @@ customElements.define("hpc-cluster-picker", HpcClusterPicker);
 customElements.define("hpc-env-editor", HpcEnvEditor);
 customElements.define("hpc-cluster-row", HpcClusterRow);
 customElements.define("hpc-app-session", HpcAppSession);
+customElements.define("hpclib-toolbar", HpclibToolbar);
+customElements.define("hpclib-toolbar-tool", HpclibToolbarTool);
+customElements.define("hpclib-extra-controls", HpclibExtraControls);
+customElements.define("hpclib-control", HpclibControl);

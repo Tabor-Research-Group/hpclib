@@ -69,6 +69,15 @@ tabs; after the console restarts, the page asks for the new key once.
 | `<hpc-env-editor label>` | `NAME=value` lines, checked as you type against the server's own rules (`rules.environment` from `GET /admin/config`). |
 | `<hpc-cluster-row cluster local>` | an agent profile's row in the Clusters table, with a detail row for its log, setup form or install/setup output. |
 | `<hpc-app-session app app-title cluster>` | a tunnel app's session on one cluster (Open, Start, Stop, Log, Settings). |
+| `<hpclib-toolbar>` of `<hpclib-toolbar-tool label>` | tunnel-specific tools in a row under a session's row: text, selects, anything wider than a button. Hidden while empty. |
+| `<hpclib-extra-controls>` of `<hpclib-control hint>` | tunnel-specific controls under a session's buttons, usually `<hpc-action-button>`s. Hidden while empty. |
+
+`confirmDialog(heading, text, ok)` asks a yes/no question in an `<hpc-dialog>`. A session's state from the
+console carries the `tools` and `controls` for its row (see `APPS` in `agent_console.py`); controls run with
+`POST /api/apps/APP/NAME/control/ID`. PAI uses both: the toolbar names the job serving the database (and
+whether this tunnel started it or only connected), and **End database job** cancels that job after asking,
+only if it is yours and registered as a PAI database, and stops this tunnel. Stop itself still only
+disconnects.
 
 The two row elements fetch their own state, every 3 s while something is in motion (a login, a starting tunnel
 or session, an install) and every 30 s otherwise. They redraw only themselves, so pages aren't reloaded to follow

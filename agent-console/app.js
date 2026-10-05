@@ -200,9 +200,51 @@ function addClusterForm(onAdded) {
 
 let promptDialogOpen = false;
 
+function hostKeyDialog(label, answerPath, prompt, { onCancel = null } = {}) {
+  // the login node's ssh reaches a compute node it has no key for, and asks whether to trust it
+  promptDialogOpen = true;
+  const node = prompt.host || "the compute node";
+  const status = el("p", {}, `The cluster's login node is connecting to ${node}` +
+    `${prompt.address ? ` (${prompt.address})` : ""}, the node your job got, for the first time, and ssh doesn't ` +
+    "know its key yet. Trusting it adds the key to ~/.ssh/known_hosts on the cluster, as typing yes in a terminal does.");
+  const key = el("p", {}, el("code", {}, `${prompt.key_type || "?"} key ${prompt.fingerprint || "(fingerprint not shown)"}`));
+  const accept = el("button", { class: "primary", type: "button" }, "Trust this key");
+  const reject = el("button", { type: "button" }, "Don't connect");
+  const later = el("button", { type: "button" }, "Not now");
+  const dialog = el("hpc-dialog", { heading: `New compute node: ${label}`, transient: true },
+    status, key, el("div", { class: "actions" }, accept, reject, later),
+    el("p", { class: "muted small" }, "To check the key, run ssh-keyscan " + node + " | ssh-keygen -lf - on the " +
+      "login node, or compare with your cluster's published fingerprints. Every new node asks once; to accept " +
+      "new compute nodes' keys without asking (a changed key is still refused), put " +
+      "HPCLIB_COMPUTE_HOST_KEYS=accept-new in ~/.local/tunnels/config.sh on the cluster."));
+  let answered = false;
+  dialog.addEventListener("close", () => {
+    promptDialogOpen = false;
+    if (!answered && onCancel) onCancel();
+  });
+  later.addEventListener("click", () => dialog.close());
+  const send = (answer) => async () => {
+    accept.disabled = reject.disabled = true;
+    try {
+      await api(answerPath, { method: "POST", body: { answer } });
+      answered = true;
+      dialog.close();
+      checkPrompts(1500);            // a password may come next
+    } catch (err) {
+      status.className = "error-box";
+      status.textContent = err.message;
+      accept.disabled = reject.disabled = false;
+    }
+  };
+  accept.addEventListener("click", send("yes"));
+  reject.addEventListener("click", send("no"));
+  dialog.showModal();
+}
+
 function promptDialog(label, answerPath, prompt, { onCancel = null } = {}) {
   // the tunnel's ssh (usually the login node's ssh to the compute node) waits for a password
   if (promptDialogOpen) return;
+  if (prompt.kind === "hostkey") return hostKeyDialog(label, answerPath, prompt, { onCancel });
   promptDialogOpen = true;
   const input = el("input", { type: "password", autocomplete: "off", placeholder: "password" });
   const status = el("p", { class: prompt.retry ? "error-box" : "muted" },

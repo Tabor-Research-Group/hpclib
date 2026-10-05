@@ -40,6 +40,9 @@ The front end depends only on the routes below; nothing here depends on it.
                                               "settings": {"VSCODE_CONTAINER": "/path/...", ...}}: the tunnel's
                                               settings, saved on the cluster with the next check/install/start
   POST /api/apps/APP/NAME/check               is the tunnel installed? (its install.sh --check, on the cluster)
+  GET  /api/apps/APP/NAME/instances           a shared app's running instances on the cluster, with owners
+  POST /api/apps/APP/NAME/control/ID          one of the session's `controls`, e.g. stop_instance {"job": ...}:
+                                              end the job serving a shared app (only yours, only a registered one)
   POST /api/apps/APP/NAME/install             its install.sh ({"force": true}: e.g. pull the image again), as
                                               the cluster's operation (GET /api/clusters/NAME/operation)
   GET  /api/clusters/NAME/settings            this machine's tunnel settings for the cluster
@@ -115,7 +118,11 @@ STREAMED_ROUTES = ("files/content",)   # passed through in chunks rather than re
 #   settings      [(NAME, label, hint)]: the tunnel's TUNNEL_SETTINGS (tunnel_config.sh) the page edits; they
 #                 are saved on the cluster (tunnels/setup_tunnel.sh --save) for its job and install.sh
 #   shared        the tunnel attaches to a running instance another job serves (SHARED_INSTANCE), and keeps
-#                 the one it starts running after Stop (KEEP_INSTANCE)
+#                 the one it starts running after Stop (KEEP_INSTANCE); `instance_label` names that service,
+#                 and its row gets a toolbar tool describing the job and a control that ends it
+# A session's state carries `tools` (for the row's <hpclib-toolbar>: {"id", "kind": "info"|"select", "label",
+# "text" | "options"/"value"/"control"}) and `controls` (for its <hpclib-extra-controls>: {"id", "label",
+# "title", "confirm", "args"}), run with POST /api/apps/APP/NAME/control/ID.
 # A tunnel with an install.sh can be checked and installed from the page (tunnels/setup_tunnel.sh).
 APPS = {
     "jupyter": {
@@ -149,6 +156,7 @@ APPS = {
         "open_path": "/",
         "health_path": "/",
         "shared": True,
+        "instance_label": "database",
         "settings": [
             ("PAI_ROOT_DIR", "Install directory", "holds proto-auto-interface/; default /scratch/user/USER/pai"),
             ("PAI_REPO", "Repository", "git URL Install clones proto-auto-interface from"),
@@ -160,6 +168,8 @@ SETTING_VALUE_RE = re.compile(r"[^\0\n\r]{0,1024}")
 TUNNEL_STATUS_RE = re.compile(r"^HPCLIB_TUNNEL_STATUS (installed|missing|unknown|nothing) ?(.*)$", re.M)
 ATTACHED_RE = re.compile(r"attaching to the running \S+ instance: job (\d+) on (\S+), port (\d+)")
 OWN_INSTANCE_RE = re.compile(r"job (\d+) serves \S+ on (\S+), port (\d+)")
+ENDED_INSTANCE_RE = re.compile(r"^hpclib console: ended job (\d+)", re.M)
+INSTANCE_LINE_RE = re.compile(r"^HPCLIB_TUNNEL_INSTANCE (\d+) (\S+) (\d+) (\S+) (\S+)$", re.M)
 APP_PROJECT_RE = re.compile(r"/[A-Za-z0-9_./@+-]{1,1023}")
 APP_MODULE_RE = re.compile(r"[A-Za-z0-9_.+-][A-Za-z0-9_.+/-]{0,127}")
 CONDA_ENV_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
@@ -229,6 +239,10 @@ class PtySession:
     """
 
     PROMPT_RE = re.compile(r"(pass(word|phrase|code)|option \(\d|verification code|one-time)[^\n]*:\s*$", re.I)
+    # ssh meeting a host it has no key for (the login node's first ssh to a compute node)
+    HOST_KEY_RE = re.compile(r"continue connecting \(yes/no(/\[fingerprint\])?\)\?\s*$", re.I)
+    HOST_RE = re.compile(r"authenticity of host '([^' ]+)(?: \(([^)]*)\))?' can't be established", re.I)
+    FINGERPRINT_RE = re.compile(r"(\w+) key fingerprint is (\S+?)\.?\s*$", re.M)
     PUSH_RE = re.compile(r"passcode|option|duo|two-factor|second factor", re.I)
     DENIED_RE = re.compile(r"permission denied|incorrect|authentication failed", re.I)
 
@@ -292,6 +306,17 @@ class PtySession:
 
     def _check_prompt(self):
         last = self.tail.rsplit("\n", 1)[-1]
+        if self.HOST_KEY_RE.search(last):
+            # yes adds the key to ~/.ssh/known_hosts on the login node, as typing it in a terminal does; asked
+            # in the page with the fingerprint, never answered here
+            before = self.tail[-1500:]
+            host = self.HOST_RE.findall(before)
+            key = self.FINGERPRINT_RE.findall(before)
+            self.prompt = {"text": last.strip()[-200:], "kind": "hostkey",
+                           "host": host[-1][0] if host else None, "address": host[-1][1] if host else None,
+                           "key_type": key[-1][0] if key else None, "fingerprint": key[-1][1] if key else None,
+                           "retry": False}
+            return
         if not self.PROMPT_RE.search(last):
             self.prompt = None          # new output after a prompt: ssh has moved on (or gave up)
             return
@@ -316,13 +341,15 @@ class PtySession:
         with self.lock:
             if self.prompt is None:
                 raise ConsoleError(409, "nothing is waiting for an answer")
+            if self.prompt["kind"] == "hostkey" and text not in ("yes", "no"):
+                raise ConsoleError(400, "a host key question takes yes or no")
             self._write(text)
             self.prompt = None
         return {"answered": True}
 
     def waiting(self):
         with self.lock:
-            return None if self.prompt is None else {k: self.prompt[k] for k in ("text", "kind", "host", "retry")}
+            return None if self.prompt is None else dict(self.prompt)
 
 
 def ssh_options(profile):
@@ -1086,14 +1113,94 @@ class Clusters:
     def _app_instance(self, name, app):
         """For a shared app: the job serving it, and whether this tunnel attached to it or started it."""
         text = self._last_launch(name, app)
+        ended = set(ENDED_INSTANCE_RE.findall(text))
         for pattern, how in ((ATTACHED_RE, "attached"), (OWN_INSTANCE_RE, "started")):
             found = pattern.findall(text)
             if found:
                 job, node, port = found[-1]
+                if job in ended:
+                    return None
                 return {"job": job, "node": node, "port": int(port), "how": how}
         return None
 
+    def app_extras(self, spec, state):
+        """The row's toolbar tools and extra controls (see APPS)."""
+        tools, controls = [], []
+        inst = state.get("instance")
+        if spec.get("shared"):
+            what = spec.get("instance_label", "instance")
+            if inst:
+                tools.append({"id": "instance", "kind": "info", "label": what.capitalize(),
+                              "text": f"job {inst['job']} on {inst['node']}, port {inst['port']}; " +
+                                      ("this tunnel started it, and it keeps running after Stop"
+                                       if inst["how"] == "started" else
+                                       "another tunnel started it; Stop only disconnects")})
+                controls.append({"id": "stop_instance", "label": f"End {what} job",
+                                 "title": f"scancel {inst['job']}: ends the {what} for every tunnel using it",
+                                 "confirm": f"End job {inst['job']}, the {what} on {inst['node']}? Every tunnel "
+                                            f"connected to it loses it, and this tunnel stops too.",
+                                 "args": {"job": inst["job"]}})
+            else:
+                tools.append({"id": "instance", "kind": "info", "label": what.capitalize(),
+                              "text": f"none seen yet: Start connects to a running {what} job, or starts one"})
+        return tools, controls
+
+    def app_instances(self, profile, app, wait=60):
+        """The shared app's registered running instances on the cluster, with their owners."""
+        spec = self.app_spec(app)
+        text = self._run_setup(profile, ["tunnel_setup"] + ssh_options(profile) +
+                               [profile["host"], spec["tunnel"], "--instances"], wait)
+        return [{"job": j, "node": n, "port": int(p), "state": st, "owner": u}
+                for j, n, p, st, u in INSTANCE_LINE_RE.findall(text)]
+
+    def _run_setup(self, profile, args, wait):
+        if not self.logins.alive(profile):
+            raise ConsoleError(409, f"log in to {profile['name']} first: this runs over the console's ssh login")
+        with tempfile.TemporaryFile() as out:
+            proc = self.shell_runner(args, out)
+            try:
+                code = proc.wait(wait)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGTERM)
+                raise ConsoleError(504, f"no answer from {profile['name']} within {wait} s")
+            out.seek(0)
+            text = out.read().decode(errors="replace")
+        return text if code == 0 else text + f"\n(exit {code})"
+
+    def app_control(self, profile, app, control, body):
+        """One of the row's extra controls."""
+        spec = self.app_spec(app)
+        if control != "stop_instance" or not spec.get("shared"):
+            raise ConsoleError(404, f"{spec['title']} has no control {control!r}")
+        job = str(body.get("job") or "")
+        if not job.isdigit() or set(body) - {"job"}:
+            raise ConsoleError(400, "stop_instance takes {\"job\": \"JOB ID\"}")
+        text = self._run_setup(profile, ["tunnel_setup"] + ssh_options(profile) +
+                               [profile["host"], spec["tunnel"], "--stop-instance", job], 120)
+        if f"HPCLIB_TUNNEL_INSTANCE_STOPPED {job}" in text:
+            result = "stopped"
+        elif f"HPCLIB_TUNNEL_INSTANCE_GONE {job}" in text:
+            result = "already ended"
+        else:
+            reason = next((l.split(": ", 1)[1] for l in text.splitlines() if l.startswith("setup_tunnel: ")),
+                          " ".join(text.strip().splitlines()[-2:]))
+            raise ConsoleError(409, f"job {job} was not ended: {reason}")
+        with open(self.app_log_path(profile["name"], app), "a") as log:
+            log.write(f"hpclib console: ended job {job} ({result})\n")
+        # the tunnel to it has nothing left to reach
+        with self.lock:
+            proc = self.app_procs.get((profile["name"], app))
+        _, conf = self.app_config(profile, app)
+        if (proc is not None and proc.poll() is None) or self.port_open(conf["port"]):
+            self.app_stop(profile, app)
+        return {"job": job, "result": result, "message": f"job {job} {result}"}
+
     def app_state(self, profile, app):
+        state = self._app_state(profile, app)
+        state["tools"], state["controls"] = self.app_extras(APPS[app], state)
+        return state
+
+    def _app_state(self, profile, app):
         spec = self.app_spec(app)
         name = profile["name"]
         _, conf = self.app_config(profile, app)
@@ -1525,6 +1632,10 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             return 200, dict(install=c.app_check(profile, app), ok=True)
         if action == ["install"] and verb == "POST":
             return 202, dict(c.app_install(profile, app, self.json_body()), ok=True)
+        if action == ["instances"] and verb == "GET":
+            return 200, dict(instances=c.app_instances(profile, app), ok=True)
+        if len(action) == 2 and action[0] == "control" and verb == "POST":
+            return 200, dict(c.app_control(profile, app, action[1], self.json_body()), ok=True)
         if action == ["settings"] and verb == "GET":
             return 200, dict(c.app_settings(profile, app), ok=True)
         if action == ["settings"] and verb == "PUT":

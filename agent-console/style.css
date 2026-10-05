@@ -187,3 +187,15 @@ a.button.primary { background: var(--accent); border-color: var(--accent); color
 .small { font-size: 12px; }
 .install-line { margin-top: 6px; }
 .install-line .actions { margin-top: 3px; }
+/* tunnel-specific tools under a row, and extra controls under its buttons */
+hpclib-toolbar { display: flex; flex-wrap: wrap; gap: 10px 28px; align-items: flex-start;
+                 padding: 6px 10px; border-left: 3px solid var(--line); background: var(--panel); border-radius: 6px; }
+hpclib-toolbar[hidden], hpclib-extra-controls[hidden] { display: none; }
+table.rows .toolbar-row > td { padding-top: 0; }
+hpclib-toolbar-tool { display: flex; flex-direction: column; gap: 2px; min-width: 12em; max-width: 60em; }
+hpclib-toolbar-tool .tool-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+hpclib-toolbar-tool select { min-width: 16em; }
+hpclib-extra-controls { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin-top: 6px;
+                        padding-top: 6px; border-top: 1px dashed var(--line); }
+hpclib-control { display: block; }
+.control-hint { margin-top: 2px; }

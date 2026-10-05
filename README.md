@@ -136,7 +136,11 @@ cluster whose login node needs your password again to reach the compute node the
 hop), the console notices the prompt and asks you for it in the page (`"prompt"` in the tunnel's state;
 `POST .../tunnel/answer`; `GET /api/prompts` lists every tunnel and app session waiting for one, which the page
 asks every few seconds, so the dialog opens on any page); the password goes straight to that ssh and is not
-stored or logged. While that hop waits, the tunnel reads `starting`, not `error`. Where a cluster
+stored or logged. While that hop waits, the tunnel reads `starting`, not `error`. The first time the login node
+reaches a compute node, its ssh asks whether to trust that node's host key; the page shows the key's
+fingerprint and answers yes or no for you (`"kind": "hostkey"` in the prompt), and yes adds it to
+`~/.ssh/known_hosts` on the cluster, as in a terminal. To take new compute nodes' keys without asking (a changed
+key is still refused), set `HPCLIB_COMPUTE_HOST_KEYS=accept-new` in `~/.local/tunnels/config.sh` on the cluster. Where a cluster
 allows it, ssh keys between its nodes skip that step (on the cluster: `ssh-keygen -t ed25519`, then add
 `~/.ssh/id_ed25519.pub` to `~/.ssh/authorized_keys`). Other prompts (an
 unknown host key, a passcode menu without a push) end the attempt with the prompt shown; accept a new host key
@@ -554,8 +558,9 @@ which the tunnel prints (and the console offers to copy).
 **PAI**: the proto-auto-interface database, run with `singularity-compose` from
 `PAI_ROOT_DIR/proto-auto-interface` (default `/scratch/user/<username>/pai`; `install.sh` clones `PAI_REPO` there).
 It is shared: a PAI tunnel connects to the database another job already runs, if one does, and otherwise starts
-one, on port 3100 or another free one on its node, that keeps running after the tunnel closes (end it with
-`scancel`).
+one, on port 3100 or another free one on its node, that keeps running after the tunnel closes. End it with the
+console's **End database job**, `tunnel_setup HOST pai --stop-instance JOB` (only a registered PAI job of yours;
+`--instances` lists them), or `scancel`.
 
 **Jupyter**: this requires jupyter lab to be installed in whatever `conda` environment one uses by default, and requires
 that `conda` is set up when loading the environment from `~/.bashrc`
