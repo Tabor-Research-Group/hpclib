@@ -504,4 +504,26 @@ case "$(pai_job)" in *"bind=1 port="[0-9]*) ;; *) fail "PAI_BIND_SOURCE did not 
 case "$(pai_job PAI_BIND_SOURCE=0)" in *"from the images"*"bind=0 "*) ;; *) fail "PAI_BIND_SOURCE=0 not passed on" ;; esac
 [ ! -e "$test_dir/pai-data/instances/pai/8100" ] || fail 'the PAI job left its registration behind'
 
+# launch-tunnel-manager finds its hpclib through links (relative ones too) and starts the console with its page
+mkdir -p "$test_dir/launch/bin" "$test_dir/launch/elsewhere"
+printf '#!/bin/sh\ncase "$1" in -c) exit 0 ;; esac\nprintf "%%s\\n" "$@"\n' > "$test_dir/launch/fake-python"
+chmod +x "$test_dir/launch/fake-python"
+ln -s "$HPCLIB_DIR/launch-tunnel-manager" "$test_dir/launch/elsewhere/ltm"
+ln -s ../elsewhere/ltm "$test_dir/launch/bin/launch-tunnel-manager"            # a link to a link
+launched=$(cd / && HPCLIB_PYTHON="$test_dir/launch/fake-python" "$test_dir/launch/bin/launch-tunnel-manager" --port 27999)
+repo_root="$(cd -P "$HPCLIB_DIR/.." && pwd)"
+assert_equal "$(printf '%s\n' "$launched" | head -n 1)" "$(cd -P "$HPCLIB_DIR" && pwd)/servers/agent_console.py"
+assert_equal "$(printf '%s\n' "$launched" | tail -n +2 | tr '\n' ' ')" "--static $repo_root/agent-console --port 27999 --open "
+launched=$(HPCLIB_PYTHON="$test_dir/launch/fake-python" "$test_dir/launch/bin/launch-tunnel-manager" --no-open)
+case "$launched" in *--open*) fail '--no-open still opened the browser' ;; esac
+case "$("$test_dir/launch/bin/launch-tunnel-manager" --where)" in
+  *"hpclib:   $(cd -P "$HPCLIB_DIR" && pwd) ("*"web page: $repo_root/agent-console"*) ;;
+  *) fail "--where: $("$test_dir/launch/bin/launch-tunnel-manager" --where)" ;;
+esac
+out=$(PATH="/usr/bin:/bin" "$HPCLIB_DIR/launch-tunnel-manager" --install-link "$test_dir/launch/links")
+[ "$(readlink "$test_dir/launch/links/launch-tunnel-manager")" = "$(cd -P "$HPCLIB_DIR" && pwd)/launch-tunnel-manager" ] ||
+  fail "--install-link made $(readlink "$test_dir/launch/links/launch-tunnel-manager")"
+case "$out" in *"isn't on your PATH"*) ;; *) fail "no PATH advice: $out" ;; esac
+if HPCLIB_PYTHON=false "$HPCLIB_DIR/launch-tunnel-manager" > /dev/null 2>&1; then fail 'ran without a usable Python'; fi
+
 echo 'Tunnel management tests passed'

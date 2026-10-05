@@ -4,7 +4,8 @@ A minimal browser front end for `agent_console`, the local backend in
 `hpclib/servers/agent_console.py`. Plain HTML, CSS and JavaScript modules (with native custom elements), no build step.
 
 ```bash
-agent_console --static ~/path/to/hpclib/agent-console --open
+launch-tunnel-manager              # hpclib/launch-tunnel-manager, linked onto your PATH (see hpclib's README)
+agent_console --static ~/path/to/hpclib/agent-console --open      # the same, by hand
 ```
 
 `--open` opens `http://127.0.0.1:27180/#key=…`; the page keeps the key for that browser tab

@@ -99,6 +99,19 @@ server picks up the new token by itself: the client re-reads its token file when
 every cluster's tunnel, jobs, template proposals and audit log, and holds the cluster tokens itself so the
 browser never sees them.
 
+To run it with its web page (`agent-console/`) from anywhere, link the launcher onto your PATH once:
+
+```bash
+git clone https://github.com/Tabor-Research-Group/hpclib.git ~/hpclib
+~/hpclib/hpclib/launch-tunnel-manager --install-link   # a link in ~/.local/bin (or: --install-link DIR)
+launch-tunnel-manager                                  # starts the console and opens it in your browser
+```
+
+The launcher follows its link back to the clone, so `git pull` there updates what it runs. It takes
+`agent_console`'s options (`--port`, ...), `--no-open`, and `--where` (which hpclib and page it uses);
+`HPCLIB_PYTHON` picks the Python (3.7 or newer). For a system-wide link use `/usr/local/bin` (with `sudo`);
+macOS doesn't let anything be added to `/usr/bin`.
+
 ```bash
 agent_console                                   # http://127.0.0.1:27180; prints a fresh session key
 KEY=$(python3 -c 'import json,os; print(json.load(open(os.path.expanduser("~/.config/hpclib/console/session")))["key"])')

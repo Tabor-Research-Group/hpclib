@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Starts the hpclib console (agent_console) with its web page and opens it in your browser, using the hpclib this
+# file belongs to, wherever that is. Link it onto your PATH and run it from anywhere:
+#
+#   /path/to/hpclib/hpclib/launch-tunnel-manager --install-link        # a link in ~/.local/bin
+#   launch-tunnel-manager                                             # then, from any directory
+#
+#   launch-tunnel-manager [--no-open] [agent_console options...]
+#   launch-tunnel-manager --install-link [DIRECTORY]
+#   launch-tunnel-manager --where                                      # the hpclib and web page it uses
+#
+# Options after the launcher's own go to agent_console (--port, --key, ...; see agent_console --help).
+# HPCLIB_PYTHON picks the Python (default python3, 3.7 or newer); HPCLIB_CONSOLE_STATIC another web page folder.
+
+set -e
+
+# This file's real location, following links (macOS has no readlink -f), so a link elsewhere still finds hpclib.
+source_path="${BASH_SOURCE[0]}"
+while [ -h "$source_path" ]; do
+  link_dir="$(cd -P "$(dirname "$source_path")" > /dev/null 2>&1 && pwd)"
+  source_path="$(readlink "$source_path")"
+  case "$source_path" in
+    /*) ;;
+    *) source_path="$link_dir/$source_path" ;;
+  esac
+done
+HPCLIB_DIR="$(cd -P "$(dirname "$source_path")" > /dev/null 2>&1 && pwd)"
+export HPCLIB_DIR
+self="$HPCLIB_DIR/$(basename "$source_path")"
+
+if [ ! -f "$HPCLIB_DIR/hpclib.sh" ] || [ ! -f "$HPCLIB_DIR/servers/agent_console.py" ]; then
+  echo "launch-tunnel-manager: $HPCLIB_DIR is not an hpclib folder (no hpclib.sh or servers/agent_console.py)" >&2
+  exit 1
+fi
+
+# the web page: next to hpclib in a clone (hpclib/../agent-console), or inside it
+static="${HPCLIB_CONSOLE_STATIC:-}"
+if [ -z "$static" ]; then
+  for candidate in "$HPCLIB_DIR/agent-console" "$HPCLIB_DIR/../agent-console"; do
+    if [ -f "$candidate/index.html" ]; then
+      static="$(cd -P "$candidate" && pwd)"
+      break
+    fi
+  done
+fi
+
+case "${1:-}" in
+  --install-link)
+    dir="${2:-$HOME/.local/bin}"
+    mkdir -p "$dir" 2> /dev/null || true
+    if [ ! -w "$dir" ]; then
+      echo "launch-tunnel-manager: can't write to $dir; for a system-wide link run:" >&2
+      echo "  sudo ln -sf '$self' '$dir/launch-tunnel-manager'" >&2
+      exit 1
+    fi
+    ln -sf "$self" "$dir/launch-tunnel-manager"
+    echo "linked $dir/launch-tunnel-manager -> $self"
+    case ":$PATH:" in
+      *":$dir:"*) ;;
+      *) echo "note: $dir isn't on your PATH; add it in your shell profile, e.g. export PATH=\"$dir:\$PATH\"" ;;
+    esac
+    exit 0 ;;
+  --where)
+    echo "hpclib:   $HPCLIB_DIR ($(sed -n 's/^HPCLIB_VERSION="\(.*\)"/\1/p' "$HPCLIB_DIR/hpclib.sh"))"
+    echo "web page: ${static:-(not found; set HPCLIB_CONSOLE_STATIC)}"
+    exit 0 ;;
+  -h|--help)
+    sed -n '2,15p' "$self" | sed 's/^# \{0,1\}//'
+    exit 0 ;;
+esac
+
+python="${HPCLIB_PYTHON:-python3}"
+if ! "$python" -c 'import sys; sys.exit(sys.version_info < (3, 7))' 2> /dev/null; then
+  echo "launch-tunnel-manager: the console needs Python 3.7 or newer; '$python' isn't (set HPCLIB_PYTHON)" >&2
+  exit 1
+fi
+
+open=true
+args=()
+has_static=false
+for arg in "$@"; do
+  case "$arg" in
+    --no-open) open=false ;;
+    --static|--static=*) has_static=true; args+=("$arg") ;;
+    *) args+=("$arg") ;;
+  esac
+done
+if [ "$has_static" = false ]; then
+  if [ -z "$static" ]; then
+    echo "launch-tunnel-manager: no agent-console folder next to $HPCLIB_DIR; set HPCLIB_CONSOLE_STATIC" \
+      "to it, or pass --static DIR" >&2
+    exit 1
+  fi
+  args=(--static "$static" "${args[@]}")
+  if [ "$open" = true ]; then args+=(--open); fi
+fi
+
+exec "$python" "$HPCLIB_DIR/servers/agent_console.py" "${args[@]}"
