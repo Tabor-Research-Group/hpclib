@@ -751,6 +751,10 @@ export class HpcClusterRow extends TunnelRow {
         if (this.detailKind === "setup") return this.hideDetail();
         ask(this, "hpc-setup", { cluster: this._data, row: this });
       }),
+      copyUser: action("Copy username", async () => {
+        await navigator.clipboard.writeText(this._data.username || "");
+        return "Copied.";
+      }, { result: true }),
       login: action("Log in", () => {}),
     };
   }
@@ -830,6 +834,10 @@ export class HpcAppSession extends TunnelRow {
       check: action("Check", async () => { await fetcher(this.base + "/check", { method: "POST" }); await this.refresh(); }),
       copy: action("Copy password", async () => {
         await navigator.clipboard.writeText(this._data.password || "");
+        return "Copied.";
+      }, { result: true }),
+      copyUser: action("Copy username", async () => {
+        await navigator.clipboard.writeText(this._data.username || "");
         return "Copied.";
       }, { result: true }),
       login: action("Log in", () => {}),
@@ -956,12 +964,13 @@ export class HpcAppSession extends TunnelRow {
       this.loginCells(lg, cluster),
       [el("hpc-state", { state: s.state, label: stateText }),
        up && !s.token_known ? el("div", { class: "muted" }, "token not seen yet; see Log") : null,
+       up && "username" in s ? el("div", { class: "muted" }, [`if asked to sign in: user ${s.username} `, b.copyUser]) : null,
        up && "password" in s ? el("div", { class: "muted" }, s.password ? ["password ready ", b.copy]
                                                                       : "password not seen yet; see Log") : null,
        s.error ? el("div", { class: "muted" }, s.error) : null,
        this.promptLine(`${this.appTitle} on ${s.cluster}`, this.base + "/answer", s.prompt),
        this.installLine(s, loggedIn)],
-      [el("div", { class: "actions" }, open, b.start, b.stop, b.log, b.settings), this.extras],
+      [el("div", { class: "actions" }, open, b.start, b.stop, b.log, s.kind === "login" ? null : b.settings), this.extras],
     ];
   }
 

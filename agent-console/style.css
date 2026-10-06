@@ -138,6 +138,7 @@ h4 { font-size: 13px; margin: 16px 0 6px; }
 .field > span { font-weight: 500; }
 .field small { font-size: 12px; }
 .row { display: flex; flex-wrap: wrap; gap: 4px 20px; }
+.row[hidden] { display: none; }
 textarea {
   font: 12px/1.4 ui-monospace, Menlo, monospace;
   width: 100%;
@@ -199,3 +200,12 @@ hpclib-extra-controls { display: flex; flex-direction: column; align-items: flex
                         padding-top: 6px; border-top: 1px dashed var(--line); }
 hpclib-control { display: block; }
 .control-hint { margin-top: 2px; }
+
+/* Add App or Settings (packages) */
+#topbar #add-package { background: #2a2b30; color: #e8e8ea; border: 1px solid #44464e; margin-left: 12px; }
+#topbar #add-package:hover { background: #34363d; color: #fff; }
+ul.packages { list-style: none; padding: 0; }
+ul.packages > li { margin: 10px 0; padding-bottom: 8px; border-bottom: 1px solid rgba(127, 127, 127, 0.25); }
+ul.packages ul { margin: 4px 0 6px; }
+p.hash { overflow-wrap: anywhere; font-family: ui-monospace, monospace; font-size: 12px; }
+section.secrets { margin-top: 14px; padding-top: 10px; border-top: 1px solid rgba(127, 127, 127, 0.25); }

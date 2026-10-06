@@ -349,3 +349,171 @@ class TestRealSingularity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Plays `podman`: `info` answers from $FAKE_PODMAN_INFO; `run ...` logs its arguments, then runs the
+# command after the image directly, in its --workdir and with its --env values.
+FAKE_PODMAN = textwrap.dedent("""\
+    #!/usr/bin/env python3
+    import json, os, subprocess, sys
+    args = sys.argv[1:]
+    if args[:1] == ["info"]:
+        print(os.environ.get("FAKE_PODMAN_INFO", "{}")); sys.exit(0)
+    if args == ["--version"]:
+        print("podman version 0.0-fake"); sys.exit(0)
+    if args[:1] == ["unshare"]:
+        os.execvp(args[1], args[1:])
+    if args[:1] == ["rm"]:
+        sys.exit(0)
+    with open(os.environ["FAKE_RUNTIME_LOG"], "a") as f:
+        f.write(json.dumps(args) + "\\n")
+    rest = args[1:]
+    valued = {"-v", "--env", "--label", "--name", "--hostname", "--workdir", "--cpus", "--memory", "--memory-swap",
+              "--tmpfs", "--group-add", "--device", "--sysctl"}
+    env, cwd, i = dict(os.environ), None, 0
+    while rest[i].startswith("-"):
+        if rest[i] in valued:
+            if rest[i] == "--workdir":
+                cwd = rest[i + 1]
+            elif rest[i] == "--env":
+                k, _, v = rest[i + 1].partition("=")
+                env[k] = v
+            i += 2
+        else:
+            i += 1
+    sys.exit(subprocess.run(rest[i + 1:], cwd=cwd, env=env).returncode)
+""")
+
+PODMAN_V2 = {"host": {"cgroupVersion": "v2", "cgroupControllers": ["cpu", "memory", "pids"],
+                      "ociRuntime": {"name": "crun"}, "security": {"rootless": True}}}
+
+
+class TestPodmanSandbox(SandboxServerTestCase):
+
+    def use_podman(self, config, info=PODMAN_V2, singularity=False):
+        bin_dir = self.tmp / "podman-bin"
+        bin_dir.mkdir(exist_ok=True)
+        fake = bin_dir / "podman"
+        fake.write_text(FAKE_PODMAN)
+        fake.chmod(0o755)
+        self.runtime_log = self.tmp / "runtime.log"
+        for key, value in (("FAKE_RUNTIME_LOG", str(self.runtime_log)), ("FAKE_PODMAN_INFO", json.dumps(info))):
+            os.environ[key] = value
+            self.addCleanup(os.environ.pop, key, None)
+        which = lambda name: str(fake) if name == "podman" else ("/usr/bin/singularity" if singularity else None)  # noqa: E731
+        sandbox = rest_sandbox.Sandbox(config, data_dir=str(self.data / "rest"), which=which)
+        self.jobs.sandbox = sandbox
+        return sandbox
+
+    def args(self):
+        return json.loads(self.runtime_log.read_text().splitlines()[-1])
+
+    def test_config(self):
+        self.assertEqual(rest_sandbox.Sandbox({"method": "podman", "image": "docker.io/library/ubuntu:24.04"}).image,
+                         "docker.io/library/ubuntu:24.04")
+        for bad in ({"method": "auto", "image": "ubuntu:24.04"}, {"method": "singularity", "image": "ubuntu"},
+                    {"method": "podman", "network": "host"}, {"method": "podman", "image": "Bad Name"}):
+            with self.assertRaises(ValueError, msg=bad):
+                rest_sandbox.Sandbox(bad)
+        # auto takes Singularity/Apptainer where there is one, else podman
+        self.assertEqual(self.use_podman({"method": "auto"}).resolve()[0], "podman")
+        self.assertEqual(self.use_podman({"method": "auto"}, singularity=True).resolve()[0], "singularity")
+        self.assertEqual(self.use_podman({"method": "podman"}, singularity=True).resolve()[0], "podman")
+
+    def test_job_runs_in_podman(self):
+        self.use_podman({"method": "podman", "binds": ["/opt"]})
+        out = self.llm.submit_job("hello", params={"message": "hi there"}, workdir=str(self.llm_root))
+        self.assertEqual((out["sandbox"]["method"], out["sandbox"]["network"]), ("podman", "none"))
+        res = self.run_job_script(out["job_id"], self.llm_root)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("hi there", res.stdout)
+        args = self.args()
+        self.assertEqual(args[:2], ["run", "--rm"])
+        for flag in ("--pull=never", "--userns=keep-id", "--cap-drop=all", "--security-opt=no-new-privileges",
+                     "--read-only", "--network=none", "--env-host"):
+            self.assertIn(flag, args)
+        self.assertEqual(args[args.index("--group-add") + 1], "keep-groups")        # crun keeps your groups
+        volumes = [args[i + 1] for i, a in enumerate(args) if a == "-v"]
+        self.assertIn(f"{self.llm_root}:{self.llm_root}", volumes)
+        self.assertIn("/usr:/usr:ro", volumes)
+        self.assertTrue(any(v.endswith(":/etc/passwd:ro") for v in volumes))     # your account
+        self.assertTrue(any(v.endswith(":/tmp") for v in volumes))               # the job's own scratch
+        self.assertEqual(args[args.index("--rootfs") + 1], str(self.data / "rest" / "sandbox" / "host"))
+        self.assertEqual(args[args.index("--workdir") + 1], str(self.llm_root))
+        self.assertNotIn("--memory", args)                                        # SLURM sets limits, not podman
+        self.assertEqual(list(self.tmp.glob("hpc-sandbox.*")), [])                # scratch removed
+
+    def test_local_scheduler_limits_reach_podman(self):
+        self.use_podman({"method": "podman"})
+        out = self.llm.submit_job("hello", params={"message": "x"}, workdir=str(self.llm_root))
+        script = fake_job(self.slurm, out["job_id"])["script"]
+        env = dict(os.environ, TMPDIR=str(self.tmp), HPC_JOB_CPUS="2", HPC_JOB_MEMORY="512m", HPC_JOB_TAG="7-0")
+        res = subprocess.run(["bash", "-c", script], cwd=self.llm_root, capture_output=True, text=True, env=env,
+                             timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        args = self.args()
+        self.assertEqual(args[args.index("--cpus") + 1], "2")
+        self.assertEqual((args[args.index("--memory") + 1], args[args.index("--memory-swap") + 1]), ("512m", "512m"))
+        self.assertEqual(args[args.index("--name") + 1], "hpclib-job-7-0")
+        # without subordinate ids only your own group exists in the container; crun's ping sysctl must name it
+        self.assertEqual(args[args.index("--sysctl") + 1], f"net.ipv4.ping_group_range={os.getgid()} {os.getgid()}")
+
+    def test_only_delegated_limits_are_asked_for(self):
+        # RHEL 9: memory and pids are delegated, cpu isn't; podman would refuse to start a container with --cpus
+        rhel = {"host": {"cgroupVersion": "v2", "cgroupControllers": ["memory", "pids"], "ociRuntime": {"name": "crun"}}}
+        sandbox = self.use_podman({"method": "podman"}, info=rhel)
+        limits = sandbox.limits()
+        self.assertEqual((limits["enforced"], limits["cpu"], limits["memory"]), (False, False, True))
+        out = self.llm.submit_job("hello", params={"message": "x"}, workdir=str(self.llm_root))
+        script = fake_job(self.slurm, out["job_id"])["script"]
+        env = dict(os.environ, TMPDIR=str(self.tmp), HPC_JOB_CPUS="2", HPC_JOB_MEMORY="512m")
+        res = subprocess.run(["bash", "-c", script], cwd=self.llm_root, capture_output=True, text=True, env=env,
+                             timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        args = self.args()
+        self.assertNotIn("--cpus", args)
+        self.assertEqual(args[args.index("--memory") + 1], "512m")
+
+    def test_syncs_get_the_network(self):
+        sandbox = self.use_podman({"method": "podman"})
+        lines, plan = sandbox.launch("#!/bin/bash", "true", [str(self.llm_root)], network=True)
+        self.assertEqual(plan["network"], "default")
+        self.assertNotIn("--network=none", "\n".join(lines))
+        lines, plan = sandbox.launch("#!/bin/bash", "true", [str(self.llm_root)])
+        self.assertIn("--network=none", "\n".join(lines))
+
+    def test_limits(self):
+        self.assertTrue(self.use_podman({"method": "podman"}).limits()["enforced"])
+        v1 = {"host": {"cgroupVersion": "v1", "cgroupControllers": [], "ociRuntime": {"name": "runc"}}}
+        limits = self.use_podman({"method": "podman"}, info=v1).limits()
+        self.assertEqual((limits["enforced"], "v1" in limits["reason"]), (False, True))
+        partial = {"host": {"cgroupVersion": "v2", "cgroupControllers": ["cpu", "pids"], "ociRuntime": {"name": "crun"}}}
+        limits = self.use_podman({"method": "podman"}, info=partial).limits()
+        self.assertEqual((limits["enforced"], "memory" in limits["reason"]), (False, True))
+        self.assertFalse(rest_sandbox.Sandbox({"method": "none"}).limits()["enforced"])
+        described = self.use_podman({"method": "podman"}, info=v1).describe()
+        self.assertEqual((described["effective"], described["supplementary_groups"]), ("podman", False))
+
+    def test_podman_counts_as_sandboxed(self):
+        self.use_podman({"method": "podman"})
+        self.jobs.auto_approve = "all"
+        self.assertEqual(self.jobs.proposal_policy()["review"], "automatic")
+
+
+class TestRealPodman(unittest.TestCase):
+    """Real rootless containers; skipped as root (rootless podman is the point) or without podman."""
+
+    def setUp(self):
+        podman = shutil.which("podman")
+        if podman is None or os.geteuid() == 0:
+            self.skipTest("needs podman, run as an ordinary user")
+        if subprocess.run([podman, "info"], capture_output=True, timeout=60).returncode != 0:
+            self.skipTest("podman info fails here")
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_self_test_passes(self):
+        sandbox = rest_sandbox.Sandbox({"method": "podman"}, data_dir=str(self.tmp / "data"))
+        result = rest_sandbox.self_test(sandbox, str(self.tmp))
+        self.assertTrue(result["passed"], result)
+        self.assertTrue(result["checks"]["network_isolated"], result)

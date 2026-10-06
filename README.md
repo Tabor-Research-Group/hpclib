@@ -133,7 +133,7 @@ instead: `agent_console --static agent-console --open` serves the minimal front 
 | `GET /api/health` | the console is up |
 | `GET /api/clusters`, `GET /api/clusters/NAME` | profiles and tunnel state (`down`, `starting`, `up`, `error`); never token values |
 | `GET /api/clusters/NAME/mcp` | the MCP client entry |
-| `GET`/`PUT /api/clusters/NAME/settings` | this machine's tunnel settings for the cluster: `auto_approve_templates` (`all`, `new`, `review`) and `tunnel_args` (sbatch options for the tunnel job, e.g. `--time=12:00:00`), and `connection_hours` (how long the ssh login is kept, default 12); `agent_tunnel` reads them, and its own options win |
+| `GET`/`PUT /api/clusters/NAME/settings` | this machine's tunnel settings for the cluster: `auto_approve_templates` (`all`, `new`, `review`) and `tunnel_args` (sbatch options for the tunnel job, e.g. `--time=12:00:00`), `connection_hours` (how long the ssh login is kept, default 12), and `rest_on` (`job`, the default: the REST server runs in a SLURM job; `login`: on the login node, for sites that ask for that; template jobs still go to SLURM, and `tunnel_args` don't apply); `agent_tunnel` reads them, and its own options win |
 | `POST /api/clusters/NAME/tunnel/start` (`{"auto_approve_templates": "all"\|"new"\|"review"}`, default `all`), `.../tunnel/stop`, `GET .../tunnel/log` | `agent_tunnel` and `agent_stop`, logged to `~/.config/hpclib/console/logs/` |
 | `ANY /api/clusters/NAME/rest/ROUTE` | the cluster's REST route, with the owner token (`?as=agent`: the agent token); downloads (`files/content`) are streamed through |
 | `GET /api/jobs`, `GET /api/proposals` | jobs and pending proposals from every live cluster, with each cluster's `ok`/`error` |
@@ -407,6 +407,22 @@ on your machine as MCP tools.
   container runtime and its site-wide bind paths, the module trees to add to `binds`, and the result of
   running a test container, with a recommended `sandbox` section. Without a `sandbox` section jobs run
   unsandboxed, as before, and the server warns about it at startup.
+- **Machines without SLURM** (development servers with podman instead of Apptainer, and no `/scratch`):
+  `setup_agents` notices that there is no `sbatch` and sets the cluster's `rest_on` to `login`, so the REST
+  server runs on the machine itself, and writes `"scheduler": {"type": "local"}` into its config, so
+  template jobs run there too. The local scheduler (`rest_local.py`) takes the place of `sbatch`, `squeue`
+  and `scancel`: jobs wait their turn first in, first out within a CPU and memory budget (`cpus`, `memory`;
+  by default the whole machine and 80% of its memory), are held to their `--time` (`default_time` 24 h,
+  `max_time` 7 days), and keep running if the server stops. Tokens, templates, limits, proposals and the
+  audit log work as on a cluster. With `"method": "podman"` (or `auto` where there's no Apptainer) the
+  sandbox runs the same host image under rootless podman, as you, with no Linux capabilities,
+  no-new-privileges, seccomp and no network (`"network": "default"` gives it back; environment syncs always
+  have it). CPU and memory limits are only enforced where cgroups v2 delegates the cpu and memory
+  controllers to you (`GET /sandbox` says whether they are); elsewhere jobs are refused, unless the
+  scheduler's `"enforce_limits"` is `false` (run them unlimited) or `"memory"` (only memory must be held,
+  for machines such as RHEL 9 that delegate memory but not cpu). Ask the machine's admin for subordinate ids (`/etc/subuid`), and
+  for `loginctl enable-linger` so running jobs outlive your logins. Multi-node jobs and `--gres` GPUs are
+  refused; for GPUs, give the sandbox `"flags": ["--device", "nvidia.com/gpu=all"]`.
 - **Scoped tokens** are minted on the cluster and stored there only as hashes. Copy the printed token to your
   machine:
 
@@ -573,9 +589,9 @@ data-transfer-tools image. It isn't a port-forwarding tunnel; `tunnels/data-tran
 SLURM job and the image's `install.sh`.
 
 ```bash
-tunnel_setup user@grace.hprc.tamu.edu data-transfer --set SMB_HOST=10.55.179.23 \
-  --set SMB_ROOT=CLAT_research/chem/our_lab --set SMB_DOMAIN=TAMU \
-  --set SMB_REALM=AUTH.TAMU.EDU --save --install   # once; the image comes from
+tunnel_setup user@grace.hprc.tamu.edu data-transfer --set SMB_HOST=files.example.edu \
+  --set SMB_ROOT=research/our_group --set SMB_DOMAIN=EXAMPLE \
+  --set SMB_REALM=AUTH.EXAMPLE.EDU --save --install   # once; the image comes from
                                                    # docker://ghcr.io/tabor-research-group/data-transfer-tools:latest
 smbshell login                                            # on the cluster: kinit, a ticket jobs can use too
 smbshell ls                                               # SMB_ROOT (or, without one, the server's shares)
@@ -587,7 +603,17 @@ smbshell sync pull proj/raw /scratch/user/me/raw --dry-run  # sync deletes what 
 smbshell submit --time=2:00:00 get proj/raw /scratch/user/me/raw   # the same, as a SLURM job
 smbshell submit --manifest transfers.json                 # [["get", "proj/a", "/scratch/.../a"], ...]: an array job
 smbshell --on user@grace.hprc.tamu.edu ls proj            # from your own machine, over ssh
+smbshell gui --port 27555                                 # rclone's web GUI on the login node (see below)
 ```
+
+**Rclone** (a console app, like JupyterLab): rclone's own web GUI (`rclone rcd --rc-web-gui`) on the cluster's
+login node, started by `smbshell gui` over the console's ssh login, which forwards its port; Open goes straight
+in. Its remotes are `smb` (the server) and `cluster` (the node's files: home, `/scratch`), for browsing and
+copying between them, plus any in `~/.local/tunnels/settings/data-transfer.d/rclone.conf` on the cluster (a
+settings package puts them there, e.g. an alias for your group's folder; see Console packages below). Start asks for the SMB password (unless there is a Kerberos ticket or a saved
+one), which rclone keeps only in a private in-memory file until Stop; nothing is saved. rclone runs without
+retries, so a refused password is one refused logon. It uses Data transfer's image and settings; rclone fetches
+the GUI itself from GitHub the first time (into `~/.cache/rclone`).
 
 Signing in (`SMB_AUTH=auto`): a Kerberos ticket from `smbshell login` (kinit on the login node, or in the image
 if the node has none; kept in `~/.config/hpclib/smb/krb5cc`, so jobs use it while it lasts), else a password
@@ -596,6 +622,36 @@ encoding), else `smbshell` asks. Jobs never ask: they need the ticket or the sav
 rclone with SMB Kerberos support (`smbshell status` says). The console's **Data transfer** page does the
 signing in: Kerberos log in (kinit) where the cluster has kinit, otherwise Save password for sync jobs, both
 through its password dialog, plus Install/Check for the image and the settings above.
+
+**Console packages**: apps and settings that don't belong in hpclib (one group's server, a project's test
+instance) come as zip files, installed with the console's **Add App or Settings** button, which shows what a
+package adds before installing it, and lists and removes the installed ones. A package is a folder with
+`hpclib-package.json` at its top, zipped:
+
+```json
+{"format": 1, "name": "our-lab-smb", "version": "0.1.0", "description": "Our SMB share and its rclone remote",
+ "apps": {"myapp": {"title": "My app", "tunnel": "my-tunnel", "description": "shown on its page",
+                    "open_path": "/", "health_path": "/",
+                    "settings": [{"name": "MY_DIR", "label": "Directory", "hint": "where it keeps things"}]}},
+ "tunnels": {"my-tunnel": "tunnels/my-tunnel"},
+ "settings": {"data-transfer": {"values": {"SMB_HOST": "files.example.edu", "SMB_DOMAIN": "EXAMPLE"},
+                                "files": {"rclone.conf": "settings/rclone.conf"}}}}
+```
+
+`apps` are console apps (like JupyterLab), each on a tunnel: one in the package (`tunnels`: a directory with
+`sbatch_script.sh`, `tunnel_config.sh` and optionally `install.sh`, as in `hpclib/tunnels/`; with
+`RUN_ON_LOGIN_NODE=true` it runs on the login node rather than in a job) or one of hpclib's. `settings` give a
+tunnel's apps default values (yours, per cluster, win; the settings form shows the package's value in an empty
+field) and files. An app may also declare `secrets` (`[{"name": "MY_TOKEN", "label": ..., "hint": ...}]`, listed in
+its tunnel's `TUNNEL_SECRETS`): its settings panel then has password fields whose values go to the cluster over
+the console's ssh login on standard input (`setup_tunnel.sh --secrets`, never on a command line or in a log), into
+`~/.local/tunnels/secrets/TUNNEL/NAME` (mode 600, out of the agents' reach), where the tunnel's scripts read
+them; the console keeps only whether each is set. The console keeps packages in `~/.config/hpclib/console/packages/`; a packaged tunnel and the
+settings files go to a cluster with the app's next Check, Install or Start (`tunnel_setup --push`, received by
+`setup_tunnel.sh --receive` into `$HPCLIB_TUNNEL_INSTALL_LOCATION` and `~/.local/tunnels/settings/TUNNEL.d/`). A
+package can't replace hpclib's own apps or tunnels, or what another package sets; its scripts run on your clusters
+as you, so install only packages you trust. Build and check one with
+`python3 hpclib/servers/console_packages.py build DIR` (it writes `NAME-VERSION.zip` next to `DIR`).
 
 **PAI**: the proto-auto-interface database, run with `singularity-compose` from
 `PAI_ROOT_DIR/proto-auto-interface` (default `/scratch/user/<username>/pai`; `install.sh` clones `PAI_REPO` there).

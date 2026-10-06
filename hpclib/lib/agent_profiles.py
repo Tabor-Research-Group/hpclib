@@ -35,7 +35,10 @@ LIST_KEYS = ("login", "work_dirs", "binds", "local_roots", "tunnel_args")
 #   auto_approve_templates  all (default) | new | review
 #   tunnel_args             sbatch options for the tunnel's own job, e.g. --time=12:00:00
 #   connection_hours        how long an ssh login is kept for reuse once idle (default 12)
+#   rest_on                 where the REST server runs: job (default; a SLURM job on a compute node) or login (on
+#                           the login node, for sites that would rather it didn't hold a share of a compute node)
 APPROVE_MODES = ("all", "new", "review")
+REST_ON = ("job", "login")
 TUNNEL_ARG_RE = re.compile(r"--(time|mem|partition|account|qos|cpus-per-task|constraint)=[A-Za-z0-9:._,+-]{1,64}")
 
 
@@ -209,6 +212,9 @@ def cmd_set(name, *pairs):
         if key == "tunnel_args" and value and not TUNNEL_ARG_RE.fullmatch(value):
             print(f"agent_profiles: tunnel_args takes sbatch options like --time=12:00:00, not {value!r}",
                   file=sys.stderr)
+            return 2
+        if key == "rest_on" and value not in REST_ON:
+            print(f"agent_profiles: rest_on is one of {', '.join(REST_ON)}", file=sys.stderr)
             return 2
         if key == "auto_approve_templates" and value not in APPROVE_MODES:
             print(f"agent_profiles: auto_approve_templates is one of {', '.join(APPROVE_MODES)}", file=sys.stderr)

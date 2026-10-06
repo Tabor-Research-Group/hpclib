@@ -321,7 +321,8 @@ class EnvironmentManager:
         launch = None
         if self.sandbox is not None:
             try:
-                launch, _ = self.sandbox.launch("#!/bin/bash", body, writable, extra_ro=[tool["path"]])
+                # a sync downloads packages, so it gets the network even where jobs don't
+                launch, _ = self.sandbox.launch("#!/bin/bash", body, writable, extra_ro=[tool["path"]], network=True)
             except rest_sandbox.SandboxError as e:
                 raise EnvironmentError_(503, f"can't sandbox the sync: {e}")
         script = "\n".join(lines) + "\n\n" + ("\n".join(launch) + "\n" if launch else body)

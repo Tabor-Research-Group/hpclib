@@ -17,9 +17,12 @@
 #   smbshell save-credentials | forget-credentials  a saved password, for jobs where there is no Kerberos
 #   smbshell status [--json]                        the image, and how it would sign in
 #   smbshell shell                                  a shell in the image, with the server as rclone's "smb:"
+#   smbshell gui --port PORT                        rclone's web GUI (rclone rcd --rc-web-gui) on 127.0.0.1:PORT
+#                                                   of this node, signed in for this session only (the console's
+#                                                   Rclone page forwards it to your browser)
 #   smbshell rclone ARGS...                         rclone itself, likewise
 #
-# REMOTE is a path under SMB_ROOT (e.g. CLAT_research/chem/our_lab) when that is set, else SHARE/PATH on
+# REMOTE is a path under SMB_ROOT (e.g. research/our_group) when that is set, else SHARE/PATH on
 # SMB_HOST; /SHARE/PATH and //HOST/SHARE/PATH are absolute. Signing in (SMB_AUTH=auto): a Kerberos ticket from
 # `smbshell login`, else the saved password, else it asks (never in a job). Settings: settings.sh here.
 
@@ -122,7 +125,7 @@ sign_in() {  # the rclone remote "smb:", signed in the way SMB_AUTH says
   if [ -n "${SMB_DOMAIN:-}" ]; then
     export RCLONE_CONFIG_SMB_DOMAIN="$SMB_DOMAIN"
   elif [[ "$SMB_USER" == *@* ]]; then
-    # user@domain, as smbclient --user=me@tamu.edu takes it: rclone wants them apart (else its domain is WORKGROUP)
+    # user@domain, as smbclient --user=me@example.edu takes it: rclone wants them apart (else its domain is WORKGROUP)
     export RCLONE_CONFIG_SMB_USER="${SMB_USER%@*}" RCLONE_CONFIG_SMB_DOMAIN="${SMB_USER#*@}"
   fi
   # rclone needs no config file: the remote is all in the environment
@@ -318,7 +321,7 @@ case "$cmd" in
   login)
     [ -n "$(kinit_where)" ] || die "no kinit here or in the image; use smbshell save-credentials (or a password each time)"
     # the Kerberos name is the user in the realm (SMB_REALM, else krb5.conf's default): not SMB_USER's @domain,
-    # which is the Windows domain (tamu.edu), not the realm (AUTH.TAMU.EDU)
+    # which is the Windows domain (example.edu), not the realm (AUTH.EXAMPLE.EDU)
     krb kinit "${SMB_USER%@*}${SMB_REALM:+@$SMB_REALM}" "$@" || die "kinit failed"
     echo "signed in: $(krb klist 2>/dev/null | sed -n 's/^Default principal: *//p')"
     krb klist 2>/dev/null | grep -i -m 1 krbtgt ;;
@@ -391,5 +394,59 @@ PY
     echo "smbshell: the server is rclone's remote smb: here (rclone lsd smb:SHARE, rclone copy smb:SHARE/x .)" >&2
     exec "$runtime" shell "${binds[@]}" "$SMB_IMAGE" ;;
   rclone) sign_in; img rclone "$@" ;;
+  gui)
+    # rclone's web GUI on this (login) node, for as long as this runs. Its remotes are in a config file in a
+    # private directory in memory (/dev/shm or XDG_RUNTIME_DIR), removed when it stops: smb (the server),
+    # cluster (this node's files), and any in $HPCTUNNELS_DATA_DIR/settings/data-transfer.d/rclone.conf (which
+    # a settings package installs, e.g. an alias for a group's folder: [ours] type = alias remote = smb:SHARE/DIR).
+    # Its own login is a random user and password, printed once for the console to open it with.
+    port=''
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --port) port="$2"; shift 2 ;;
+        --port=*) port="${1#--port=}"; shift ;;
+        *) die "usage: smbshell gui --port PORT" ;;
+      esac
+    done
+    case "$port" in ''|*[!0-9]*) die "usage: smbshell gui --port PORT" ;; esac
+    sign_in
+    need_image
+    run_dir=$(mktemp -d "${XDG_RUNTIME_DIR:-/dev/shm}/hpclib-rclone-gui.XXXXXX" 2>/dev/null ||
+              mktemp -d "${TMPDIR:-/tmp}/hpclib-rclone-gui.XXXXXX") || die "no private directory for the session"
+    chmod 700 "$run_dir"
+    trap 'rm -rf "$run_dir"' EXIT
+    trap 'exit 129' HUP INT TERM
+    conf="$run_dir/rclone.conf"
+    extra_remotes="${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/settings/data-transfer.d/rclone.conf"
+    extra_names=$( [ -f "$extra_remotes" ] && sed -n 's/^\[\(.*\)\][[:space:]]*$/\1/p' "$extra_remotes" | tr '\n' ' ')
+    case " $extra_names " in
+      *" smb "*|*" cluster "*) die "$extra_remotes may not define smb or cluster, which smbshell makes" ;;
+    esac
+    (
+      umask 077
+      printf '[smb]\ntype = smb\nhost = %s\nuser = %s\n' "$SMB_HOST" "$RCLONE_CONFIG_SMB_USER"
+      [ -n "${RCLONE_CONFIG_SMB_DOMAIN:-}" ] && printf 'domain = %s\n' "$RCLONE_CONFIG_SMB_DOMAIN"
+      [ -n "${RCLONE_CONFIG_SMB_PASS:-}" ] && printf 'pass = %s\n' "$RCLONE_CONFIG_SMB_PASS"
+      [ -n "${RCLONE_CONFIG_SMB_USE_KERBEROS:-}" ] && printf 'use_kerberos = true\n'
+      [ -n "${RCLONE_CONFIG_SMB_SPN:-}" ] && printf 'spn = %s\n' "$RCLONE_CONFIG_SMB_SPN"
+      printf '\n[cluster]\ntype = local\n'
+      if [ -f "$extra_remotes" ]; then
+        printf '\n'
+        cat "$extra_remotes"
+      fi
+    ) > "$conf"
+    unset RCLONE_CONFIG_SMB_TYPE RCLONE_CONFIG_SMB_HOST RCLONE_CONFIG_SMB_USER RCLONE_CONFIG_SMB_DOMAIN \
+          RCLONE_CONFIG_SMB_PASS RCLONE_CONFIG_SMB_USE_KERBEROS RCLONE_CONFIG_SMB_SPN RCLONE_CONFIG
+    gui_user="hpclib"
+    gui_pass=$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    # the cluster's own folders, visible in the image
+    for d in /scratch "/scratch/user/$(id -un)" "${SCRATCH:-}"; do
+      [ -n "$d" ] && [ -d "$d" ] && binds+=(--bind "$d")
+    done
+    binds+=(--bind "$run_dir")
+    echo "HPCLIB_RCLONE_GUI port=$port user=$gui_user pass=$gui_pass"
+    echo "smbshell: rclone's web GUI on 127.0.0.1:$port of $(hostname -s); remotes: smb, cluster${extra_names:+, ${extra_names% }}" >&2
+    img rclone rcd --config "$conf" --rc-web-gui --rc-web-gui-no-open-browser --rc-addr "127.0.0.1:$port" \
+      --rc-user "$gui_user" --rc-pass "$gui_pass" --retries 1 --low-level-retries 1 ;;
   *) die "unknown command $cmd (smbshell --help)" ;;
 esac

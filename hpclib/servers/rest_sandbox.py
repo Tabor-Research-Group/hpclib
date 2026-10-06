@@ -37,11 +37,29 @@ are bound read-only over the host's in the container. They hold nothing
 the job couldn't already learn as you, and add no host directory or
 socket to the sandbox.
 
+Podman (method "podman", or "auto" where there is no Singularity or
+Apptainer): for machines that aren't clusters, rootless podman runs the
+same host image (`--rootfs`) with the same read-only and read-write binds,
+as you (`--userns=keep-id`), and adds what Apptainer doesn't: no Linux
+capabilities, no-new-privileges, the runtime's seccomp filter, and no
+network (`network`: "none", the default; environment syncs, which
+download, always get the network). Images are never pulled by a job
+(`--pull=never`); give `image` as a podman image name to run in one you
+pulled. CPU and memory limits (HPC_JOB_CPUS, HPC_JOB_MEMORY, which the
+local scheduler sets) only hold where cgroups v2 delegates the cpu and
+memory controllers to you; `limits()` says whether they do, since podman
+itself only warns and runs the job unlimited. SELinux labels are turned
+off for the container (relabelling the host's /usr to bind it would be
+worse). Supplementary groups are kept with the crun runtime; with runc a
+job has only your primary group.
+
 Config, the `sandbox` key of the server's config.json:
 
-  {"method": "auto",          # auto | singularity | none
-   "runtime": null,           # "apptainer", "singularity", or a path; default: whichever is found
+  {"method": "auto",          # auto | singularity | podman | none
+   "runtime": null,           # "apptainer", "singularity", "podman", or a path; default: whichever is found
    "image": null,             # default: the host image, built in the server's data directory
+                              #   (podman: also an image name, e.g. "docker.io/library/ubuntu:24.04")
+   "network": "none",         # podman: "none" (jobs have no network) or "default"
    "binds": ["/sw"],          # extra read-only binds (software trees, reference data, ...)
    "writable": [],            # extra read-write binds, besides the token's directories
    "scratch": "job",          # /tmp in the container: "job" (a per-job directory under
@@ -60,6 +78,7 @@ program installed somewhere not bound fails with "not found". GET
 
 Standard library only.
 """
+import getpass
 import json
 import os
 import platform
@@ -112,9 +131,17 @@ def child_env(env=None):
             del env[key]
     return env
 
-METHODS = ("auto", "singularity", "none")
+METHODS = ("auto", "singularity", "podman", "none")
 RUNTIMES = ("apptainer", "singularity")
-CONFIG_KEYS = {"method", "runtime", "image", "binds", "writable", "scratch", "flags", "allow_unsandboxed"}
+PODMAN = "podman"
+# the methods that sandbox a job (an effective method of either means jobs are sandboxed)
+SANDBOXED = ("singularity", "podman")
+NETWORKS = ("none", "default")
+CONFIG_KEYS = {"method", "runtime", "image", "binds", "writable", "scratch", "flags", "allow_unsandboxed", "network"}
+# podman's --init program (catatonit), where distributions put it
+PODMAN_INITS = ("/usr/libexec/podman/catatonit", "/usr/bin/catatonit", "/usr/libexec/catatonit/catatonit")
+# a podman image reference: [registry/]name[:tag][@digest]
+PODMAN_IMAGE_RE = re.compile(r"[a-z0-9][a-z0-9._/:-]{0,254}(@sha256:[0-9a-f]{64})?")
 # host directories every host image binds read-only
 HOST_IMAGE_BINDS = ("/usr", "/etc", "/opt")
 # top-level directories that are symlinks into /usr on most current distributions
@@ -206,7 +233,15 @@ class Sandbox:
         image = config.get("image")
         if image is not None and not isinstance(image, str):
             raise ValueError("sandbox `image` must be a path")
-        self.image = _absolute(image, "image") if image else None
+        if image and not image.startswith(("/", "~")):
+            if self.method != "podman" or not PODMAN_IMAGE_RE.fullmatch(image):
+                raise ValueError("sandbox `image` must be an absolute path (or, with method podman, an image name)")
+            self.image = image
+        else:
+            self.image = _absolute(image, "image") if image else None
+        self.network = config.get("network", "none")
+        if self.network not in NETWORKS:
+            raise ValueError(f"sandbox `network` must be one of {', '.join(NETWORKS)}")
         self.binds = [_absolute(b, "binds") for b in _string_list(config, "binds")]
         self.writable = [_absolute(w, "writable") for w in _string_list(config, "writable")]
         self.flags = _string_list(config, "flags")
@@ -220,18 +255,37 @@ class Sandbox:
         self.data_dir = data_dir
         self.which = which
         self._help_cache = {}
+        self._podman_cache = {}
         self._lock = threading.Lock()
 
     # -- what will actually run -------------------------------------------
 
-    def find_runtime(self):
-        """The runtime's absolute path, or None."""
-        names = [self.runtime] if self.runtime else RUNTIMES
+    def _find(self, names):
         for name in names:
             path = name if os.path.isabs(os.path.expanduser(name)) else self.which(name)
             if path and os.access(os.path.expanduser(path), os.X_OK):
                 return os.path.expanduser(path)
         return None
+
+    def find_runtime(self):
+        """The Singularity/Apptainer runtime's absolute path, or None."""
+        return self._find([self.runtime] if self.runtime and not self._is_podman(self.runtime) else RUNTIMES)
+
+    @staticmethod
+    def _is_podman(name):
+        return PODMAN in os.path.basename(name or "")
+
+    def _locate(self):
+        """(kind, path) of the runtime the method calls for; path is None if it isn't found."""
+        if self.method == "podman" or (self.method == "auto" and self._is_podman(self.runtime)):
+            return "podman", self._find([self.runtime] if self.runtime else [PODMAN])
+        if self.method == "singularity" or self.runtime:
+            return "singularity", self.find_runtime()
+        found = self.find_runtime()
+        if found:
+            return "singularity", found
+        podman = self._find([PODMAN])
+        return ("podman", podman) if podman else ("singularity", None)
 
     @property
     def host_image(self):
@@ -245,17 +299,20 @@ class Sandbox:
         if self.method == "none":
             return "none", ("no `sandbox` in the server config" if not self.configured
                             else "the config sets sandbox method none")
-        runtime = self.find_runtime()
+        kind, runtime = self._locate()
         if runtime is None:
-            wanted = self.runtime or " or ".join(RUNTIMES)
+            wanted = self.runtime or (PODMAN if kind == "podman" or self.method == "podman"
+                                      else " or ".join(RUNTIMES) + (", or podman" if self.method == "auto" else ""))
             reason = (f"{wanted} was not found on the server's PATH; set sandbox `runtime` to its full path "
                       f"(GET /sandbox shows what the node has)")
             if self.method == "auto" and self.allow_unsandboxed:
                 return "none", reason
             raise SandboxError(f"jobs must run sandboxed but {reason}")
-        if self.image and not os.path.exists(self.image):
+        if self.image and self.image.startswith("/") and not os.path.exists(self.image):
             raise SandboxError(f"sandbox image {self.image} does not exist")
-        return "singularity", runtime
+        if self.image and not self.image.startswith("/") and kind != "podman":
+            raise SandboxError(f"sandbox image {self.image} is a podman image name, and the runtime is {runtime}")
+        return kind, runtime
 
     def supports(self, runtime, flag):
         """Whether `runtime exec --help` lists `flag` (cached)."""
@@ -289,8 +346,10 @@ class Sandbox:
             if d in rw:
                 continue
             (rw if os.path.exists(d) else missing).append(d)
-        plan = {"method": "singularity", "runtime": detail, "image": self.image or self.host_image,
+        plan = {"method": method, "runtime": detail, "image": self.image or self.host_image,
                 "host_image": self.image is None, "read_only": ro, "read_write": rw}
+        if method == "podman":
+            plan["network"] = self.network
         if missing:
             plan["missing"] = missing   # not on this node; left out
         return plan
@@ -298,7 +357,7 @@ class Sandbox:
     # -- the job script -----------------------------------------------------
 
     @staticmethod
-    def account_lines():
+    def account_lines(flag="--bind"):
         """
         Bash for the job script, on the host: passwd, group and nsswitch.conf files that know your account,
         for the container's /etc (the host image binds the host's /etc, whose passwd usually doesn't: the
@@ -323,14 +382,14 @@ class Sandbox:
             '  done',
             '} > "$hpc_sandbox_etc/group"',
             'chmod 644 "$hpc_sandbox_etc/passwd" "$hpc_sandbox_etc/group"',
-            'hpc_sandbox_account=(--bind "$hpc_sandbox_etc/passwd:/etc/passwd:ro" '
-            '--bind "$hpc_sandbox_etc/group:/etc/group:ro")',
+            f'hpc_sandbox_account=({flag} "$hpc_sandbox_etc/passwd:/etc/passwd:ro" '
+            f'{flag} "$hpc_sandbox_etc/group:/etc/group:ro")',
             'if [ -f /etc/nsswitch.conf ]; then',
             '  # look users and groups up in those files only: the directory service is out of reach in there',
             "  sed -E 's/^[[:space:]]*(passwd|group|shadow|gshadow|initgroups)[[:space:]]*:.*/\\1: files/' "
             '/etc/nsswitch.conf > "$hpc_sandbox_etc/nsswitch.conf"',
             '  chmod 644 "$hpc_sandbox_etc/nsswitch.conf"',
-            '  hpc_sandbox_account+=(--bind "$hpc_sandbox_etc/nsswitch.conf:/etc/nsswitch.conf:ro")',
+            f'  hpc_sandbox_account+=({flag} "$hpc_sandbox_etc/nsswitch.conf:/etc/nsswitch.conf:ro")',
             'fi',
         ]
 
@@ -343,13 +402,15 @@ class Sandbox:
             raise SandboxError(f"a sandboxed template body must be a shell or Python script, not {shebang!r}")
         return words
 
-    def launch(self, shebang, body, writable, prelude=None, extra_ro=()):
+    def launch(self, shebang, body, writable, prelude=None, extra_ro=(), network=False):
         """
         Lines for the end of the job script: start `body` in the
         sandbox and exit with its status. Returns (lines, plan).
         `prelude` (bash lines) runs inside the sandbox first, in the
         same shell that then execs the body: e.g. activating a Python
         environment, whose activation scripts must not run outside.
+        `network`: give it the network whatever the config says (podman;
+        Apptainer always shares the host's), for environment syncs.
         """
         plan = self.plan(writable, extra_ro)
         if plan["method"] == "none":
@@ -357,6 +418,10 @@ class Sandbox:
         runtime, image = plan["runtime"], plan["image"]
         if plan["host_image"]:
             build_host_image(image, plan["read_only"] + plan["read_write"])
+        if plan["method"] == "podman":
+            if network:
+                plan["network"] = "default"
+            return self._podman_launch(plan, shebang, body, prelude), plan
         # --no-home: no writable stand-in for $HOME (allowed directories under it are still bound)
         args = [runtime, "-q", "exec", "--contain", "--no-home", "--pid", "--ipc"]
         if self.supports(runtime, "--no-mount"):
@@ -427,15 +492,163 @@ class Sandbox:
         ]
         return lines, plan
 
+    # -- podman ---------------------------------------------------------------
+
+    def podman_info(self, runtime):
+        """Facts from `podman info` (cached): cgroups, the controllers you may use, the OCI runtime."""
+        with self._lock:
+            if runtime in self._podman_cache:
+                return self._podman_cache[runtime]
+        code, out, err = _run([runtime, "info", "--format", "json"], timeout=60)
+        info = {"ok": code == 0, "error": None if code == 0 else (err.strip()[-500:] or "podman info failed")}
+        try:
+            host = json.loads(out).get("host", {}) if code == 0 else {}
+        except ValueError:
+            host = {}
+        info.update(cgroup_version=host.get("cgroupVersion"), cgroup_manager=host.get("cgroupManager"),
+                    cgroup_controllers=list(host.get("cgroupControllers") or []),
+                    oci_runtime=(host.get("ociRuntime") or {}).get("name"),
+                    rootless=(host.get("security") or {}).get("rootless"),
+                    id_mappings=bool((host.get("idMappings") or {}).get("uidmap")))
+        with self._lock:
+            self._podman_cache[runtime] = info
+        return info
+
+    def limits(self):
+        """
+        Whether jobs' CPU and memory limits are enforced: {"enforced": bool (both), "cpu": bool, "memory": bool,
+        "reason": text}. Only podman with cgroups v2 and the controllers delegated to you enforces them.
+        """
+        none = {"enforced": False, "cpu": False, "memory": False}
+        try:
+            method, detail = self.resolve()
+        except SandboxError as e:
+            return dict(none, reason=str(e))
+        if method != "podman":
+            return dict(none, reason="only the podman sandbox applies CPU and memory limits outside "
+                                     f"SLURM (this sandbox: {method})")
+        info = self.podman_info(detail)
+        if not info["ok"]:
+            return dict(none, reason=f"`podman info` failed: {info['error']}")
+        if info["cgroup_version"] != "v2":
+            return dict(none, reason=f"cgroups {info['cgroup_version'] or 'unknown'}: rootless podman "
+                                     f"can only limit CPU and memory with cgroups v2")
+        have = {c: c in info["cgroup_controllers"] for c in ("cpu", "memory")}
+        missing = [c for c, ok in have.items() if not ok]
+        if missing:
+            return dict(have, enforced=False, reason=f"the {' and '.join(missing)} cgroup controller"
+                        f"{'s are' if len(missing) > 1 else ' is'} not delegated to you "
+                        f"(systemd's Delegate= for user@.service; ask the admin)")
+        return dict(have, enforced=True, reason="cgroups v2 with the cpu and memory controllers delegated")
+
+    def _podman_launch(self, plan, shebang, body, prelude):
+        runtime, image = plan["runtime"], plan["image"]
+        for path in plan["read_only"] + plan["read_write"]:
+            if ":" in path or "," in path:
+                raise SandboxError(f"podman can't bind {path!r} (it contains ':' or ',')")
+        info = self.podman_info(runtime)
+        args = [runtime, "run", "--rm", "--pull=never", "--userns=keep-id", "--cap-drop=all",
+                "--security-opt=no-new-privileges", "--security-opt=label=disable", "--read-only",
+                "--pid=private", "--ipc=private"] + (["--network=none"] if plan.get("network", "none") == "none" else []) + [
+                "--env-host", "--env", "TMPDIR=/tmp", "--label", "hpclib.sandbox=job"]
+        if info.get("oci_runtime") == "crun":
+            args += ["--group-add", "keep-groups"]   # your groups, for group-owned project directories
+        controllers = info.get("cgroup_controllers") or []
+        if any(os.path.exists(p) for p in PODMAN_INITS):
+            # a small init as PID 1, which passes scancel's TERM on: the job's shell as PID 1 would ignore it
+            args.append("--init")
+        for path in plan["read_only"]:
+            args += ["-v", f"{path}:{path}:ro"]
+        for path in plan["read_write"]:
+            args += ["-v", f"{path}:{path}"]
+        args += self.flags
+        quoted = " ".join(shlex.quote(a) for a in args)
+        own_account = plan["host_image"] and "/etc" in plan["read_only"]
+        image_args = ("--rootfs " + shlex.quote(image)) if image.startswith("/") else shlex.quote(image)
+
+        delimiter = "HPC_SANDBOX_BODY_" + secrets.token_hex(8)
+        while delimiter in body:
+            delimiter = "HPC_SANDBOX_BODY_" + secrets.token_hex(8)
+        lines = [
+            f"# template body, run in a podman sandbox: read-write {', '.join(plan['read_write']) or '(none)'}; "
+            f"read-only {', '.join(plan['read_only']) or '(none)'}; network {plan.get('network', 'none')}",
+            f"hpc_sandbox_body=$(cat <<'{delimiter}'",
+            body.rstrip("\n"),
+            delimiter,
+            ")",
+        ]
+        # /tmp and /var/tmp: the job's own scratch directories, or small in-memory ones
+        if self.scratch == "session":
+            lines += ["hpc_sandbox_tmp=",
+                      "hpc_sandbox_scratch=(--tmpfs /tmp:rw,mode=1777 --tmpfs /var/tmp:rw,mode=1777)"]
+        else:
+            parent = '"${TMPDIR:-/tmp}"' if self.scratch == "job" else shlex.quote(os.path.expanduser(self.scratch))
+            lines += [
+                f'hpc_sandbox_tmp=$(mktemp -d {parent}/hpc-sandbox.XXXXXX) && mkdir "$hpc_sandbox_tmp/tmp" '
+                '"$hpc_sandbox_tmp/var-tmp" || { echo "hpclib: could not make the sandbox scratch directory" >&2; '
+                'exit 125; }',
+                'hpc_sandbox_scratch=(-v "$hpc_sandbox_tmp/tmp:/tmp" -v "$hpc_sandbox_tmp/var-tmp:/var/tmp")',
+            ]
+        # CPU and memory limits from the local scheduler (SLURM applies its own); no swap beyond the memory
+        lines += [
+            # crun's default ping_group_range ("0 0") names gid 0, which doesn't exist in the container when you
+            # have no subordinate ids (a single id mapping): name your own group instead
+            'hpc_sandbox_limits=(--sysctl "net.ipv4.ping_group_range=$(id -g) $(id -g)")',
+        ]
+        # only the limits whose cgroup controller you have: podman refuses to start a container asking for others
+        if "cpu" in controllers:
+            lines.append('if [ -n "${HPC_JOB_CPUS:-}" ]; then hpc_sandbox_limits+=(--cpus "$HPC_JOB_CPUS"); fi')
+        if "memory" in controllers:
+            lines += [
+                'if [ -n "${HPC_JOB_MEMORY:-}" ]; then',
+                '  hpc_sandbox_limits+=(--memory "$HPC_JOB_MEMORY" --memory-swap "$HPC_JOB_MEMORY")',
+                'fi',
+            ]
+        lines += [
+            # a name the local scheduler can remove the container by, if the job is killed
+            'hpc_sandbox_name="hpclib-job-${HPC_JOB_TAG:-${SLURM_JOB_ID:-x}-${SLURM_ARRAY_TASK_ID:-0}-$$}"',
+        ]
+        if own_account:
+            lines += self.account_lines(flag="-v")
+        else:
+            lines += ["hpc_sandbox_etc=", "hpc_sandbox_account=()"]
+        interp = " ".join(shlex.quote(w) for w in self.interpreter(shebang))
+        if prelude:
+            prelude_text = "\n".join(prelude) + '\nexec "$@"'
+            delimiter = "HPC_SANDBOX_PRELUDE_" + secrets.token_hex(8)
+            lines += [f"hpc_sandbox_prelude=$(cat <<'{delimiter}'", prelude_text, delimiter, ")"]
+            start = f'/bin/bash -c "$hpc_sandbox_prelude" hpc-env {interp}'
+        else:
+            start = interp
+        lines += [
+            f'{quoted} --name "$hpc_sandbox_name" --hostname "$(hostname)" "${{hpc_sandbox_limits[@]}}" '
+            f'"${{hpc_sandbox_scratch[@]}}" '
+            f'"${{hpc_sandbox_account[@]}}" --workdir "$PWD" {image_args} {start} -c "$hpc_sandbox_body" hpc-job',
+            "hpc_sandbox_status=$?",
+            # mount points podman made inside the scratch belong to ids of its user namespace
+            f'[ -n "$hpc_sandbox_tmp" ] && {{ rm -rf "$hpc_sandbox_tmp" 2>/dev/null || '
+            f'{shlex.quote(runtime)} unshare rm -rf "$hpc_sandbox_tmp"; }}',
+            '[ -n "$hpc_sandbox_etc" ] && rm -rf "$hpc_sandbox_etc"',
+            'if [ "$hpc_sandbox_status" = 125 ]; then',
+            '  echo "hpclib: the podman sandbox failed to start (exit 125); see the messages above" >&2',
+            "fi",
+            'exit "$hpc_sandbox_status"',
+        ]
+        return lines
+
     def describe(self):
         """The configured sandbox, for /cluster and /sandbox."""
         out = {"configured": self.configured, "method": self.method, "runtime": self.runtime,
                "image": self.image, "binds": self.binds, "writable": self.writable, "scratch": self.scratch,
-               "flags": self.flags, "allow_unsandboxed": self.allow_unsandboxed}
+               "flags": self.flags, "allow_unsandboxed": self.allow_unsandboxed, "network": self.network}
         try:
             method, detail = self.resolve()
             out["effective"] = method
             out["runtime_path" if method != "none" else "reason"] = detail
+            if method == "podman":
+                info = self.podman_info(detail)
+                out["limits"] = self.limits()
+                out["supplementary_groups"] = info.get("oci_runtime") == "crun"
         except SandboxError as e:
             out["effective"] = "unavailable"
             out["error"] = str(e)
@@ -560,6 +773,7 @@ def self_test(sandbox: Sandbox, base_dir):
         'echo "pid_one=$(cat /proc/1/comm 2>/dev/null)"',
         'echo "programs=$(command -v bash >/dev/null && echo yes || echo no)"',
         'id -un >/dev/null 2>&1 && echo "user_known=yes" || echo "user_known=no"',
+        'echo "net_devices=$(ls /sys/class/net 2>/dev/null | tr "\\n" " ")"',
     ])
     try:
         lines, plan = sandbox.launch("#!/bin/bash", body, [allowed])
@@ -576,9 +790,11 @@ def self_test(sandbox: Sandbox, base_dir):
         checks = {k: results.get(k) == "yes"
                   for k in ("write_allowed", "outside_hidden", "usr_read_only", "home_read_only", "tmp_writable",
                             "programs", "user_known")}
+        if plan["method"] == "podman" and plan.get("network") == "none":
+            checks["network_isolated"] = results.get("net_devices", "").split() in ([], ["lo"])
         return {"ran": True, "exit_code": res.returncode, "seconds": round(time.time() - start, 2),
                 "passed": res.returncode == 0 and all(checks.values()), "checks": checks,
-                "pid_one": results.get("pid_one"), "stderr": res.stderr[-2000:]}
+                "pid_one": results.get("pid_one"), "method": plan["method"], "stderr": res.stderr[-2000:]}
     except SandboxError as e:
         return {"ran": False, "reason": str(e)}
     finally:
@@ -613,6 +829,16 @@ def probe(sandbox: Sandbox, base_dir, run_self_test=True):
         entry["no_mount_flag"] = sandbox.supports(path, "--no-mount")
         entry.update(_runtime_config(path, entry["version"]))
         runtimes.append(entry)
+    podman = sandbox._find([sandbox.runtime] if sandbox._is_podman(sandbox.runtime) else [PODMAN])
+    if podman:
+        code, out, err = _run([podman, "--version"])
+        user = getpass.getuser()
+        entry = {"name": PODMAN, "path": podman, "version": (out or err).strip()}
+        entry.update({k: v for k, v in sandbox.podman_info(podman).items() if k != "ok"})
+        entry["subuid"] = any(line.split(":")[0] in (user, str(os.getuid()))
+                              for line in (_read("/etc/subuid") or "").splitlines())
+        entry["linger"] = os.path.exists(f"/var/lib/systemd/linger/{user}")
+        runtimes.append(entry)
     info["container_runtimes"] = runtimes
     modulepath, roots = _module_roots()
     info["modules"] = {"modulepath": modulepath, "roots": roots}
@@ -621,16 +847,27 @@ def probe(sandbox: Sandbox, base_dir, run_self_test=True):
 
     recommended = {"method": "auto"}
     notes = []
+    podman_entry = next((r for r in runtimes if r["name"] == PODMAN), None)
+    if podman_entry and len(runtimes) == 1:
+        recommended = {"method": "podman"}
+        if not podman_entry["subuid"]:
+            notes.append("you have no subordinate ids in /etc/subuid; rootless podman needs them (ask the admin)")
+        if not podman_entry["linger"]:
+            notes.append("lingering is off for you (loginctl enable-linger), so your podman jobs may be stopped "
+                         "when you log out")
+        limits = Sandbox(recommended, data_dir=sandbox.data_dir, which=sandbox.which).limits()
+        if not limits["enforced"]:
+            notes.append(f"jobs' CPU and memory limits can't be enforced: {limits['reason']}")
     if runtimes:
         if roots:
             recommended["binds"] = roots
             notes.append(f"`binds` makes the module trees ({', '.join(roots)}) readable in jobs")
         site = [b for r in runtimes for b in r.get("site_bind_paths", [])]
-        if site and not all(r["no_mount_flag"] for r in runtimes):
+        if site and not all(r.get("no_mount_flag", True) for r in runtimes):
             notes.append(f"this runtime can't turn off the site's bind paths ({', '.join(site)}); jobs will see them")
     else:
         recommended = {"method": "none"}
-        notes.append("no Singularity or Apptainer on this node, so jobs can't be sandboxed here; "
+        notes.append("no Singularity, Apptainer or podman on this node, so jobs can't be sandboxed here; "
                      "`module avail` may list one to set as `runtime`")
     if info["automounts"]:
         notes.append("some paths are automounted (autofs); a bind of one fails if it isn't mounted yet")

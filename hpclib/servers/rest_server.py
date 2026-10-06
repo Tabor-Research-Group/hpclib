@@ -131,10 +131,11 @@ import traceback
 import urllib.parse
 
 try:
-    from . import rest_envs, rest_jobs, rest_sandbox
+    from . import rest_envs, rest_jobs, rest_local, rest_sandbox
 except ImportError:  # run as a script from the servers directory
     import rest_envs
     import rest_jobs
+    import rest_local
     import rest_sandbox
 RESTError = rest_jobs.RESTError  # re-exported
 
@@ -1027,7 +1028,7 @@ class HPCRESTHandler(RESTHandler):
             apply_config(self.server, built)
         self.audit_detail = {"config": sorted(changes)}
         out = {"changed": sorted(changes), "config": new, "backup": backup, "applied": True}
-        if "sandbox" in changes and built["sandbox"].describe().get("effective") != "singularity":
+        if "sandbox" in changes and built["sandbox"].describe().get("effective") not in rest_sandbox.SANDBOXED:
             out["warning"] = "template jobs are no longer sandboxed with this config"
         return 200, out
 
@@ -1236,7 +1237,8 @@ class HPCRESTHandler(RESTHandler):
 ##
 
 CONFIG_KEYS = {"limits", "templates_dir", "jobs_db", "audit_log", "tokens_file", "cluster_notes",
-               "poll_interval", "proposals_dir", "module_command", "sandbox", "environments", "environment"}
+               "poll_interval", "proposals_dir", "module_command", "sandbox", "environments", "environment",
+               "scheduler"}
 
 def load_config(path):
     """
@@ -1247,7 +1249,8 @@ def load_config(path):
        "module_command": ["bash", "-lc", "module \"$@\" 2>&1", "hpclib-module"],
        "sandbox": {...rest_sandbox.Sandbox...},
        "environments": {...rest_envs.EnvironmentManager...},
-       "environment": {"all": {VAR: VALUE}, "jobs": {...}, "syncs": {...}}}
+       "environment": {"all": {VAR: VALUE}, "jobs": {...}, "syncs": {...}},
+       "scheduler": {"type": "slurm"} or {"type": "local", ...rest_local.LocalRunner...}}
     """
     explicit = path is not None
     path = os.path.expanduser(path or os.path.join(rest_data_dir(), "config.json"))
@@ -1276,6 +1279,7 @@ def load_config(path):
     if environments is not None and not isinstance(environments, dict):
         raise ValueError("`environments` must be an object")
     rest_jobs.check_env_section(config.get("environment"))
+    rest_local.check_scheduler_section(config.get("scheduler"))
     config["path"] = path
     return config
 
@@ -1362,6 +1366,8 @@ def apply_config(server, built):
     jobs.poll_interval = built["poll_interval"]
     jobs.job_env = built["job_env"]
     jobs.sandbox = built["sandbox"]
+    if isinstance(jobs.runner, rest_local.LocalRunner):
+        jobs.runner.sandbox = jobs.sandbox   # it checks the sandbox's limits
     if server.sandbox_prober is not None:
         server.sandbox_prober = rest_sandbox.Prober(jobs.sandbox, server.sandbox_prober.base_dir)
     envs = built["environments"]
@@ -1524,6 +1530,16 @@ def _detached_delete(path):
     except OSError:
         pass
 
+def _has_slurm():
+    """sbatch on PATH, here or in a login shell (where some clusters put it)."""
+    if shutil.which("sbatch"):
+        return True
+    try:
+        return subprocess.run(["bash", "-lc", "command -v sbatch"], capture_output=True, timeout=60,
+                              stdin=subprocess.DEVNULL).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return True   # can't tell: leave it to SLURM, as before
+
 def init_config(opts):
     """--init-config: write (or with --rebuild, replace) the config file; prints what it did."""
     path = os.path.expanduser(opts.config or os.path.join(rest_data_dir(), "config.json"))
@@ -1536,32 +1552,47 @@ def init_config(opts):
             raise ValueError(f"{opts.config_base} must hold a JSON object")
         base.update(given)
     stamp = time.strftime("%Y%m%dT%H%M%S")
+    # a machine without SLURM (a development server) runs jobs itself
+    no_slurm = not _has_slurm()
     if os.path.exists(path) and not opts.rebuild:
         with open(path) as f:
             config = json.load(f)
-        if "sandbox" in config or opts.no_sandbox:
+        needs_sandbox = "sandbox" not in config and not opts.no_sandbox
+        needs_scheduler = no_slurm and "scheduler" not in config
+        if not needs_sandbox and not needs_scheduler:
             print(f"kept the existing {path}")
             return
         shutil.copy2(path, f"{path}.replaced-{stamp}")
-        config["sandbox"] = _sandbox_section(base.get("sandbox"), opts.sandbox_bind)
-        action = f"added a job sandbox to {path} (the old file is {path}.replaced-{stamp})"
+        added = []
+        if needs_sandbox:
+            config["sandbox"] = _sandbox_section(base.get("sandbox"), opts.sandbox_bind)
+            added.append("a job sandbox")
+        if needs_scheduler:
+            config["scheduler"] = {"type": "local"}
+            added.append("the local scheduler (no SLURM here)")
+        action = f"added {' and '.join(added)} to {path} (the old file is {path}.replaced-{stamp})"
     else:
         config = base
         if opts.no_sandbox:
             config["sandbox"] = {"method": "none"}
         else:
             config["sandbox"] = _sandbox_section(config.get("sandbox"), opts.sandbox_bind)
+        if no_slurm:
+            config.setdefault("scheduler", {"type": "local"})
         action = f"wrote {path}"
         if os.path.exists(path):
             os.replace(path, f"{path}.replaced-{stamp}")
             action = f"rebuilt {path} (the old file is {path}.replaced-{stamp})"
     rest_sandbox.Sandbox(config.get("sandbox"))   # validate before writing
+    scheduler = rest_local.check_scheduler_section(config.get("scheduler"))
     unknown = set(config) - CONFIG_KEYS
     if unknown:
         raise ValueError(f"unknown config keys {sorted(unknown)}; known: {sorted(CONFIG_KEYS)}")
     TokenAuth.write_private(path, json.dumps(config, indent=2) + "\n")
     sandbox = config.get("sandbox", {})
     print(action)
+    if scheduler["type"] == "local":
+        print("  jobs: run on this machine by the local scheduler (no SLURM); start its tunnel with rest_on=login")
     if sandbox.get("method") == "none":
         print("  job sandbox: off")
     else:
@@ -1601,13 +1632,19 @@ def probe_sandbox(config):
             print(f"  test container: not run ({test.get('reason')})")
     for note in info["notes"]:
         print(f"  note: {note}")
-    if not os.environ.get("SLURM_JOB_ID"):
+    if rest_local.check_scheduler_section(config.get("scheduler"))["type"] == "local":
+        print("  (probed on this machine, where the local scheduler runs jobs)")
+    elif not os.environ.get("SLURM_JOB_ID"):
         print("  (probed on this node; jobs run on compute nodes, where GET /sandbox reports again)")
     return test is None or test.get("passed", False)
 
 def build_jobs(config, command_timeout, auto_approve=None):
-    runner = rest_jobs.SlurmRunner(timeout=command_timeout)
     sandbox = rest_sandbox.Sandbox(config.get("sandbox"), data_dir=rest_data_dir())
+    scheduler = rest_local.check_scheduler_section(config.get("scheduler"))
+    if scheduler["type"] == "local":
+        runner = rest_local.LocalRunner(scheduler, data_dir=rest_data_dir(), sandbox=sandbox, timeout=command_timeout)
+    else:
+        runner = rest_jobs.SlurmRunner(timeout=command_timeout)
     env = rest_jobs.check_env_section(config.get("environment"))
     templates = rest_jobs.TemplateStore(config["templates_dir"])
     return rest_jobs.JobManager(
@@ -1675,13 +1712,20 @@ def main(argv=None, handler_class=HPCRESTHandler):
     print("  python environments: " + ", ".join(
         f"{m} {info['version'] or ''}".strip() if info["available"] else f"{m} not found" for m, info in managers.items()))
     sandbox = jobs.sandbox.describe()
-    if sandbox["effective"] == "singularity":
+    if sandbox["effective"] in rest_sandbox.SANDBOXED:
         print(f"  job sandbox: {sandbox['runtime_path']}")
+        if sandbox["effective"] == "podman" and not sandbox["limits"]["enforced"]:
+            print(f"  job CPU and memory limits: NOT enforced ({sandbox['limits']['reason']})", file=sys.stderr)
     elif sandbox["effective"] == "unavailable":
         print(f"  job sandbox: UNAVAILABLE, template jobs will be refused: {sandbox['error']}", file=sys.stderr)
     else:
         print(f"WARNING: template jobs are not sandboxed ({sandbox['reason']}); GET /sandbox recommends a "
               f"config", file=sys.stderr)
+    if isinstance(jobs.runner, rest_local.LocalRunner):
+        local = jobs.runner.describe()
+        print(f"  jobs: run here by the local scheduler (no SLURM): {local['cpus']} CPUs, {local['memory_mb']} MB, "
+              f"limits {'enforced' if local['limits']['enforced'] else 'NOT enforced: ' + local['limits']['reason']}"
+              + ("" if local["limits"]["enforced"] or not local["enforce_limits"] else "; jobs will be refused"))
     print(f"  base dir: {whitelist.base_dir}", flush=True)
 
     try:

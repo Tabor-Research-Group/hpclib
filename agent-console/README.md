@@ -32,7 +32,9 @@ connected to it. **Data transfer** isn't a tunnel: per cluster it installs the d
 signs you in to the SMB server for `smbshell` (Kerberos log in with kinit where the cluster has it, otherwise a
 password saved for sync jobs), both through the password dialog. Agents keeps its addresses (`#/clusters`, `#/files?...`); other apps live under
 `#/APP/PAGE`, e.g. `#/vscode/sessions`. A new tunnel app is an entry in `APPS` in
-`hpclib/servers/agent_console.py`; the page picks it up.
+`hpclib/servers/agent_console.py`, or, for one that doesn't belong in hpclib, a package: **Add App or Settings**
+(top right) checks a package zip, shows what it adds (apps, tunnels, settings and their values), installs it,
+and lists and removes installed ones (see "Console packages" in hpclib's README). Its apps join the top bar.
 
 Agents pages:
 

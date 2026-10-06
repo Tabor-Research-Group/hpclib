@@ -122,6 +122,32 @@ HOME="$test_dir/home" HPCLIB_DIR="$HPCLIB_DIR" \
 assert_equal "$(tail -n 2 "$test_dir/sbatch-args" | head -n 1)" "$HPCLIB_DIR/tunnels/flask/sbatch_script.sh"
 assert_equal "$(tail -n 1 "$test_dir/sbatch-args")" 'mypackage:create_app("hello world")'
 
+# --login-node: no sbatch; the tunnel's script runs on the login node, on the forwarded port, until it ends.
+mkdir -p "$test_dir/login-tunnels/svc"
+cat > "$test_dir/login-tunnels/svc/sbatch_script.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+echo "svc on port $PROCESS_PORT login=$TUNNEL_ON_LOGIN_NODE greeting=$GREETING args=$*"
+SCRIPT
+printf 'START_GIT_SERVER=false\nSTART_SLURM_SERVER=false\n' > "$test_dir/login-tunnels/svc/tunnel_config.sh"
+rm -f "$test_dir/sbatch-args"
+HOME="$test_dir/home" HPCLIB_DIR="$HPCLIB_DIR" \
+  HPCLIB_TUNNEL_PATH="$test_dir/login-tunnels:$HPCLIB_DIR/tunnels" HPCSESSIONS_DIR="$test_dir/sessions" \
+  HPCSERVERS_DIR="$test_dir" TEST_SBATCH_ARGS_FILE="$test_dir/sbatch-args" PATH="$test_dir/bin:$PATH" \
+  timeout 60 bash "$HPCLIB_DIR/tunnels/start_tunnel.sh" svc -P 5151 --login-node --mem=2gb --env=GREETING=hi -- \
+    one two > "$test_dir/login.log" 2>&1 || fail "the login-node tunnel failed: $(cat "$test_dir/login.log")"
+[ ! -e "$test_dir/sbatch-args" ] || fail 'a login-node tunnel called sbatch'
+grep -q 'svc on port 5151 login=true greeting=hi args=one two' "$test_dir/login.log" ||
+  fail "the login-node script didn't run with the forwarded port: $(cat "$test_dir/login.log")"
+grep -q 'ignoring the sbatch options: --mem=2gb' "$test_dir/login.log" || fail "sbatch options were silently dropped: $(cat "$test_dir/login.log")"
+grep -q 'on the login node has ended (exit 0)' "$test_dir/login.log" || fail 'the end was not reported'
+[ ! -e "$test_dir/sessions/ports/$(hostname -s)-5151" ] || fail 'the port record was left behind'
+if HOME="$test_dir/home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PATH="$HPCLIB_DIR/tunnels" \
+  HPCSESSIONS_DIR="$test_dir/sessions" HPCSERVERS_DIR="$test_dir" PATH="$test_dir/bin:$PATH" \
+  timeout 60 bash "$HPCLIB_DIR/tunnels/start_tunnel.sh" pai -P 5152 --login-node > "$test_dir/login-pai.log" 2>&1; then
+  fail 'ran a shared-instance tunnel on the login node'
+fi
+grep -q "can't run on the login node" "$test_dir/login-pai.log" || fail 'no reason for refusing --login-node'
+
 # The Flask batch script uses the chosen compute-node port and app.
 mkdir -p "$test_dir/common" "$test_dir/flask-bin"
 touch "$test_dir/common/configure_job.sh"
@@ -472,6 +498,30 @@ assert_equal "$(sed -n 1,3p "$test_dir/setup-remote" | tr '\n' ' ')" '-p 2222 me
 grep -q 'tunnels/setup_tunnel.sh vscode --set VSCODE_CONTAINER=/a\\ b/c.sif --save --check' "$test_dir/setup-remote" ||
   fail "remote command: $(cat "$test_dir/setup-remote")"
 
+# --push DIR: the directory goes along as a tar on the same ssh call, to setup_tunnel.sh --receive
+mkdir -p "$test_dir/push/settings.d" && printf 'x\n' > "$test_dir/push/settings.d/a.conf"
+(
+  pssh() { printf '%s\n' "$@" > "$test_dir/push-remote"; cat > "$test_dir/push-stdin"; }
+  tunnel_setup me@login.example data-transfer --push "$test_dir/push" --set SMB_HOST=h --save --check
+)
+grep -q 'tunnels/setup_tunnel.sh data-transfer --receive --set SMB_HOST=h --save --check' "$test_dir/push-remote" ||
+  fail "push remote command: $(cat "$test_dir/push-remote")"
+tar -t -f "$test_dir/push-stdin" | grep -q 'settings.d/a.conf' || fail 'the pushed directory was not sent'
+if tunnel_setup me@login.example vscode --push "$test_dir/nowhere" --check 2>/dev/null; then fail 'pushed a missing directory'; fi
+# macOS's tar (bsdtar) leaves out extended attributes, which the cluster's GNU tar warns about
+if command -v bsdtar > /dev/null 2>&1 && command -v setfattr > /dev/null 2>&1 &&
+    setfattr -n user.com.apple.provenance -v 01 "$test_dir/push/settings.d/a.conf" 2> /dev/null; then
+  mkdir -p "$test_dir/bsd-bin" && ln -sf "$(command -v bsdtar)" "$test_dir/bsd-bin/tar"
+  (
+    PATH="$test_dir/bsd-bin:$PATH"
+    pssh() { cat > "$test_dir/push-stdin"; }
+    tunnel_setup me@login.example data-transfer --push "$test_dir/push" --check
+  )
+  mkdir -p "$test_dir/push-out"
+  warnings=$(tar -x -C "$test_dir/push-out" -f "$test_dir/push-stdin" 2>&1)
+  [ -z "$warnings" ] || fail "the pushed archive makes GNU tar warn: $warnings"
+fi
+
 # setup_tunnel.sh lists a tunnel's running instances and ends one you own (PAI's "Stop database job")
 (
   export "${share_env[@]}"
@@ -550,6 +600,10 @@ case "$1 $2" in
 esac
 { printf 'rclone'; printf ' %s' "$@"; printf '\n'
   env | grep -E '^(RCLONE_CONFIG_SMB_|KRB5CCNAME=|KRB5_CONFIG=)' | sort; } >> "$TEST_SMB_LOG"
+if [ "$1" = rcd ]; then   # the web GUI: note its config, then stop as if Stop was pressed
+  conf=''; prev=''; for a in "$@"; do [ "$prev" = --config ] && conf="$a"; prev="$a"; done
+  { echo "--- config"; cat "$conf"; echo "--- end"; } >> "$TEST_SMB_LOG"; exit 0
+fi
 if [ -n "$TEST_RCLONE_REFUSE" ] && [ "$RCLONE_CONFIG_SMB_PASS" = "$TEST_RCLONE_REFUSE" ]; then
   echo "CRITICAL: couldn't connect SMB: response error: The attempted logon is invalid." >&2; exit 1
 fi
@@ -594,11 +648,11 @@ grep -q '^RCLONE_CONFIG_SMB_PASS=OBS:hunter2$' "$sb/log" || fail 'the saved pass
 grep -q '^RCLONE_CONFIG_SMB_HOST=files.example.edu$' "$sb/log" && grep -q '^RCLONE_CONFIG_SMB_DOMAIN=EXAMPLE$' "$sb/log" ||
   fail 'host or domain missing'
 # paths under SMB_ROOT, a share and folder: relative ones there, /SHARE/... from the top
-: > "$sb/log"; SMB_ROOT=CLAT_research/chem/lab smbsh ls raw
-grep -q '^rclone lsf --retries 1 --low-level-retries 1 smb:CLAT_research/chem/lab/raw$' "$sb/log" || fail "root: $(cat "$sb/log")"
-: > "$sb/log"; SMB_ROOT=CLAT_research/chem/lab smbsh ls
-grep -q '^rclone lsf --retries 1 --low-level-retries 1 smb:CLAT_research/chem/lab$' "$sb/log" || fail "root itself: $(cat "$sb/log")"
-: > "$sb/log"; SMB_ROOT=CLAT_research/chem/lab smbsh ls /other/x
+: > "$sb/log"; SMB_ROOT=research/our_group smbsh ls raw
+grep -q '^rclone lsf --retries 1 --low-level-retries 1 smb:research/our_group/raw$' "$sb/log" || fail "root: $(cat "$sb/log")"
+: > "$sb/log"; SMB_ROOT=research/our_group smbsh ls
+grep -q '^rclone lsf --retries 1 --low-level-retries 1 smb:research/our_group$' "$sb/log" || fail "root itself: $(cat "$sb/log")"
+: > "$sb/log"; SMB_ROOT=research/our_group smbsh ls /other/x
 grep -q '^rclone lsf --retries 1 --low-level-retries 1 smb:other/x$' "$sb/log" || fail "absolute: $(cat "$sb/log")"
 : > "$sb/log"; smbsh ls
 grep -q '^rclone lsf --retries 1 --low-level-retries 1 smb:$' "$sb/log" || fail "the shares: $(cat "$sb/log")"
@@ -684,11 +738,11 @@ grep -q "binds=.*$copy:/etc/hpclib-krb5.conf:ro" "$sb/log" || fail 'the copy is 
 grep -q '^RCLONE_CONFIG_SMB_USE_KERBEROS=true$' "$sb/log" || fail 'Kerberos not used with a server name'
 # a server given by address: no Kerberos (no ticket names it), so the password
 printf 'pass=OBS:hunter2\n' > "$sb/home/.config/hpclib/smb/credentials"
-: > "$sb/log"; smbsh ls //10.55.179.23/proj 2> "$sb/err"
+: > "$sb/log"; smbsh ls //10.0.0.12/proj 2> "$sb/err"
 grep -q 'USE_KERBEROS' "$sb/log" && fail 'Kerberos used with an address'
 grep -q '^RCLONE_CONFIG_SMB_PASS=OBS:hunter2$' "$sb/log" || fail 'the password was not used for an address'
 grep -q "needs the server's name" "$sb/err" || fail "no note about the address: $(cat "$sb/err")"
-if SMB_AUTH=kerberos smbsh ls //10.55.179.23/proj 2>/dev/null; then fail 'SMB_AUTH=kerberos accepted an address'; fi
+if SMB_AUTH=kerberos smbsh ls //10.0.0.12/proj 2>/dev/null; then fail 'SMB_AUTH=kerberos accepted an address'; fi
 # a user name as smbclient takes it, me@tamu.edu: rclone gets the user and the domain apart
 mkdir -p "$sb/data2/settings"
 printf 'export SMB_HOST=files.example.edu SMB_USER=me@tamu.edu SMB_IMAGE=%q\n' "$sb/images/dtt.sif" > "$sb/data2/settings/data-transfer.sh"
@@ -720,11 +774,38 @@ case "$out" in *"not known: cifs/files.example.edu"*"known:     cifs/FILES"*"--s
 : > "$sb/log"; SMB_SPN=cifs/FILES smbsh ls proj
 grep -q '^RCLONE_CONFIG_SMB_SPN=cifs/FILES$' "$sb/log" || fail "SMB_SPN not given to rclone: $(cat "$sb/log")"
 smbsh logout > /dev/null
+# gui: rclone's web GUI for the session, its remotes in a private file that goes away with it
+mkdir -p "$sb/run" "$sb/data/settings/data-transfer.d"
+printf '[ours]\ntype = alias\nremote = smb:research/our_group\n' > "$sb/data/settings/data-transfer.d/rclone.conf"
+printf 'pass=OBS:hunter2\n' > "$sb/home/.config/hpclib/smb/credentials"
+: > "$sb/log"
+out=$(env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
+  XDG_RUNTIME_DIR="$sb/run" SMB_ROOT=research/our_group SMB_AUTH=password \
+  bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" gui --port 27555 2>/dev/null < /dev/null) || fail "gui: $out"
+case "$out" in "HPCLIB_RCLONE_GUI port=27555 user=hpclib pass="[0-9a-f]*) ;; *) fail "gui login line: $out" ;; esac
+grep -q -- '--rc-web-gui --rc-web-gui-no-open-browser --rc-addr 127.0.0.1:27555 --rc-user hpclib --rc-pass ' "$sb/log" ||
+  fail "rcd: $(cat "$sb/log")"
+sed -n '/^--- config$/,/^--- end$/p' "$sb/log" > "$sb/gui.conf"
+for want in '[smb]' 'type = smb' 'host = files.example.edu' 'domain = EXAMPLE' 'pass = OBS:hunter2' \
+            '[cluster]' 'type = local' '[ours]' 'remote = smb:research/our_group'; do
+  grep -qxF "$want" "$sb/gui.conf" || fail "gui config lacks '$want': $(cat "$sb/gui.conf")"
+done
+grep -qF '[lab]' "$sb/gui.conf" && fail 'the gui config still has a [lab] remote of its own'
+# a settings file may add remotes, not replace smbshell's own
+printf '[smb]\ntype = local\n' > "$sb/data/settings/data-transfer.d/rclone.conf"
+if env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
+  XDG_RUNTIME_DIR="$sb/run" SMB_AUTH=password bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" gui --port 27555 \
+  > /dev/null 2>&1 < /dev/null; then fail 'a settings file replaced the smb remote'; fi
+rm -rf "$sb/data/settings/data-transfer.d"
+[ -z "$(ls -A "$sb/run")" ] || fail 'the session config was left behind'
+if smbsh gui 2>/dev/null; then fail 'gui ran without a port'; fi
+rm -f "$sb/home/.config/hpclib/smb/credentials"
+
 # a refused sign-in: tried once, without rclone's retries, and the transfer isn't started
 printf 'pass=OBS:wrong\n' > "$sb/home/.config/hpclib/smb/credentials"
 smbsh logout > /dev/null
 : > "$sb/log"
-if TEST_RCLONE_REFUSE=OBS:wrong smbsh get //10.55.179.23/proj/raw "$sb/scratch/out" 2> "$sb/err"; then fail 'a refused sign-in went on'; fi
+if TEST_RCLONE_REFUSE=OBS:wrong smbsh get //10.0.0.12/proj/raw "$sb/scratch/out" 2> "$sb/err"; then fail 'a refused sign-in went on'; fi
 grep -q 'refused the sign-in (tried once' "$sb/err" || fail "refusal: $(cat "$sb/err")"
 grep -q '^rclone lsf --max-depth 1 --retries 1 --low-level-retries 1 smb:proj$' "$sb/log" || fail "probe: $(cat "$sb/log")"
 grep -q '^rclone copy' "$sb/log" && fail 'the transfer ran after a refused sign-in'

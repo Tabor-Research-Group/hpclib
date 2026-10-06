@@ -257,8 +257,8 @@ function install_tunnel {
 # with the cluster's tunnels/setup_tunnel.sh (see it for the options), e.g.
 #   tunnel_setup user@grace.hprc.tamu.edu vscode --set VSCODE_CONTAINER=/scratch/user/me/vscode.sif --save --install --check
 function tunnel_setup {
-  local usage='usage: tunnel_setup [ssh options] [user@]host TUNNEL [--set NAME=VALUE]... [--save] [--install [--force]] [--check]'
-  local login_args=() host='' tunnel='' rest=() remote_hpclib remote_command
+  local usage='usage: tunnel_setup [ssh options] [user@]host TUNNEL [--push DIR] [--set NAME=VALUE]... [--save] [--install [--force]] [--check]'
+  local login_args=() host='' tunnel='' rest=() remote_hpclib remote_command push='' given=() i
   while [ "$#" -gt 0 ]; do
     if [ -n "$tunnel" ]; then
       rest=("$@")
@@ -278,9 +278,36 @@ function tunnel_setup {
     echo "$usage" >&2
     return 2
   fi
+  # --push DIR: send DIR (tunnel/ and settings.d/, as the console stages a packaged app or settings) along
+  given=("${rest[@]}") rest=()
+  for ((i = 0; i < ${#given[@]}; i++)); do
+    if [ "${given[$i]}" = --push ]; then
+      push="${given[$((i + 1))]:-}"
+      i=$((i + 1))
+    else
+      rest+=("${given[$i]}")
+    fi
+  done
+  if [ -n "$push" ] && [ ! -d "$push" ]; then
+    echo "tunnel_setup: --push needs a directory, not '$push'" >&2
+    return 2
+  fi
   remote_hpclib=$(_hpclib_remote_path "$HPCLIB_REMOTE_INSTALL_LOCATION")
-  remote_command=$(_hpclib_remote_script_cmd /bin/bash "$remote_hpclib/tunnels/setup_tunnel.sh" "$tunnel" "${rest[@]}")
-  HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$host" "$remote_command"
+  if [ -n "$push" ]; then
+    remote_command=$(_hpclib_remote_script_cmd /bin/bash "$remote_hpclib/tunnels/setup_tunnel.sh" "$tunnel" --receive "${rest[@]}")
+    # plain files only (no owners, no links followed), as setup_tunnel.sh --receive expects. macOS's tar
+    # (bsdtar) would add extended attributes (com.apple.provenance, ...) the cluster's GNU tar warns about.
+    local tar_opts=()
+    if tar --version 2> /dev/null | grep -qi bsdtar; then
+      tar_opts=(--no-xattrs --no-acls)
+      [ "$(uname -s)" = Darwin ] && tar_opts+=(--no-mac-metadata)
+    fi
+    (cd "$push" && COPYFILE_DISABLE=1 tar -c -f - "${tar_opts[@]}" --exclude='._*' .) |
+      HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$host" "$remote_command"
+  else
+    remote_command=$(_hpclib_remote_script_cmd /bin/bash "$remote_hpclib/tunnels/setup_tunnel.sh" "$tunnel" "${rest[@]}")
+    HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$host" "$remote_command"
+  fi
 }
 
 # SMB transfers with rclone from the data-transfer-tools image (tunnels/data-transfer/smbshell.sh; smbshell --help).
@@ -901,10 +928,14 @@ function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROF
   printf '%s         local folders the agent may push from and pull into: %s%s\n\n' \
     "$_c_dim" "${roots:-none (rerun with --local-root DIR)}" "$_c_reset"
 
-  printf '%s1. Start the tunnel%s (leave it running; it is a SLURM job)\n' "$_c_head" "$_c_reset"
+  local where="it is a SLURM job" login_node=''
+  if [ "$(_hpclib_agent_profiles get "$name" rest_on 2>/dev/null)" = login ]; then
+    where="the server runs on the login node, not in a job" login_node=' --login-node'
+  fi
+  printf '%s1. Start the tunnel%s (leave it running; %s)\n' "$_c_head" "$_c_reset" "$where"
   printf '   %sagent_tunnel %s%s\n' "$_c_cmd" "$name" "$_c_reset"
-  printf '%s   = launch_tunnel -A none -P %s %s rest --process-port=%s --%s%s\n\n' \
-    "$_c_dim" "$port" "$host" "$process_port" "$allow" "$_c_reset"
+  printf '%s   = launch_tunnel -A none -P %s %s rest --process-port=%s%s --%s%s\n\n' \
+    "$_c_dim" "$port" "$host" "$process_port" "$login_node" "$allow" "$_c_reset"
 
   printf '%s2. REQUIRED: add the MCP server to your LLM client.%s setup_agents does not change the client'"'"'s config, and\n' \
     "$_c_alert" "$_c_reset"
@@ -1144,6 +1175,15 @@ function setup_agents {
   _hpclib_agents_remote _hpclib_remote_setup_agents "$base_config" "$remote_hpclib" "$rebuild" "$sandbox" \
     "$templates" "$bind_list" "${work_dirs[@]}" || return 1
 
+  # A machine without SLURM (a development server) runs the server itself: its tunnel can't submit a job
+  if [ -z "$(_hpclib_agent_profiles get "$name" rest_on 2>/dev/null)" ] &&
+      [ "$(HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "bash -lc 'command -v sbatch > /dev/null 2>&1 && echo slurm || echo none'" \
+        < /dev/null 2> /dev/null | tail -n 1)" = none ]; then
+    _hpclib_agent_profiles set "$name" rest_on=login || return 1
+    echo "no SLURM on $(_hpclib_agent_profiles get "$name" host): its REST server will run on the machine itself" \
+      "(rest_on=login), and so will jobs"
+  fi
+
   echo "== owner token"
   local state hash result legacy="$HOME/.config/hpclib/rest_token"
   state=$(_hpclib_agents_remote _hpclib_remote_owner_token "" check | tail -n 1)
@@ -1277,6 +1317,10 @@ function agent_tunnel {
   approve=$(_hpclib_agent_profiles get "$name" auto_approve_templates 2>/dev/null || echo all)
   [ "$approve" = review ] && approve=''
   while IFS= read -r d; do [ -n "$d" ] && launch+=("$d"); done < <(_hpclib_agent_lines "$name" tunnel_args)
+  # where the server runs (the profile's rest_on): in a job (default), or on the login node
+  if [ "$(_hpclib_agent_profiles get "$name" rest_on 2>/dev/null)" = login ]; then
+    launch=(--login-node)   # no job, so no sbatch options
+  fi
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --auto-approve-templates|--auto-approve-templates=new) approve=new ;;

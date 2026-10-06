@@ -89,7 +89,7 @@ done
 set -- "${START_TUNNEL_ARGS[@]}"
 
 START_TUNNEL_FLAGS="fP:"
-START_TUNNEL_LONG_FLAGS="port:,process-port:,env:"
+START_TUNNEL_LONG_FLAGS="port:,process-port:,env:,login-node"
 
 CLI_HOST_PORT=$(mcoptvalue "$START_TUNNEL_FLAGS" "$START_TUNNEL_LONG_FLAGS" "P" "$@")
 if [ -z "$CLI_HOST_PORT" ]; then
@@ -97,6 +97,7 @@ if [ -z "$CLI_HOST_PORT" ]; then
 fi
 CLI_PROCESS_PORT=$(mclongvalue "$START_TUNNEL_LONG_FLAGS" "process-port" "$@")
 CLI_ENV=$(mclongvalue "$START_TUNNEL_LONG_FLAGS" "env" "$@")
+CLI_LOGIN_NODE=$(mclongvalue "$START_TUNNEL_LONG_FLAGS" "login-node" "$@")
 start_bg=$(mcoptvalue "$START_TUNNEL_FLAGS" "$START_TUNNEL_LONG_FLAGS" "f" "$@")
 
 # Everything else - short or long, meant for sbatch (--mem=, --time=,
@@ -123,6 +124,7 @@ START_SLURM_SERVER=true
 SHARED_INSTANCE=false        # true: attach to a running instance another job serves, if there is one
 PROCESS_PORT_FROM_JOB=false  # true: the job picks its port and registers it (see instances.sh)
 KEEP_INSTANCE=false          # true: closing the tunnel leaves the job running (for others to attach to)
+RUN_ON_LOGIN_NODE=false      # true (or --login-node): run the sbatch script here, on the login node, not in a job
 
 if tunnel_config_path=$(resolve_tunnel_file tunnel_config.sh); then
   source "$tunnel_config_path"
@@ -142,6 +144,7 @@ fi
 
 if [ -n "$CLI_PROCESS_PORT" ]; then PROCESS_PORT="$CLI_PROCESS_PORT"; fi
 if [ -n "$CLI_HOST_PORT" ]; then DEFAULT_PORT="$CLI_HOST_PORT"; fi
+if [ "$CLI_LOGIN_NODE" = "true" ]; then RUN_ON_LOGIN_NODE=true; fi
 
 HOST_PORT="$DEFAULT_PORT"
 if [ -z "$PROCESS_PORT" ]; then
@@ -181,6 +184,62 @@ _hpclib_record_port "$HOST_PORT" "$$"
 
 STATUS_FILE="$SESSIONS_DIR/status-$job_uuid.txt"
 echo "submitting job..." > "$STATUS_FILE"
+
+################################################################################
+##
+##  On the login node (--login-node, or RUN_ON_LOGIN_NODE=true): for sites that
+##  would rather a small service ran on the login node than in a job holding a
+##  share of a compute node. The tunnel's sbatch script runs here as a child of
+##  this script, listening on the forwarded port itself; it ends when the tunnel
+##  does (stop_tunnel, Ctrl+C, a dropped ssh), as a job would be cancelled. There
+##  is no job, so sbatch options (--time, --mem, ...) don't apply.
+##
+
+if [ "$RUN_ON_LOGIN_NODE" = "true" ]; then
+  if [ "$SHARED_INSTANCE" = "true" ] || [ "$PROCESS_PORT_FROM_JOB" = "true" ]; then
+    echo "start_tunnel: $TUNNEL_NAME shares its service between jobs or registers its port from its job;" \
+      "it can't run on the login node" >&2
+    exit 1
+  fi
+  if [ "$start_bg" = "true" ]; then
+    echo "start_tunnel: -f (background) isn't supported with --login-node; the service ends with the tunnel" >&2
+    exit 1
+  fi
+  if [ -n "${CLI_SBATCH_ARGS// /}" ]; then
+    echo "hpclib: on the login node there is no job; ignoring the sbatch options: ${CLI_SBATCH_ARGS# }" >&2
+  fi
+  PROCESS_PORT="$HOST_PORT"
+  TUNNEL_ON_LOGIN_NODE=true
+  SESSION_ID="login-$job_uuid"
+  SESSION_FILE="$SESSIONS_DIR/session-$SESSION_ID.log"
+  # --env=NAME=value,NAME2=value2, which sbatch's --export would have set
+  if [ -n "$CLI_ENV" ]; then
+    IFS=',' read -r -a login_env <<< "$CLI_ENV"
+    for pair in "${login_env[@]}"; do
+      case "$pair" in
+        [A-Za-z_]*=*) export "$pair" ;;
+        *) echo "start_tunnel: ignoring --env entry '$pair' (expected NAME=value)" >&2 ;;
+      esac
+    done
+  fi
+  echo "running on the login node $(hostname -s), not in a job" > "$STATUS_FILE"
+  echo "hpclib: running $TUNNEL_NAME on the login node $(hostname -s) (no SLURM job), port $PROCESS_PORT; log: $SESSION_FILE"
+  bash "$SBATCH_SCRIPT" "${TUNNEL_SCRIPT_ARGS[@]}" >> "$SESSION_FILE" 2>&1 < /dev/null &
+  LOGIN_PID=$!
+  login_cleanup() {
+    kill -TERM "$LOGIN_PID" 2>/dev/null
+    pkill -TERM -P $$ 2>/dev/null   # the log's tail
+    _hpclib_forget_port "$HOST_PORT" "$$"
+  }
+  trap login_cleanup 0
+  trap 'exit 130' 1 2 3 15
+  tail -f -n +1 --pid="$LOGIN_PID" "$SESSION_FILE" 2>/dev/null &
+  wait "$LOGIN_PID"
+  login_status=$?
+  sleep 1   # the tail's last lines
+  echo "hpclib: $TUNNEL_NAME on the login node has ended (exit $login_status)"
+  exit "$login_status"
+fi
 
 # A shared service (a database, say) that another job already runs: connect to it rather than starting
 # another. The tunnel then never cancels that job.

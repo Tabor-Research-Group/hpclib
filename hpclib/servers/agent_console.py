@@ -30,7 +30,11 @@ The front end depends only on the routes below; nothing here depends on it.
   POST /api/clusters/NAME/setup               setup_agents ({"work_dirs": [...], "binds": [...],
                                               "templates": "...", "rebuild": false})
   GET  /api/clusters/NAME/operation           the running or last install/setup, with its log
-  GET  /api/apps                              the console's apps: agents, and tunnel apps (JupyterLab)
+  GET  /api/apps                              the console's apps: agents, and tunnel apps (JupyterLab), with
+                                              the package each came from (null: hpclib's own)
+  GET  /api/packages                          apps and settings installed from packages (console_packages.py)
+  POST /api/packages[?dry_run=1]              body: a package zip; checks it (dry_run) or installs it
+  DELETE /api/packages/NAME                   removes one (its apps go; what it sent to clusters stays)
   GET  /api/apps/APP                          that app's session on every cluster: state (down, starting,
                                               queued, up), the job's queue status, and the URL to open
   POST /api/apps/APP/NAME/start|stop          launch_tunnel / stop_tunnel for it, over the login
@@ -39,6 +43,9 @@ The front end depends only on the routes below; nothing here depends on it.
                                               "project": "/path/to/uv-or-pixi-project",
                                               "settings": {"VSCODE_CONTAINER": "/path/...", ...}}: the tunnel's
                                               settings, saved on the cluster with the next check/install/start
+  PUT  /api/apps/APP/NAME/secrets             {"values": {NAME: value or ""}}: a packaged app's secrets, sent to the
+                                              cluster over ssh on standard input (setup_tunnel.sh --secrets); only
+                                              whether each is set is kept here (GET .../settings shows it)
   POST /api/apps/APP/NAME/check               is the tunnel installed? (its install.sh --check, on the cluster)
   GET  /api/apps/APP/NAME/instances           a shared app's running instances on the cluster, with owners
   POST /api/apps/APP/NAME/control/ID          one of the session's `controls`, e.g. stop_instance {"job": ...}:
@@ -48,7 +55,7 @@ The front end depends only on the routes below; nothing here depends on it.
   GET  /api/clusters/NAME/settings            this machine's tunnel settings for the cluster
   PUT  /api/clusters/NAME/settings            {"auto_approve_templates": all|new|review,
                                                "tunnel_args": ["--time=12:00:00", ...],
-                                               "connection_hours": 12}
+                                               "connection_hours": 12, "rest_on": job|login}
   POST /api/clusters/NAME/tunnel/start        runs agent_tunnel NAME ({"auto_approve_templates": all|new|review})
   POST /api/clusters/NAME/tunnel/stop         runs agent_stop NAME
   GET  /api/clusters/NAME/tunnel/log?lines=N  the console's log of that tunnel
@@ -75,6 +82,7 @@ if sys.version_info < (3, 7):
     sys.exit("agent_console needs Python 3.7 or newer")
 
 import argparse
+import base64
 from html import unescape as html_unescape
 import concurrent.futures
 import contextlib
@@ -87,6 +95,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -101,6 +110,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HPCLIB_DIR = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(HPCLIB_DIR, "lib"))
 import agent_profiles  # noqa: E402
+sys.path.insert(0, HERE)
+import console_packages  # noqa: E402
 
 VERSION = "0.1"
 DEFAULT_PORT = 27180
@@ -118,6 +129,8 @@ STREAMED_ROUTES = ("files/content",)   # passed through in chunks rather than re
 #   settings      [(NAME, label, hint[, choices])]: the tunnel's TUNNEL_SETTINGS (tunnel_config.sh) the page
 #                 edits (with choices: a select of those values); they are saved on the cluster
 #                 (tunnels/setup_tunnel.sh --save) for its job and install.sh
+#   kind "login"  runs on the cluster's login node over the console's ssh login, its port forwarded there,
+#                 rather than in a SLURM job (Rclone: rclone's web GUI, signed in for the session only)
 #   kind "tool"   not a port-forwarding tunnel but commands run on the cluster (Data transfer: smbshell); its
 #                 row has no Open/Start/Stop, and its controls run them
 #   shared        the tunnel attaches to a running instance another job serves (SHARED_INSTANCE), and keeps
@@ -158,14 +171,14 @@ APPS = {
         "tunnel": "data-transfer",
         "kind": "tool",
         "settings": [
-            ("SMB_HOST", "SMB server", "just the host, e.g. 10.55.179.23; //HOST/SHARE/FOLDER fills in the folder too"),
-            ("SMB_ROOT", "Folder", "SHARE/FOLDER that smbshell paths are relative to, e.g. CLAT_research/chem/lab"),
-            ("SMB_USER", "User name", "on the server, as smbclient --user takes it, e.g. me@tamu.edu; default your "
+            ("SMB_HOST", "SMB server", "just the host, e.g. files.example.edu; //HOST/SHARE/FOLDER fills in the folder too"),
+            ("SMB_ROOT", "Folder", "SHARE/FOLDER that smbshell paths are relative to, e.g. research/our_group"),
+            ("SMB_USER", "User name", "on the server, as smbclient --user takes it, e.g. me@example.edu; default your "
                                       "cluster user name"),
             ("SMB_DOMAIN", "Domain", "for a password, the domain if User name has none (rclone's default is "
-                                     "WORKGROUP), e.g. tamu.edu"),
+                                     "WORKGROUP), e.g. example.edu"),
             ("SMB_REALM", "Kerberos realm", "for kinit (the user name without its @domain, in this realm), e.g. "
-                                            "AUTH.TAMU.EDU; default krb5.conf's"),
+                                            "AUTH.EXAMPLE.EDU; default krb5.conf's"),
             ("SMB_SPN", "Kerberos name of the server", "if Kerberos says cifs/SERVER is \"not found in Kerberos "
                                                        "database\": smbshell find-spn shows the one it knows"),
             ("SMB_AUTH", "Sign in with", "auto: a Kerberos ticket if you have one, else the saved password",
@@ -176,6 +189,19 @@ APPS = {
                                                  "or a .sif); default docker://ghcr.io/tabor-research-group/"
                                                  "data-transfer-tools:latest"),
         ],
+    },
+    "rclone": {
+        "title": "Rclone",
+        "tunnel": "data-transfer",          # the data-transfer-tools image, and Data transfer's settings
+        "kind": "login",
+        "open_path": "/",
+        "health_path": "/",                 # rclone rcd: 401 without its login, which says it's up
+        # smbshell gui prints the GUI's own (random) login once; the page opens it with rclone's login_token
+        "gui_re": re.compile(r"^HPCLIB_RCLONE_GUI port=\d+ user=(\S+) pass=(\S+)\s*$", re.M),
+        "note": "The SMB password for this rclone web GUI session, on the cluster's login node: rclone keeps it "
+                "(in rclone's reversible encoding) in a private in-memory file until you Stop it. Nothing is "
+                "saved for later.",
+        "settings": [],
     },
     "pai": {
         "title": "PAI",
@@ -194,7 +220,42 @@ APPS = {
         ],
     },
 }
+# hpclib's own apps; installed packages add theirs to APPS (load_package_apps)
+BUILTIN_APPS = dict(APPS)
 SETTING_VALUE_RE = re.compile(r"[^\0\n\r]{0,1024}")
+
+
+def package_store():
+    """The apps and settings installed from packages (console_packages), in the console's directory."""
+    tunnels = os.path.join(HPCLIB_DIR, "tunnels")
+    builtin_tunnels = {d for d in os.listdir(tunnels) if os.path.isdir(os.path.join(tunnels, d))}
+    return console_packages.PackageStore(
+        os.path.join(console_dir(), "packages"),
+        {k: (v["tunnel"], [f[0] for f in v.get("settings", [])]) for k, v in BUILTIN_APPS.items()},
+        builtin_tunnels)
+
+
+def load_package_apps(store=None):
+    """APPS: hpclib's own, then each installed package's (as they are now)."""
+    store = store or package_store()
+    for app_id in [k for k, v in APPS.items() if v.get("package")]:
+        del APPS[app_id]
+    for app_id, (manifest, app, _) in store.apps().items():
+        spec = {"title": app["title"], "tunnel": app["tunnel"], "open_path": app["open_path"],
+                "health_path": app["health_path"], "package": manifest["name"],
+                "package_version": manifest["version"],
+                "settings": [(f["name"], f["label"], f["hint"]) + ((tuple(f["choices"]),) if f["choices"] else ())
+                             for f in app["settings"]]}
+        if app.get("description"):
+            spec["description"] = app["description"]
+        if app.get("token_regex"):
+            spec["token_re"] = re.compile(app["token_regex"])
+        if app.get("secrets"):
+            spec["secrets"] = [(f["name"], f["label"], f["hint"]) for f in app["secrets"]]
+        APPS[app_id] = spec
+    return store
+SECRETS_STATUS_RE = re.compile(r"^HPCLIB_TUNNEL_SECRETS((?: [A-Z_][A-Z0-9_]*:(?:set|unset))*)\s*$", re.M)
+SECRET_VALUE_RE = re.compile(r"[^\0\n\r]{1,4096}")
 TUNNEL_STATUS_RE = re.compile(r"^HPCLIB_TUNNEL_STATUS (installed|missing|unknown|nothing) ?(.*)$", re.M)
 ATTACHED_RE = re.compile(r"attaching to the running \S+ instance: job (\d+) on (\S+), port (\d+)")
 OWN_INSTANCE_RE = re.compile(r"job (\d+) serves \S+ on (\S+), port (\d+)")
@@ -657,6 +718,8 @@ class Clusters:
         self.logins = logins or Logins()
         self.ops = {}
         self.app_procs = {}
+        self.packages = load_package_apps()
+        self.secret_runner = self._run_with_input
 
     # profiles
     def names(self):
@@ -1006,6 +1069,13 @@ class Clusters:
                 "fields": [{"name": f[0], "label": f[1], "hint": f[2], "choices": list(f[3]) if len(f) > 3 else None}
                            for f in spec.get("settings", [])],
                 "settings": dict(conf.get("settings") or {}),
+                # what installed packages fill in where you haven't set a value
+                "defaults": {k: {"value": v, "package": p} for k, (v, p) in self.packages.defaults(spec["tunnel"]).items()
+                             if k in {f[0] for f in spec.get("settings", [])}},
+                "package": spec.get("package"),
+                # secrets: whether each is set on the cluster (as of the last Check or send), never their values
+                "secrets": [{"name": f[0], "label": f[1], "hint": f[2],
+                             "set": (conf.get("secrets") or {}).get(f[0])} for f in spec.get("secrets", [])],
                 "installable": self.app_installable(app),
                 "applies": "the next time it starts; settings go to the cluster with the next Check, Install or Start"}
 
@@ -1063,15 +1133,20 @@ class Clusters:
 
     # -- what a tunnel needs on the cluster (its settings, and its install.sh) -----------------
 
-    @staticmethod
-    def app_installable(app):
-        """Whether the app's tunnel has an install.sh (in this machine's hpclib, which install_hpclib copies)."""
-        return os.path.isfile(os.path.join(HPCLIB_DIR, "tunnels", APPS[app]["tunnel"], "install.sh"))
+    def app_installable(self, app):
+        """Whether the app's tunnel has an install.sh (in this machine's hpclib, or the package it came from)."""
+        tunnel = APPS[app]["tunnel"]
+        directory = self.packages.tunnel_dir(tunnel) or os.path.join(HPCLIB_DIR, "tunnels", tunnel)
+        return os.path.isfile(os.path.join(directory, "install.sh"))
 
-    @staticmethod
-    def app_vars(spec, conf):
-        """The tunnel's settings as environment variables, as saved on the cluster."""
-        out = dict(conf.get("settings") or {})
+    def app_vars(self, spec, conf):
+        """
+        The tunnel's settings as environment variables, as saved on the cluster: yours, over the defaults
+        installed packages give its fields.
+        """
+        fields = {f[0] for f in spec.get("settings", [])}
+        out = {k: v for k, (v, _) in self.packages.defaults(spec["tunnel"]).items() if k in fields}
+        out.update(conf.get("settings") or {})
         if "env_settings" in spec:
             if conf.get("conda_env") is not None:
                 out["CONDA_ENVIRONMENT"] = conf["conda_env"]
@@ -1086,17 +1161,111 @@ class Clusters:
         spec = self.app_spec(app)
         _, conf = self.app_config(profile, app)
         args = ["tunnel_setup"] + ssh_options(profile) + [profile["host"], spec["tunnel"]]
+        # what packages give the tunnel (itself, settings files) goes along; and once more after they stop
+        # giving anything, to clear what an earlier push left there
+        stage, digest = self.package_stage(spec["tunnel"])
+        if digest is not None or conf.get("pushed_package"):
+            args += ["--push", stage]
+        if not spec.get("settings") and "env_settings" not in spec:
+            return args + list(actions)            # no settings of its own (Rclone shares Data transfer's)
         for k, v in sorted(self.app_vars(spec, conf).items()):
             args += ["--set", f"{k}={v}"]
         return args + ["--save"] + list(actions)
+
+    # -- packages: apps and settings installed from zip files (console_packages) ---------------------
+
+    def packages_list(self):
+        return [{"name": m["name"], "version": m["version"], "description": m["description"],
+                 "installed": m.get("installed"), "sha256": m.get("sha256"), "apps": sorted(m["apps"]),
+                 "summary": console_packages.summary(m)} for m, _ in self.packages.installed()]
+
+    def package_add(self, data, dry_run=False):
+        """Check (dry_run) or install a package zip; its apps are there at once."""
+        if not data:
+            raise ConsoleError(400, "send the package's zip file as the request body")
+        try:
+            if dry_run:
+                report = self.packages.inspect(data)
+            else:
+                with self.lock:
+                    report = self.packages.install(data)
+                    load_package_apps(self.packages)
+                    shutil.rmtree(os.path.join(console_dir(), "staging"), ignore_errors=True)
+        except console_packages.PackageError as e:
+            raise ConsoleError(422, str(e))
+        return dict(report, summary=console_packages.summary(report["package"]), installed=not dry_run)
+
+    def package_remove(self, name):
+        apps = [a for a, v in APPS.items() if v.get("package") == name]
+        with self.lock:
+            running = sorted({a for (_, a), p in self.app_procs.items() if a in apps and p.poll() is None})
+            if running:
+                raise ConsoleError(409, f"stop {', '.join(APPS[a]['title'] for a in running)} first")
+            try:
+                self.packages.remove(name)
+            except console_packages.PackageError as e:
+                raise ConsoleError(404, str(e))
+            load_package_apps(self.packages)
+            shutil.rmtree(os.path.join(console_dir(), "staging"), ignore_errors=True)
+        return {"removed": name, "apps": apps,
+                "note": "what it sent to clusters stays there; their settings files go with each app's next Check"}
+
+    def send_secrets(self, profile, app, body, wait=120):
+        """
+        Put an app's secrets on the cluster ({"values": {NAME: value, ...}}; "" removes one). The values go to
+        setup_tunnel.sh --secrets on standard input, base64-encoded, over the console's ssh login; the console
+        keeps only whether each is set.
+        """
+        spec = self.app_spec(app)
+        names = [f[0] for f in spec.get("secrets", [])]
+        values = body.get("values") if isinstance(body, dict) else None
+        if not names:
+            raise ConsoleError(404, f"{spec['title']} has no secrets")
+        if not isinstance(values, dict) or not values or set(body) - {"values"} or set(values) - set(names):
+            raise ConsoleError(422, f"send {{\"values\": {{NAME: value}}}} with names from {names}")
+        for k, v in values.items():
+            if not isinstance(v, str) or (v and not SECRET_VALUE_RE.fullmatch(v)):
+                raise ConsoleError(422, f"{k} must be one line of text (at most 4096 characters), or \"\" to remove it")
+        if not self.logins.alive(profile):
+            raise ConsoleError(409, f"log in to {profile['name']} first: secrets go over the console's ssh login")
+        data = "".join(f"{k}={base64.b64encode(v.strip().encode()).decode() if v.strip() else ''}\n"
+                       for k, v in sorted(values.items())).encode()
+        args = ["tunnel_setup"] + ssh_options(profile) + [profile["host"], spec["tunnel"], "--secrets"]
+        code, text = self.secret_runner(args, data, wait)
+        found = SECRETS_STATUS_RE.findall(text)
+        if code != 0 or not found:
+            tail = " ".join(line for line in text.strip().splitlines()[-3:])
+            raise ConsoleError(502, f"the cluster didn't take the secrets (exit {code}); update hpclib there "
+                                    f"(Agents → Clusters → Update hpclib) if it is older than this console: {tail}")
+        self._record_setup(profile, app, text)
+        return {"app": app, "cluster": profile["name"], "secrets": self.app_settings(profile, app)["secrets"]}
+
+    def _run_with_input(self, args, data, wait):
+        """An hpclib shell function with `data` on its standard input; (exit code, output). Nothing is logged."""
+        try:
+            res = subprocess.run(self.hpclib_argv(args), input=data, capture_output=True, timeout=wait,
+                                 env=dict(os.environ, **self.HPCLIB_ENV), start_new_session=True)
+        except subprocess.TimeoutExpired:
+            raise ConsoleError(504, f"sending the secrets took over {wait} s")
+        return res.returncode, (res.stdout + res.stderr).decode(errors="replace")
+
+    def package_stage(self, tunnel):
+        """(directory, hash) of what the packages send a cluster for `tunnel` (see PackageStore.stage)."""
+        return self.packages.stage(tunnel, os.path.join(console_dir(), "staging"))
 
     def _record_setup(self, profile, app, text):
         """Note what a tunnel_setup run said: the settings it saved, and the install status it found."""
         fresh, conf = self.app_config(profile, app, save=False)
         if "setting(s) for" in text:
             conf["pushed"] = time.time()
+        secrets = SECRETS_STATUS_RE.findall(text)
+        if secrets:
+            conf["secrets"] = {n: state == "set" for n, state in re.findall(r"([A-Z_][A-Z0-9_]*):(set|unset)",
+                                                                             secrets[-1])}
         found = TUNNEL_STATUS_RE.findall(text)
         if found:
+            # it ran, so what was sent with it (if anything) arrived
+            conf["pushed_package"] = self.package_stage(self.app_spec(app)["tunnel"])[1]
             state, message = found[-1]
             conf["install"] = {"state": state, "message": message.strip(), "checked": time.time()}
         agent_profiles.save(fresh)
@@ -1390,7 +1559,7 @@ class Clusters:
                "started_here": proc is not None and proc.poll() is None, "url": None, "prompt": self.prompt_of(proc),
                "install": (conf.get("install") or {"state": "unchecked"}) if self.app_installable(app)
                           else {"state": "nothing"},
-               "shared": bool(spec.get("shared"))}
+               "shared": bool(spec.get("shared")), "kind": spec.get("kind", "tunnel")}
         with self.lock:
             op = self.ops.get(name)
             if op and op.get("app") == app:
@@ -1418,6 +1587,18 @@ class Clusters:
             info = {}
         token = self._app_token(name, app)
         url = f"http://127.0.0.1:{port}{spec['open_path']}" + (f"?token={token}" if token else "")
+        if spec.get("gui_re") is not None:
+            found = spec["gui_re"].findall(self._last_launch(name, app))
+            if not found:
+                return dict(out, state="starting", error="waiting for its login to be printed")
+            user, password = found[-1]
+            # As rclone rcd opens it itself: the login in the address answers the server's basic-auth prompt for
+            # the page, and login_token gives the GUI the same login for its API calls.
+            login = base64.urlsafe_b64encode(f"{user}:{password}".encode()).decode()
+            q = urllib.parse.quote
+            url = (f"http://{q(user, safe='')}:{q(password, safe='')}@127.0.0.1:{port}{spec['open_path']}"
+                   f"?login_token={q(login, safe='')}")
+            return dict(out, state="up", url=url, token_known=True, username=user, password=password)
         extra = {}
         if spec.get("password_re") is not None:
             extra["password"] = self._app_token(name, app, "password_re")
@@ -1448,11 +1629,23 @@ class Clusters:
         if (conf.get("install") or {}).get("state") == "missing" and self.app_installable(app):
             raise ConsoleError(409, f"{spec['title']} isn't installed on {name} ({conf['install'].get('message')}); "
                                     f"install it, or Check again if you installed it yourself")
-        if spec.get("settings") and not conf.get("pushed"):
-            self.app_check(profile, app)       # sends the settings, so the job sees them
+        stale_package = self.package_stage(spec["tunnel"])[1] != conf.get("pushed_package")
+        if (spec.get("settings") and not conf.get("pushed")) or stale_package:
+            self.app_check(profile, app)       # sends the settings (and a package's files), so the job sees them
             _, conf = self.app_config(profile, app)
             if (conf.get("install") or {}).get("state") == "missing" and self.app_installable(app):
                 raise ConsoleError(409, f"{spec['title']} isn't installed on {name} ({conf['install'].get('message')})")
+        if spec.get("kind") == "login":
+            # smbshell gui on the login node; the console's ssh forwards the port (stop_tunnel cancels it)
+            port = str(conf["port"])
+            args = (["smbshell", "--on", "-L", f"127.0.0.1:{port}:127.0.0.1:{port}"] + ssh_options(profile) +
+                    [profile["host"], "gui", "--port", port])
+            self._open_log(name, " ".join(args), self.app_log_path(name, app)).close()
+            proc = self.tunnel_runner(args, self.app_log_path(name, app))
+            proc.note = spec.get("note")
+            with self.lock:
+                self.app_procs[(name, app)] = proc
+            return {"started": name, "app": app, "pid": proc.pid, "command": args}
         env = []
         if conf.get("conda_env") is not None:
             env.append(f"CONDA_ENVIRONMENT={conf['conda_env']}")
@@ -1734,9 +1927,18 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         if parts == ["health"] and verb == "GET":
             return 200, {"ok": True, "console": VERSION, "clusters": len(c.names()), "pid": os.getpid(),
                          "hpclib_version": local_hpclib_version()}
+        if parts == ["packages"] and verb == "GET":
+            return 200, {"ok": True, "packages": c.packages_list()}
+        if parts == ["packages"] and verb == "POST":
+            data = self.body(console_packages.MAX_ZIP)
+            return (200 if self.flag("dry_run") else 201), dict(c.package_add(data, self.flag("dry_run")), ok=True)
+        if len(parts) == 2 and parts[0] == "packages" and verb == "DELETE":
+            return 200, dict(c.package_remove(parts[1]), ok=True)
         if parts == ["apps"] and verb == "GET":
             return 200, {"ok": True, "apps": [{"id": "agents", "title": "Agents"}] +
-                         [{"id": k, "title": v["title"], "kind": v.get("kind", "tunnel")} for k, v in APPS.items()]}
+                         [{"id": k, "title": v["title"], "kind": v.get("kind", "tunnel"),
+                           "description": v.get("description"), "package": v.get("package")}
+                          for k, v in APPS.items()]}
         if len(parts) >= 2 and parts[0] == "apps":
             return self.app_route(verb, parts[1], parts[2:])
         if parts == ["clusters"] and verb == "POST":
@@ -1819,6 +2021,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             return 200, dict(c.app_control(profile, app, action[1], self.json_body()), ok=True)
         if action == ["settings"] and verb == "GET":
             return 200, dict(c.app_settings(profile, app), ok=True)
+        if action == ["secrets"] and verb == "PUT":
+            return 200, dict(c.send_secrets(profile, app, self.json_body()), ok=True)
         if action == ["settings"] and verb == "PUT":
             return 200, dict(c.save_app_settings(profile, app, self.json_body()), ok=True)
         raise ConsoleError(404, f"no route {verb} /api/apps/{app}/{'/'.join(rest)}")
@@ -1909,12 +2113,14 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 "auto_approve_templates": profile.get("auto_approve_templates") or "all",
                 "tunnel_args": profile.get("tunnel_args") or [],
                 "connection_hours": profile.get("connection_hours") or Logins.DEFAULT_HOURS,
+                "rest_on": profile.get("rest_on") or "job",
+                "rest_on_choices": list(agent_profiles.REST_ON),
                 "modes": list(agent_profiles.APPROVE_MODES),
                 "tunnel_arg_pattern": agent_profiles.TUNNEL_ARG_RE.pattern,
                 "applies": "the next time the tunnel starts"}
 
     def save_tunnel_settings(self, profile, body):
-        unknown = set(body) - {"auto_approve_templates", "tunnel_args", "connection_hours"}
+        unknown = set(body) - {"auto_approve_templates", "tunnel_args", "connection_hours", "rest_on"}
         if unknown:
             raise ConsoleError(400, f"unknown settings {sorted(unknown)}")
         mode = body.get("auto_approve_templates", profile.get("auto_approve_templates") or "all")
@@ -1928,8 +2134,11 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         hours = body.get("connection_hours", profile.get("connection_hours") or Logins.DEFAULT_HOURS)
         if isinstance(hours, bool) or not isinstance(hours, int) or not 1 <= hours <= 168:
             raise ConsoleError(422, "connection_hours must be a whole number of hours from 1 to 168")
+        rest_on = body.get("rest_on", profile.get("rest_on") or "job")
+        if rest_on not in agent_profiles.REST_ON:
+            raise ConsoleError(422, f"rest_on must be one of {list(agent_profiles.REST_ON)}")
         fresh = agent_profiles.load(profile["name"]) or profile
-        fresh.update(auto_approve_templates=mode, tunnel_args=args, connection_hours=hours)
+        fresh.update(auto_approve_templates=mode, tunnel_args=args, connection_hours=hours, rest_on=rest_on)
         agent_profiles.save(fresh)
         return self.tunnel_settings(fresh)
 

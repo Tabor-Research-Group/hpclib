@@ -1391,7 +1391,7 @@ class JobManager:
         """How proposals are approved on this server, for clients."""
         if not self.auto_approve:
             return {"review": "owner", "detail": "proposals wait until the cluster owner approves them"}
-        if self.sandbox.describe().get("effective") != "singularity":
+        if self.sandbox.describe().get("effective") not in rest_sandbox.SANDBOXED:
             return {"review": "owner", "detail": "the server would approve proposals automatically, but only "
                                                  "while template jobs are sandboxed, and they are not"}
         return {"review": "automatic", "replace_existing": self.auto_approve == "all",
@@ -1539,6 +1539,7 @@ class JobManager:
             "base_dir": whitelist.base_dir,
             "notes": self.cluster_notes,
             "sandbox": self.sandbox.describe(),
+            "scheduler": self.runner.describe() if hasattr(self.runner, "describe") else {"type": "slurm"},
             "template_proposals": self.proposal_policy(),
             "environments": self.environments.describe() if self.environments is not None else None,
             "job_environment": sorted(self.job_env),   # names only: values may be license keys and the like
@@ -1713,7 +1714,7 @@ class JobManager:
             res = self.runner.run(args, input=script, cwd=workdir)
             job_id = res.stdout.strip().split(";")[0]
             if res.returncode != 0 or not job_id.isdigit():
-                raise RESTError(502, "sbatch rejected the job", returncode=res.returncode,
+                raise RESTError(502, f"{getattr(self.runner, 'SUBMITTER', 'sbatch')} rejected the job", returncode=res.returncode,
                                 stdout=res.stdout, stderr=res.stderr)
             now = time.time()
             job = {

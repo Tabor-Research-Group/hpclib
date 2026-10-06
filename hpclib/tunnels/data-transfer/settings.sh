@@ -1,10 +1,10 @@
 # The data-transfer settings with their defaults; sourced by smbshell.sh, install.sh and sbatch_script.sh.
-#   SMB_HOST           the SMB server, e.g. files.chem.tamu.edu or 10.55.179.23 (just the host)
-#   SMB_ROOT           a SHARE/FOLDER that paths are relative to, e.g. CLAT_research/chem/our_lab (optional)
+#   SMB_HOST           the SMB server, e.g. files.example.edu or 10.0.0.12 (just the host)
+#   SMB_ROOT           a SHARE/FOLDER that paths are relative to, e.g. research/our_group (optional)
 #   SMB_USER           your user name there (default: your user name here)
-#   SMB_DOMAIN         its (NetBIOS) domain, e.g. TAMU, if it wants one
+#   SMB_DOMAIN         its (NetBIOS) domain, e.g. EXAMPLE, if it wants one
 #   SMB_SPN            the server's Kerberos name, if not cifs/SMB_HOST (smbshell find-spn finds it)
-#   SMB_REALM          the Kerberos realm for kinit, e.g. AUTH.TAMU.EDU (default: krb5.conf's default realm)
+#   SMB_REALM          the Kerberos realm for kinit, e.g. AUTH.EXAMPLE.EDU (default: krb5.conf's default realm)
 #   SMB_AUTH           auto (Kerberos when you have a ticket, else the saved password, else ask), kerberos or password
 #   SMB_IMAGE          the data-transfer-tools image (default /scratch/user/USER/images/data-transfer-tools.sif)
 #   SMB_IMAGE_SOURCE   where install.sh gets it (default docker://ghcr.io/tabor-research-group/data-transfer-tools:latest):

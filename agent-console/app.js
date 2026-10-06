@@ -6,7 +6,7 @@
 // and open   http://127.0.0.1:8000/?api=http://127.0.0.1:27180
 
 // The page's building blocks are custom elements, in components.js (see its header).
-import { configure, el, action, LOGIN_BUSY, LOGIN_LABEL, HpcClusterPicker } from "./components.js";
+import { configure, el, action, confirmDialog, LOGIN_BUSY, LOGIN_LABEL, HpcClusterPicker } from "./components.js";
 
 const params = new URLSearchParams(location.search);
 const API = (params.get("api") || "").replace(/\/$/, "");
@@ -54,12 +54,14 @@ class ApiError extends Error {
   }
 }
 
-async function api(path, { method = "GET", body } = {}) {
+async function api(path, { method = "GET", body, raw, contentType } = {}) {
+  // body: sent as JSON; raw (an ArrayBuffer or Blob, e.g. a package zip): sent as it is, as contentType
   if (!key) { askForKey(); throw new ApiError(401, { error: "no session key yet" }); }
+  const type = raw !== undefined ? (contentType || "application/octet-stream") : (body ? "application/json" : null);
   const res = await fetch(API + "/api/" + path, {
     method,
-    headers: { Authorization: `Bearer ${key}`, ...(body ? { "Content-Type": "application/json" } : {}) },
-    body: body ? JSON.stringify(body) : undefined,
+    headers: { Authorization: `Bearer ${key}`, ...(type ? { "Content-Type": type } : {}) },
+    body: raw !== undefined ? raw : (body ? JSON.stringify(body) : undefined),
   });
   let payload = {};
   try { payload = await res.json(); } catch { /* empty or not JSON */ }
@@ -655,18 +657,29 @@ async function tunnelSettings(c) {
   const inputs = Object.fromEntries(TUNNEL_FIELDS.map(([k]) => [k, el("input", { value: given[k] || "", size: 16 })]));
   const other = s.tunnel_args.filter((a) => !TUNNEL_FIELDS.some(([k]) => a.startsWith(`--${k}=`)));
   const hours = el("input", { type: "number", min: 1, max: 168, value: s.connection_hours, size: 6 });
+  const restOn = el("select", {}, (s.rest_on_choices || ["job", "login"]).map((m) => el("option",
+    { value: m, selected: m === (s.rest_on || "job") },
+    { job: "In a SLURM job on a compute node", login: "On the login node (no job)" }[m] || m)));
+  const jobFields = el("div", { class: "row" },
+    TUNNEL_FIELDS.map(([k, label, hint]) => field(`Tunnel job: ${label}`, inputs[k], hint)));
+  const showJob = () => { jobFields.hidden = restOn.value === "login"; };
+  restOn.addEventListener("change", showJob);
+  showJob();
   const save = saveButton("Save tunnel settings", async () => {
     const args = TUNNEL_FIELDS.filter(([k]) => inputs[k].value.trim()).map(([k]) => `--${k}=${inputs[k].value.trim()}`)
       .concat(other);
     await api(cluster(c.name) + "/settings", { method: "PUT", body: {
-      auto_approve_templates: mode.value, tunnel_args: args, connection_hours: Number(hours.value) } });
+      auto_approve_templates: mode.value, tunnel_args: args, connection_hours: Number(hours.value),
+      rest_on: restOn.value } });
     return "Saved. Applies the next time the tunnel starts (the login hours: the next time you log in).";
   });
   return el("section", { class: "card" },
     el("h3", {}, "Tunnel ", el("span", { class: "muted" }, "· kept on this machine")),
     field("Template proposals", mode, "only while jobs are sandboxed"),
     field("Keep the ssh login for (hours)", hours, "after it was last used; 1 to 168, default 12"),
-    el("div", { class: "row" }, TUNNEL_FIELDS.map(([k, label, hint]) => field(`Tunnel job: ${label}`, inputs[k], hint))),
+    field("Run the REST server", restOn, "on the login node where a site asks for it, or on a machine without SLURM "
+      + "(its server config then runs jobs there too); setup_agents picks this for a machine without sbatch"),
+    jobFields,
     other.length ? el("p", { class: "muted" }, `Also: ${other.join(" ")}`) : null,
     el("div", { class: "actions" }, save));
 }
@@ -819,10 +832,14 @@ async function appSettingsForm(app, s, row) {
                               placeholder: "default", size: 16 });
   const modules = el("input", { value: conf.modules.join(" "), placeholder: "e.g. JupyterLab/4.2.0", size: 32 });
   const project = el("input", { value: conf.project, placeholder: "/scratch/user/me/llm/my-project", size: 40 });
+  // empty: a package's value if one gives it (shown, with the package), else the tunnel's own default
+  const defaults = conf.defaults || {};
+  const fallback = (name) => defaults[name] ? `${defaults[name].value} (from ${defaults[name].package})`
+                                            : "the tunnel's default";
   const own = Object.fromEntries(conf.fields.map((f) => [f.name, f.choices
-    ? el("select", {}, el("option", { value: "" }, "the tunnel's default"),
+    ? el("select", {}, el("option", { value: "" }, fallback(f.name)),
         f.choices.map((c) => el("option", { value: c, selected: conf.settings[f.name] === c }, c)))
-    : el("input", { value: conf.settings[f.name] || "", placeholder: "the tunnel's default", size: 44 })]));
+    : el("input", { value: conf.settings[f.name] || "", placeholder: fallback(f.name), size: 44 })]));
   const save = saveButton("Save", async () => {
     const tunnel_args = APP_TUNNEL_FIELDS.filter(([k]) => inputs[k].value.trim())
       .map(([k]) => `--${k}=${inputs[k].value.trim()}`).concat(other);
@@ -838,6 +855,30 @@ async function appSettingsForm(app, s, row) {
       ? "Saved. They go to the cluster with the next Check, Install or Start."
       : "Saved. Applies the next time it starts.";
   });
+  // secrets (a packaged app's tokens, OAuth client secrets): typed here, sent to the cluster over ssh, never kept
+  // by the console or shown again; the panel only says whether each is set there
+  const secrets = conf.secrets || [];
+  const secretInputs = Object.fromEntries(secrets.map((f) => [f.name, el("input", {
+    type: "password", autocomplete: "new-password", size: 44,
+    placeholder: f.set === true ? "set on the cluster; type to replace" : f.set === false ? "not set" : "not checked yet" })]));
+  const secretsPath = `apps/${app}/${encodeURIComponent(s.cluster)}/secrets`;
+  const sendSecrets = saveButton("Send to the cluster", async () => {
+    const values = Object.fromEntries(secrets.map((f) => [f.name, secretInputs[f.name].value.trim()]).filter(([, v]) => v));
+    if (!Object.keys(values).length) throw new Error("Type at least one value (empty fields are left as they are).");
+    const out = await api(secretsPath, { method: "PUT", body: { values } });
+    for (const f of out.secrets) {
+      secretInputs[f.name].value = "";
+      secretInputs[f.name].placeholder = f.set ? "set on the cluster; type to replace" : "not set";
+    }
+    return "Sent. The app uses them from its next Start.";
+  });
+  const clearSecrets = action("Remove them", async () => {
+    if (!await confirmDialog("Remove the secrets?", `They are deleted on ${s.cluster}; the app runs without them ` +
+                             "from its next Start.", "Remove")) return;
+    const out = await api(secretsPath, { method: "PUT", body: { values: Object.fromEntries(secrets.map((f) => [f.name, ""])) } });
+    for (const f of out.secrets) secretInputs[f.name].placeholder = f.set ? "set on the cluster; type to replace" : "not set";
+    return "Removed.";
+  }, { result: true });
   row.showDetail("settings", el("hpc-panel", { heading: `${APPS_UI[app].title} on ${s.cluster}`, dismissible: true },
     el("p", { class: "muted" }, "The tunnel's job (empty: its defaults):"),
     el("div", { class: "row" }, APP_TUNNEL_FIELDS.map(([k, label, hint]) => field(`Job: ${label}`, inputs[k], hint))),
@@ -848,9 +889,16 @@ async function appSettingsForm(app, s, row) {
         field("Modules", modules, "loaded in the job, space-separated"),
         field("uv or pixi project", project, "its .venv or .pixi/envs/default; Install puts jupyterlab there"))] : null,
     conf.fields.length ? [
-      el("p", { class: "muted" }, "On the cluster (empty: the tunnel's default). Install and the job both use these."),
+      el("p", { class: "muted" }, "On the cluster (empty: an installed package's value, else the tunnel's default). " +
+        "Install and the job both use these."),
       el("div", { class: "row" }, conf.fields.map((f) => field(f.label, own[f.name], f.hint)))] : null,
-    el("div", { class: "actions" }, save)));
+    el("div", { class: "actions" }, save),
+    secrets.length ? el("section", { class: "secrets" },
+      el("h4", {}, "Secrets"),
+      el("p", { class: "muted" }, `Sent to ${s.cluster} over your login and kept there in a file only you can ` +
+        "read (out of the agents' reach); this machine keeps only whether each is set. Needs the login."),
+      el("div", { class: "row" }, secrets.map((f) => field(f.label, secretInputs[f.name], f.hint))),
+      el("div", { class: "actions" }, sendSecrets, clearSecrets)) : null));
 }
 
 async function appPage(app) {
@@ -861,13 +909,18 @@ async function appPage(app) {
     row.data = s;
     return row;
   });
-  const tool = (APPS_UI[app] || {}).kind === "tool";
+  const { kind, description } = APPS_UI[app] || {};
+  const tool = kind === "tool";
   return [
     el("h2", {}, title),
-    el("p", { class: "muted" }, tool
+    el("p", { class: "muted" }, description ? description : tool
       ? "Files between each cluster and an SMB server, with rclone from the data-transfer-tools image: " +
         "smbshell on the cluster (smbshell --help), and smbshell submit for SLURM jobs. Sign in here once: " +
         "Kerberos (kinit) where the cluster has it, or a password saved for sync jobs. Settings… names the server."
+      : kind === "login"
+      ? "rclone's web GUI per cluster, on its login node, reached through the console's ssh login: browse the SMB " +
+        "server (remote smb, plus any a settings package adds) and the cluster's files (cluster), and copy between them. Start asks for the " +
+        "SMB password, kept only until Stop. It uses Data transfer's settings and image."
       : `A ${title} session per cluster, in a SLURM job reached through its own tunnel. ` +
         "It runs as you, with your full permissions on the cluster (it is not the agents' sandbox). " +
         "What it needs on the cluster is checked once you're logged in, and Install sets it up there."),
@@ -892,8 +945,8 @@ const APPS_UI = {
   // the tunnel apps (JupyterLab, VS Code, PAI, ...) come from GET /api/apps, each with a Sessions page
 };
 
-function addApp(id, title, kind = "tunnel") {
-  APPS_UI[id] = { title, kind, default: "sessions",
+function addApp(id, title, kind = "tunnel", description = null) {
+  APPS_UI[id] = { title, kind, description, default: "sessions",
                   pages: { sessions: [kind === "tool" ? "Clusters" : "Sessions", () => appPage(id)] } };
 }
 addApp("jupyter", "JupyterLab");     // until the console says which it has
@@ -902,7 +955,7 @@ async function loadApps() {
   if (!key) return;
   try {
     const { apps } = await api("apps");
-    for (const a of apps) if (a.id !== "agents" && !APPS_UI[a.id]) addApp(a.id, a.title, a.kind);
+    for (const a of apps) if (a.id !== "agents" && !APPS_UI[a.id]) addApp(a.id, a.title, a.kind, a.description);
   } catch { /* an older console: JupyterLab only */ }
 }
 
@@ -1004,6 +1057,68 @@ takeKeyFromHash();
 key = key || storedKey();
 window.addEventListener("hashchange", () => { takeKeyFromHash(); render(); });
 document.getElementById("refresh").addEventListener("click", render);
+document.getElementById("add-package").addEventListener("click", () => packagesDialog());
+
+// ---------------------------------------------------------------- packages
+
+// Apps and settings that aren't part of hpclib come as package zips (hpclib-package.json and its files; see
+// console_packages.py). This dialog lists the installed ones, and checks a zip, shows what it adds, and installs it.
+async function packagesDialog() {
+  const list = el("div", {});
+  const report = el("div", {});
+  const file = el("input", { type: "file", accept: ".zip,application/zip" });
+  const dialog = el("hpc-dialog", { heading: "Add App or Settings", transient: true },
+    el("p", { class: "muted" }, "A package is a zip file with an hpclib-package.json: apps for this console, the " +
+      "tunnels they run on your clusters, and settings (such as a group's SMB server). Its scripts run on your " +
+      "clusters as you, so install only packages you trust."),
+    field("Package zip", file, "it is checked first; nothing is installed until you say so"),
+    report, el("h4", {}, "Installed"), list);
+
+  async function drawList() {
+    const { packages } = await api("packages");
+    list.replaceChildren(packages.length ? el("ul", { class: "packages" }, packages.map((p) => el("li", {},
+      el("strong", {}, `${p.name} ${p.version}`), p.description ? el("span", { class: "muted" }, ` · ${p.description}`) : null,
+      el("ul", {}, p.summary.map((line) => el("li", { class: "muted" }, line))),
+      action("Remove", async () => {
+        if (!await confirmDialog(`Remove ${p.name}?`, `Its apps leave the console. What it sent to clusters stays ` +
+                                 `there; its settings files are cleared with each app's next Check.`, "Remove")) return;
+        await api(`packages/${encodeURIComponent(p.name)}`, { method: "DELETE" });
+        location.reload();
+      })))) : el("p", { class: "muted" }, "None yet."));
+  }
+
+  file.addEventListener("change", async () => {
+    const chosen = file.files[0];
+    if (!chosen) return;
+    report.replaceChildren(el("p", { class: "muted" }, `Checking ${chosen.name}…`));
+    const raw = await chosen.arrayBuffer();
+    let checked;
+    try {
+      checked = await api("packages?dry_run=1", { method: "POST", raw, contentType: "application/zip" });
+    } catch (err) {
+      report.replaceChildren(errorBox(err));
+      return;
+    }
+    const p = checked.package;
+    const install = action(checked.replaces ? `Replace ${p.version === checked.replaces ? "it" : checked.replaces}`
+                                            : "Install", async () => {
+      await api("packages", { method: "POST", raw, contentType: "application/zip" });
+      location.reload();     // its apps join the top bar
+    }, { primary: true });
+    report.replaceChildren(el("section", { class: "card" },
+      el("h4", {}, `${p.name} ${p.version}`, checked.replaces ? el("span", { class: "muted" },
+        ` (installed: ${checked.replaces})`) : null),
+      p.description ? el("p", {}, p.description) : null,
+      el("ul", {}, checked.summary.map((line) => el("li", {}, line))),
+      el("p", { class: "muted hash" }, `sha256 ${checked.sha256}`),
+      checked.problems.length
+        ? el("div", { class: "error-box" }, "It can't be installed: ", checked.problems.join("; "))
+        : el("div", { class: "actions" }, install)));
+  });
+
+  dialog.showModal();
+  try { await drawList(); } catch (err) { list.replaceChildren(errorBox(err)); }
+}
 loadApps().then(render);
 checkPrompts();
 refreshBadge();

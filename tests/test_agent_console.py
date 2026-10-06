@@ -269,6 +269,22 @@ class TestSettings(ConsoleTestCase):
         self.assertIn("--time=12:00:00 --time=2:00:00 --", second)                # the later one wins in sbatch
         self.assertNotIn("auto-approve", second)
 
+    def test_rest_on_login_node(self):
+        self.assertEqual(self.call("GET", f"/api/clusters/{self.live}/settings")[1]["rest_on"], "job")
+        status, out = self.call("PUT", f"/api/clusters/{self.live}/settings", {"rest_on": "login"})
+        self.assertEqual((status, out["rest_on"]), (200, "login"), out)
+        self.assertEqual(self.call("PUT", f"/api/clusters/{self.live}/settings", {"rest_on": "node1"})[0], 422)
+        agent_profiles.cmd_set(self.live, "tunnel_args=--time=12:00:00")
+        repo = Path(__file__).resolve().parents[1]
+        script = (f'source {repo / "hpclib" / "hpclib.sh"}; launch_tunnel() {{ printf "%s\\n" "$*"; }}; '
+                  f'agent_tunnel {self.live}')
+        res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                             env=dict(os.environ, HPCLIB_AGENTS_DIR=str(self.agents)))
+        self.assertIn(" rest --process-port=", res.stdout)
+        self.assertIn(" --login-node -- ", res.stdout)
+        self.assertNotIn("--time=12:00:00", res.stdout)                            # no job, no sbatch options
+        self.assertEqual(agent_profiles.cmd_set(self.live, "rest_on=elsewhere"), 2)
+
     def test_server_config_through_the_proxy(self):
         path = self.data / "rest" / "config.json"
         path.write_text("{}")
@@ -526,7 +542,7 @@ class TestApps(ConsoleTestCase):
 
     def test_listing_and_ports(self):
         out = self.call("GET", "/api/apps")[1]
-        self.assertEqual([a["id"] for a in out["apps"]], ["agents", "jupyter", "vscode", "transfer", "pai"])
+        self.assertEqual([a["id"] for a in out["apps"]], ["agents", "jupyter", "vscode", "transfer", "rclone", "pai"])
         self.assertEqual({a["id"]: a.get("kind") for a in out["apps"]}["transfer"], "tool")
         status, out = self.call("GET", "/api/apps/jupyter")
         self.assertEqual(status, 200)
@@ -800,7 +816,7 @@ class TestDataTransfer(ConsoleTestCase):
             self.assertIn("confirm", controls[0])
             self.assertEqual(self.call("POST", self.route + "/control/nope", {})[0], 404)
             # a server given by address: Kerberos can't sign in to it, so the password is offered
-            self.shell.smb_status.update(host="10.55.179.23", kinit="host", credentials=False,
+            self.shell.smb_status.update(host="10.0.0.12", kinit="host", credentials=False,
                                          ticket={"principal": "me@AUTH.EXAMPLE.EDU", "expires": "later"})
             self.call("POST", self.route + "/control/status", {})
             state = self.call("GET", self.route)[1]
@@ -811,15 +827,15 @@ class TestDataTransfer(ConsoleTestCase):
         self.assertEqual(out["settings"], {"SMB_HOST": "files.example.edu", "SMB_AUTH": "kerberos"})
         self.assertEqual(self.call("PUT", self.route + "/settings", {"settings": {"SMB_AUTH": "magic"}})[0], 422)
         # the address as it is usually written: the host, and the folder smbshell's paths are relative to
-        for given in ("//10.55.179.23/CLAT_research/chem/our_lab", "\\\\10.55.179.23\\CLAT_research\\chem\\our_lab"):
+        for given in ("//10.0.0.12/research/our_group", "\\\\10.0.0.12\\research\\our_group"):
             out = self.call("PUT", self.route + "/settings", {"settings": {"SMB_HOST": given}})[1]
-            self.assertEqual(out["settings"], {"SMB_HOST": "10.55.179.23", "SMB_ROOT": "CLAT_research/chem/our_lab"}, given)
+            self.assertEqual(out["settings"], {"SMB_HOST": "10.0.0.12", "SMB_ROOT": "research/our_group"}, given)
         # and they reach the cluster before the next status
         with mock.patch.object(self.clusters.logins, "alive", return_value=True):
             self.call("POST", self.route + "/control/status", {})
         pushed = self.shell.calls[-2]
         self.assertEqual(pushed[:3], ["tunnel_setup", self.host, "data-transfer"])
-        self.assertIn("SMB_ROOT=CLAT_research/chem/our_lab", pushed)
+        self.assertIn("SMB_ROOT=research/our_group", pushed)
 
     def test_kinit_in_the_page(self):
         with mock.patch.object(self.clusters.logins, "alive", return_value=True):
@@ -845,6 +861,36 @@ class TestDataTransfer(ConsoleTestCase):
         self.assertIn("signed in: me@AUTH.EXAMPLE.EDU", log)
         self.assertIn(f"smbshell --on {self.host} login", log)
         self.assertNotIn("kerberos-pass", log)
+
+
+class TestRcloneGui(ConsoleTestCase):
+    """Rclone: rclone's web GUI on the login node, its port forwarded over the console's login."""
+    serve = TestApps.serve
+
+    def test_start_and_open(self):
+        route = f"/api/apps/rclone/{self.dead}"
+        state = self.call("GET", route)[1]
+        self.assertEqual((state["kind"], state["state"]), ("login", "down"))
+        port = agent_profiles.load(self.dead)["apps"]["rclone"]["port"]
+        host = agent_profiles.load(self.dead)["host"]
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            status, out = self.call("POST", route + "/start")
+            self.assertEqual(status, 202, out)
+            self.assertEqual(self.shell.calls[-1], ["smbshell", "--on", "-L", f"127.0.0.1:{port}:127.0.0.1:{port}",
+                                                    host, "gui", "--port", str(port)])
+            # Check and Install use Data transfer's image, and never overwrite its settings
+            self.call("POST", route + "/check")
+            self.assertEqual(self.shell.calls[-1], ["tunnel_setup", host, "data-transfer", "--check"])
+        # once it prints its login, Open goes straight in
+        log = self.console / "logs" / f"{self.dead}.rclone.log"
+        log.write_text(log.read_text() + "HPCLIB_RCLONE_GUI port=%d user=hpclib pass=0a1b2c\r\n" % port)
+        self.serve(port)
+        state = self.call("GET", route)[1]
+        self.assertEqual(state["state"], "up", state)
+        self.assertEqual(state["url"], f"http://hpclib:0a1b2c@127.0.0.1:{port}/?login_token=aHBjbGliOjBhMWIyYw%3D%3D")
+        self.assertEqual((state["username"], state["password"]), ("hpclib", "0a1b2c"))
+        self.call("POST", route + "/stop")
+        self.assertEqual(self.shell.calls[-1], ["stop_tunnel", "-P", str(port), host])
 
 
 class TestSecondLogin(ConsoleTestCase):

@@ -228,9 +228,13 @@ class TestSetupAgents(unittest.TestCase):
             d.mkdir()
         (bin_dir / "ssh").write_text(FAKE_SSH)
         (bin_dir / "ssh").chmod(0o755)
+        slurm = self.tmp / "slurm"   # the cluster has SLURM (an sbatch on its PATH) unless a test takes it away
+        slurm.mkdir()
+        (slurm / "sbatch").write_text("#!/bin/sh\nexit 1\n")
+        (slurm / "sbatch").chmod(0o755)
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(("HPC", "HPCLIB"))}
         self.env.update(HOME=str(self.local_home), PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-                        TEST_REMOTE_HOME=str(self.remote_home), TEST_REMOTE_PATH=os.environ["PATH"])
+                        TEST_REMOTE_HOME=str(self.remote_home), TEST_REMOTE_PATH=f"{slurm}{os.pathsep}{os.environ['PATH']}")
         self.rest = self.remote_home / ".local" / "tunnels" / "rest"
         self.work = [self.tmp / "scratch" / "llm", self.tmp / "project" / "shared"]
         self.profile_dir = self.local_home / ".config" / "hpclib" / "agents" / "me@login.example"
@@ -361,6 +365,22 @@ class TestSetupAgents(unittest.TestCase):
         out = self.bash("agent_list")
         self.assertIn("me@login.example", out)
         self.assertIn("me@other.example", out)
+
+    def test_machine_without_slurm(self):
+        if shutil.which("sbatch"):
+            self.skipTest("this machine has a real sbatch")
+        self.env["TEST_REMOTE_PATH"] = os.environ["PATH"]   # a development server: no sbatch
+        out = self.setup_agents("--work-dir", str(self.work[0]), "me@login.example")
+        self.assertIn("no SLURM on me@login.example", out)
+        self.assertEqual(self.profile()["rest_on"], "login")
+        self.assertEqual(self.config()["scheduler"], {"type": "local"})
+        out = self.bash('launch_tunnel() { printf "%s\\n" "$*"; }; agent_tunnel "$@"', "hpclib-login")
+        self.assertIn(" rest --process-port=", out)
+        self.assertIn(" --login-node -- ", out)
+        # a rerun keeps the choice, and an owner who sets it back to job keeps that
+        self.bash('_hpclib_agent_profiles set me@login.example rest_on=job')
+        self.setup_agents("--work-dir", str(self.work[0]), "me@login.example")
+        self.assertEqual(self.profile()["rest_on"], "job")
 
     def test_agent_tunnel_uses_the_profile(self):
         self.setup_agents("--work-dir", str(self.work[0]), "--templates", "hello", "me@login.example")
