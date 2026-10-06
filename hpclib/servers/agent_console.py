@@ -118,6 +118,8 @@ STREAMED_ROUTES = ("files/content",)   # passed through in chunks rather than re
 #   settings      [(NAME, label, hint[, choices])]: the tunnel's TUNNEL_SETTINGS (tunnel_config.sh) the page
 #                 edits (with choices: a select of those values); they are saved on the cluster
 #                 (tunnels/setup_tunnel.sh --save) for its job and install.sh
+#   kind "tool"   not a port-forwarding tunnel but commands run on the cluster (Data transfer: smbshell); its
+#                 row has no Open/Start/Stop, and its controls run them
 #   shared        the tunnel attaches to a running instance another job serves (SHARED_INSTANCE), and keeps
 #                 the one it starts running after Stop (KEEP_INSTANCE); `instance_label` names that service,
 #                 and its row gets a toolbar tool describing the job and a control that ends it
@@ -151,6 +153,30 @@ APPS = {
                                                                  "/scratch/user/me:/scratch/user/me,/home/me:/home/me"),
         ],
     },
+    "transfer": {
+        "title": "Data transfer",
+        "tunnel": "data-transfer",
+        "kind": "tool",
+        "settings": [
+            ("SMB_HOST", "SMB server", "just the host, e.g. 10.55.179.23; //HOST/SHARE/FOLDER fills in the folder too"),
+            ("SMB_ROOT", "Folder", "SHARE/FOLDER that smbshell paths are relative to, e.g. CLAT_research/chem/lab"),
+            ("SMB_USER", "User name", "on the server, as smbclient --user takes it, e.g. me@tamu.edu; default your "
+                                      "cluster user name"),
+            ("SMB_DOMAIN", "Domain", "for a password, the domain if User name has none (rclone's default is "
+                                     "WORKGROUP), e.g. tamu.edu"),
+            ("SMB_REALM", "Kerberos realm", "for kinit (the user name without its @domain, in this realm), e.g. "
+                                            "AUTH.TAMU.EDU; default krb5.conf's"),
+            ("SMB_SPN", "Kerberos name of the server", "if Kerberos says cifs/SERVER is \"not found in Kerberos "
+                                                       "database\": smbshell find-spn shows the one it knows"),
+            ("SMB_AUTH", "Sign in with", "auto: a Kerberos ticket if you have one, else the saved password",
+             ("auto", "kerberos", "password")),
+            ("SMB_IMAGE", "Image", "where data-transfer-tools.sif is kept; default /scratch/user/USER/images/"
+                                   "data-transfer-tools.sif"),
+            ("SMB_IMAGE_SOURCE", "Image source", "what Install pulls or builds it from (oras://, docker://, a .def "
+                                                 "or a .sif); default docker://ghcr.io/tabor-research-group/"
+                                                 "data-transfer-tools:latest"),
+        ],
+    },
     "pai": {
         "title": "PAI",
         "tunnel": "pai",
@@ -172,6 +198,7 @@ SETTING_VALUE_RE = re.compile(r"[^\0\n\r]{0,1024}")
 TUNNEL_STATUS_RE = re.compile(r"^HPCLIB_TUNNEL_STATUS (installed|missing|unknown|nothing) ?(.*)$", re.M)
 ATTACHED_RE = re.compile(r"attaching to the running \S+ instance: job (\d+) on (\S+), port (\d+)")
 OWN_INSTANCE_RE = re.compile(r"job (\d+) serves \S+ on (\S+), port (\d+)")
+SMB_STATUS_RE = re.compile(r"^HPCLIB_SMB_STATUS (\{.*\})\s*$", re.M)
 ENDED_INSTANCE_RE = re.compile(r"^hpclib console: ended job (\d+)", re.M)
 INSTANCE_LINE_RE = re.compile(r"^HPCLIB_TUNNEL_INSTANCE (\d+) (\S+) (\d+) (\S+) (\S+)$", re.M)
 APP_PROJECT_RE = re.compile(r"/[A-Za-z0-9_./@+-]{1,1023}")
@@ -353,7 +380,12 @@ class PtySession:
 
     def waiting(self):
         with self.lock:
-            return None if self.prompt is None else dict(self.prompt)
+            if self.prompt is None:
+                return None
+            out = dict(self.prompt)
+            if getattr(self, "note", None) and out["kind"] == "password":
+                out["note"] = self.note         # what the password is for, when it isn't a tunnel's second login
+            return out
 
 
 def ssh_options(profile):
@@ -1016,7 +1048,15 @@ class Clusters:
                 choices = fields[k][3] if len(fields[k]) > 3 else None
                 if choices and v.strip() and v.strip() not in choices:
                     raise ConsoleError(422, f"{k} is one of {', '.join(choices)} (or empty for the default)")
-            conf["settings"] = {k: v.strip() for k, v in values.items() if v.strip()}
+            settings = {k: v.strip() for k, v in values.items() if v.strip()}
+            host = settings.get("SMB_HOST", "")
+            if "SMB_HOST" in fields and ("/" in host or "\\" in host):
+                # //HOST/SHARE/FOLDER (or \\HOST\SHARE\FOLDER, as Windows writes it): the host, and the folder
+                parts = [x for x in host.replace("\\", "/").split("/") if x]
+                settings["SMB_HOST"] = parts[0] if parts else ""
+                if len(parts) > 1 and not settings.get("SMB_ROOT"):
+                    settings["SMB_ROOT"] = "/".join(parts[1:])
+            conf["settings"] = settings
         conf["pushed"] = None              # the cluster's copy is out of date until the next Check, Install or Start
         agent_profiles.save(fresh)
         return self.app_settings(fresh, app)
@@ -1133,6 +1173,8 @@ class Clusters:
 
     def app_extras(self, spec, state):
         """The row's toolbar tools and extra controls (see APPS)."""
+        if spec.get("kind") == "tool":
+            return self.transfer_extras(state)
         tools, controls = [], []
         inst = state.get("instance")
         if spec.get("shared"):
@@ -1152,6 +1194,120 @@ class Clusters:
                 tools.append({"id": "instance", "kind": "info", "label": what.capitalize(),
                               "text": f"none seen yet: Start connects to a running {what} job, or starts one"})
         return tools, controls
+
+    # -- Data transfer (smbshell): signing in to the SMB server --------------------------------
+
+    TRANSFER_CONTROLS = {
+        # id: (smbshell command, runs in a terminal that may ask for a password, note for the password dialog)
+        "status": ("status", False, None),
+        "kinit": ("login", True, "Kerberos sign-in for the SMB server (kinit, on the cluster): your password "
+                                  "goes to kinit, which keeps a ticket on the cluster; nothing is stored here."),
+        "kdestroy": ("logout", False, None),
+        "save_credentials": ("save-credentials", True,
+                             "The SMB server's password, saved on the cluster (mode 600, in rclone's reversible "
+                             "encoding) so sync jobs can sign in without you: there is no Kerberos there."),
+        "forget_credentials": ("forget-credentials", False, None),
+    }
+
+    def transfer_extras(self, state):
+        auth = state.get("auth")
+        tools, controls = [], []
+        if not auth:
+            tools.append({"id": "signin", "kind": "info", "label": "Signing in",
+                          "text": "not checked yet" + ("" if state.get("install", {}).get("state") == "installed"
+                                                       else "; install the image first")})
+            controls.append({"id": "status", "label": "Check sign-in"})
+            return tools, controls
+        tools.append({"id": "server", "kind": "info", "label": "Server",
+                      "text": f"{auth['host']} as {auth.get('user')}" if auth.get("host")
+                              else "not set: SMB server in Settings…"})
+        if auth.get("host"):
+            tools.append({"id": "folder", "kind": "info", "label": "Folder",
+                          "text": auth.get("root") or "none: smbshell paths are SHARE/PATH"})
+        kerberos = bool(auth.get("kinit")) and auth.get("rclone_kerberos")
+        ticket = auth.get("ticket")
+        by_address = bool(re.fullmatch(r"[0-9.]+|.*:.*", auth.get("host") or ""))
+        if kerberos and by_address:
+            # tickets are for cifs/NAME: an address can't be signed in to with Kerberos
+            text = ("the SMB server is an address, so Kerberos can't be used (it needs the server's DNS name); "
+                    + ("a saved password signs in" if auth.get("credentials") else "save a password, or use its name"))
+            tools.append({"id": "signin", "kind": "info", "label": "Signing in", "text": text})
+            controls.append({"id": "forget_credentials", "label": "Forget saved password",
+                             "confirm": "Remove the password saved on the cluster?"} if auth.get("credentials")
+                            else {"id": "save_credentials", "label": "Save password for sync jobs", "primary": True})
+            if ticket:
+                controls.append({"id": "kdestroy", "label": "Kerberos log out"})
+            controls.append({"id": "status", "label": "Refresh"})
+            return tools, controls
+        if ticket:
+            text = f"Kerberos ticket for {ticket.get('principal')}, until {ticket.get('expires')}"
+        elif auth.get("credentials"):
+            text = "a saved password (used by sync jobs, and by smbshell when there is no ticket)"
+        elif kerberos:
+            text = "kinit is available: sign in with Kerberos"
+        elif auth.get("kinit"):
+            text = "kinit is available, but this image's rclone has no Kerberos: save a password for jobs"
+        else:
+            text = "no kinit here: save a password for sync jobs (smbshell asks for it otherwise)"
+        tools.append({"id": "signin", "kind": "info", "label": "Signing in", "text": text})
+        if kerberos:
+            controls.append({"id": "kdestroy", "label": "Kerberos log out"} if ticket else
+                            {"id": "kinit", "label": "Kerberos log in (kinit)", "primary": True})
+        if not kerberos or auth.get("credentials"):
+            controls.append({"id": "forget_credentials", "label": "Forget saved password",
+                             "confirm": "Remove the password saved on the cluster? Sync jobs can't sign in "
+                                        "without it (or a Kerberos ticket)."} if auth.get("credentials") else
+                            {"id": "save_credentials", "label": "Save password for sync jobs"})
+        controls.append({"id": "status", "label": "Refresh"})
+        return tools, controls
+
+    def transfer_control(self, profile, app, control):
+        spec = self.app_spec(app)
+        if control not in self.TRANSFER_CONTROLS:
+            raise ConsoleError(404, f"{spec['title']} has no control {control!r}")
+        command, interactive, note = self.TRANSFER_CONTROLS[control]
+        name = profile["name"]
+        _, conf = self.app_config(profile, app)
+        if not conf.get("pushed"):          # settings saved since: the cluster's copy first
+            self._record_setup(profile, app, self._run_setup(profile, self.setup_args(profile, app), 120))
+        args = ["smbshell", "--on"] + ssh_options(profile) + [profile["host"]]
+        if not interactive:
+            text = self._run_setup(profile, args + ([command, "--json"] if command == "status" else [command]), 120)
+            if command != "status":
+                text = self._run_setup(profile, args + ["status", "--json"], 120)
+            return {"auth": self._record_auth(profile, app, text), "message": "Done."}
+        if not self.logins.alive(profile):
+            raise ConsoleError(409, f"log in to {name} first: this runs over the console's ssh login")
+        with self.lock:
+            proc = self.app_procs.get((name, app))
+            if proc is not None and proc.poll() is None:
+                raise ConsoleError(409, f"{spec['title']} on {name} is already running something")
+        self._open_log(name, " ".join(args + [command]), self.app_log_path(name, app)).close()
+        proc = self.tunnel_runner(args + [command], self.app_log_path(name, app))
+        proc.note = note
+        with self.lock:
+            self.app_procs[(name, app)] = proc
+
+        def then():                                   # once it's done, what the cluster says now
+            proc.wait()
+            try:
+                self._record_auth(profile, app, self._run_setup(profile, args + ["status", "--json"], 120))
+            except Exception:
+                pass
+        threading.Thread(target=then, daemon=True).start()
+        return {"started": command, "message": "Started; answer the password dialog."}
+
+    def _record_auth(self, profile, app, text):
+        found = SMB_STATUS_RE.findall(text)
+        if not found:
+            tail = " ".join(text.strip().splitlines()[-2:])
+            raise ConsoleError(502, f"no answer from smbshell on {profile['name']} (update hpclib there if it is "
+                                    f"older than this console): {tail}")
+        auth = json.loads(found[-1])
+        fresh, conf = self.app_config(profile, app, save=False)
+        conf["auth"] = dict(auth, checked=time.time())
+        agent_profiles.save(fresh)
+        return conf["auth"]
 
     def app_instances(self, profile, app, wait=60):
         """The shared app's registered running instances on the cluster, with their owners."""
@@ -1178,6 +1334,8 @@ class Clusters:
     def app_control(self, profile, app, control, body):
         """One of the row's extra controls."""
         spec = self.app_spec(app)
+        if spec.get("kind") == "tool":
+            return self.transfer_control(profile, app, control)
         if control != "stop_instance" or not spec.get("shared"):
             raise ConsoleError(404, f"{spec['title']} has no control {control!r}")
         job = str(body.get("job") or "")
@@ -1215,6 +1373,19 @@ class Clusters:
         port = conf["port"]
         with self.lock:
             proc = self.app_procs.get((name, app))
+        if spec.get("kind") == "tool":
+            running = proc is not None and proc.poll() is None
+            out = {"app": app, "cluster": name, "host": profile.get("host"), "kind": "tool", "port": None,
+                   "started_here": running, "state": "working" if running else "ready", "url": None,
+                   "prompt": self.prompt_of(proc), "auth": conf.get("auth"),
+                   "install": (conf.get("install") or {"state": "unchecked"}) if self.app_installable(app)
+                              else {"state": "nothing"}}
+            with self.lock:
+                op = self.ops.get(name)
+                if op and op.get("app") == app:
+                    out["operation"] = {k: op.get(k) for k in ("kind", "title", "app", "state", "exit_code",
+                                                               "started", "finished")}
+            return out
         out = {"app": app, "cluster": name, "host": profile.get("host"), "port": port,
                "started_here": proc is not None and proc.poll() is None, "url": None, "prompt": self.prompt_of(proc),
                "install": (conf.get("install") or {"state": "unchecked"}) if self.app_installable(app)
@@ -1262,6 +1433,8 @@ class Clusters:
 
     def app_start(self, profile, app):
         spec = self.app_spec(app)
+        if spec.get("kind") == "tool":
+            raise ConsoleError(400, f"{spec['title']} has nothing to start; use smbshell, or its controls")
         name = profile["name"]
         _, conf = self.app_config(profile, app)
         with self.lock:
@@ -1563,7 +1736,7 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                          "hpclib_version": local_hpclib_version()}
         if parts == ["apps"] and verb == "GET":
             return 200, {"ok": True, "apps": [{"id": "agents", "title": "Agents"}] +
-                         [{"id": k, "title": v["title"]} for k, v in APPS.items()]}
+                         [{"id": k, "title": v["title"], "kind": v.get("kind", "tunnel")} for k, v in APPS.items()]}
         if len(parts) >= 2 and parts[0] == "apps":
             return self.app_route(verb, parts[1], parts[2:])
         if parts == ["clusters"] and verb == "POST":

@@ -526,4 +526,245 @@ out=$(PATH="/usr/bin:/bin" "$HPCLIB_DIR/launch-tunnel-manager" --install-link "$
 case "$out" in *"isn't on your PATH"*) ;; *) fail "no PATH advice: $out" ;; esac
 if HPCLIB_PYTHON=false "$HPCLIB_DIR/launch-tunnel-manager" > /dev/null 2>&1; then fail 'ran without a usable Python'; fi
 
+################################################################################
+# smbshell: rclone in the data-transfer-tools image, with Kerberos or a saved password
+sb="$test_dir/smb"
+mkdir -p "$sb/bin" "$sb/home" "$sb/data" "$sb/scratch/out" "$sb/images"
+: > "$sb/images/dtt.sif"
+cat > "$sb/bin/singularity" <<'SCRIPT'
+#!/usr/bin/env bash
+# runs the command directly, after noting the binds and the environment rclone gets
+[ "$1" = exec ] || [ "$1" = shell ] || exit 2
+shift; binds=()
+while [ "$#" -gt 0 ]; do case "$1" in --bind) binds+=("$2"); shift 2 ;; -*) shift ;; *) break ;; esac; done
+shift   # the image
+printf 'binds=%s\n' "${binds[*]}" >> "$TEST_SMB_LOG"
+exec "$@"
+SCRIPT
+cat > "$sb/bin/rclone" <<'SCRIPT'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "obscure -") printf 'OBS:%s\n' "$(cat)"; exit 0 ;;
+  "help backend") echo "  --smb-use-kerberos  Use Kerberos authentication"; exit 0 ;;
+  "version ") echo "rclone v1.70.0"; exit 0 ;;
+esac
+{ printf 'rclone'; printf ' %s' "$@"; printf '\n'
+  env | grep -E '^(RCLONE_CONFIG_SMB_|KRB5CCNAME=|KRB5_CONFIG=)' | sort; } >> "$TEST_SMB_LOG"
+if [ -n "$TEST_RCLONE_REFUSE" ] && [ "$RCLONE_CONFIG_SMB_PASS" = "$TEST_RCLONE_REFUSE" ]; then
+  echo "CRITICAL: couldn't connect SMB: response error: The attempted logon is invalid." >&2; exit 1
+fi
+SCRIPT
+cat > "$sb/bin/kinit" <<'SCRIPT'
+#!/usr/bin/env bash
+echo "kinit $*" >> "$TEST_SMB_LOG"; : > "${KRB5CCNAME#FILE:}"
+SCRIPT
+cat > "$sb/bin/klist" <<'SCRIPT'
+#!/usr/bin/env bash
+[ -f "${KRB5CCNAME#FILE:}" ] || exit 1
+[ "$1" = -s ] && exit 0
+echo "Default principal: me@AUTH.EXAMPLE.EDU"
+echo "10/05/2026 08:00:00  10/05/2026 18:00:00  krbtgt/AUTH.EXAMPLE.EDU@AUTH.EXAMPLE.EDU"
+SCRIPT
+printf '#!/usr/bin/env bash\nrm -f "${KRB5CCNAME#FILE:}"\n' > "$sb/bin/kdestroy"
+cat > "$sb/bin/sbatch" <<'SCRIPT'
+#!/usr/bin/env bash
+{ printf 'sbatch'; printf ' %s' "$@"; printf '\nSMBSHELL_DIR=%s\n' "$SMBSHELL_DIR"; } >> "$TEST_SMB_LOG"; echo 9001
+SCRIPT
+chmod +x "$sb/bin/"*
+mkdir -p "$sb/data/settings"
+printf 'export SMB_HOST=files.example.edu SMB_DOMAIN=EXAMPLE SMB_REALM=AUTH.EXAMPLE.EDU SMB_IMAGE=%q\n' "$sb/images/dtt.sif" \
+  > "$sb/data/settings/data-transfer.sh"
+smbsh() {  # smbsh ARGS: smbshell on "the cluster", with no terminal
+  env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
+    SMB_KRB5_CONF=/dev/null bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" "$@" < /dev/null
+}
+case "$(smbsh status --json)" in
+  *'"host": "files.example.edu"'*'"kinit": "host"'*'"rclone_kerberos": true'*'"ticket": null'*'"credentials": false'*) ;;
+  *) fail "status: $(smbsh status --json)" ;;
+esac
+if smbsh ls proj 2> "$sb/err"; then fail 'ls signed in with nothing to sign in with'; fi
+grep -q 'smbshell login (Kerberos) or smbshell save-credentials' "$sb/err" || fail "no advice: $(cat "$sb/err")"
+if smbsh submit get proj/raw "$sb/scratch/out" 2> "$sb/err"; then fail 'submitted a job that could not sign in'; fi
+
+# a saved password (as save-credentials leaves it), given to rclone in its environment only
+mkdir -p "$sb/home/.config/hpclib/smb" && printf 'pass=OBS:hunter2\n' > "$sb/home/.config/hpclib/smb/credentials"
+: > "$sb/log"; smbsh ls proj/raw --json
+grep -q '^rclone lsjson --retries 1 --low-level-retries 1 smb:proj/raw$' "$sb/log" || fail "ls: $(cat "$sb/log")"
+grep -q '^RCLONE_CONFIG_SMB_PASS=OBS:hunter2$' "$sb/log" || fail 'the saved password was not used'
+grep -q '^RCLONE_CONFIG_SMB_HOST=files.example.edu$' "$sb/log" && grep -q '^RCLONE_CONFIG_SMB_DOMAIN=EXAMPLE$' "$sb/log" ||
+  fail 'host or domain missing'
+# paths under SMB_ROOT, a share and folder: relative ones there, /SHARE/... from the top
+: > "$sb/log"; SMB_ROOT=CLAT_research/chem/lab smbsh ls raw
+grep -q '^rclone lsf --retries 1 --low-level-retries 1 smb:CLAT_research/chem/lab/raw$' "$sb/log" || fail "root: $(cat "$sb/log")"
+: > "$sb/log"; SMB_ROOT=CLAT_research/chem/lab smbsh ls
+grep -q '^rclone lsf --retries 1 --low-level-retries 1 smb:CLAT_research/chem/lab$' "$sb/log" || fail "root itself: $(cat "$sb/log")"
+: > "$sb/log"; SMB_ROOT=CLAT_research/chem/lab smbsh ls /other/x
+grep -q '^rclone lsf --retries 1 --low-level-retries 1 smb:other/x$' "$sb/log" || fail "absolute: $(cat "$sb/log")"
+: > "$sb/log"; smbsh ls
+grep -q '^rclone lsf --retries 1 --low-level-retries 1 smb:$' "$sb/log" || fail "the shares: $(cat "$sb/log")"
+smbsh forget-credentials > /dev/null
+[ ! -e "$sb/home/.config/hpclib/smb/credentials" ] || fail 'forget-credentials kept the password'
+
+# save-credentials asks at a terminal and writes the encoded password, mode 600
+HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" SMB_KRB5_CONF=/dev/null \
+  python3 - "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" <<'PY'
+import os, pty, sys, time
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp("bash", ["bash", sys.argv[1], "save-credentials"])
+out = b""
+while b"Password for" not in out:
+    out += os.read(fd, 1024)
+os.write(fd, b"s3cret\n")
+while True:
+    try:
+        chunk = os.read(fd, 1024)
+    except OSError:
+        break
+    if not chunk:
+        break
+    out += chunk
+os.waitpid(pid, 0)
+assert b"s3cret" not in out, out          # not echoed
+PY
+assert_equal "$(cat "$sb/home/.config/hpclib/smb/credentials")" 'pass=OBS:s3cret'
+assert_equal "$(stat -c %a "$sb/home/.config/hpclib/smb/credentials" 2>/dev/null || stat -f %Lp "$sb/home/.config/hpclib/smb/credentials")" 600
+rm -f "$sb/home/.config/hpclib/smb/credentials"
+
+# Kerberos: login keeps the ticket where jobs see it; transfers use it, and no password
+smbsh login > "$sb/out" || fail "login: $(cat "$sb/out")"
+grep -q '^kinit me@AUTH.EXAMPLE.EDU$' "$sb/log" 2>/dev/null || grep -q "^kinit $(id -un)@AUTH.EXAMPLE.EDU$" "$sb/log" ||
+  fail "kinit: $(cat "$sb/log")"
+grep -q 'signed in: me@AUTH.EXAMPLE.EDU' "$sb/out" || fail "login output: $(cat "$sb/out")"
+[ -f "$sb/home/.config/hpclib/smb/krb5cc" ] || fail 'the ticket cache is not where jobs look'
+: > "$sb/log"; smbsh get //other.example.edu/proj/raw "$sb/scratch/out" --include '*.h5'
+grep -q "^rclone copy --stats=1m --stats-one-line -v smb:proj/raw $sb/scratch/out --include \*.h5$" "$sb/log" ||
+  fail "get: $(cat "$sb/log")"
+grep -q '^RCLONE_CONFIG_SMB_USE_KERBEROS=true$' "$sb/log" || fail 'Kerberos not used'
+grep -q '^RCLONE_CONFIG_SMB_HOST=other.example.edu$' "$sb/log" || fail '//HOST/... did not pick the host'
+grep -q 'RCLONE_CONFIG_SMB_PASS' "$sb/log" && fail 'a password went with a Kerberos transfer'
+grep -q "binds=.*$sb/scratch/out" "$sb/log" || fail 'the local folder was not bound into the image'
+: > "$sb/log"; smbsh sync push "$sb/scratch/out" proj/out --dry-run 2> "$sb/err"
+grep -q "^rclone sync --stats=1m --stats-one-line -v $sb/scratch/out smb:proj/out --dry-run$" "$sb/log" || fail "sync: $(cat "$sb/log")"
+grep -q 'deleting what' "$sb/err" || fail 'sync did not warn that it deletes'
+
+# submit: a job with the transfer, the tunnel's sbatch defaults, and yours
+: > "$sb/log"; assert_equal "$(smbsh submit --time=1:00:00 get proj/raw "$sb/scratch/out" 2>/dev/null)" 9001
+grep -q -- "--job-name=smb-transfer --output=$sb/data/sessions/data-transfer/transfer-%j.log --time=0-4:00:00 --mem=2gb --ntasks=1 --cpus-per-task=2 --time=1:00:00 $HPCLIB_DIR/tunnels/data-transfer/sbatch_script.sh get proj/raw $sb/scratch/out$" "$sb/log" ||
+  fail "sbatch: $(cat "$sb/log")"
+grep -q "^SMBSHELL_DIR=$HPCLIB_DIR/tunnels/data-transfer$" "$sb/log" || fail 'the job does not know where smbshell is'
+printf '[["get", "proj/a", "%s/scratch/a"], ["put", "%s/scratch/out", "proj/b", "--checksum"]]\n' "$sb" "$sb" > "$sb/manifest.json"
+: > "$sb/log"; smbsh submit --manifest "$sb/manifest.json" > /dev/null 2>&1 || fail 'manifest not submitted'
+grep -q -- '--array=0-1 ' "$sb/log" || fail "no array: $(cat "$sb/log")"
+lines=$(ls "$sb/data/sessions/data-transfer/"manifest-*.jsonl)
+printf '[["ls"]]\n' > "$sb/bad.json"
+if smbsh submit --manifest "$sb/bad.json" 2>/dev/null; then fail 'accepted a manifest entry that is not a transfer'; fi
+# the job itself: entry 1 of the manifest, signed in without asking
+: > "$sb/log"
+env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" SMB_KRB5_CONF=/dev/null \
+  SMBSHELL_DIR="$HPCLIB_DIR/tunnels/data-transfer" SLURM_ARRAY_TASK_ID=1 SLURM_JOB_ID=9001 \
+  bash "$HPCLIB_DIR/tunnels/data-transfer/sbatch_script.sh" --manifest "$lines" > "$sb/job.out" 2>&1 < /dev/null ||
+  fail "the job failed: $(cat "$sb/job.out")"
+grep -q "^rclone copy --stats=1m --stats-one-line -v $sb/scratch/out smb:proj/b --checksum$" "$sb/log" || fail "job: $(cat "$sb/log")"
+# rclone's Kerberos library gets a krb5.conf it can read (RHEL's has includedir and dns_canonicalize_hostname=fallback)
+printf 'includedir /etc/krb5.conf.d/\n[libdefaults]\n    dns_canonicalize_hostname = fallback\n    default_realm = AUTH.EXAMPLE.EDU\n' > "$sb/krb5.conf"
+: > "$sb/log"
+env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
+  SMB_KRB5_CONF="$sb/krb5.conf" bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" ls proj < /dev/null
+copy="$sb/home/.config/hpclib/smb/krb5.conf"
+grep -q includedir "$copy" && fail 'includedir left in the copy for rclone'
+grep -q '^    dns_canonicalize_hostname = false$' "$copy" || fail "fallback not turned into false: $(cat "$copy")"
+grep -q 'default_realm = AUTH.EXAMPLE.EDU' "$copy" || fail 'the rest of krb5.conf was lost'
+grep -q '^    dns_lookup_kdc = true$' "$copy" || fail "KDCs not looked up in DNS: $(cat "$copy")"
+printf '[libdefaults]\n dns_lookup_kdc = false\n' > "$sb/krb5-nodns.conf"
+env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
+  SMB_KRB5_CONF="$sb/krb5-nodns.conf" bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" status > /dev/null < /dev/null
+assert_equal "$(grep -c dns_lookup_kdc "$copy")" 1          # a site's own choice is kept
+grep -q "binds=.*$copy:/etc/hpclib-krb5.conf:ro" "$sb/log" || fail 'the copy is not what the image sees'
+grep -q '^RCLONE_CONFIG_SMB_USE_KERBEROS=true$' "$sb/log" || fail 'Kerberos not used with a server name'
+# a server given by address: no Kerberos (no ticket names it), so the password
+printf 'pass=OBS:hunter2\n' > "$sb/home/.config/hpclib/smb/credentials"
+: > "$sb/log"; smbsh ls //10.55.179.23/proj 2> "$sb/err"
+grep -q 'USE_KERBEROS' "$sb/log" && fail 'Kerberos used with an address'
+grep -q '^RCLONE_CONFIG_SMB_PASS=OBS:hunter2$' "$sb/log" || fail 'the password was not used for an address'
+grep -q "needs the server's name" "$sb/err" || fail "no note about the address: $(cat "$sb/err")"
+if SMB_AUTH=kerberos smbsh ls //10.55.179.23/proj 2>/dev/null; then fail 'SMB_AUTH=kerberos accepted an address'; fi
+# a user name as smbclient takes it, me@tamu.edu: rclone gets the user and the domain apart
+mkdir -p "$sb/data2/settings"
+printf 'export SMB_HOST=files.example.edu SMB_USER=me@tamu.edu SMB_IMAGE=%q\n' "$sb/images/dtt.sif" > "$sb/data2/settings/data-transfer.sh"
+: > "$sb/log"
+env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data2" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" SMB_AUTH=password \
+  bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" ls proj < /dev/null 2>/dev/null
+grep -q '^RCLONE_CONFIG_SMB_USER=me$' "$sb/log" && grep -q '^RCLONE_CONFIG_SMB_DOMAIN=tamu.edu$' "$sb/log" ||
+  fail "user@domain: $(cat "$sb/log")"
+# and kinit asks for the user in the Kerberos realm, not in the Windows domain
+: > "$sb/log"
+env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data2" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
+  bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" login < /dev/null > /dev/null 2>&1
+grep -qx 'kinit me' "$sb/log" || fail "kinit with user@domain: $(cat "$sb/log")"
+: > "$sb/log"
+env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data2" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" SMB_REALM=AUTH.TAMU.EDU \
+  bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" login < /dev/null > /dev/null 2>&1
+grep -qx 'kinit me@AUTH.TAMU.EDU' "$sb/log" || fail "kinit with a realm: $(cat "$sb/log")"
+rm -f "$sb/home/.config/hpclib/smb/krb5cc"
+# find-spn: the names DNS gives for the server, tried with kvno; SMB_SPN then reaches rclone
+cat > "$sb/bin/kvno" <<'SCRIPT'
+#!/usr/bin/env bash
+[ "$1" = "cifs/FILES" ]
+SCRIPT
+chmod +x "$sb/bin/kvno"
+if smbsh find-spn > /dev/null 2>&1; then fail 'find-spn ran without a ticket'; fi
+smbsh login > /dev/null
+out=$(smbsh find-spn) || fail "find-spn: $out"
+case "$out" in *"not known: cifs/files.example.edu"*"known:     cifs/FILES"*"--set SMB_SPN=cifs/FILES"*) ;; *) fail "find-spn: $out" ;; esac
+: > "$sb/log"; SMB_SPN=cifs/FILES smbsh ls proj
+grep -q '^RCLONE_CONFIG_SMB_SPN=cifs/FILES$' "$sb/log" || fail "SMB_SPN not given to rclone: $(cat "$sb/log")"
+smbsh logout > /dev/null
+# a refused sign-in: tried once, without rclone's retries, and the transfer isn't started
+printf 'pass=OBS:wrong\n' > "$sb/home/.config/hpclib/smb/credentials"
+smbsh logout > /dev/null
+: > "$sb/log"
+if TEST_RCLONE_REFUSE=OBS:wrong smbsh get //10.55.179.23/proj/raw "$sb/scratch/out" 2> "$sb/err"; then fail 'a refused sign-in went on'; fi
+grep -q 'refused the sign-in (tried once' "$sb/err" || fail "refusal: $(cat "$sb/err")"
+grep -q '^rclone lsf --max-depth 1 --retries 1 --low-level-retries 1 smb:proj$' "$sb/log" || fail "probe: $(cat "$sb/log")"
+grep -q '^rclone copy' "$sb/log" && fail 'the transfer ran after a refused sign-in'
+rm -f "$sb/home/.config/hpclib/smb/credentials"
+smbsh logout > /dev/null
+[ ! -e "$sb/home/.config/hpclib/smb/krb5cc" ] || fail 'logout kept the ticket'
+
+# the image: checked and installed with setup_tunnel.sh, from a source of your choosing
+rm -f "$sb/images/dtt.sif"
+out=$(env HOME="$sb/home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PATH="$HPCLIB_DIR/tunnels" HPCTUNNELS_DATA_DIR="$sb/data" \
+  PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" bash "$HPCLIB_DIR/tunnels/setup_tunnel.sh" data-transfer \
+  --set SMB_HOST=files.example.edu --set "SMB_IMAGE=$sb/images/dtt.sif" --set "SMB_IMAGE_SOURCE=$sb/built.sif" --save --check)
+case "$out" in *"HPCLIB_TUNNEL_STATUS missing not installed: no image at $sb/images/dtt.sif"*) ;; *) fail "check: $out" ;; esac
+: > "$sb/built.sif"
+out=$(env HOME="$sb/home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PATH="$HPCLIB_DIR/tunnels" HPCTUNNELS_DATA_DIR="$sb/data" \
+  PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" bash "$HPCLIB_DIR/tunnels/setup_tunnel.sh" data-transfer --install --check)
+case "$out" in *"HPCLIB_TUNNEL_STATUS installed installed: $sb/images/dtt.sif (rclone v1.70.0; Kerberos in rclone: yes)"*) ;;
+  *) fail "install: $out" ;; esac
+# by default it is pulled from the lab's registry, and Reinstall pulls it again
+mkdir -p "$sb/pull-bin"
+cat > "$sb/pull-bin/singularity" <<'SCRIPT'
+#!/usr/bin/env bash
+if [ "$1" = pull ]; then echo "pull $2 $3" >> "$TEST_SMB_LOG"; : > "$2"; exit 0; fi
+exec "$(dirname "$0")/../bin/singularity" "$@"
+SCRIPT
+chmod +x "$sb/pull-bin/singularity"
+out=$(env HOME="$sb/home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PATH="$HPCLIB_DIR/tunnels" HPCTUNNELS_DATA_DIR="$sb/data" \
+  PATH="$sb/pull-bin:$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" bash "$HPCLIB_DIR/tunnels/setup_tunnel.sh" data-transfer \
+  --set SMB_HOST=files.example.edu --set "SMB_IMAGE=$sb/images/dtt.sif" --save --install --force --check)
+grep -q '^pull .*/dtt.sif.partial.[0-9]* docker://ghcr.io/tabor-research-group/data-transfer-tools:latest$' "$sb/log" ||
+  fail "not pulled from ghcr.io: $(cat "$sb/log")"
+case "$out" in *"HPCLIB_TUNNEL_STATUS installed"*) ;; *) fail "after the pull: $out" ;; esac
+
+# smbshell --on runs it on the login node, with a terminal for a password prompt
+(
+  pssh() { printf '%s\n' "$@" > "$test_dir/smb-remote"; }
+  smbshell --on -p 2222 me@login.example get proj/raw '/scratch/user/me/a b'
+)
+assert_equal "$(sed -n 1,4p "$test_dir/smb-remote" | tr '\n' ' ')" '-t -p 2222 me@login.example '
+grep -q 'tunnels/data-transfer/smbshell.sh get proj/raw /scratch/user/me/a\\ b' "$test_dir/smb-remote" ||
+  fail "remote: $(cat "$test_dir/smb-remote")"
+
 echo 'Tunnel management tests passed'

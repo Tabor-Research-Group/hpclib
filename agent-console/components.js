@@ -810,7 +810,7 @@ export class HpcAppSession extends TunnelRow {
 
   get busy() {
     const s = this._data;
-    return !!(s.prompt || ["starting", "queued"].includes(s.state) || (s.started_here && s.state !== "up") ||
+    return !!(s.prompt || ["starting", "queued", "working"].includes(s.state) || (s.started_here && s.state !== "up") ||
               LOGIN_BUSY.includes((s.login || {}).state) || (s.operation && s.operation.state === "running"));
   }
 
@@ -845,6 +845,12 @@ export class HpcAppSession extends TunnelRow {
     if (s.install && s.install.state === "unchecked" && (s.login || {}).state === "connected" && !this._checked) {
       this._checked = true;
       this.buttons.check.run();
+    }
+    // a tool (Data transfer): how it would sign in, asked once you're logged in, after the install check
+    if (s.kind === "tool" && !s.auth && (s.login || {}).state === "connected" && !this._authAsked &&
+        s.install && s.install.state !== "unchecked") {
+      this._authAsked = true;
+      this.runControl({ id: "status" }).catch(() => {});
     }
   }
 
@@ -903,6 +909,7 @@ export class HpcAppSession extends TunnelRow {
       wrap.button.setAttribute("label", c.label);
       wrap.button.title = c.title || "";
       wrap.button.disabled = !!c.disabled;
+      wrap.button.toggleAttribute("primary", !!c.primary);
       return wrap;
     });
     this.extras = this.extras || el("hpclib-extra-controls");
@@ -934,6 +941,16 @@ export class HpcAppSession extends TunnelRow {
     const stateText = up ? `running${s.version ? ` (${s.version})` : ""}`
       : (s.state === "queued" ? `queued: ${s.status}` : (APP_STATE_LABEL[s.state] || s.state));
     const cluster = { name: s.cluster, host: s.host, connection_hours: lg.connection_hours };
+    if (s.kind === "tool") {   // commands on the cluster, not a tunnel: no Open/Start/Stop
+      return [
+        s.cluster,
+        this.loginCells(lg, cluster),
+        [s.state === "working" ? el("hpc-state", { tone: "starting", label: "working…" }) : null,
+         this.promptLine(`${this.appTitle} on ${s.cluster}`, this.base + "/answer", s.prompt),
+         this.installLine(s, loggedIn)],
+        [el("div", { class: "actions" }, b.log, b.settings), this.extras],
+      ];
+    }
     return [
       [s.cluster, el("div", { class: "muted" }, `port ${s.port}`)],
       this.loginCells(lg, cluster),

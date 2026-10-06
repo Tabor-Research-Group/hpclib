@@ -283,6 +283,36 @@ function tunnel_setup {
   HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$host" "$remote_command"
 }
 
+# SMB transfers with rclone from the data-transfer-tools image (tunnels/data-transfer/smbshell.sh; smbshell --help).
+# On a cluster it runs there; from your own machine, --on runs it on a cluster's login node over ssh, with a
+# terminal, so it can ask for a password:
+#   smbshell --on [ssh options] user@host get proj/raw /scratch/user/me/raw
+function smbshell {
+  local login_args=() host='' remote_hpclib
+  if [ "${1:-}" != --on ]; then
+    bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" "$@"
+    return
+  fi
+  shift
+  while [ "$#" -gt 0 ] && [ -z "$host" ]; do
+    case "$1" in
+      -?)
+        login_args+=("$1")
+        if [[ "$SSH_FLAGS" == *"${1#-}:"* ]] && [ "$#" -ge 2 ]; then login_args+=("$2"); shift; fi
+        shift ;;
+      -*) login_args+=("$1"); shift ;;
+      *) host="$1"; shift ;;
+    esac
+  done
+  if [ -z "$host" ]; then
+    echo 'usage: smbshell --on [ssh options] [user@]host COMMAND ...' >&2
+    return 2
+  fi
+  remote_hpclib=$(_hpclib_remote_path "$HPCLIB_REMOTE_INSTALL_LOCATION")
+  HPCLIB_ECHO_COMMANDS= pssh -t "${login_args[@]}" "$host" \
+    "$(_hpclib_remote_script_cmd /bin/bash "$remote_hpclib/tunnels/data-transfer/smbshell.sh" "$@")"
+}
+
 ################################################################################
 ##
 ##  Installing hpclib itself on a remote (SLURM) system

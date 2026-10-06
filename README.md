@@ -568,6 +568,35 @@ VSCODE_CONTAINER=... --save` (as the console's VS Code settings do). Singularity
 available on the login node. code-server asks for the password in `VSCODE_ROOT_DIR/.config/code-server/config.yaml`,
 which the tunnel prints (and the console offers to copy).
 
+**Data transfer (SMB)**: `smbshell` moves files between a cluster and an SMB server with rclone from the
+data-transfer-tools image. It isn't a port-forwarding tunnel; `tunnels/data-transfer/` holds the command, its
+SLURM job and the image's `install.sh`.
+
+```bash
+tunnel_setup user@grace.hprc.tamu.edu data-transfer --set SMB_HOST=10.55.179.23 \
+  --set SMB_ROOT=CLAT_research/chem/our_lab --set SMB_DOMAIN=TAMU \
+  --set SMB_REALM=AUTH.TAMU.EDU --save --install   # once; the image comes from
+                                                   # docker://ghcr.io/tabor-research-group/data-transfer-tools:latest
+smbshell login                                            # on the cluster: kinit, a ticket jobs can use too
+smbshell ls                                               # SMB_ROOT (or, without one, the server's shares)
+smbshell ls proj/raw                                      # under SMB_ROOT if set, else SHARE/PATH; /SHARE/PATH
+                                                          # and //HOST/SHARE/PATH are absolute
+smbshell get proj/raw /scratch/user/me/raw --include '*.h5'
+smbshell put /scratch/user/me/results proj/results
+smbshell sync pull proj/raw /scratch/user/me/raw --dry-run  # sync deletes what the source lacks
+smbshell submit --time=2:00:00 get proj/raw /scratch/user/me/raw   # the same, as a SLURM job
+smbshell submit --manifest transfers.json                 # [["get", "proj/a", "/scratch/.../a"], ...]: an array job
+smbshell --on user@grace.hprc.tamu.edu ls proj            # from your own machine, over ssh
+```
+
+Signing in (`SMB_AUTH=auto`): a Kerberos ticket from `smbshell login` (kinit on the login node, or in the image
+if the node has none; kept in `~/.config/hpclib/smb/krb5cc`, so jobs use it while it lasts), else a password
+saved with `smbshell save-credentials` (`~/.config/hpclib/smb/credentials`, mode 600, in rclone's reversible
+encoding), else `smbshell` asks. Jobs never ask: they need the ticket or the saved password. Kerberos needs an
+rclone with SMB Kerberos support (`smbshell status` says). The console's **Data transfer** page does the
+signing in: Kerberos log in (kinit) where the cluster has kinit, otherwise Save password for sync jobs, both
+through its password dialog, plus Install/Check for the image and the settings above.
+
 **PAI**: the proto-auto-interface database, run with `singularity-compose` from
 `PAI_ROOT_DIR/proto-auto-interface` (default `/scratch/user/<username>/pai`; `install.sh` clones `PAI_REPO` there).
 `PAI_BIND_SOURCE` (default `1`) has `singularity-compose.sh` bind that checkout's source into the containers, so

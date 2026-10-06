@@ -43,6 +43,8 @@ class FakeShell:
         self.calls = []
         self.setup_status = "missing not installed: no image at /x/vscode.sif"   # what tunnel_setup --check says
         self.stop_answer = None                                                  # what --stop-instance says
+        self.smb_status = {"host": "files.example.edu", "user": "me", "auth": "auto", "kinit": "host",
+                           "rclone_kerberos": True, "ticket": None, "credentials": False, "image": True}
 
     def __call__(self, args, log):
         self.calls.append(list(args))
@@ -57,6 +59,8 @@ class FakeShell:
             if "--stop-instance" in args:
                 job = args[args.index("--stop-instance") + 1]
                 log.write((self.stop_answer or f"HPCLIB_TUNNEL_INSTANCE_STOPPED {job}").encode() + b"\n")
+        if args[0] == "smbshell" and "status" in args:      # like tunnels/data-transfer/smbshell.sh status --json
+            log.write(("HPCLIB_SMB_STATUS " + json.dumps(self.smb_status) + "\n").encode())
         return subprocess.Popen(["sleep", "30" if args[0] in ("agent_tunnel", "launch_tunnel") else "0"], start_new_session=True)
 
 
@@ -522,7 +526,8 @@ class TestApps(ConsoleTestCase):
 
     def test_listing_and_ports(self):
         out = self.call("GET", "/api/apps")[1]
-        self.assertEqual([a["id"] for a in out["apps"]], ["agents", "jupyter", "vscode", "pai"])
+        self.assertEqual([a["id"] for a in out["apps"]], ["agents", "jupyter", "vscode", "transfer", "pai"])
+        self.assertEqual({a["id"]: a.get("kind") for a in out["apps"]}["transfer"], "tool")
         status, out = self.call("GET", "/api/apps/jupyter")
         self.assertEqual(status, 200)
         by_name = {x["cluster"]: x for x in out["sessions"]}
@@ -736,6 +741,110 @@ class TestTunnelInstall(ConsoleTestCase):
         pai = self.call("GET", base)[1]
         self.assertNotIn("stop_instance", [c["id"] for c in pai["controls"]])
         self.assertIn("none seen yet", pai["tools"][0]["text"])
+
+
+FAKE_KINIT = textwrap.dedent("""\
+    #!/bin/bash
+    # smbshell --on HOST login: kinit asks for the password on the terminal
+    printf "Password for me@AUTH.EXAMPLE.EDU: "
+    IFS= read -rs pw < /dev/tty
+    echo
+    [ "$pw" = "kerberos-pass" ] || { echo "kinit: Password incorrect while getting initial credentials"; exit 1; }
+    echo "signed in: me@AUTH.EXAMPLE.EDU"
+""")
+
+
+class TestDataTransfer(ConsoleTestCase):
+    """The Data transfer page: signing in to the SMB server (kinit, or a password saved for jobs) for smbshell."""
+
+    def setUp(self):
+        super().setUp()
+        script = self.tmp / "fake-kinit"
+        script.write_text(FAKE_KINIT)
+        script.chmod(0o755)
+        self.clusters.tunnel_runner = lambda args, log_path: agent_console.PtySession([str(script)], log_path, dict(os.environ))
+        self.route = f"/api/apps/transfer/{self.dead}"
+        self.host = agent_profiles.load(self.dead)["host"]
+
+    def test_status_and_controls(self):
+        state = self.call("GET", self.route)[1]
+        self.assertEqual((state["kind"], state["auth"], state["port"]), ("tool", None, None))
+        self.assertEqual([c["id"] for c in state["controls"]], ["status"])
+        self.assertEqual(self.call("POST", self.route + "/start")[0], 400)
+        self.assertEqual(self.call("POST", self.route + "/control/status", {})[0], 409)          # needs the login
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            status, out = self.call("POST", self.route + "/control/status", {})
+            self.assertEqual(status, 200, out)
+            self.assertEqual(out["auth"]["kinit"], "host")
+            self.assertEqual(self.shell.calls[-1], ["smbshell", "--on", self.host, "status", "--json"])
+            state = self.call("GET", self.route)[1]
+            self.assertIn("files.example.edu as me", state["tools"][0]["text"])
+            self.assertEqual([c["id"] for c in state["controls"]], ["kinit", "status"])   # Kerberos: no password kept
+            # a ticket: log out instead
+            self.shell.smb_status["ticket"] = {"principal": "me@AUTH.EXAMPLE.EDU", "expires": "10/05/2026 18:00:00"}
+            self.call("POST", self.route + "/control/status", {})
+            state = self.call("GET", self.route)[1]
+            tools = {t["id"]: t["text"] for t in state["tools"]}
+            self.assertIn("Kerberos ticket for me@AUTH.EXAMPLE.EDU", tools["signin"])
+            self.assertEqual([c["id"] for c in state["controls"]], ["kdestroy", "status"])
+            self.call("POST", self.route + "/control/kdestroy", {})
+            self.assertEqual(self.shell.calls[-2], ["smbshell", "--on", self.host, "logout"])
+            # no kinit: a password saved for sync jobs
+            self.shell.smb_status.update(kinit=None, ticket=None)
+            self.call("POST", self.route + "/control/status", {})
+            self.assertEqual([c["id"] for c in self.call("GET", self.route)[1]["controls"]], ["save_credentials", "status"])
+            self.shell.smb_status["credentials"] = True
+            self.call("POST", self.route + "/control/status", {})
+            controls = self.call("GET", self.route)[1]["controls"]
+            self.assertEqual(controls[0]["id"], "forget_credentials")
+            self.assertIn("confirm", controls[0])
+            self.assertEqual(self.call("POST", self.route + "/control/nope", {})[0], 404)
+            # a server given by address: Kerberos can't sign in to it, so the password is offered
+            self.shell.smb_status.update(host="10.55.179.23", kinit="host", credentials=False,
+                                         ticket={"principal": "me@AUTH.EXAMPLE.EDU", "expires": "later"})
+            self.call("POST", self.route + "/control/status", {})
+            state = self.call("GET", self.route)[1]
+            self.assertIn("needs the server's DNS name", {t["id"]: t["text"] for t in state["tools"]}["signin"])
+            self.assertEqual([c["id"] for c in state["controls"]], ["save_credentials", "kdestroy", "status"])
+        # its settings: the server, and how to sign in
+        out = self.call("PUT", self.route + "/settings", {"settings": {"SMB_HOST": "files.example.edu", "SMB_AUTH": "kerberos"}})[1]
+        self.assertEqual(out["settings"], {"SMB_HOST": "files.example.edu", "SMB_AUTH": "kerberos"})
+        self.assertEqual(self.call("PUT", self.route + "/settings", {"settings": {"SMB_AUTH": "magic"}})[0], 422)
+        # the address as it is usually written: the host, and the folder smbshell's paths are relative to
+        for given in ("//10.55.179.23/CLAT_research/chem/our_lab", "\\\\10.55.179.23\\CLAT_research\\chem\\our_lab"):
+            out = self.call("PUT", self.route + "/settings", {"settings": {"SMB_HOST": given}})[1]
+            self.assertEqual(out["settings"], {"SMB_HOST": "10.55.179.23", "SMB_ROOT": "CLAT_research/chem/our_lab"}, given)
+        # and they reach the cluster before the next status
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.call("POST", self.route + "/control/status", {})
+        pushed = self.shell.calls[-2]
+        self.assertEqual(pushed[:3], ["tunnel_setup", self.host, "data-transfer"])
+        self.assertIn("SMB_ROOT=CLAT_research/chem/our_lab", pushed)
+
+    def test_kinit_in_the_page(self):
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            status, out = self.call("POST", self.route + "/control/kinit", {})
+            self.assertEqual(status, 200, out)
+            for _ in range(50):
+                prompts = self.call("GET", "/api/prompts")[1]["prompts"]
+                if prompts:
+                    break
+                time.sleep(0.1)
+            self.assertEqual((prompts[0]["app"], prompts[0]["title"]), ("transfer", "Data transfer"))
+            self.assertIn("Kerberos", prompts[0]["prompt"]["note"])
+            self.assertEqual(self.call("POST", self.route + "/control/kinit", {})[0], 409)       # one at a time
+            self.shell.smb_status["ticket"] = {"principal": "me@AUTH.EXAMPLE.EDU", "expires": "later"}
+            self.assertEqual(self.call("POST", "/api/" + prompts[0]["answer"], {"answer": "kerberos-pass"})[0], 200)
+            for _ in range(50):
+                auth = self.call("GET", self.route)[1].get("auth") or {}
+                if auth.get("ticket"):
+                    break
+                time.sleep(0.1)
+        self.assertEqual(auth["ticket"]["principal"], "me@AUTH.EXAMPLE.EDU")          # status asked afterwards
+        log = (self.console / "logs" / f"{self.dead}.transfer.log").read_text()
+        self.assertIn("signed in: me@AUTH.EXAMPLE.EDU", log)
+        self.assertIn(f"smbshell --on {self.host} login", log)
+        self.assertNotIn("kerberos-pass", log)
 
 
 class TestSecondLogin(ConsoleTestCase):

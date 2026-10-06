@@ -248,17 +248,17 @@ function promptDialog(label, answerPath, prompt, { onCancel = null } = {}) {
   promptDialogOpen = true;
   const input = el("input", { type: "password", autocomplete: "off", placeholder: "password" });
   const status = el("p", { class: prompt.retry ? "error-box" : "muted" },
-    prompt.retry ? "That password was refused; try again." :
+    prompt.retry ? "That password was refused; try again." : prompt.note ? prompt.note :
       `${prompt.host ? `The cluster's login node is connecting to ${prompt.host.split("@")[1]}, the compute node ` +
         "your job got, and it" : "The tunnel's ssh"} asks for your password again.`);
   const go = el("button", { class: "primary", type: "submit" }, "Send");
   const cancel = el("button", { type: "button" }, "Not now");
   const form = el("form", {}, status,
     el("p", {}, el("code", {}, prompt.text)), input, el("div", { class: "actions" }, go, cancel),
-    el("p", { class: "muted small" }, "Tip: if your cluster allows it, ssh keys between its nodes skip this step: " +
+    prompt.note ? null : el("p", { class: "muted small" }, "Tip: if your cluster allows it, ssh keys between its nodes skip this step: " +
       "on the cluster, ssh-keygen -t ed25519 (press Enter for no passphrase), then add ~/.ssh/id_ed25519.pub " +
       "to ~/.ssh/authorized_keys. Some clusters don't allow it; then this prompt is the way."));
-  const dialog = el("hpc-dialog", { heading: `Second login: ${label}`, transient: true }, form);
+  const dialog = el("hpc-dialog", { heading: `${prompt.note ? "Password" : "Second login"}: ${label}`, transient: true }, form);
   let answered = false;
   const close = () => dialog.close();
   dialog.addEventListener("close", () => {
@@ -861,11 +861,16 @@ async function appPage(app) {
     row.data = s;
     return row;
   });
+  const tool = (APPS_UI[app] || {}).kind === "tool";
   return [
     el("h2", {}, title),
-    el("p", { class: "muted" }, `A ${title} session per cluster, in a SLURM job reached through its own tunnel. ` +
-      "It runs as you, with your full permissions on the cluster (it is not the agents' sandbox). " +
-      "What it needs on the cluster is checked once you're logged in, and Install sets it up there."),
+    el("p", { class: "muted" }, tool
+      ? "Files between each cluster and an SMB server, with rclone from the data-transfer-tools image: " +
+        "smbshell on the cluster (smbshell --help), and smbshell submit for SLURM jobs. Sign in here once: " +
+        "Kerberos (kinit) where the cluster has it, or a password saved for sync jobs. Settings… names the server."
+      : `A ${title} session per cluster, in a SLURM job reached through its own tunnel. ` +
+        "It runs as you, with your full permissions on the cluster (it is not the agents' sandbox). " +
+        "What it needs on the cluster is checked once you're logged in, and Install sets it up there."),
     sessions.length ? el("table", { class: "rows" },
       el("thead", {}, el("tr", {}, ["Cluster", "Login", title, ""].map((h) => el("th", {}, h)))),
       rows)
@@ -887,8 +892,9 @@ const APPS_UI = {
   // the tunnel apps (JupyterLab, VS Code, PAI, ...) come from GET /api/apps, each with a Sessions page
 };
 
-function addApp(id, title) {
-  APPS_UI[id] = { title, default: "sessions", pages: { sessions: ["Sessions", () => appPage(id)] } };
+function addApp(id, title, kind = "tunnel") {
+  APPS_UI[id] = { title, kind, default: "sessions",
+                  pages: { sessions: [kind === "tool" ? "Clusters" : "Sessions", () => appPage(id)] } };
 }
 addApp("jupyter", "JupyterLab");     // until the console says which it has
 
@@ -896,7 +902,7 @@ async function loadApps() {
   if (!key) return;
   try {
     const { apps } = await api("apps");
-    for (const a of apps) if (a.id !== "agents" && !APPS_UI[a.id]) addApp(a.id, a.title);
+    for (const a of apps) if (a.id !== "agents" && !APPS_UI[a.id]) addApp(a.id, a.title, a.kind);
   } catch { /* an older console: JupyterLab only */ }
 }
 
