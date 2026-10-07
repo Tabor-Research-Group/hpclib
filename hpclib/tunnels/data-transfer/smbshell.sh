@@ -72,6 +72,15 @@ img() {  # img COMMAND...: run it in the image, with the binds asked for
   fi
 }
 
+img_exec() {  # img_exec COMMAND...: img, replacing this (sub)shell, so its pid is the image runtime's
+  need_image
+  if [ -n "$krb5_conf" ]; then
+    KRB5_CONFIG=/etc/hpclib-krb5.conf exec "$runtime" exec "${binds[@]}" "$SMB_IMAGE" "$@"
+  else
+    exec "$runtime" exec "${binds[@]}" "$SMB_IMAGE" "$@"
+  fi
+}
+
 bind_local() {  # bind_local PATH: make a local path (or, if it doesn't exist yet, its parent) visible in the image
   local path dir
   path=$(cd "$(dirname "$1")" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$(basename "$1")") ||
@@ -409,12 +418,34 @@ PY
       esac
     done
     case "$port" in ''|*[!0-9]*) die "usage: smbshell gui --port PORT" ;; esac
+    # marked as hpclib's for this port (see _hpclib_port_holders), and the port cleared of what an earlier GUI
+    # or tunnel of yours left on it, before asking for a password
+    export HPCLIB_TUNNEL_PORT="$port"
+    hpclib_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../lib" 2> /dev/null && pwd)/tunnels.sh"
+    if [ -f "$hpclib_lib" ]; then
+      # shellcheck source=/dev/null
+      . "$hpclib_lib"
+      _hpclib_clear_port "$port" || die "port $port is busy; pick another"
+    fi
     sign_in
     need_image
     run_dir=$(mktemp -d "${XDG_RUNTIME_DIR:-/dev/shm}/hpclib-rclone-gui.XXXXXX" 2>/dev/null ||
               mktemp -d "${TMPDIR:-/tmp}/hpclib-rclone-gui.XXXXXX") || die "no private directory for the session"
     chmod 700 "$run_dir"
-    trap 'rm -rf "$run_dir"' EXIT
+    # rclone runs as a child and is stopped with this script, whichever way it ends (the console's Stop, a closed
+    # or dropped ssh session), so it can't stay behind holding the port
+    gui_pid=''
+    gui_stop() {
+      trap '' HUP INT TERM
+      if [ -n "$gui_pid" ] && kill -0 "$gui_pid" 2> /dev/null; then
+        # the image's runtime, which passes the signal on to rclone and ends with it
+        kill -TERM "$gui_pid" 2> /dev/null
+        for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$gui_pid" 2> /dev/null || break; sleep 0.5; done
+        kill -KILL "$gui_pid" 2> /dev/null
+      fi
+      rm -rf "$run_dir"
+    }
+    trap gui_stop EXIT
     trap 'exit 129' HUP INT TERM
     conf="$run_dir/rclone.conf"
     extra_remotes="${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/settings/data-transfer.d/rclone.conf"
@@ -446,7 +477,21 @@ PY
     binds+=(--bind "$run_dir")
     echo "HPCLIB_RCLONE_GUI port=$port user=$gui_user pass=$gui_pass"
     echo "smbshell: rclone's web GUI on 127.0.0.1:$port of $(hostname -s); remotes: smb, cluster${extra_names:+, ${extra_names% }}" >&2
-    img rclone rcd --config "$conf" --rc-web-gui --rc-web-gui-no-open-browser --rc-addr "127.0.0.1:$port" \
-      --rc-user "$gui_user" --rc-pass "$gui_pass" --retries 1 --low-level-retries 1 ;;
+    ( img_exec rclone rcd --config "$conf" --rc-web-gui --rc-web-gui-no-open-browser --rc-addr "127.0.0.1:$port" \
+        --rc-user "$gui_user" --rc-pass "$gui_pass" --retries 1 --low-level-retries 1 < /dev/null ) &
+    gui_pid=$!
+    # the session's parent (sshd, or the shell that ran this): when it is gone the session is, even if no hangup
+    # arrived (a dropped connection), so the GUI stops too
+    parent=$PPID
+    while kill -0 "$gui_pid" 2> /dev/null; do
+      if ! kill -0 "$parent" 2> /dev/null; then
+        echo "smbshell: the session that started the GUI has ended; stopping it" >&2
+        exit 129
+      fi
+      sleep 5 &
+      wait $! 2> /dev/null
+    done
+    wait "$gui_pid"
+    exit $? ;;
   *) die "unknown command $cmd (smbshell --help)" ;;
 esac

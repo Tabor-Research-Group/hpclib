@@ -3,6 +3,11 @@
 A collection of shell scripts and python TCP servers to simplify the process of developing code
 across different HPC systems
 
+**Documentation** is in [`hpclib/docs/`](hpclib/docs/README.md): [installation](hpclib/docs/installation.md),
+using [the interface](hpclib/docs/interface/README.md) or [the command line](hpclib/docs/cli/README.md),
+[the tunnel architecture](hpclib/docs/architecture.md), [the MCP server](hpclib/docs/mcp-server.md) and
+[extending hpclib](hpclib/docs/extending.md). This README is the detailed reference.
+
 ## installation
 
 On a login node run
@@ -219,8 +224,13 @@ terminal) cancels the job.
 
 Each tunnel records itself under `~/.local/tunnels/sessions/ports/` by login node and port. A new tunnel on the
 same port first stops anything an earlier one left behind on that login node: its script, its job, a stale
-forward or waiting page. If the port is held by something that isn't one of your tunnels, such as another
-user's program on a shared login node, `start_tunnel.sh` stops and says so; pick another `-P`.
+forward or waiting page. It also looks at what is actually listening on the port, so a piece that outlived
+its tunnel some other way (rclone's web GUI from Data transfer, a podman pod's port forwarder) goes too: whatever
+hpclib starts for a port carries `HPCLIB_TUNNEL_PORT=PORT` in its environment, and a process of yours listening
+on that port with that mark is stopped (TERM, then KILL after 5 s). `smbshell gui` clears its port the same way
+before it starts, and stops rclone when its own session ends, even if the connection dropped without a hangup.
+If the port is held by something else, such as another user's program on a shared login node or a program of
+yours hpclib didn't start, `start_tunnel.sh` stops, lists what holds it, and leaves it alone; pick another `-P`.
 
 To clear a port from your own machine, for example after your laptop slept or the VPN dropped:
 
@@ -420,7 +430,10 @@ on your machine as MCP tools.
   have it). CPU and memory limits are only enforced where cgroups v2 delegates the cpu and memory
   controllers to you (`GET /sandbox` says whether they are); elsewhere jobs are refused, unless the
   scheduler's `"enforce_limits"` is `false` (run them unlimited) or `"memory"` (only memory must be held,
-  for machines such as RHEL 9 that delegate memory but not cpu). Ask the machine's admin for subordinate ids (`/etc/subuid`), and
+  for machines such as RHEL 9 that delegate memory but not cpu). Rootless podman can't keep its storage on
+  NFS (`chown ...: operation not permitted`), so where your home is on a network file system jobs use
+  `/var/tmp/<you>/hpclib-podman` instead; the sandbox's `"storage"` (`"auto"`, `"default"`, or a directory)
+  sets this. Ask the machine's admin for subordinate ids (`/etc/subuid`), and
   for `loginctl enable-linger` so running jobs outlive your logins. Multi-node jobs and `--gres` GPUs are
   refused; for GPUs, give the sandbox `"flags": ["--device", "nvidia.com/gpu=all"]`.
 - **Scoped tokens** are minted on the cluster and stored there only as hashes. Copy the printed token to your
@@ -639,7 +652,9 @@ package adds before installing it, and lists and removes the installed ones. A p
 ```
 
 `apps` are console apps (like JupyterLab), each on a tunnel: one in the package (`tunnels`: a directory with
-`sbatch_script.sh`, `tunnel_config.sh` and optionally `install.sh`, as in `hpclib/tunnels/`; with
+`sbatch_script.sh`, `tunnel_config.sh` and optionally `install.sh`, as in `hpclib/tunnels/`, and `clear_port.sh PORT`,
+which `start_tunnel.sh` runs before it checks the port, to clear what an earlier run left there that hpclib can't
+recognize, such as a podman pod; with
 `RUN_ON_LOGIN_NODE=true` it runs on the login node rather than in a job) or one of hpclib's. `settings` give a
 tunnel's apps default values (yours, per cluster, win; the settings form shows the package's value in an empty
 field) and files. An app may also declare `secrets` (`[{"name": "MY_TOKEN", "label": ..., "hint": ...}]`, listed in
@@ -654,7 +669,13 @@ as you, so install only packages you trust. Build and check one with
 `python3 hpclib/servers/console_packages.py build DIR` (it writes `NAME-VERSION.zip` next to `DIR`).
 
 **PAI**: the proto-auto-interface database, run with `singularity-compose` from
-`PAI_ROOT_DIR/proto-auto-interface` (default `/scratch/user/<username>/pai`; `install.sh` clones `PAI_REPO` there).
+`PAI_ROOT_DIR/proto-auto-interface` (default `/scratch/user/<username>/pai`; `install.sh` clones `PAI_REPO` there,
+and pulls the app's image, `proto-auto-interface.sif`, from `PAI_IMAGE`, default
+`docker://ghcr.io/tabor-research-group/proto-auto-interface:master`, and the database's,
+`docker-postgres-rdkit.sif`, if they aren't there). Once it is installed, the console's **Update** (`tunnel_setup
+HOST pai --install --force`) fast-forwards the checkout from its remote and pulls the app's image again; the
+database's image is kept, since a newer postgres may not read the old data directory (delete the `.sif` to pull it
+again). A database job that is already running keeps what it started with: End database job, then Start.
 `PAI_BIND_SOURCE` (default `1`) has `singularity-compose.sh` bind that checkout's source into the containers, so
 your changes run; `0` runs the images' own. It is one of PAI's settings (console: PAI → Settings → Bind source)
 and applies to the next database job, not one already running.

@@ -359,6 +359,12 @@ class LocalRunner(SlurmRunner):
             method, runtime = "none", None
         if method == "podman":
             env["HPC_JOB_PODMAN"] = runtime
+            try:
+                conf = self.sandbox.podman_storage_conf()
+            except Exception:
+                conf = None
+            if conf:  # so the clean-up's `podman rm` finds the job's container
+                env["CONTAINERS_STORAGE_CONF"] = conf
         return env
 
     def _start(self, job, task):

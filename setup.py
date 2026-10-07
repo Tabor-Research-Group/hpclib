@@ -42,6 +42,8 @@ setuptools.setup(
             "tunnels/rest/templates/*/*",  # example REST job templates (template.json + script.sh)
             "tunnels/rest/templates/*/*/*",  # ... and their examples/*.json
             "examples/*/*",  # worked examples, e.g. examples/orca_scan
+            "docs/*.md",  # hpclib/docs: installation, usage, architecture
+            "docs/*/*.md",  # ... and its interface/ and cli/ sections
         ],
         "hpclib.job_queue": [
             "templates/*.sh",  # hpclib/job_queue/templates/*.sh - same non-package-subdir situation

@@ -174,9 +174,19 @@ job_name="$TUNNEL_NAME-$job_uuid"
 
 mkdir -p "$SESSIONS_DIR"
 
+# What this tunnel starts here carries the port in its environment, so a later tunnel (or stop_tunnel) can tell
+# what is listening on it was left by one of yours (_hpclib_port_holders), however it was orphaned.
+export HPCLIB_TUNNEL_PORT="$HOST_PORT"
+
 # Anything an earlier tunnel on this port left running (its forward, its
 # waiting page, its job) is stopped first; a port held by something else
-# is an error rather than a tunnel that silently doesn't work.
+# is an error rather than a tunnel that silently doesn't work. A tunnel whose
+# service isn't one of these (a podman pod, say) clears what an earlier run of
+# it left with its own clear_port.sh PORT, first.
+if [ -f "$TUNNEL_DIR/clear_port.sh" ]; then
+  bash "$TUNNEL_DIR/clear_port.sh" "$HOST_PORT" ||
+    echo "hpclib: $TUNNEL_NAME's clear_port.sh failed; checking the port anyway" >&2
+fi
 if ! _hpclib_clear_port "$HOST_PORT"; then
   exit 1
 fi

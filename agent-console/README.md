@@ -28,7 +28,8 @@ the tunnel's own settings such as VS Code's container path). Open goes straight 
 printed; VS Code shows a **Copy password** button. Once you're logged in, each row checks whether the tunnel is
 installed on the cluster (its `install.sh --check`) and offers **Install** (or Reinstall), whose output shows
 below the row. PAI's row says which job serves the shared database, and whether this tunnel started it or only
-connected to it. **Data transfer** isn't a tunnel: per cluster it installs the data-transfer-tools image and
+connected to it, and once PAI is installed its Install button is **Update**: it fast-forwards the
+proto-auto-interface checkout and pulls the app's image again (its Image setting says from where). **Data transfer** isn't a tunnel: per cluster it installs the data-transfer-tools image and
 signs you in to the SMB server for `smbshell` (Kerberos log in with kinit where the cluster has it, otherwise a
 password saved for sync jobs), both through the password dialog. Agents keeps its addresses (`#/clusters`, `#/files?...`); other apps live under
 `#/APP/PAGE`, e.g. `#/vscode/sessions`. A new tunnel app is an entry in `APPS` in

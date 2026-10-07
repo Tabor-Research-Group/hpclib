@@ -129,6 +129,7 @@ cat > "$test_dir/login-tunnels/svc/sbatch_script.sh" <<'SCRIPT'
 echo "svc on port $PROCESS_PORT login=$TUNNEL_ON_LOGIN_NODE greeting=$GREETING args=$*"
 SCRIPT
 printf 'START_GIT_SERVER=false\nSTART_SLURM_SERVER=false\n' > "$test_dir/login-tunnels/svc/tunnel_config.sh"
+printf 'echo "cleared port $1 for $TUNNEL_NAME" > "$HOME/cleared"\n' > "$test_dir/login-tunnels/svc/clear_port.sh"
 rm -f "$test_dir/sbatch-args"
 HOME="$test_dir/home" HPCLIB_DIR="$HPCLIB_DIR" \
   HPCLIB_TUNNEL_PATH="$test_dir/login-tunnels:$HPCLIB_DIR/tunnels" HPCSESSIONS_DIR="$test_dir/sessions" \
@@ -140,6 +141,7 @@ grep -q 'svc on port 5151 login=true greeting=hi args=one two' "$test_dir/login.
   fail "the login-node script didn't run with the forwarded port: $(cat "$test_dir/login.log")"
 grep -q 'ignoring the sbatch options: --mem=2gb' "$test_dir/login.log" || fail "sbatch options were silently dropped: $(cat "$test_dir/login.log")"
 grep -q 'on the login node has ended (exit 0)' "$test_dir/login.log" || fail 'the end was not reported'
+assert_equal "$(cat "$test_dir/home/cleared")" 'cleared port 5151 for svc'
 [ ! -e "$test_dir/sessions/ports/$(hostname -s)-5151" ] || fail 'the port record was left behind'
 if HOME="$test_dir/home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PATH="$HPCLIB_DIR/tunnels" \
   HPCSESSIONS_DIR="$test_dir/sessions" HPCSERVERS_DIR="$test_dir" PATH="$test_dir/bin:$PATH" \
@@ -269,6 +271,39 @@ chmod +x "$test_dir/clear-bin/"*
   grep -q 'pick another port' "$test_dir/clear.err" || fail 'no advice for a busy port'
   kill -0 "$holder" 2>/dev/null || fail 'killed a process that is not a tunnel'
   kill "$holder"
+
+  # what is listening on the port, found from the socket tables: a process an hpclib session of yours left there
+  # (marked with HPCLIB_TUNNEL_PORT, however it was orphaned) is stopped; one marked for another port is not
+  port=$(free_port)
+  HPCLIB_TUNNEL_PORT=$port listen_as "$port" python3 -m orphaned_service
+  holder=$!
+  _hpclib_clear_port "$port" 2> "$test_dir/clear.err" || fail "did not clear a marked leftover: $(cat "$test_dir/clear.err")"
+  grep -q "stopping pid $holder" "$test_dir/clear.err" || fail "no message: $(cat "$test_dir/clear.err")"
+  sleep 0.2; if kill -0 "$holder" 2> /dev/null; then fail 'marked leftover still running'; fi
+  port=$(free_port)
+  HPCLIB_TUNNEL_PORT=1 listen_as "$port" python3 -m another_service
+  holder=$!
+  if _hpclib_clear_port "$port" 2> "$test_dir/clear.err"; then fail 'stopped a process marked for another port'; fi
+  grep -q "pid $holder: python3 -m another_service .*(not an hpclib tunnel of yours)" "$test_dir/clear.err" ||
+    fail "holder not listed: $(cat "$test_dir/clear.err")"
+  kill "$holder"
+  # rclone's web GUI from an hpclib older than the mark: recognized by its session config
+  port=$(free_port)
+  listen_as "$port" rclone rcd --config /run/user/1/hpclib-rclone-gui.AbC123/rclone.conf --rc-web-gui --rc-addr "127.0.0.1:$port"
+  holder=$!
+  _hpclib_clear_port "$port" 2> "$test_dir/clear.err" || fail "did not clear a stale rclone GUI: $(cat "$test_dir/clear.err")"
+  sleep 0.2; if kill -0 "$holder" 2> /dev/null; then fail 'stale rclone GUI still running'; fi
+  # one that ignores TERM is killed
+  port=$(free_port)
+  (export HPCLIB_TUNNEL_PORT=$port; exec python3 -c 'import signal, socket, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(300)' "$port") &
+  holder=$!
+  for _ in $(seq 50); do _hpclib_port_free "$port" || break; sleep 0.1; done
+  _hpclib_clear_port "$port" 2> "$test_dir/clear.err" || fail "did not clear one ignoring TERM: $(cat "$test_dir/clear.err")"
+  grep -q 'ignored TERM; killed' "$test_dir/clear.err" || fail "$(cat "$test_dir/clear.err")"
+  wait "$holder" 2> /dev/null || true
 
   # records are only forgotten by their owner
   _hpclib_record_port 1234 111 9
@@ -600,6 +635,13 @@ case "$1 $2" in
 esac
 { printf 'rclone'; printf ' %s' "$@"; printf '\n'
   env | grep -E '^(RCLONE_CONFIG_SMB_|KRB5CCNAME=|KRB5_CONFIG=)' | sort; } >> "$TEST_SMB_LOG"
+if [ "$1" = rcd ] && [ -n "${TEST_RCD_LISTEN:-}" ]; then   # the web GUI, serving until it is stopped
+  addr=''; prev=''; for a in "$@"; do [ "$prev" = --rc-addr ] && addr="$a"; prev="$a"; done
+  echo $$ > "$TEST_RCD_LISTEN"
+  exec python3 -c 'import socket, sys, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(300)' "${addr##*:}"
+fi
 if [ "$1" = rcd ]; then   # the web GUI: note its config, then stop as if Stop was pressed
   conf=''; prev=''; for a in "$@"; do [ "$prev" = --config ] && conf="$a"; prev="$a"; done
   { echo "--- config"; cat "$conf"; echo "--- end"; } >> "$TEST_SMB_LOG"; exit 0
@@ -799,6 +841,41 @@ if env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH"
 rm -rf "$sb/data/settings/data-transfer.d"
 [ -z "$(ls -A "$sb/run")" ] || fail 'the session config was left behind'
 if smbsh gui 2>/dev/null; then fail 'gui ran without a port'; fi
+# a GUI an earlier session left on the port is stopped first, and this one goes with the session that started it
+(
+PATH="$CLEAN_PATH"   # the real python3
+port=$(free_port)
+(exec -a "rclone rcd --config /run/user/1/hpclib-rclone-gui.Old000/rclone.conf --rc-addr 127.0.0.1:$port" \
+  python3 -c 'import socket, sys, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(300)' "$port") &
+stale=$!
+for _ in $(seq 50); do _hpclib_port_free "$port" || break; sleep 0.1; done
+rm -f "$sb/rcd.pid"
+env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
+  XDG_RUNTIME_DIR="$sb/run" SMB_AUTH=password TEST_RCD_LISTEN="$sb/rcd.pid" HPCSESSIONS_DIR="$sb/sessions" \
+  bash -c 'bash "$1" gui --port "$2" > "$3" 2>&1 < /dev/null & sleep 3' _ \
+  "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" "$port" "$sb/gui.out"
+kill -0 "$stale" 2> /dev/null && fail "the stale GUI was left on the port: $(cat "$sb/gui.out")"
+[ -s "$sb/rcd.pid" ] || fail "the new GUI did not start: $(cat "$sb/gui.out")"
+grep -q 'stopped what an earlier hpclib session left listening' "$sb/gui.out" || fail "$(cat "$sb/gui.out")"
+# its session (the shell that started it) has ended: within a few seconds the GUI stops and the port is free
+for _ in $(seq 100); do _hpclib_port_free "$port" && break; sleep 0.1; done
+_hpclib_port_free "$port" || fail "the GUI outlived its session: $(cat "$sb/gui.out")"
+grep -q 'the session that started the GUI has ended' "$sb/gui.out" || fail "$(cat "$sb/gui.out")"
+for _ in $(seq 50); do [ -z "$(ls -A "$sb/run")" ] && break; sleep 0.1; done
+[ -z "$(ls -A "$sb/run")" ] || fail 'the session config was left behind'
+# and a TERM (the console's Stop, an ssh hangup) stops it too
+rm -f "$sb/rcd.pid"
+env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
+  XDG_RUNTIME_DIR="$sb/run" SMB_AUTH=password TEST_RCD_LISTEN="$sb/rcd.pid" HPCSESSIONS_DIR="$sb/sessions" \
+  bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" gui --port "$port" > "$sb/gui.out" 2>&1 < /dev/null &
+gui=$!
+for _ in $(seq 50); do [ -s "$sb/rcd.pid" ] && ! _hpclib_port_free "$port" && break; sleep 0.1; done
+kill -TERM "$gui"; wait "$gui" 2> /dev/null || true
+for _ in $(seq 50); do _hpclib_port_free "$port" && break; sleep 0.1; done
+_hpclib_port_free "$port" || fail "TERM left the GUI running: $(cat "$sb/gui.out")"
+)
 rm -f "$sb/home/.config/hpclib/smb/credentials"
 
 # a refused sign-in: tried once, without rclone's retries, and the transfer isn't started
@@ -847,5 +924,53 @@ case "$out" in *"HPCLIB_TUNNEL_STATUS installed"*) ;; *) fail "after the pull: $
 assert_equal "$(sed -n 1,4p "$test_dir/smb-remote" | tr '\n' ' ')" '-t -p 2222 me@login.example '
 grep -q 'tunnels/data-transfer/smbshell.sh get proj/raw /scratch/user/me/a\\ b' "$test_dir/smb-remote" ||
   fail "remote: $(cat "$test_dir/smb-remote")"
+
+# PAI: Install clones the checkout and pulls both images; Update (--force) fast-forwards the checkout and pulls
+# the app's image again, leaving the database's alone
+pai="$test_dir/pai-test"
+mkdir -p "$pai/bin" "$pai/origin"
+cat > "$pai/bin/singularity" <<'SCRIPT'
+#!/usr/bin/env bash
+echo "pull $2 $3" >> "$PAI_TEST_LOG"
+[ "$1" = pull ] && printf 'image from %s\n' "$3" > "$2"
+SCRIPT
+chmod +x "$pai/bin/singularity"
+git -C "$pai/origin" init -q -b master
+printf 'echo compose\n' > "$pai/origin/singularity-compose.sh"
+git -C "$pai/origin" add . && git -C "$pai/origin" -c user.name=t -c user.email=t@x commit -qm one
+pai_install() {
+  PATH="$pai/bin:$PATH" PAI_TEST_LOG="$pai/log" PAI_ROOT_DIR="$pai/root" PAI_REPO="$pai/origin" \
+    bash "$HPCLIB_DIR/tunnels/pai/install.sh" "$@"
+}
+if pai_install --check > "$pai/out"; then fail 'PAI check passed before the install'; fi
+grep -q 'not installed: no .*/proto-auto-interface/singularity-compose.sh' "$pai/out" || fail "check: $(cat "$pai/out")"
+pai_install > "$pai/out" 2>&1 || fail "PAI install: $(cat "$pai/out")"
+grep -q "^pull $pai/root/proto-auto-interface.sif.partial.[0-9]* docker://ghcr.io/tabor-research-group/proto-auto-interface:master$" "$pai/log" ||
+  fail "app image: $(cat "$pai/log")"
+grep -q "^pull $pai/root/docker-postgres-rdkit.sif.partial.[0-9]* docker://mcs07/postgres-rdkit:latest$" "$pai/log" ||
+  fail "database image: $(cat "$pai/log")"
+pai_install --check > "$pai/out" || fail "check after the install: $(cat "$pai/out")"
+grep -q "^installed: $pai/root/proto-auto-interface ([0-9a-f]* [0-9-]*); image $pai/root/proto-auto-interface.sif" "$pai/out" ||
+  fail "check: $(cat "$pai/out")"
+: > "$pai/log"
+pai_install > /dev/null 2>&1 || fail 'PAI install, installed'
+[ ! -s "$pai/log" ] || fail "pulled again without --force: $(cat "$pai/log")"
+printf 'echo compose 2\n' > "$pai/origin/singularity-compose.sh"
+git -C "$pai/origin" -c user.name=t -c user.email=t@x commit -qam two
+PAI_IMAGE=docker://example.org/pai:new pai_install --force > "$pai/out" 2>&1 || fail "PAI update: $(cat "$pai/out")"
+assert_equal "$(cat "$pai/root/proto-auto-interface/singularity-compose.sh")" 'echo compose 2'
+assert_equal "$(cat "$pai/root/proto-auto-interface.sif")" 'image from docker://example.org/pai:new'
+[ "$(wc -l < "$pai/log")" -eq 1 ] || fail "update pulled more than the app's image: $(cat "$pai/log")"
+grep -q 'keeps running what it started with' "$pai/out" || fail "no note about a running job: $(cat "$pai/out")"
+# your own commits in the checkout: no fast-forward, so nothing changes
+git -C "$pai/root/proto-auto-interface" -c user.name=t -c user.email=t@x commit -q --allow-empty -m mine
+printf 'echo compose 3\n' > "$pai/origin/singularity-compose.sh"
+git -C "$pai/origin" -c user.name=t -c user.email=t@x commit -qam three
+: > "$pai/log"
+if pai_install --force > "$pai/out" 2>&1; then fail 'updated a checkout that cannot fast-forward'; fi
+grep -q 'could not fast-forward' "$pai/out" || fail "diverged: $(cat "$pai/out")"
+[ ! -s "$pai/log" ] || fail 'pulled the image although the checkout could not be updated'
+# the setting reaches it through setup_tunnel.sh
+grep -q 'PAI_IMAGE' "$HPCLIB_DIR/tunnels/pai/tunnel_config.sh" || fail 'PAI_IMAGE is not a PAI setting'
 
 echo 'Tunnel management tests passed'

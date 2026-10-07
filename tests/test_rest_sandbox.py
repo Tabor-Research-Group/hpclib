@@ -6,6 +6,7 @@ Most tests use a fake `singularity` that records its arguments and runs
 the command directly. TestRealSingularity runs real containers and is
 skipped where neither Singularity nor Apptainer is installed.
 """
+import getpass
 import json
 import os
 import shutil
@@ -15,6 +16,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_rest_jobs import JobServerTestCase, fake_job  # noqa: E402
@@ -494,6 +496,51 @@ class TestPodmanSandbox(SandboxServerTestCase):
         described = self.use_podman({"method": "podman"}, info=v1).describe()
         self.assertEqual((described["effective"], described["supplementary_groups"]), ("podman", False))
 
+    def test_storage(self):
+        for bad in ("relative/dir", 7):
+            with self.assertRaises(ValueError, msg=bad):
+                rest_sandbox.Sandbox({"method": "podman", "storage": bad})
+        # podman's own storage on a local disk: left alone
+        info = dict(PODMAN_V2, store={"graphRoot": str(self.tmp / "graph")})
+        sandbox = self.use_podman({"method": "podman"}, info=info)
+        self.assertIsNone(sandbox.podman_storage_conf())
+        lines, _ = sandbox.launch("#!/bin/bash", "true", [str(self.llm_root)])
+        self.assertNotIn("CONTAINERS_STORAGE_CONF", "\n".join(lines))
+        # on NFS (where rootless overlay can't chown to subordinate ids): moved to /var/tmp/USER/hpclib-podman
+        with mock.patch.object(rest_sandbox, "_filesystem_type", return_value="nfs4"):
+            sandbox = self.use_podman({"method": "podman"}, info=info)
+            self.assertEqual(sandbox.podman_storage_conf(),
+                             os.path.join("/var/tmp", getpass.getuser(), "hpclib-podman", "storage.conf"))
+            self.assertIsNone(self.use_podman({"method": "podman", "storage": "default"}, info=info)
+                              .podman_storage_conf())
+        # an explicit directory: the job writes its storage.conf there and podman (and the clean-up) use it
+        store = self.tmp / "pstore"
+        sandbox = self.use_podman({"method": "podman", "storage": str(store)}, info=info)
+        self.assertEqual(sandbox.describe()["podman_storage"], str(store))
+        lines, _ = sandbox.launch("#!/bin/bash", 'echo "conf=$CONTAINERS_STORAGE_CONF"', [str(self.llm_root)])
+        res = subprocess.run(["bash", "-c", "\n".join(lines)], cwd=self.llm_root, capture_output=True, text=True,
+                             env=dict(os.environ, TMPDIR=str(self.tmp)), timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"conf={store}/storage.conf", res.stdout)
+        self.assertEqual((store / "storage.conf").read_text(),
+                         f'[storage]\ndriver = "overlay"\ngraphroot = "{store}/storage"\nrunroot = "{store}/run"\n')
+        self.assertEqual(oct((store / "storage").stat().st_mode & 0o777), "0o700")
+
+    def test_filesystem_type(self):
+        mountinfo = ("22 1 0:20 / / rw - ext4 /dev/sda1 rw\n"
+                     "40 22 0:44 / /net/snowflake rw - nfs4 snowflake:/stor rw\n"
+                     "41 22 0:45 / /h rw - autofs map rw\n"
+                     "42 41 0:46 / /h/maboyer rw - nfs4 snowflake:/stor/homes/maboyer rw\n"
+                     "43 22 0:47 / /odd\\040dir rw - xfs /dev/sdb rw\n")
+        with mock.patch.object(rest_sandbox, "_read", return_value=mountinfo), \
+                mock.patch.object(os.path, "realpath", side_effect=lambda p: p), \
+                mock.patch.object(os.path, "exists", return_value=True):
+            self.assertEqual(rest_sandbox._filesystem_type("/h/maboyer/.local/share/containers/storage"), "nfs4")
+            self.assertEqual(rest_sandbox._filesystem_type("/h/other"), "autofs")
+            self.assertEqual(rest_sandbox._filesystem_type("/var/tmp/x"), "ext4")
+            self.assertEqual(rest_sandbox._filesystem_type("/odd dir/y"), "xfs")
+            self.assertEqual(rest_sandbox._filesystem_type("/net/snowflakes"), "ext4")
+
     def test_podman_counts_as_sandboxed(self):
         self.use_podman({"method": "podman"})
         self.jobs.auto_approve = "all"
@@ -517,3 +564,13 @@ class TestRealPodman(unittest.TestCase):
         result = rest_sandbox.self_test(sandbox, str(self.tmp))
         self.assertTrue(result["passed"], result)
         self.assertTrue(result["checks"]["network_isolated"], result)
+
+    def test_self_test_with_local_storage(self):
+        # what "auto" does when podman's own storage is on NFS: a storage directory of the sandbox's
+        store = self.tmp / "store"
+        sandbox = rest_sandbox.Sandbox({"method": "podman", "storage": str(store)}, data_dir=str(self.tmp / "data"))
+        result = rest_sandbox.self_test(sandbox, str(self.tmp))
+        self.assertTrue(result["passed"], result)
+        self.assertTrue((store / "storage.conf").is_file())
+        self.addCleanup(subprocess.run, ["podman", "unshare", "rm", "-rf", str(store)], capture_output=True,
+                        env=dict(os.environ, CONTAINERS_STORAGE_CONF=str(store / "storage.conf")))

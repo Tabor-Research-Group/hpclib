@@ -172,6 +172,22 @@ class TestLocalRunner(LocalRunnerTestCase):
         with self.assertRaises(ValueError):
             rest_local.check_scheduler_section({"type": "local", "enforce_limits": "cpu"})
 
+    def test_podman_storage_reaches_the_job(self):
+        # the sandbox moved podman's storage (NFS home): the wrapper's `podman rm` must look in the same place
+        class Podman:
+            def limits(self):
+                return {"enforced": True, "cpu": True, "memory": True}
+            def resolve(self):
+                return "podman", shutil.which("true")
+            def podman_storage_conf(self):
+                return "/var/tmp/someone/hpclib-podman/storage.conf"
+        self.runner.sandbox = Podman()
+        script = '#!/bin/bash\necho "$HPC_JOB_PODMAN $CONTAINERS_STORAGE_CONF"\n'
+        job = self.submit("--output=out-%j.txt", script=script)
+        self.assertEqual(self.finished(job)["state"], "COMPLETED")
+        self.assertEqual((self.work / f"out-{job}.txt").read_text().strip(),
+                         f"{shutil.which('true')} /var/tmp/someone/hpclib-podman/storage.conf")
+
     def test_test_only_and_sinfo(self):
         res = self.sbatch("--test-only", "--partition=gpu")
         self.assertEqual(res.returncode, 0)

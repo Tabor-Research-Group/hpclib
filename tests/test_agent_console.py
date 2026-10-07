@@ -697,6 +697,20 @@ class TestTunnelInstall(ConsoleTestCase):
             self.assertEqual(self.shell.calls[-1][0], "launch_tunnel")
         self.assertEqual(self.call("POST", f"/api/apps/jupyter/{self.dead}/install", {"force": "x"})[0], 400)
 
+    def test_pai_update(self):
+        # PAI, once installed, updates: its checkout fast-forwarded and its image pulled again (install.sh --force)
+        base = f"/api/apps/pai/{self.dead}"
+        state = self.call("GET", base)[1]
+        self.assertEqual(state["reinstall"]["label"], "Update")
+        self.assertNotIn("reinstall", self.call("GET", f"/api/apps/vscode/{self.dead}")[1])
+        self.assertIn("PAI_IMAGE", [f["name"] for f in self.call("GET", base + "/settings")[1]["fields"]])
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.shell.setup_status = "installed installed: /s/pai/proto-auto-interface"
+            status, out = self.call("POST", base + "/install", {"force": True})
+            self.assertEqual((status, out["title"]), (202, "update PAI"), out)
+            self.assertEqual(self.shell.calls[-1][-3:], ["--install", "--force", "--check"])
+            self.assertEqual(self.wait_op(self.dead)["state"], "succeeded")
+
     def test_old_cluster_without_setup_tunnel(self):
         # an older hpclib on the cluster: no setup_tunnel.sh, so no status line
         with mock.patch.object(self.clusters.logins, "alive", return_value=True):

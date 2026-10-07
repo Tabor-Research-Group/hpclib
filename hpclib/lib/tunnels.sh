@@ -1419,6 +1419,77 @@ function _hpclib_forget_port {  # _hpclib_forget_port PORT PID: remove the recor
   if [ "$pid" = "$2" ]; then rm -f "$file"; fi
 }
 
+# Everything hpclib starts for a port carries HPCLIB_TUNNEL_PORT=PORT in its
+# environment (start_tunnel.sh and smbshell gui export it), and so does what
+# that starts: podman's port forwarder, rclone, the ssh forward, the waiting
+# page. Whatever is listening on the port is found from the kernel's socket
+# tables, so a leftover is recognized however it was started or orphaned.
+#   _hpclib_port_holders PORT [--stop]
+# lists the processes listening on PORT (on stderr; 1 if there are none), and
+# with --stop ends the ones that are yours and hpclib's for PORT: by that mark,
+# or (for those started before it) rclone's web GUI from smbshell. TERM, then
+# KILL after 5 s; 0 if it stopped any.
+function _hpclib_port_holders {
+  python3 - "$1" "${2:-}" <<'PY'
+import os, signal, sys, time
+port, stop = int(sys.argv[1]), sys.argv[2] == "--stop"
+inodes = set()
+for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+    try:
+        with open(table) as f:
+            next(f)
+            for line in f:
+                fields = line.split()
+                if fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:   # LISTEN on PORT
+                    inodes.add(f"socket:[{fields[9]}]")
+    except OSError:
+        pass
+if not inodes:
+    sys.exit(1)
+me, mine, seen = os.getuid(), [], 0
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    try:                     # only your own processes' sockets and environment can be read
+        if not any(os.readlink(f"/proc/{pid}/fd/{fd}") in inodes for fd in os.listdir(f"/proc/{pid}/fd")):
+            continue
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            args = " ".join(f.read().replace(b"\0", b" ").decode(errors="replace").split())
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            env = f.read().split(b"\0")
+    except OSError:
+        continue
+    seen += 1
+    marked = f"HPCLIB_TUNNEL_PORT={port}".encode() in env
+    legacy = "rclone" in args and " rcd " in f" {args} " and "hpclib-rclone-gui." in args
+    ours = os.stat(f"/proc/{pid}").st_uid == me and (marked or legacy)
+    if ours:
+        mine.append(int(pid))
+    if not stop or ours:
+        print(f"  {'stopping ' if stop else ''}pid {pid}: {args[:200]}"
+              f"{'' if ours else ' (not an hpclib tunnel of yours)'}", file=sys.stderr)
+if not stop:
+    if not seen:
+        print("  a process of another user's (or one you can't see)", file=sys.stderr)
+    sys.exit(0)
+if not mine:
+    sys.exit(1)
+for pid in mine:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+deadline = time.time() + 5
+while time.time() < deadline and any(os.path.exists(f"/proc/{pid}") for pid in mine):
+    time.sleep(0.1)
+for pid in mine:
+    try:
+        os.kill(pid, signal.SIGKILL)
+        print(f"  pid {pid} ignored TERM; killed", file=sys.stderr)
+    except ProcessLookupError:
+        pass
+print(f"stopped what an earlier hpclib session left listening on port {port}", file=sys.stderr)
+PY
+}
+
 # _hpclib_clear_port PORT: stop whatever an earlier tunnel left on PORT on
 # this login node, then check the port is free. Only touches your own
 # processes, and only ones that look like hpclib tunnel pieces for PORT.
@@ -1454,11 +1525,14 @@ function _hpclib_clear_port {
   done
   for tries in 1 2 3 4 5 6 7 8 9 10; do
     if _hpclib_port_free "$port"; then return 0; fi
+    # still held: by something an earlier session left (orphaned, or started outside a tunnel, such as rclone's
+    # web GUI or a podman forwarder), found by what is listening rather than by a record
+    if [ "$tries" = 2 ]; then _hpclib_port_holders "$port" --stop && continue; fi
     sleep 0.5
   done
   echo "port $port on $(hostname -s) is in use by something that isn't one of your tunnels:" >&2
-  ss -ltnp "sport = :$port" 2>/dev/null | tail -n +2 >&2 || true
-  echo "pick another port with -P" >&2
+  _hpclib_port_holders "$port" || ss -ltnp "sport = :$port" 2>/dev/null | tail -n +2 >&2 || true
+  echo "pick another port with -P (or stop that process, if it is yours and you are done with it)" >&2
   return 1
 }
 
@@ -1484,7 +1558,7 @@ function stop_tunnel {
     echo "$usage" >&2
     return 2
   fi
-  script="$(declare -f _hpclib_sessions_root _hpclib_port_file _hpclib_port_free _hpclib_clear_port)
+  script="$(declare -f _hpclib_sessions_root _hpclib_port_file _hpclib_port_free _hpclib_port_holders _hpclib_clear_port)
 _hpclib_clear_port \"\$1\" && echo \"port \$1 is free on \$(hostname -s)\""
   printf '%s\n' "$script" | HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$(printf '%q ' bash -s -- "$port")"
   # the forward this machine's ssh master holds for the tunnel

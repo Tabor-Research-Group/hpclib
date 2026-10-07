@@ -137,7 +137,12 @@ PODMAN = "podman"
 # the methods that sandbox a job (an effective method of either means jobs are sandboxed)
 SANDBOXED = ("singularity", "podman")
 NETWORKS = ("none", "default")
-CONFIG_KEYS = {"method", "runtime", "image", "binds", "writable", "scratch", "flags", "allow_unsandboxed", "network"}
+CONFIG_KEYS = {"method", "runtime", "image", "binds", "writable", "scratch", "flags", "allow_unsandboxed", "network",
+               "storage"}
+# file systems where rootless podman's storage can't live: they refuse the chown to your subordinate ids that its
+# overlay layers need ("chown ...: operation not permitted")
+NETWORK_FILESYSTEMS = ("nfs", "nfs4", "cifs", "smb3", "smbfs", "fuse.sshfs", "lustre", "gpfs", "beegfs",
+                       "fuse.glusterfs", "ceph", "fuse.ceph", "panfs", "afs")
 # podman's --init program (catatonit), where distributions put it
 PODMAN_INITS = ("/usr/libexec/podman/catatonit", "/usr/bin/catatonit", "/usr/libexec/catatonit/catatonit")
 # a podman image reference: [registry/]name[:tag][@digest]
@@ -239,6 +244,12 @@ class Sandbox:
             self.image = image
         else:
             self.image = _absolute(image, "image") if image else None
+        # podman's storage: "auto" (podman's own, unless that is on a network file system: then a local
+        # directory, /var/tmp/USER/hpclib-podman), "default" (podman's own), or a directory
+        self.storage = config.get("storage", "auto")
+        if not isinstance(self.storage, str) or not (self.storage in ("auto", "default") or
+                                                     os.path.isabs(os.path.expanduser(self.storage))):
+            raise ValueError('sandbox `storage` must be "auto", "default", or an absolute directory')
         self.network = config.get("network", "none")
         if self.network not in NETWORKS:
             raise ValueError(f"sandbox `network` must be one of {', '.join(NETWORKS)}")
@@ -502,17 +513,42 @@ class Sandbox:
         code, out, err = _run([runtime, "info", "--format", "json"], timeout=60)
         info = {"ok": code == 0, "error": None if code == 0 else (err.strip()[-500:] or "podman info failed")}
         try:
-            host = json.loads(out).get("host", {}) if code == 0 else {}
+            parsed = json.loads(out) if code == 0 else {}
         except ValueError:
-            host = {}
+            parsed = {}
+        host, store = parsed.get("host") or {}, parsed.get("store") or {}
         info.update(cgroup_version=host.get("cgroupVersion"), cgroup_manager=host.get("cgroupManager"),
                     cgroup_controllers=list(host.get("cgroupControllers") or []),
                     oci_runtime=(host.get("ociRuntime") or {}).get("name"),
                     rootless=(host.get("security") or {}).get("rootless"),
-                    id_mappings=bool((host.get("idMappings") or {}).get("uidmap")))
+                    id_mappings=bool((host.get("idMappings") or {}).get("uidmap")),
+                    graph_root=store.get("graphRoot"))
         with self._lock:
             self._podman_cache[runtime] = info
         return info
+
+    def podman_storage(self, runtime):
+        """
+        The directory jobs' podman storage goes in (its storage.conf, graph root and run root), or None for
+        podman's own. With "auto", podman's own unless that is on a network file system.
+        """
+        if self.storage == "default":
+            return None
+        if self.storage != "auto":
+            return os.path.normpath(os.path.expanduser(self.storage))
+        graph = self.podman_info(runtime).get("graph_root") or os.path.expanduser("~/.local/share/containers/storage")
+        if _filesystem_type(graph) in NETWORK_FILESYSTEMS:
+            return os.path.join("/var/tmp", getpass.getuser(), "hpclib-podman")
+        return None
+
+    def podman_storage_conf(self):
+        """CONTAINERS_STORAGE_CONF for jobs' podman, or None (its own); for the local scheduler's clean-up."""
+        try:
+            method, runtime = self.resolve()
+        except SandboxError:
+            return None
+        directory = self.podman_storage(runtime) if method == "podman" else None
+        return os.path.join(directory, "storage.conf") if directory else None
 
     def limits(self):
         """
@@ -589,6 +625,18 @@ class Sandbox:
                 'exit 125; }',
                 'hpc_sandbox_scratch=(-v "$hpc_sandbox_tmp/tmp:/tmp" -v "$hpc_sandbox_tmp/var-tmp:/var/tmp")',
             ]
+        storage = self.podman_storage(runtime)
+        if storage:
+            # podman's storage on a local disk (see podman_storage); its storage.conf is written by each job, the same
+            q = shlex.quote
+            conf = (f'[storage]\ndriver = "overlay"\ngraphroot = "{storage}/storage"\nrunroot = "{storage}/run"\n')
+            lines += [
+                f'(umask 077 && mkdir -p {q(storage + "/storage")} {q(storage + "/run")} && '
+                f'printf %s {q(conf)} > {q(storage + "/storage.conf.$$")} && '
+                f'mv -f {q(storage + "/storage.conf.$$")} {q(storage + "/storage.conf")}) || '
+                f'{{ echo "hpclib: could not set up podman storage in {storage}" >&2; exit 125; }}',
+                f'export CONTAINERS_STORAGE_CONF={q(storage + "/storage.conf")}',
+            ]
         # CPU and memory limits from the local scheduler (SLURM applies its own); no swap beyond the memory
         lines += [
             # crun's default ping_group_range ("0 0") names gid 0, which doesn't exist in the container when you
@@ -640,7 +688,8 @@ class Sandbox:
         """The configured sandbox, for /cluster and /sandbox."""
         out = {"configured": self.configured, "method": self.method, "runtime": self.runtime,
                "image": self.image, "binds": self.binds, "writable": self.writable, "scratch": self.scratch,
-               "flags": self.flags, "allow_unsandboxed": self.allow_unsandboxed, "network": self.network}
+               "flags": self.flags, "allow_unsandboxed": self.allow_unsandboxed, "network": self.network,
+               "storage": self.storage}
         try:
             method, detail = self.resolve()
             out["effective"] = method
@@ -649,6 +698,7 @@ class Sandbox:
                 info = self.podman_info(detail)
                 out["limits"] = self.limits()
                 out["supplementary_groups"] = info.get("oci_runtime") == "crun"
+                out["podman_storage"] = self.podman_storage(detail) or info.get("graph_root")
         except SandboxError as e:
             out["effective"] = "unavailable"
             out["error"] = str(e)
@@ -659,6 +709,23 @@ class Sandbox:
 ##
 ##  Probe
 ##
+
+def _filesystem_type(path):
+    """The type of the file system `path` (or its nearest existing parent) is on, from /proc/self/mountinfo."""
+    path = os.path.realpath(path)
+    while not os.path.exists(path) and path != "/":
+        path = os.path.dirname(path)
+    best, kind = "", None
+    for line in (_read("/proc/self/mountinfo", 1 << 20) or "").splitlines():
+        left, _, right = line.partition(" - ")
+        fields = left.split()
+        if len(fields) < 5 or not right:
+            continue
+        point = fields[4].replace("\\040", " ")
+        if (path == point or path.startswith(point.rstrip("/") + "/")) and len(point) >= len(best):
+            best, kind = point, right.split()[0]
+    return kind
+
 
 def _read(path, limit=1 << 16):
     try:
@@ -838,6 +905,9 @@ def probe(sandbox: Sandbox, base_dir, run_self_test=True):
         entry["subuid"] = any(line.split(":")[0] in (user, str(os.getuid()))
                               for line in (_read("/etc/subuid") or "").splitlines())
         entry["linger"] = os.path.exists(f"/var/lib/systemd/linger/{user}")
+        entry["graph_root_filesystem"] = _filesystem_type(entry.get("graph_root") or
+                                                          os.path.expanduser("~/.local/share/containers/storage"))
+        entry["job_storage"] = sandbox.podman_storage(podman)
         runtimes.append(entry)
     info["container_runtimes"] = runtimes
     modulepath, roots = _module_roots()
@@ -855,6 +925,10 @@ def probe(sandbox: Sandbox, base_dir, run_self_test=True):
         if not podman_entry["linger"]:
             notes.append("lingering is off for you (loginctl enable-linger), so your podman jobs may be stopped "
                          "when you log out")
+        if podman_entry["graph_root_filesystem"] in NETWORK_FILESYSTEMS:
+            notes.append(f"podman's own storage is on {podman_entry['graph_root_filesystem']}, where rootless "
+                         f"containers can't be created; jobs keep theirs in {podman_entry['job_storage'] or '(none)'}"
+                         " (the sandbox's \"storage\")")
         limits = Sandbox(recommended, data_dir=sandbox.data_dir, which=sandbox.which).limits()
         if not limits["enforced"]:
             notes.append(f"jobs' CPU and memory limits can't be enforced: {limits['reason']}")

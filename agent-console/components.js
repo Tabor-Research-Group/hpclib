@@ -868,7 +868,10 @@ export class HpcAppSession extends TunnelRow {
     const busy = !!(s.operation && s.operation.state === "running");
     b.install.disabled = b.check.disabled = !loggedIn || busy;
     b.install.title = b.check.title = loggedIn ? "" : "log in first";
-    b.install.setAttribute("label", inst.state === "installed" ? "Reinstall" : "Install");
+    // once installed it installs again (--force): Reinstall, or what the app calls it (PAI: Update)
+    const again = s.reinstall || {};
+    b.install.setAttribute("label", inst.state === "installed" ? again.label || "Reinstall" : "Install");
+    if (loggedIn && inst.state === "installed" && again.title) b.install.title = again.title;
     b.install.toggleAttribute("primary", inst.state === "missing");
     const text = { installed: "installed", missing: "not installed", unknown: "install status unknown",
                    unchecked: "not checked yet" }[inst.state];

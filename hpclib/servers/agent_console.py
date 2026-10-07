@@ -210,9 +210,17 @@ APPS = {
         "health_path": "/",
         "shared": True,
         "instance_label": "database",
+        # once installed, Install --force fast-forwards the checkout and pulls the app's image again
+        "reinstall": {"label": "Update", "title": "fast-forward the proto-auto-interface checkout and pull the "
+                                                  "app's image again; a running database job keeps the old ones "
+                                                  "until it is restarted"},
         "settings": [
-            ("PAI_ROOT_DIR", "Install directory", "holds proto-auto-interface/; default /scratch/user/USER/pai"),
+            ("PAI_ROOT_DIR", "Install directory", "holds proto-auto-interface/ and the images; default "
+                                                  "/scratch/user/USER/pai"),
             ("PAI_REPO", "Repository", "git URL Install clones proto-auto-interface from"),
+            ("PAI_IMAGE", "Image", "where Install and Update pull the app's image (PAI_ROOT_DIR/proto-auto-interface"
+                                   ".sif) from; default docker://ghcr.io/tabor-research-group/proto-auto-interface"
+                                   ":master"),
             ("INCLUDE_DEV_ENDPOINTS", "Development endpoints", "true or false; default true"),
             ("PAI_BIND_SOURCE", "Bind source", "1: singularity-compose.sh binds your proto-auto-interface "
                                                "source into the containers, so your changes run; 0: the images' "
@@ -1302,7 +1310,8 @@ class Clusters:
         if not self.app_installable(app):
             raise ConsoleError(409, f"{spec['title']} has nothing to install")
         args = self.setup_args(profile, app, "--install", *(["--force"] if force else []), "--check")
-        record = self.run_operation(profile, "tunnel_install", args, title=f"install {spec['title']}", app=app)
+        verb = (spec.get("reinstall") or {}).get("label", "install").lower() if force else "install"
+        record = self.run_operation(profile, "tunnel_install", args, title=f"{verb} {spec['title']}", app=app)
         return record
 
     def app_log_path(self, name, app):
@@ -1533,6 +1542,8 @@ class Clusters:
     def app_state(self, profile, app):
         state = self._app_state(profile, app)
         state["tools"], state["controls"] = self.app_extras(APPS[app], state)
+        if APPS[app].get("reinstall"):     # what Install does once installed (PAI: Update), if not Reinstall
+            state["reinstall"] = APPS[app]["reinstall"]
         return state
 
     def _app_state(self, profile, app):
