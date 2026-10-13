@@ -510,13 +510,14 @@ class TestManage(TestLogin):
 class FakeApp(http.server.BaseHTTPRequestHandler):
     """Stands in for JupyterLab (JSON at /api) or for the tunnel's waiting page while the job is queued."""
     waiting = False
+    answer = b'{"version": "4.2.5"}'
 
     def do_GET(self):
         if self.waiting:
             body, ctype = (b"<html><h2>Waiting for jupyter&hellip;</h2>\n<p>job 123 queued (Priority) - poll #4</p>"
                            b"</html>", "text/html")
         else:
-            body, ctype = b'{"version": "4.2.5"}', "application/json"
+            body, ctype = self.answer, "application/json"
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -529,8 +530,8 @@ class FakeApp(http.server.BaseHTTPRequestHandler):
 
 class TestApps(ConsoleTestCase):
 
-    def serve(self, port, waiting=False):
-        handler = type("H", (FakeApp,), {"waiting": waiting})
+    def serve(self, port, waiting=False, answer=FakeApp.answer):
+        handler = type("H", (FakeApp,), {"waiting": waiting, "answer": answer})
         server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
@@ -539,6 +540,13 @@ class TestApps(ConsoleTestCase):
 
     def port(self, name=None):
         return agent_profiles.load(name or self.dead)["apps"]["jupyter"]["port"]
+
+    def test_health_answer_that_is_not_an_object(self):
+        # a health path may answer with any JSON: CMCC DB's /api/fetch_datasets is a list
+        self.call("GET", f"/api/apps/jupyter/{self.dead}")
+        self.serve(self.port(), answer=b'[{"name": "dataset"}]')
+        status, out = self.call("GET", f"/api/apps/jupyter/{self.dead}")
+        self.assertEqual((status, out["state"], out["version"]), (200, "up", None), out)
 
     def test_listing_and_ports(self):
         out = self.call("GET", "/api/apps")[1]

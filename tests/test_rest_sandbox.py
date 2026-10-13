@@ -526,6 +526,43 @@ class TestPodmanSandbox(SandboxServerTestCase):
                          f'[storage]\ndriver = "overlay"\ngraphroot = "{store}/storage"\nrunroot = "{store}/run"\n')
         self.assertEqual(oct((store / "storage").stat().st_mode & 0o777), "0o700")
 
+    def test_host_image_off_network_file_systems(self):
+        # podman with subordinate ids sets containers up as one of them, which NFS treats as another user: the
+        # host image in a private NFS home can't be opened ("crun: readlink ``"), so it goes to a local disk
+        default = str(self.data / "rest" / "sandbox" / "host")
+        local = os.path.join("/var/tmp", getpass.getuser(), "hpclib-podman", "host")
+        sandbox = self.use_podman({"method": "podman"})
+        self.assertEqual(sandbox.host_image_for("podman"), default)
+        with mock.patch.object(rest_sandbox, "_filesystem_type", return_value="nfs4"):
+            self.assertEqual(sandbox.host_image_for("podman"), local)
+            self.assertEqual(sandbox.host_image_for("singularity"), default)   # it runs as you
+            store = str(self.tmp / "pstore")
+            self.assertEqual(self.use_podman({"method": "podman", "storage": store}).host_image_for("podman"),
+                             os.path.join(store, "host"))
+            self.assertEqual(self.use_podman({"method": "podman", "storage": store}).plan([str(self.llm_root)])
+                             ["image"], os.path.join(store, "host"))
+
+    def test_hint_for_directories_subordinate_ids_cannot_pass(self):
+        info = dict(PODMAN_V2, host=dict(PODMAN_V2["host"], idMappings={"uidmap": [{"size": 65536}]}))
+        sandbox = self.use_podman({"method": "podman"}, info=info)
+        with mock.patch.object(rest_sandbox, "_untraversable_on_network",
+                               side_effect=lambda p: "/h/me" if p.startswith(str(self.llm_root)) else None):
+            lines, _ = sandbox.launch("#!/bin/bash", "true", [str(self.llm_root)])
+        script = "\n".join(lines)
+        self.assertIn("cannot pass through /h/me", script)
+        self.assertIn('"$hpc_sandbox_status" -ge 125', script)
+        lines, _ = self.use_podman({"method": "podman"}, info=info).launch("#!/bin/bash", "true", [str(self.llm_root)])
+        self.assertNotIn("subordinate ids", "\n".join(lines))
+        # the check itself: a directory without o+x on a network file system
+        private = self.tmp / "private" / "inner"
+        private.mkdir(parents=True)
+        os.chmod(self.tmp, 0o755)                     # mkdtemp's own is private too
+        os.chmod(self.tmp / "private", 0o700)
+        self.addCleanup(os.chmod, self.tmp / "private", 0o755)
+        with mock.patch.object(rest_sandbox, "_filesystem_type", return_value="nfs"):
+            self.assertEqual(rest_sandbox._untraversable_on_network(str(private)), str(self.tmp / "private"))
+        self.assertIsNone(rest_sandbox._untraversable_on_network(str(private)))     # local: capabilities apply
+
     def test_filesystem_type(self):
         mountinfo = ("22 1 0:20 / / rw - ext4 /dev/sda1 rw\n"
                      "40 22 0:44 / /net/snowflake rw - nfs4 snowflake:/stor rw\n"

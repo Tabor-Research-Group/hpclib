@@ -1596,6 +1596,8 @@ class Clusters:
             info = json.loads(body)
         except ValueError:
             info = {}
+        if not isinstance(info, dict):   # a health path may answer with any JSON (CMCC DB: a list of datasets)
+            info = {}
         token = self._app_token(name, app)
         url = f"http://127.0.0.1:{port}{spec['open_path']}" + (f"?token={token}" if token else "")
         if spec.get("gui_re") is not None:

@@ -182,6 +182,9 @@ def build_host_image(path, targets=()):
     mount point for each bind and the host's /bin-style symlinks. It
     holds no programs of its own; everything comes from the binds.
     """
+    parent = os.path.dirname(os.path.normpath(path))
+    if not os.path.isdir(parent):
+        os.makedirs(parent, mode=0o700, exist_ok=True)   # e.g. /var/tmp/USER/hpclib-podman: yours alone
     os.makedirs(path, mode=0o755, exist_ok=True)
     for name in USR_LINKS:
         host, mine = os.path.join("/", name), os.path.join(path, name)
@@ -302,6 +305,20 @@ class Sandbox:
     def host_image(self):
         return os.path.join(self.data_dir or tempfile.gettempdir(), "sandbox", "host")
 
+    def host_image_for(self, method):
+        """
+        Where the host image is for `method`. Rootless podman with subordinate ids sets the container up as a
+        subordinate id, which a network file system judges as a stranger (it ignores capabilities): a host image
+        in your NFS home then can't be opened ("crun: readlink ``: No such file or directory"). So for podman it
+        is kept on a local disk, beside the jobs' storage, when the server's directory is on one.
+        """
+        path = self.host_image
+        if method != "podman" or _filesystem_type(path) not in NETWORK_FILESYSTEMS:
+            return path
+        if self.storage not in ("auto", "default"):
+            return os.path.join(os.path.normpath(os.path.expanduser(self.storage)), "host")
+        return os.path.join("/var/tmp", getpass.getuser(), "hpclib-podman", "host")
+
     def resolve(self):
         """
         ("singularity", runtime path) or ("none", reason). Raises
@@ -357,7 +374,7 @@ class Sandbox:
             if d in rw:
                 continue
             (rw if os.path.exists(d) else missing).append(d)
-        plan = {"method": method, "runtime": detail, "image": self.image or self.host_image,
+        plan = {"method": method, "runtime": detail, "image": self.image or self.host_image_for(method),
                 "host_image": self.image is None, "read_only": ro, "read_write": rw}
         if method == "podman":
             plan["network"] = self.network
@@ -680,8 +697,17 @@ class Sandbox:
             'if [ "$hpc_sandbox_status" = 125 ]; then',
             '  echo "hpclib: the podman sandbox failed to start (exit 125); see the messages above" >&2',
             "fi",
-            'exit "$hpc_sandbox_status"',
         ]
+        # with subordinate ids, podman sets the container up as one of them; NFS treats that as another user
+        blocked = sorted({b for b in map(_untraversable_on_network, plan["read_only"] + plan["read_write"] + [image])
+                          if b}) if info.get("id_mappings") else []
+        if blocked:
+            hint = (f"hpclib: podman sets jobs up as one of your subordinate ids, which cannot pass through "
+                    f"{', '.join(blocked)} (on a network file system), so what is under it cannot be bound into the "
+                    f"job; chmod o+x lets it through without letting anyone list it")
+            lines += ['if [ "$hpc_sandbox_status" -ge 125 ] && [ "$hpc_sandbox_status" -le 127 ]; then',
+                      f"  echo {shlex.quote(hint)} >&2", "fi"]
+        lines += ['exit "$hpc_sandbox_status"']
         return lines
 
     def describe(self):
@@ -709,6 +735,24 @@ class Sandbox:
 ##
 ##  Probe
 ##
+
+def _untraversable_on_network(path):
+    """
+    The first directory on the way to `path` that is on a network file system and that other users (and so your
+    subordinate ids, which rootless podman sets containers up as) can't pass through, or None.
+    """
+    path = os.path.realpath(path)
+    parts = path.strip("/").split("/")
+    for i in range(1, len(parts) + 1):
+        d = "/" + "/".join(parts[:i])
+        try:
+            mode = os.stat(d).st_mode
+        except OSError:
+            return None
+        if not mode & 0o001 and _filesystem_type(d) in NETWORK_FILESYSTEMS:
+            return d
+    return None
+
 
 def _filesystem_type(path):
     """The type of the file system `path` (or its nearest existing parent) is on, from /proc/self/mountinfo."""
@@ -929,6 +973,14 @@ def probe(sandbox: Sandbox, base_dir, run_self_test=True):
             notes.append(f"podman's own storage is on {podman_entry['graph_root_filesystem']}, where rootless "
                          f"containers can't be created; jobs keep theirs in {podman_entry['job_storage'] or '(none)'}"
                          " (the sandbox's \"storage\")")
+        if podman_entry.get("id_mappings"):
+            # set up as a subordinate id: on NFS, a directory others can't pass through stops the job's binds
+            for d in sandbox.binds + sandbox.writable:
+                blocked = _untraversable_on_network(d)
+                if blocked:
+                    notes.append(f"podman sets jobs up as one of your subordinate ids, which {blocked} (on a "
+                                 f"network file system) doesn't let through, so {d} can't be bound into jobs; "
+                                 f"`chmod o+x {blocked}` lets others pass through it without listing it")
         limits = Sandbox(recommended, data_dir=sandbox.data_dir, which=sandbox.which).limits()
         if not limits["enforced"]:
             notes.append(f"jobs' CPU and memory limits can't be enforced: {limits['reason']}")
@@ -949,7 +1001,16 @@ def probe(sandbox: Sandbox, base_dir, run_self_test=True):
     info["notes"] = notes
     if run_self_test and runtimes:
         current = sandbox if sandbox.method != "none" else Sandbox(dict(recommended), data_dir=sandbox.data_dir)
-        info["self_test"] = self_test(current, base_dir)
+        test_dir = base_dir
+        try:
+            if current.resolve()[0] == "podman" and _untraversable_on_network(base_dir):
+                # the server's own directory is private on NFS, where podman's subordinate ids can't reach it;
+                # test beside the host image instead (jobs' own directories get the note above if they can't)
+                test_dir = os.path.join(os.path.dirname(current.host_image_for("podman")), "probe")
+                os.makedirs(test_dir, mode=0o700, exist_ok=True)
+        except SandboxError:
+            pass
+        info["self_test"] = self_test(current, test_dir)
         info["self_test"]["config"] = "current" if current is sandbox else "recommended"
     return info
 

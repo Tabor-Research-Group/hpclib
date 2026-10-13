@@ -92,6 +92,7 @@ Proposals are approved automatically only while jobs are sandboxed and the polic
 | apptainer or singularity, or podman was not found on the server's PATH | no container runtime where the REST server runs | load its module in `~/.bashrc`, or set the sandbox's `runtime` to its full path |
 | `chown ...: operation not permitted` (podman) | podman's storage is on NFS | update hpclib (newer versions move it to `/var/tmp` automatically), or set `"sandbox": {"storage": "/var/tmp/USER/hpclib-podman"}` |
 | `no subordinate ids` (podman) | your account has no range in `/etc/subuid` | the admin adds one: `echo USER:START:65536 \| sudo tee -a /etc/subuid /etc/subgid`, then `podman system migrate` |
+| `crun: readlink ``: No such file or directory` (podman) | with subordinate ids, podman sets the container up as one of them, and NFS treats that as another user: it can't open a host image (or bind a directory) in a private NFS home | update hpclib (0.2.54+ keeps podman's host image on local disk); for job directories under a private NFS home, `chmod o+x` each directory on the way (traverse only, no listing) |
 | CPU and memory limits can't be enforced | cgroups v2 doesn't delegate the controllers to you | set the scheduler's `"enforce_limits"` to `"memory"` or `false` in `config.json` |
 
 ## The console
