@@ -13,6 +13,20 @@ source "$HPCLIB_DIR/hpclib.sh"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 assert_equal() { [ "$1" = "$2" ] || fail "expected '$2', got '$1'"; }
 
+# A tunnel that shares one running instance (what an app like PAI does): used to test attaching, KEEP_INSTANCE and
+# --instances/--stop-instance without any particular app. Apps ship as packages, with their own tests.
+fixture_tunnels="$test_dir/fixture-tunnels"
+mkdir -p "$fixture_tunnels/shared-demo"
+printf 'true\n' > "$fixture_tunnels/shared-demo/sbatch_script.sh"
+cat > "$fixture_tunnels/shared-demo/tunnel_config.sh" <<'CONFIG'
+unset ENABLE_WEB_PROXY
+DEFAULT_SBATCH_ARGS="--time=1:00:00 --mem=1gb --ntasks=1 --cpus-per-task=1"
+PROCESS_PORT=3100
+SHARED_INSTANCE=true
+PROCESS_PORT_FROM_JOB=true
+KEEP_INSTANCE=true
+CONFIG
+
 assert_equal "$(resolve_tunnel vscode)" "$HPCLIB_DIR/tunnels/vscode"
 assert_equal "$(resolve_tunnel flask)" "$HPCLIB_DIR/tunnels/flask"
 assert_equal "$HPCLIB_TUNNEL_PATH" "$HPCLIB_TUNNEL_INSTALL_LOCATION:$HPCLIB_DIR/tunnels"
@@ -143,12 +157,12 @@ grep -q 'ignoring the sbatch options: --mem=2gb' "$test_dir/login.log" || fail "
 grep -q 'on the login node has ended (exit 0)' "$test_dir/login.log" || fail 'the end was not reported'
 assert_equal "$(cat "$test_dir/home/cleared")" 'cleared port 5151 for svc'
 [ ! -e "$test_dir/sessions/ports/$(hostname -s)-5151" ] || fail 'the port record was left behind'
-if HOME="$test_dir/home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PATH="$HPCLIB_DIR/tunnels" \
+if HOME="$test_dir/home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PATH="$fixture_tunnels:$HPCLIB_DIR/tunnels" \
   HPCSESSIONS_DIR="$test_dir/sessions" HPCSERVERS_DIR="$test_dir" PATH="$test_dir/bin:$PATH" \
-  timeout 60 bash "$HPCLIB_DIR/tunnels/start_tunnel.sh" pai -P 5152 --login-node > "$test_dir/login-pai.log" 2>&1; then
+  timeout 60 bash "$HPCLIB_DIR/tunnels/start_tunnel.sh" shared-demo -P 5152 --login-node > "$test_dir/login-shared.log" 2>&1; then
   fail 'ran a shared-instance tunnel on the login node'
 fi
-grep -q "can't run on the login node" "$test_dir/login-pai.log" || fail 'no reason for refusing --login-node'
+grep -q "can't run on the login node" "$test_dir/login-shared.log" || fail 'no reason for refusing --login-node'
 
 # The Flask batch script uses the chosen compute-node port and app.
 mkdir -p "$test_dir/common" "$test_dir/flask-bin"
@@ -417,7 +431,7 @@ if run_configure CONDA_ENVIRONMENT=myenv REQUIRE_CONDA=true > /dev/null 2>&1; th
 fi
 
 ################################################################################
-# Shared instances (pai): a job registers its service and port; a tunnel attaches to a running one.
+# Shared instances (shared-demo): a job registers its service and port; a tunnel attaches to a running one.
 mkdir -p "$test_dir/share-bin" "$test_dir/share-home" "$test_dir/share-data"
 : > "$test_dir/share-home/.bashrc"
 printf 'JOB_INITIALIZATION_PAUSE=0\nJOB_CONNECT_RETRY_WAIT_TIME=0\n' > "$test_dir/share-data/config.sh"
@@ -448,20 +462,20 @@ cat > "$test_dir/share-bin/ssh" <<'SCRIPT'
 echo "ssh $*" >> "$TEST_SHARE_LOG"
 SCRIPT
 chmod +x "$test_dir/share-bin/"*
-share_env=(HOME="$test_dir/share-home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PATH="$HPCLIB_DIR/tunnels"
+share_env=(HOME="$test_dir/share-home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PATH="$fixture_tunnels:$HPCLIB_DIR/tunnels"
            HPCTUNNELS_DATA_DIR="$test_dir/share-data" HPCSESSIONS_DIR="$test_dir/share-data/sessions"
            HPCSERVERS_DIR="$test_dir" TEST_SHARE_LOG="$test_dir/share.log" PATH="$test_dir/share-bin:$CLEAN_PATH")
 (
   export "${share_env[@]}"
   source "$HPCLIB_DIR/tunnels/instances.sh"
   # a job registers itself; another finds it while it runs, and forgets it once it has ended
-  SLURM_JOB_ID=4000 tunnel_register_instance pai 3100
+  SLURM_JOB_ID=4000 tunnel_register_instance shared-demo 3100
   sleep 1
-  SLURM_JOB_ID=4001 tunnel_register_instance pai 3999      # newer, and its job has ended
-  assert_equal "$(tunnel_instance_port pai 4001)" 3999
-  assert_equal "$(TEST_RUNNING=4000 tunnel_find_instance pai)" "4000 $(hostname -s) 3100"
-  [ ! -e "$test_dir/share-data/instances/pai/4001" ] || fail 'kept the instance of an ended job'
-  if TEST_RUNNING= tunnel_find_instance pai > /dev/null; then fail 'found an instance whose job ended'; fi
+  SLURM_JOB_ID=4001 tunnel_register_instance shared-demo 3999      # newer, and its job has ended
+  assert_equal "$(tunnel_instance_port shared-demo 4001)" 3999
+  assert_equal "$(TEST_RUNNING=4000 tunnel_find_instance shared-demo)" "4000 $(hostname -s) 3100"
+  [ ! -e "$test_dir/share-data/instances/shared-demo/4001" ] || fail 'kept the instance of an ended job'
+  if TEST_RUNNING= tunnel_find_instance shared-demo > /dev/null; then fail 'found an instance whose job ended'; fi
   # a taken port isn't picked
   port=$(free_port); listen_as "$port" python3 -m held
   picked=$(tunnel_pick_port "$port")
@@ -472,26 +486,26 @@ share_env=(HOME="$test_dir/share-home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PA
 # start_tunnel attaches to the running instance: no new job, its port, and it isn't cancelled afterwards
 (
   export "${share_env[@]}"
-  SLURM_JOB_ID=6000 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance pai 3777"
-  TEST_RUNNING=6000 timeout 60 bash "$HPCLIB_DIR/tunnels/start_tunnel.sh" pai -P "$(free_port)" > "$test_dir/attach.log" 2>&1 ||
+  SLURM_JOB_ID=6000 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance shared-demo 3777"
+  TEST_RUNNING=6000 timeout 60 bash "$HPCLIB_DIR/tunnels/start_tunnel.sh" shared-demo -P "$(free_port)" > "$test_dir/attach.log" 2>&1 ||
     fail "attaching failed: $(cat "$test_dir/attach.log")"
 )
-grep -q 'attaching to the running pai instance: job 6000' "$test_dir/attach.log" || fail "no attach message: $(cat "$test_dir/attach.log")"
+grep -q 'attaching to the running shared-demo instance: job 6000' "$test_dir/attach.log" || fail "no attach message: $(cat "$test_dir/attach.log")"
 grep -q submitted "$test_dir/share.log" && fail 'submitted a job although one runs'
 grep -q -- '127.0.0.1:[0-9]*:127.0.0.1:3777' "$test_dir/share.log" || fail "not forwarded to the instance's port: $(cat "$test_dir/share.log")"
 grep -q scancel "$test_dir/share.log" && fail 'cancelled a job it only attached to'
-rm -f "$test_dir/share.log" "$test_dir/share-data/instances/pai/"*
+rm -f "$test_dir/share.log" "$test_dir/share-data/instances/shared-demo/"*
 # with none running it submits a job and forwards to the port that job reports (PROCESS_PORT_FROM_JOB)
 (
   export "${share_env[@]}"
-  ( sleep 1; SLURM_JOB_ID=5151 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance pai 3888" ) &
-  TEST_RUNNING=5151 timeout 60 bash "$HPCLIB_DIR/tunnels/start_tunnel.sh" pai -P "$(free_port)" > "$test_dir/own.log" 2>&1 ||
+  ( sleep 1; SLURM_JOB_ID=5151 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance shared-demo 3888" ) &
+  TEST_RUNNING=5151 timeout 60 bash "$HPCLIB_DIR/tunnels/start_tunnel.sh" shared-demo -P "$(free_port)" > "$test_dir/own.log" 2>&1 ||
     fail "starting its own instance failed: $(cat "$test_dir/own.log")"
 )
 grep -q submitted "$test_dir/share.log" || fail 'no job submitted'
-grep -q 'job 5151 serves pai on node9, port 3888' "$test_dir/own.log" || fail "port not taken from the job: $(cat "$test_dir/own.log")"
+grep -q 'job 5151 serves shared-demo on node9, port 3888' "$test_dir/own.log" || fail "port not taken from the job: $(cat "$test_dir/own.log")"
 grep -q -- '127.0.0.1:[0-9]*:127.0.0.1:3888' "$test_dir/share.log" || fail "not forwarded to the reported port"
-grep -q scancel "$test_dir/share.log" && fail 'cancelled the job pai keeps for others (KEEP_INSTANCE)'
+grep -q scancel "$test_dir/share.log" && fail 'cancelled the job shared-demo keeps for others (KEEP_INSTANCE)'
 # postconnect leaves an attached job alone
 printf '%s\n' ended > "$test_dir/pc-replies"
 (
@@ -520,7 +534,6 @@ case "$out" in *"HPCLIB_TUNNEL_STATUS installed installed: $image"*) ;; *) fail 
 if setup vscode --set PATH=/evil --save > /dev/null 2>&1; then fail 'accepted a setting the tunnel does not have'; fi
 grep -q "VSCODE_CONTAINER=" "$test_dir/setup-data/settings/vscode.sh" || fail 'a refused setting replaced the saved ones'
 case "$(setup flask --check)" in *"HPCLIB_TUNNEL_STATUS nothing"*) ;; *) fail 'flask has nothing to install' ;; esac
-case "$(setup pai --set "PAI_ROOT_DIR=$test_dir/pai" --check)" in *"HPCLIB_TUNNEL_STATUS missing"*) ;; *) fail 'pai check' ;; esac
 # start_tunnel reads the saved settings
 grep -q 'TUNNEL_SETTINGS_FILE="$HPCTUNNELS_DATA_DIR/settings/$TUNNEL_NAME.sh"' "$HPCLIB_DIR/tunnels/start_tunnel.sh" ||
   fail 'start_tunnel does not read the settings file'
@@ -557,37 +570,24 @@ if command -v bsdtar > /dev/null 2>&1 && command -v setfattr > /dev/null 2>&1 &&
   [ -z "$warnings" ] || fail "the pushed archive makes GNU tar warn: $warnings"
 fi
 
-# setup_tunnel.sh lists a tunnel's running instances and ends one you own (PAI's "Stop database job")
+# setup_tunnel.sh lists a tunnel's running instances and ends one you own (an app's "End job")
 (
   export "${share_env[@]}"
-  stop() { bash "$HPCLIB_DIR/tunnels/setup_tunnel.sh" pai "$@"; }
-  SLURM_JOB_ID=7100 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance pai 3101"
-  SLURM_JOB_ID=7200 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance pai 3102"
+  stop() { bash "$HPCLIB_DIR/tunnels/setup_tunnel.sh" shared-demo "$@"; }
+  SLURM_JOB_ID=7100 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance shared-demo 3101"
+  SLURM_JOB_ID=7200 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance shared-demo 3102"
   out=$(TEST_RUNNING=7100 stop --instances)
   assert_equal "$out" "HPCLIB_TUNNEL_INSTANCE 7100 $(hostname -s) 3101 RUNNING $(id -un)"
-  [ ! -e "$test_dir/share-data/instances/pai/7200" ] || fail 'listed (kept) an ended instance'
-  if TEST_RUNNING=7100 stop --stop-instance 9999 2>/dev/null; then fail 'cancelled a job that is not a pai instance'; fi
+  [ ! -e "$test_dir/share-data/instances/shared-demo/7200" ] || fail 'listed (kept) an ended instance'
+  if TEST_RUNNING=7100 stop --stop-instance 9999 2>/dev/null; then fail 'cancelled a job that is not a shared-demo instance'; fi
   if TEST_RUNNING=7100 TEST_OWNER=someone stop --stop-instance 7100 2>/dev/null; then fail "cancelled someone else's job"; fi
   grep -q 'scancel' "$TEST_SHARE_LOG" 2>/dev/null && fail 'scancel ran for a refused stop'
   assert_equal "$(TEST_RUNNING=7100 stop --stop-instance 7100)" 'HPCLIB_TUNNEL_INSTANCE_STOPPED 7100'
   grep -q 'scancel 7100' "$TEST_SHARE_LOG" || fail 'the job was not cancelled'
-  [ ! -e "$test_dir/share-data/instances/pai/7100" ] || fail 'the stopped instance is still registered'
-  SLURM_JOB_ID=7300 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance pai 3103"
+  [ ! -e "$test_dir/share-data/instances/shared-demo/7100" ] || fail 'the stopped instance is still registered'
+  SLURM_JOB_ID=7300 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance shared-demo 3103"
   assert_equal "$(TEST_RUNNING= stop --stop-instance 7300)" 'HPCLIB_TUNNEL_INSTANCE_GONE 7300'
 )
-
-# the PAI job passes PAI_BIND_SOURCE (default 1) to singularity-compose.sh, and registers its port
-mkdir -p "$test_dir/pai-common" "$test_dir/pai-root/proto-auto-interface"
-printf '. %q\n' "$HPCLIB_DIR/tunnels/instances.sh" > "$test_dir/pai-common/configure_job.sh"
-printf 'echo "bind=$PAI_BIND_SOURCE port=$PAI_PORT"\n' > "$test_dir/pai-root/proto-auto-interface/singularity-compose.sh"
-pai_job() {
-  env TUNNEL_DIR="$HPCLIB_DIR/tunnels/pai" HPCTUNNELS_DIR="$test_dir/pai-common" PAI_ROOT_DIR="$test_dir/pai-root" \
-    HPCTUNNELS_DATA_DIR="$test_dir/pai-data" SLURM_JOB_ID=8100 PROCESS_PORT="$(free_port)" PATH="$CLEAN_PATH" "$@" \
-    bash "$HPCLIB_DIR/tunnels/pai/sbatch_script.sh"
-}
-case "$(pai_job)" in *"bind=1 port="[0-9]*) ;; *) fail "PAI_BIND_SOURCE did not default to 1: $(pai_job)" ;; esac
-case "$(pai_job PAI_BIND_SOURCE=0)" in *"from the images"*"bind=0 "*) ;; *) fail "PAI_BIND_SOURCE=0 not passed on" ;; esac
-[ ! -e "$test_dir/pai-data/instances/pai/8100" ] || fail 'the PAI job left its registration behind'
 
 # launch-tunnel-manager finds its hpclib through links (relative ones too) and starts the console with its page
 mkdir -p "$test_dir/launch/bin" "$test_dir/launch/elsewhere"
@@ -924,53 +924,5 @@ case "$out" in *"HPCLIB_TUNNEL_STATUS installed"*) ;; *) fail "after the pull: $
 assert_equal "$(sed -n 1,4p "$test_dir/smb-remote" | tr '\n' ' ')" '-t -p 2222 me@login.example '
 grep -q 'tunnels/data-transfer/smbshell.sh get proj/raw /scratch/user/me/a\\ b' "$test_dir/smb-remote" ||
   fail "remote: $(cat "$test_dir/smb-remote")"
-
-# PAI: Install clones the checkout and pulls both images; Update (--force) fast-forwards the checkout and pulls
-# the app's image again, leaving the database's alone
-pai="$test_dir/pai-test"
-mkdir -p "$pai/bin" "$pai/origin"
-cat > "$pai/bin/singularity" <<'SCRIPT'
-#!/usr/bin/env bash
-echo "pull $2 $3" >> "$PAI_TEST_LOG"
-[ "$1" = pull ] && printf 'image from %s\n' "$3" > "$2"
-SCRIPT
-chmod +x "$pai/bin/singularity"
-git -C "$pai/origin" init -q -b master
-printf 'echo compose\n' > "$pai/origin/singularity-compose.sh"
-git -C "$pai/origin" add . && git -C "$pai/origin" -c user.name=t -c user.email=t@x commit -qm one
-pai_install() {
-  PATH="$pai/bin:$PATH" PAI_TEST_LOG="$pai/log" PAI_ROOT_DIR="$pai/root" PAI_REPO="$pai/origin" \
-    bash "$HPCLIB_DIR/tunnels/pai/install.sh" "$@"
-}
-if pai_install --check > "$pai/out"; then fail 'PAI check passed before the install'; fi
-grep -q 'not installed: no .*/proto-auto-interface/singularity-compose.sh' "$pai/out" || fail "check: $(cat "$pai/out")"
-pai_install > "$pai/out" 2>&1 || fail "PAI install: $(cat "$pai/out")"
-grep -q "^pull $pai/root/proto-auto-interface.sif.partial.[0-9]* docker://ghcr.io/tabor-research-group/proto-auto-interface:master$" "$pai/log" ||
-  fail "app image: $(cat "$pai/log")"
-grep -q "^pull $pai/root/docker-postgres-rdkit.sif.partial.[0-9]* docker://mcs07/postgres-rdkit:latest$" "$pai/log" ||
-  fail "database image: $(cat "$pai/log")"
-pai_install --check > "$pai/out" || fail "check after the install: $(cat "$pai/out")"
-grep -q "^installed: $pai/root/proto-auto-interface ([0-9a-f]* [0-9-]*); image $pai/root/proto-auto-interface.sif" "$pai/out" ||
-  fail "check: $(cat "$pai/out")"
-: > "$pai/log"
-pai_install > /dev/null 2>&1 || fail 'PAI install, installed'
-[ ! -s "$pai/log" ] || fail "pulled again without --force: $(cat "$pai/log")"
-printf 'echo compose 2\n' > "$pai/origin/singularity-compose.sh"
-git -C "$pai/origin" -c user.name=t -c user.email=t@x commit -qam two
-PAI_IMAGE=docker://example.org/pai:new pai_install --force > "$pai/out" 2>&1 || fail "PAI update: $(cat "$pai/out")"
-assert_equal "$(cat "$pai/root/proto-auto-interface/singularity-compose.sh")" 'echo compose 2'
-assert_equal "$(cat "$pai/root/proto-auto-interface.sif")" 'image from docker://example.org/pai:new'
-[ "$(wc -l < "$pai/log")" -eq 1 ] || fail "update pulled more than the app's image: $(cat "$pai/log")"
-grep -q 'keeps running what it started with' "$pai/out" || fail "no note about a running job: $(cat "$pai/out")"
-# your own commits in the checkout: no fast-forward, so nothing changes
-git -C "$pai/root/proto-auto-interface" -c user.name=t -c user.email=t@x commit -q --allow-empty -m mine
-printf 'echo compose 3\n' > "$pai/origin/singularity-compose.sh"
-git -C "$pai/origin" -c user.name=t -c user.email=t@x commit -qam three
-: > "$pai/log"
-if pai_install --force > "$pai/out" 2>&1; then fail 'updated a checkout that cannot fast-forward'; fi
-grep -q 'could not fast-forward' "$pai/out" || fail "diverged: $(cat "$pai/out")"
-[ ! -s "$pai/log" ] || fail 'pulled the image although the checkout could not be updated'
-# the setting reaches it through setup_tunnel.sh
-grep -q 'PAI_IMAGE' "$HPCLIB_DIR/tunnels/pai/tunnel_config.sh" || fail 'PAI_IMAGE is not a PAI setting'
 
 echo 'Tunnel management tests passed'

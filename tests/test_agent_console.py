@@ -23,6 +23,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_rest_jobs import OWNER, JobServerTestCase  # noqa: E402
 import agent_console  # noqa: E402
+import console_packages  # noqa: E402
 import agent_profiles  # noqa: E402
 
 KEY = "console-key"
@@ -37,12 +38,39 @@ def free_port():
         return s.getsockname()[1]
 
 
+def shared_app_package(tmp):
+    """A package like PAI's: a shared app (one database job serves everyone) with its own tunnel and an Update."""
+    root = Path(tmp) / "shared-package"
+    tunnel = root / "tunnels" / "pai"
+    tunnel.mkdir(parents=True)
+    (tunnel / "sbatch_script.sh").write_text("#!/bin/bash\ntrue\n")
+    (tunnel / "tunnel_config.sh").write_text("SHARED_INSTANCE=true\nKEEP_INSTANCE=true\n"
+                                             "TUNNEL_SETTINGS=\"PAI_ROOT_DIR PAI_IMAGE PAI_BIND_SOURCE\"\n")
+    (tunnel / "install.sh").write_text("#!/usr/bin/env bash\n# hpclib-install: --check --force\n")
+    (root / "hpclib-package.json").write_text(json.dumps({
+        "format": 1, "name": "pai", "version": "0.1.0",
+        "apps": {"pai": {
+            "title": "PAI", "tunnel": "pai", "shared": True, "instance_label": "database",
+            "reinstall": {"label": "Update", "title": "fast-forward the checkout and pull the image again"},
+            "settings": [
+                {"name": "PAI_ROOT_DIR", "label": "Install directory", "hint": "holds proto-auto-interface/"},
+                {"name": "PAI_IMAGE", "label": "Image", "hint": "where Install and Update pull the app's image from"},
+                {"name": "PAI_BIND_SOURCE", "label": "Bind source", "hint": "1 or 0", "choices": ["1", "0"]}]}},
+        "tunnels": {"pai": "tunnels/pai"}}))
+    out = Path(tmp) / "pai-0.1.0.zip"
+    console_packages.build(str(root), str(out))
+    return out.read_bytes()
+
+
 class FakeShell:
     """Stands in for `bash -c '. hpclib.sh; agent_tunnel ...'`."""
     def __init__(self):
         self.calls = []
         self.setup_status = "missing not installed: no image at /x/vscode.sif"   # what tunnel_setup --check says
         self.stop_answer = None                                                  # what --stop-instance says
+        self.tokens = []                                                         # the app's tokens, for --tokens
+        self.tokens_error = None                                                 # what tunnel_setup --tokens says instead
+        self.secret_seen = []                                                    # whatever it printed with a token
         self.smb_status = {"host": "files.example.edu", "user": "me", "auth": "auto", "kinit": "host",
                            "rclone_kerberos": True, "ticket": None, "credentials": False, "image": True}
 
@@ -59,6 +87,31 @@ class FakeShell:
             if "--stop-instance" in args:
                 job = args[args.index("--stop-instance") + 1]
                 log.write((self.stop_answer or f"HPCLIB_TUNNEL_INSTANCE_STOPPED {job}").encode() + b"\n")
+        if args[0] == "tunnel_setup" and "--tokens" in args:   # like setup_tunnel.sh --tokens over tokens.sh --json
+            rest = args[args.index("--tokens") + 1:]
+            if self.tokens_error:
+                log.write(self.tokens_error.encode() + b"\n")
+            elif rest[0] == "list":
+                log.write(b"banner\nHPCLIB_TOKENS " + json.dumps({"tokens": self.tokens}).encode() + b"\n")
+            elif rest[0] == "create":
+                opt = dict(zip(rest[1::2], rest[2::2]))
+                rec = {"id": f"t{len(self.tokens):07d}", "label": opt["--label"], "scopes": opt["--scopes"].split(","),
+                       "created": 1.0, "expires": None if opt["--days"] == "0" else 2e9, "revoked": False,
+                       "hash": "must-never-reach-the-page"}
+                self.tokens.append(rec)
+                made = {"id": rec["id"], "label": rec["label"], "scopes": rec["scopes"], "expires": rec["expires"]}
+                if "--save-to" in opt:
+                    made.update(token=None, saved_to=opt["--save-to"])
+                else:
+                    made["token"] = "pai_" + rec["id"] + "_SECRETSECRET"
+                log.write(b"HPCLIB_TOKEN_CREATED " + json.dumps(made).encode() + b"\n")
+            elif rest[0] == "revoke":
+                hit = [t for t in self.tokens if t["id"] == rest[1]]
+                if hit:
+                    hit[0]["revoked"] = True
+                    log.write(f"HPCLIB_TOKEN_REVOKED {rest[1]}\n".encode())
+                else:
+                    log.write(b"setup_tunnel: tokens.sh revoke failed\n")
         if args[0] == "smbshell" and "status" in args:      # like tunnels/data-transfer/smbshell.sh status --json
             log.write(("HPCLIB_SMB_STATUS " + json.dumps(self.smb_status) + "\n").encode())
         return subprocess.Popen(["sleep", "30" if args[0] in ("agent_tunnel", "launch_tunnel") else "0"], start_new_session=True)
@@ -550,7 +603,7 @@ class TestApps(ConsoleTestCase):
 
     def test_listing_and_ports(self):
         out = self.call("GET", "/api/apps")[1]
-        self.assertEqual([a["id"] for a in out["apps"]], ["agents", "jupyter", "vscode", "transfer", "rclone", "pai"])
+        self.assertEqual([a["id"] for a in out["apps"]], ["agents", "jupyter", "vscode", "transfer", "rclone"])   # PAI is a package now
         self.assertEqual({a["id"]: a.get("kind") for a in out["apps"]}["transfer"], "tool")
         status, out = self.call("GET", "/api/apps/jupyter")
         self.assertEqual(status, 200)
@@ -637,8 +690,13 @@ FAKE_TUNNEL = textwrap.dedent("""\
 
 
 class TestTunnelInstall(ConsoleTestCase):
-    """vscode and pai: tunnel settings saved on the cluster, Check and Install with install.sh, shared instances."""
+    """vscode and a packaged shared app (PAI's shape): settings saved on the cluster, Check and Install with
+    install.sh, shared instances."""
     serve = TestApps.serve
+
+    def setUp(self):
+        super().setUp()
+        self.clusters.package_add(shared_app_package(self.tmp))
 
     def wait_op(self, name):
         for _ in range(50):
@@ -704,6 +762,19 @@ class TestTunnelInstall(ConsoleTestCase):
             self.assertIn("VSCODE_CONTAINER=/y/vscode.sif", self.shell.calls[-2])
             self.assertEqual(self.shell.calls[-1][0], "launch_tunnel")
         self.assertEqual(self.call("POST", f"/api/apps/jupyter/{self.dead}/install", {"force": "x"})[0], 400)
+
+    def test_a_packaged_app_can_be_shared_and_updatable(self):
+        apps = {a["id"]: a for a in self.call("GET", "/api/apps")[1]["apps"]}
+        self.assertEqual(apps["pai"]["package"], "pai")
+        self.assertEqual(agent_console.APPS["pai"]["instance_label"], "database")
+        self.assertTrue(agent_console.APPS["pai"]["shared"])
+        # refused when inconsistent
+        for bad in ({"shared": "yes"}, {"instance_label": "x"}, {"reinstall": {"label": ""}}, {"reinstall": []}):
+            members = {"hpclib-package.json": b"", "t/sbatch_script.sh": b"x"}
+            manifest = {"format": 1, "name": "bad", "apps": {"b": dict({"title": "B", "tunnel": "t"}, **bad)},
+                        "tunnels": {"t": "t"}}
+            with self.assertRaises(console_packages.PackageError, msg=bad):
+                console_packages.check_manifest(manifest, members, set())
 
     def test_pai_update(self):
         # PAI, once installed, updates: its checkout fast-forwarded and its image pulled again (install.sh --force)

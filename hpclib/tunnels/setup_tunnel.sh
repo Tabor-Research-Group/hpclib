@@ -3,7 +3,7 @@
 # saves a tunnel's settings, and checks or installs what the tunnel needs with its install.sh.
 #
 #   setup_tunnel.sh TUNNEL [--receive] [--set NAME=VALUE]... [--save] [--install [--force]] [--check]
-#                   [--instances] [--stop-instance JOB]
+#                   [--instances] [--stop-instance JOB] [--tokens ACTION [ARGS...]]
 #
 #   --secrets         read secrets for the tunnel from standard input, one NAME=BASE64 a line (an empty value
 #                     removes one): each must be in the tunnel's TUNNEL_SECRETS (tunnel_config.sh). Each is kept
@@ -32,6 +32,15 @@
 #                     tunnel, and only if you own it. Ends with HPCLIB_TUNNEL_INSTANCE_STOPPED JOB, or
 #                     HPCLIB_TUNNEL_INSTANCE_GONE JOB if it had already ended.
 #
+#   --tokens ACTION [ARGS...]
+#                     the app's own bearer tokens: runs the tunnel's tokens.sh as `tokens.sh --json ACTION ARGS`
+#                     (list; create --label L --scopes a,b --days N [--save-to FILE]; revoke ID), with the
+#                     tunnel's settings in its environment, and passes on the one line of JSON it prints, as
+#                       HPCLIB_TOKENS {...}          (list)
+#                       HPCLIB_TOKEN_CREATED {...}   (create: the token itself, or the file it went to)
+#                       HPCLIB_TOKEN_REVOKED ID      (revoke)
+#                     It must be the last option. The token is on standard output only, never in a log or argument.
+#
 # An install.sh that can check says so on a line "# hpclib-install: --check" (and "--force" if it takes it);
 # one that doesn't is never run for a check, since it would install instead.
 
@@ -47,6 +56,7 @@ usage='usage: setup_tunnel.sh TUNNEL [--set NAME=VALUE]... [--save] [--install [
 TUNNEL_NAME="$1"
 shift || true
 sets=() save=false install=false force=false check=false instances=false stop_job='' receive=false secrets=false
+tokens=false tokens_action='' tokens_args=()
 source "$HPCLIB_DIR/tunnels/instances.sh"
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -61,6 +71,7 @@ while [ "$#" -gt 0 ]; do
     --secrets) secrets=true; shift ;;
     --stop-instance) stop_job="$2"; shift 2 ;;
     --stop-instance=*) stop_job="${1#--stop-instance=}"; shift ;;
+    --tokens) tokens=true; tokens_action="${2:-}"; shift; [ "$#" -gt 0 ] && shift; tokens_args=("$@"); break ;;
     *) echo "$usage" >&2; exit 2 ;;
   esac
 done
@@ -194,6 +205,34 @@ if [ "$secrets" = true ]; then
     mv -f "$secrets_dir/.$name.new" "$secrets_dir/$name"
   done
   secrets_status
+fi
+
+# The app's own tokens: its tokens.sh does the work (it knows the app's token store); this passes on its JSON
+if [ "$tokens" = true ]; then
+  case "$tokens_action" in list|create|revoke) ;; *) echo "setup_tunnel: --tokens takes list, create or revoke" >&2; exit 2 ;; esac
+  if [ ! -f "$TUNNEL_DIR/tokens.sh" ]; then
+    echo "setup_tunnel: $TUNNEL_NAME has no tokens.sh on this cluster (install or update the package with the app's Install)" >&2
+    exit 1
+  fi
+  tokens_err=$(mktemp "${TMPDIR:-/tmp}/hpclib-tokens.XXXXXX") || exit 1
+  trap 'rm -f "$tokens_err"' EXIT
+  tokens_out=$(cd "$TUNNEL_DIR" && HPCLIB_TUNNEL_DIR="$TUNNEL_DIR" bash ./tokens.sh --json "$tokens_action" "${tokens_args[@]}" 2> "$tokens_err") || {
+    # tokens.sh's own complaint (its standard error never holds a token), so the console can say why
+    reason=$(grep -v '^[[:space:]]*$' "$tokens_err" | tail -n 1 | tr -d '\r' | cut -c1-300)
+    echo "setup_tunnel: tokens.sh $tokens_action failed${reason:+: $reason}" >&2
+    exit 1
+  }
+  tokens_json=$(printf '%s\n' "$tokens_out" | grep '^{' | tail -n 1)
+  if [ -z "$tokens_json" ]; then
+    echo "setup_tunnel: tokens.sh $tokens_action printed no JSON" >&2
+    exit 1
+  fi
+  case "$tokens_action" in
+    list) printf 'HPCLIB_TOKENS %s\n' "$tokens_json" ;;
+    create) printf 'HPCLIB_TOKEN_CREATED %s\n' "$tokens_json" ;;
+    revoke) printf 'HPCLIB_TOKEN_REVOKED %s\n' "${tokens_args[0]}" ;;
+  esac
+  exit 0
 fi
 
 if [ "$check" = true ]; then

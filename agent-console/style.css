@@ -209,3 +209,7 @@ ul.packages > li { margin: 10px 0; padding-bottom: 8px; border-bottom: 1px solid
 ul.packages ul { margin: 4px 0 6px; }
 p.hash { overflow-wrap: anywhere; font-family: ui-monospace, monospace; font-size: 12px; }
 section.secrets { margin-top: 14px; padding-top: 10px; border-top: 1px solid rgba(127, 127, 127, 0.25); }
+section.tokens { margin-top: 14px; padding-top: 10px; border-top: 1px solid rgba(127, 127, 127, 0.25); }
+section.tokens .checks { display: flex; gap: 12px; flex-wrap: wrap; padding: 4px 0; }
+section.tokens label.check { display: inline-flex; align-items: center; gap: 4px; }
+.token-secret { font-family: ui-monospace, monospace; width: 100%; }

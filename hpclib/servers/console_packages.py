@@ -13,17 +13,40 @@ A package is a zip file with hpclib-package.json at its top level:
                 "description": "shown on its page",
                 "open_path": "/", "health_path": "/health",
                 "token_regex": null,         # optional: finds a login token in its log, for Open
+                "shared": false,             # optional: one running instance serves everyone (see below)
+                "instance_label": "database",   # with shared: what the instance is called in the console
+                "reinstall": {"label": "Update", "title": "what it does"},   # optional: what Install does once installed
                 "settings": [{"name": "MY_DIR", "label": "Directory", "hint": "...", "choices": null}],
-                "secrets": [{"name": "MY_TOKEN", "label": "API token", "hint": "..."}]}},   # see below
+                "secrets": [{"name": "MY_TOKEN", "label": "API token", "hint": "..."}],   # see below
+                "tokens": {"scopes": ["read", "write", "admin"], "default_scope": "write",
+                           "days": 90, "label": "API tokens"}}},   # optional: manage the app's own tokens (below)
    "tunnels": {"my-tunnel": "tunnels/my-tunnel"},      # directories in the zip: an hpclib tunnel each
    "settings": {                             # defaults and files for tunnels (this package's or hpclib's)
      "data-transfer": {"values": {"SMB_HOST": "files.example.edu", "SMB_DOMAIN": "EXAMPLE"},
                        "files": {"rclone.conf": "settings/rclone.conf"}}}}
 
+A `shared` app's tunnel attaches to a running instance another job serves instead of starting a second one, and
+leaves the one it starts running after Stop (the tunnel's tunnel_config.sh sets SHARED_INSTANCE and KEEP_INSTANCE,
+and its job registers itself with tunnel_register_instance); the app's row then shows the job and a control that
+ends it. `reinstall` renames what Install does once the app is installed (for PAI: Update).
+
 An app's `secrets` (tokens, OAuth client secrets) are typed into its settings panel and sent to a cluster over
 ssh on standard input (setup_tunnel.sh --secrets), never kept by the console, logged or put on a command line.
 The cluster keeps each in ~/.local/tunnels/secrets/TUNNEL/NAME (mode 600), out of the agents' reach; the
 tunnel's scripts read them there. The tunnel must list them in TUNNEL_SECRETS (its tunnel_config.sh).
+
+An app's `tokens` section puts a Tokens panel in its settings, for apps that keep their own bearer tokens (PAI's
+write API). The tunnel ships tokens.sh, which the console runs on the cluster over its login (setup_tunnel.sh
+--tokens) as `tokens.sh --json ACTION ...`, where it prints ONE line of JSON on its standard output:
+
+  list                         {"tokens": [{"id", "label", "scopes": [...], "created", "expires", "revoked"}]}
+  create --label L --scopes a,b --days N [--save-to PATH]
+                               {"id", "token", "label", "scopes", "expires"}; with --save-to it writes the token to
+                               that file (mode 600, refusing one that exists) and prints "saved_to" instead of "token"
+  revoke ID                    {"revoked": ID}
+
+The secret of a new token is shown once (or goes straight to a file on the cluster) and is never kept by the
+console. What a token may do is the app's business: the console only offers the `scopes` the manifest lists.
 
 A package with only `settings` is a settings package: e.g. a group's SMB server and its rclone remotes, which
 don't belong in hpclib itself.
@@ -71,7 +94,10 @@ MAX_ZIP = 64 << 20          # bytes, the zip itself
 MAX_UNPACKED = 256 << 20    # bytes, everything in it
 MAX_FILES = 5000
 MAX_SETTINGS_FILE = 1 << 20
-APP_KEYS = {"title", "tunnel", "description", "open_path", "health_path", "token_regex", "settings", "secrets"}
+APP_KEYS = {"title", "tunnel", "description", "open_path", "health_path", "token_regex", "settings", "secrets",
+            "shared", "instance_label", "reinstall", "tokens"}
+TOKEN_KEYS = {"label", "scopes", "default_scope", "days", "description"}
+SCOPE_RE = re.compile(r"[a-z][a-z0-9_-]{0,19}")
 TOP_KEYS = {"format", "name", "version", "description", "apps", "tunnels", "settings"}
 
 
@@ -193,7 +219,41 @@ def check_manifest(manifest, members, builtin_tunnels):
         app = {"title": _text(spec.get("title"), f"apps.{app_id}.title", 60), "tunnel": tunnel,
                "description": _text(spec.get("description"), f"apps.{app_id}.description", 2000, required=False),
                "open_path": spec.get("open_path", "/"), "health_path": spec.get("health_path", "/"),
-               "token_regex": spec.get("token_regex"), "settings": [], "secrets": []}
+               "token_regex": spec.get("token_regex"), "settings": [], "secrets": [],
+               "shared": spec.get("shared", False), "instance_label": None, "reinstall": None, "tokens": None}
+        if not isinstance(app["shared"], bool):
+            raise PackageError(f"app {app_id}: shared is true or false")
+        if spec.get("instance_label") is not None:
+            if not app["shared"]:
+                raise PackageError(f"app {app_id}: instance_label is for shared apps")
+            app["instance_label"] = _text(spec["instance_label"], f"apps.{app_id}.instance_label", 40)
+        if spec.get("reinstall") is not None:
+            re_spec = spec["reinstall"]
+            if not isinstance(re_spec, dict) or set(re_spec) - {"label", "title"}:
+                raise PackageError(f"app {app_id}: reinstall is {{label, title}}")
+            app["reinstall"] = {"label": _text(re_spec.get("label"), f"apps.{app_id}.reinstall.label", 20),
+                                "title": _text(re_spec.get("title", ""), f"apps.{app_id}.reinstall.title", 300,
+                                               required=False) or ""}
+        if spec.get("tokens") is not None:
+            t = spec["tokens"]
+            if not isinstance(t, dict) or set(t) - TOKEN_KEYS:
+                raise PackageError(f"app {app_id}: tokens is {{{', '.join(sorted(TOKEN_KEYS))}}}")
+            scopes = t.get("scopes")
+            if (not isinstance(scopes, list) or not 1 <= len(scopes) <= 8 or len(set(scopes)) != len(scopes) or
+                    not all(isinstance(x, str) and SCOPE_RE.fullmatch(x) for x in scopes)):
+                raise PackageError(f"app {app_id}: tokens.scopes is a list of 1 to 8 distinct names (lowercase)")
+            default = t.get("default_scope", scopes[0])
+            if default not in scopes:
+                raise PackageError(f"app {app_id}: tokens.default_scope must be one of the scopes")
+            days = t.get("days", 90)
+            if isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 3650:
+                raise PackageError(f"app {app_id}: tokens.days is a whole number of days, 0 for no expiry")
+            if tunnel in out["tunnels"] and f"{out['tunnels'][tunnel]['dir']}/tokens.sh" not in members:
+                raise PackageError(f"app {app_id}: tokens needs {out['tunnels'][tunnel]['dir']}/tokens.sh in the tunnel")
+            app["tokens"] = {"label": _text(t.get("label", "API tokens"), f"apps.{app_id}.tokens.label", 40),
+                             "scopes": scopes, "default_scope": default, "days": days,
+                             "description": _text(t.get("description", ""), f"apps.{app_id}.tokens.description", 400,
+                                                  required=False) or ""}
         for key in ("open_path", "health_path"):
             if not isinstance(app[key], str) or not URL_PATH_RE.fullmatch(app[key]):
                 raise PackageError(f"app {app_id}: {key} must be a path such as /lab")

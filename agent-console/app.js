@@ -820,6 +820,86 @@ async function settingsPage() {
 const APP_TUNNEL_FIELDS = [["time", "Time limit", "e.g. 12:00:00"], ["mem", "Memory", "e.g. 16gb"],
                            ["cpus-per-task", "CPUs", "e.g. 4"], ["partition", "Partition", ""]];
 
+// An app's own bearer tokens (a package's `tokens` section: PAI's write tokens). Listed, made and revoked on the
+// cluster by the app's tokens.sh over the console's login; a new token is shown once, or saved straight to a file on
+// the cluster (what jobs read), and this machine never keeps it.
+function tokensSection(app, s, tk) {
+  const base = `apps/${app}/${encodeURIComponent(s.cluster)}/tokens`;
+  const listing = el("div", {});
+  const scopeBoxes = tk.scopes.map((name) => {
+    const box = el("input", { type: "checkbox", value: name, checked: name === tk.default_scope });
+    return [name, box, el("label", { class: "check" }, box, " " + name)];
+  });
+  const label = el("input", { size: 24, placeholder: "e.g. jenga-mcp", autocomplete: "off" });
+  const days = el("input", { type: "number", min: 0, max: 3650, value: tk.days, size: 6 });
+  const saveTo = el("input", { size: 44, autocomplete: "off",
+                               placeholder: "/scratch/user/me/llm/tokens/jenga-mcp.token (empty: show it once here)" });
+  const fmt = (t) => (t ? new Date(t * 1000).toLocaleDateString() : "never");
+  const show = async () => {
+    try {
+      const { tokens } = await api(base);
+      listing.replaceChildren(tokens.length ? el("table", { class: "rows" },
+        el("thead", {}, el("tr", {}, ["Id", "Label", "Scopes", "Expires", "State", ""].map((h) => el("th", {}, h)))),
+        el("tbody", {}, tokens.map((t) => {
+          const expired = t.expires && t.expires * 1000 < Date.now();
+          return el("tr", {}, el("td", {}, el("code", {}, t.id)), el("td", {}, t.label), el("td", {}, t.scopes.join(", ")),
+            el("td", {}, fmt(t.expires)), el("td", {}, t.revoked ? "revoked" : expired ? "expired" : "active"),
+            el("td", {}, t.revoked ? null : action("Revoke", async () => {
+              if (!await confirmDialog(`Revoke token ${t.id}?`, `Anything using "${t.label}" is refused from now on ` +
+                                       "(the database reads the change at once).", "Revoke")) return;
+              await api(`${base}/${encodeURIComponent(t.id)}`, { method: "DELETE" });
+              await show();
+              return "Revoked.";
+            }, { result: true })));
+        }))) : el("p", { class: "muted" }, "No tokens yet."));
+    } catch (err) {
+      listing.replaceChildren(errorBox(err));
+    }
+  };
+  const reveal = (made) => new Promise((resolve) => {
+    const out = el("input", { readonly: true, size: 60, value: made.token, class: "token-secret" });
+    const copy = el("button", { type: "button" }, "Copy");
+    const done = el("button", { class: "primary", type: "button" }, "I have saved it");
+    const dialog = el("hpc-dialog", { heading: `New token ${made.record.id}`, transient: true },
+      el("p", {}, "This is the only time the token is shown; this machine doesn't keep it. Put it in a file only you " +
+        "can read on the cluster, or use “Save to a file” next time."),
+      out, el("div", { class: "actions" }, copy, done));
+    copy.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(made.token); copy.textContent = "Copied"; }
+      catch { out.select(); copy.textContent = "Press Ctrl/Cmd+C"; }
+    });
+    done.addEventListener("click", () => dialog.close());
+    dialog.addEventListener("close", () => { out.value = ""; resolve(); });
+    dialog.showModal();
+    out.select();
+  });
+  const create = saveButton("Make a token", async () => {
+    const scopes = scopeBoxes.filter(([, box]) => box.checked).map(([name]) => name);
+    if (!label.value.trim()) throw new Error("Give the token a label (what will use it).");
+    if (!scopes.length) throw new Error("Pick at least one scope.");
+    const body = { label: label.value.trim(), scopes, days: Number(days.value) };
+    if (saveTo.value.trim()) body.save_to = saveTo.value.trim();
+    const made = await api(base, { method: "POST", body });
+    label.value = "";
+    await show();
+    if (made.token) { await reveal(made); return `Made token ${made.record.id}.`; }
+    return `Made token ${made.record.id}; its secret is in ${made.saved_to} on ${s.cluster} (mode 600).`;
+  });
+  show();
+  return el("section", { class: "tokens" },
+    el("h4", {}, tk.label),
+    tk.description ? el("p", { class: "muted" }, tk.description) : null,
+    el("p", { class: "muted" }, `Run on ${s.cluster} over your login (it must be logged in, and the app installed or ` +
+      "updated there first, so its tokens.sh is on the cluster)."),
+    listing,
+    el("div", { class: "row" },
+      field("Label", label, "what uses it"),
+      field("Valid for (days)", days, "0: never expires"),
+      el("hpc-field", { label: "Scopes" }, el("div", { class: "checks" }, scopeBoxes.map(([, , l]) => l)))),
+    field("Save to a file", saveTo, "a new file on the cluster, mode 600: for jobs (database.token_file, PAI_API_TOKEN_FILE)"),
+    el("div", { class: "actions" }, create));
+}
+
 async function appSettingsForm(app, s, row) {
   // the tunnel job's sbatch options, JupyterLab's environment fields, and the tunnel's own settings (paths and the
   // like, saved on the cluster for its job and install.sh)
@@ -898,7 +978,8 @@ async function appSettingsForm(app, s, row) {
       el("p", { class: "muted" }, `Sent to ${s.cluster} over your login and kept there in a file only you can ` +
         "read (out of the agents' reach); this machine keeps only whether each is set. Needs the login."),
       el("div", { class: "row" }, secrets.map((f) => field(f.label, secretInputs[f.name], f.hint))),
-      el("div", { class: "actions" }, sendSecrets, clearSecrets)) : null));
+      el("div", { class: "actions" }, sendSecrets, clearSecrets)) : null,
+    conf.tokens ? tokensSection(app, s, conf.tokens) : null));
 }
 
 async function appPage(app) {

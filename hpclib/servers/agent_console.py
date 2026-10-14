@@ -46,6 +46,12 @@ The front end depends only on the routes below; nothing here depends on it.
   PUT  /api/apps/APP/NAME/secrets             {"values": {NAME: value or ""}}: a packaged app's secrets, sent to the
                                               cluster over ssh on standard input (setup_tunnel.sh --secrets); only
                                               whether each is set is kept here (GET .../settings shows it)
+  GET  /api/apps/APP/NAME/tokens              a packaged app's own bearer tokens (its `tokens` section), listed on the
+                                              cluster by the tunnel's tokens.sh: id, label, scopes, expiry, revoked
+  POST /api/apps/APP/NAME/tokens              {"label", "scopes": [...], "days"?, "save_to"?}: make one. The answer has
+                                              the token once ("token"), or, with save_to (an absolute path on the
+                                              cluster), only that the file holds it: never kept or logged here
+  DELETE /api/apps/APP/NAME/tokens/ID         revoke one
   POST /api/apps/APP/NAME/check               is the tunnel installed? (its install.sh --check, on the cluster)
   GET  /api/apps/APP/NAME/instances           a shared app's running instances on the cluster, with owners
   POST /api/apps/APP/NAME/control/ID          one of the session's `controls`, e.g. stop_instance {"job": ...}:
@@ -203,30 +209,6 @@ APPS = {
                 "saved for later.",
         "settings": [],
     },
-    "pai": {
-        "title": "PAI",
-        "tunnel": "pai",
-        "open_path": "/",
-        "health_path": "/",
-        "shared": True,
-        "instance_label": "database",
-        # once installed, Install --force fast-forwards the checkout and pulls the app's image again
-        "reinstall": {"label": "Update", "title": "fast-forward the proto-auto-interface checkout and pull the "
-                                                  "app's image again; a running database job keeps the old ones "
-                                                  "until it is restarted"},
-        "settings": [
-            ("PAI_ROOT_DIR", "Install directory", "holds proto-auto-interface/ and the images; default "
-                                                  "/scratch/user/USER/pai"),
-            ("PAI_REPO", "Repository", "git URL Install clones proto-auto-interface from"),
-            ("PAI_IMAGE", "Image", "where Install and Update pull the app's image (PAI_ROOT_DIR/proto-auto-interface"
-                                   ".sif) from; default docker://ghcr.io/tabor-research-group/proto-auto-interface"
-                                   ":master"),
-            ("INCLUDE_DEV_ENDPOINTS", "Development endpoints", "true or false; default true"),
-            ("PAI_BIND_SOURCE", "Bind source", "1: singularity-compose.sh binds your proto-auto-interface "
-                                               "source into the containers, so your changes run; 0: the images' "
-                                               "own; default 1. Applies to the next database job", ("1", "0")),
-        ],
-    },
 }
 # hpclib's own apps; installed packages add theirs to APPS (load_package_apps)
 BUILTIN_APPS = dict(APPS)
@@ -256,14 +238,26 @@ def load_package_apps(store=None):
                              for f in app["settings"]]}
         if app.get("description"):
             spec["description"] = app["description"]
+        if app.get("shared"):
+            spec["shared"] = True
+            spec["instance_label"] = app.get("instance_label") or "instance"
+        if app.get("reinstall"):
+            spec["reinstall"] = dict(app["reinstall"])
         if app.get("token_regex"):
             spec["token_re"] = re.compile(app["token_regex"])
         if app.get("secrets"):
             spec["secrets"] = [(f["name"], f["label"], f["hint"]) for f in app["secrets"]]
+        if app.get("tokens"):
+            spec["tokens"] = dict(app["tokens"])
         APPS[app_id] = spec
     return store
 SECRETS_STATUS_RE = re.compile(r"^HPCLIB_TUNNEL_SECRETS((?: [A-Z_][A-Z0-9_]*:(?:set|unset))*)\s*$", re.M)
 SECRET_VALUE_RE = re.compile(r"[^\0\n\r]{1,4096}")
+TOKENS_LINE_RE = re.compile(r"^HPCLIB_TOKENS (\{.*\})\s*$", re.M)
+TOKEN_CREATED_RE = re.compile(r"^HPCLIB_TOKEN_CREATED (\{.*\})\s*$", re.M)
+TOKEN_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._@-]{0,63}")
+TOKEN_ID_RE = re.compile(r"[A-Za-z0-9]{1,32}")
+TOKEN_FILE_RE = re.compile(r"/[A-Za-z0-9_./@+-]{1,1023}")
 TUNNEL_STATUS_RE = re.compile(r"^HPCLIB_TUNNEL_STATUS (installed|missing|unknown|nothing) ?(.*)$", re.M)
 ATTACHED_RE = re.compile(r"attaching to the running \S+ instance: job (\d+) on (\S+), port (\d+)")
 OWN_INSTANCE_RE = re.compile(r"job (\d+) serves \S+ on (\S+), port (\d+)")
@@ -1084,6 +1078,7 @@ class Clusters:
                 # secrets: whether each is set on the cluster (as of the last Check or send), never their values
                 "secrets": [{"name": f[0], "label": f[1], "hint": f[2],
                              "set": (conf.get("secrets") or {}).get(f[0])} for f in spec.get("secrets", [])],
+                "tokens": spec.get("tokens"),               # the Tokens panel (None: the app has no tokens of its own)
                 "installable": self.app_installable(app),
                 "applies": "the next time it starts; settings go to the cluster with the next Check, Install or Start"}
 
@@ -1247,6 +1242,106 @@ class Clusters:
                                     f"(Agents → Clusters → Update hpclib) if it is older than this console: {tail}")
         self._record_setup(profile, app, text)
         return {"app": app, "cluster": profile["name"], "secrets": self.app_settings(profile, app)["secrets"]}
+
+    # -- an app's own bearer tokens (a package's `tokens` section; see console_packages) --------
+
+    def _tokens_run(self, profile, app, args, wait=120):
+        spec = self.app_spec(app)
+        if not spec.get("tokens"):
+            raise ConsoleError(404, f"{spec['title']} has no tokens to manage")
+        text = self._run_setup(profile, ["tunnel_setup"] + ssh_options(profile) +
+                               [profile["host"], spec["tunnel"], "--tokens"] + args, wait)
+        return spec, text
+
+    @staticmethod
+    def _tokens_failure(what, text, quote=True):
+        """Why it failed, from setup_tunnel's own message or (quote) the last lines; a create never quotes the
+        output, since that could hold the token."""
+        reason = next((l.split(": ", 1)[1] for l in text.splitlines() if l.startswith("setup_tunnel: ")),
+                      " ".join(l for l in text.strip().splitlines()[-2:]) if quote else "see the tunnel's tokens.sh")
+        return ConsoleError(502, f"{what}: {reason}")
+
+    @staticmethod
+    def _token_record(rec):
+        """The fields of a token the panel shows, nothing else (never a hash or a secret)."""
+        if not isinstance(rec, dict):
+            return None
+        scopes = rec.get("scopes")
+        out = {"id": str(rec.get("id", ""))[:32], "label": str(rec.get("label") or "")[:64],
+               "scopes": [str(x)[:20] for x in scopes] if isinstance(scopes, list) else [],
+               "created": rec.get("created") if isinstance(rec.get("created"), (int, float)) else None,
+               "expires": rec.get("expires") if isinstance(rec.get("expires"), (int, float)) else None,
+               "revoked": rec.get("revoked") is True}
+        return out if TOKEN_ID_RE.fullmatch(out["id"]) else None
+
+    def app_tokens(self, profile, app):
+        """The app's tokens on the cluster, from its tokens.sh."""
+        spec, text = self._tokens_run(profile, app, ["list"])
+        found = TOKENS_LINE_RE.findall(text)
+        if not found:
+            raise self._tokens_failure("couldn't list the tokens", text)
+        try:
+            records = json.loads(found[-1]).get("tokens", [])
+        except (ValueError, AttributeError):
+            raise ConsoleError(502, "the tunnel's tokens.sh didn't print valid JSON")
+        tokens = [t for t in map(self._token_record, records if isinstance(records, list) else []) if t]
+        return {"app": app, "cluster": profile["name"], "tokens": tokens}
+
+    def create_token(self, profile, app, body):
+        """
+        Make a token ({"label", "scopes", "days"?, "save_to"?}). The secret comes back once, in this answer, or goes
+        into the cluster file `save_to` and doesn't come back at all. It is neither stored nor logged here.
+        """
+        spec = self.app_spec(app)
+        conf = spec.get("tokens")
+        if not conf:
+            raise ConsoleError(404, f"{spec['title']} has no tokens to manage")
+        if not isinstance(body, dict) or set(body) - {"label", "scopes", "days", "save_to"}:
+            raise ConsoleError(400, "send {\"label\", \"scopes\", \"days\"?, \"save_to\"?}")
+        label = body.get("label")
+        scopes = body["scopes"] if "scopes" in body else [conf["default_scope"]]
+        if not isinstance(label, str) or not TOKEN_LABEL_RE.fullmatch(label):
+            raise ConsoleError(422, "label: letters, digits, space and . _ @ - (at most 64), starting with a letter or digit")
+        if (not isinstance(scopes, list) or not scopes or len(set(scopes)) != len(scopes) or
+                not all(x in conf["scopes"] for x in scopes)):
+            raise ConsoleError(422, f"scopes: some of {conf['scopes']}")
+        days = body.get("days", conf["days"])
+        if isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 3650:
+            raise ConsoleError(422, "days: a whole number, 0 for a token that never expires")
+        save_to = body.get("save_to") or None
+        if save_to is not None and (not isinstance(save_to, str) or not TOKEN_FILE_RE.fullmatch(save_to) or
+                                    ".." in save_to.split("/") or save_to.endswith("/")):
+            raise ConsoleError(422, "save_to: an absolute path of a new file on the cluster (letters, digits, _ . / @ + -)")
+        args = ["create", "--label", label, "--scopes", ",".join(scopes), "--days", str(days)]
+        if save_to:
+            args += ["--save-to", save_to]
+        _, text = self._tokens_run(profile, app, args)
+        found = TOKEN_CREATED_RE.findall(text)
+        if not found:
+            raise self._tokens_failure("the token wasn't made", text, quote=False)
+        try:
+            made = json.loads(found[-1])
+        except ValueError:
+            raise ConsoleError(502, "the tunnel's tokens.sh didn't print valid JSON")
+        rec = self._token_record(dict(made, label=made.get("label", label), scopes=made.get("scopes", scopes)))
+        if rec is None:
+            raise ConsoleError(502, "the tunnel's tokens.sh answered without a token id")
+        out = {"app": app, "cluster": profile["name"], "token": None, "saved_to": None, "record": rec}
+        if isinstance(made.get("token"), str) and made["token"]:
+            out["token"] = made["token"]
+        elif isinstance(made.get("saved_to"), str):
+            out["saved_to"] = made["saved_to"]
+        else:
+            raise ConsoleError(502, "the tunnel's tokens.sh printed neither a token nor a file")
+        return out
+
+    def revoke_token(self, profile, app, ident):
+        if not TOKEN_ID_RE.fullmatch(ident or ""):
+            raise ConsoleError(400, "a token id is letters and digits")
+        _, text = self._tokens_run(profile, app, ["revoke", ident])
+        if f"HPCLIB_TOKEN_REVOKED {ident}" not in text:
+            raise self._tokens_failure(f"token {ident} wasn't revoked", text)
+        return {"app": app, "cluster": profile["name"], "revoked": ident}
 
     def _run_with_input(self, args, data, wait):
         """An hpclib shell function with `data` on its standard input; (exit code, output). Nothing is logged."""
@@ -2034,6 +2129,12 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             return 200, dict(c.app_control(profile, app, action[1], self.json_body()), ok=True)
         if action == ["settings"] and verb == "GET":
             return 200, dict(c.app_settings(profile, app), ok=True)
+        if action == ["tokens"] and verb == "GET":
+            return 200, dict(c.app_tokens(profile, app), ok=True)
+        if action == ["tokens"] and verb == "POST":
+            return 201, dict(c.create_token(profile, app, self.json_body()), ok=True)
+        if len(action) == 2 and action[0] == "tokens" and verb == "DELETE":
+            return 200, dict(c.revoke_token(profile, app, action[1]), ok=True)
         if action == ["secrets"] and verb == "PUT":
             return 200, dict(c.send_secrets(profile, app, self.json_body()), ok=True)
         if action == ["settings"] and verb == "PUT":

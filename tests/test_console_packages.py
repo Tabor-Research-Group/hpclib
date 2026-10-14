@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 import urllib.error
 import urllib.request
@@ -251,6 +252,88 @@ class TestConsolePackages(ConsoleTestCase):
         self.assertEqual(status, 422)
         self.assertIn("both a setting and a secret", out["error"])
 
+    def test_tokens_panel(self):
+        tokens = {"label": "Write tokens", "scopes": ["read", "write", "admin"], "default_scope": "write", "days": 90}
+        manifest = dict(DEMO, apps={"demo": dict(DEMO["apps"]["demo"], tokens=tokens)})
+        files = dict(DEMO_FILES, **{"tunnels/demo-tunnel/tokens.sh": "#!/bin/bash\n"})
+        self.assertEqual(self._post(make_zip(manifest, files), dry_run=False)[0], 201)
+        base = f"/api/apps/demo/{self.dead}"
+        panel = self.call("GET", base + "/settings")[1]["tokens"]
+        self.assertEqual((panel["label"], panel["scopes"], panel["default_scope"], panel["days"]),
+                         ("Write tokens", ["read", "write", "admin"], "write", 90))
+        self.assertIsNone(self.call("GET", f"/api/apps/vscode/{self.dead}/settings")[1]["tokens"])
+        self.assertEqual(self.call("GET", base + "/tokens")[0], 409)                       # needs the login
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            host = agent_profiles.load(self.dead)["host"]
+            self.assertEqual(self.call("GET", base + "/tokens")[1]["tokens"], [])
+            self.assertEqual(self.shell.calls[-1][-4:], [host, "demo-tunnel", "--tokens", "list"])
+            # a token: its secret comes back once, in this answer
+            status, out = self.call("POST", base + "/tokens", {"label": "jenga mcp", "scopes": ["write"]})
+            self.assertEqual(status, 201, out)
+            self.assertEqual(out["token"], "pai_t0000000_SECRETSECRET")
+            self.assertEqual(out["record"]["scopes"], ["write"])
+            self.assertEqual(self.shell.calls[-1][-8:], ["--tokens", "create", "--label", "jenga mcp", "--scopes", "write",
+                                                         "--days", "90"])
+            # ... and is never listed, logged or stored here
+            listed = self.call("GET", base + "/tokens")[1]["tokens"]
+            self.assertEqual([(t["id"], t["label"], t["revoked"]) for t in listed], [("t0000000", "jenga mcp", False)])
+            self.assertNotIn("hash", listed[0])
+            self.assertNotIn("must-never-reach-the-page", json.dumps(listed))
+            everything = json.dumps(agent_profiles.load(self.dead)) + "".join(
+                p.read_text(errors="replace") for p in (self.console).rglob("*") if p.is_file() and p.suffix != ".zip")
+            self.assertNotIn("SECRETSECRET", everything)
+            # saved to a file on the cluster: the answer has no token at all
+            status, out = self.call("POST", base + "/tokens", {"label": "ci", "scopes": ["read", "write"], "days": 0,
+                                                              "save_to": "/scratch/user/me/llm/jenga.token"})
+            self.assertEqual((status, out["token"], out["saved_to"]), (201, None, "/scratch/user/me/llm/jenga.token"), out)
+            self.assertEqual(self.shell.calls[-1][-4:], ["--days", "0", "--save-to", "/scratch/user/me/llm/jenga.token"])
+            self.assertIsNone(out["record"]["expires"])
+            for bad in ({"label": ""}, {"label": "x;rm"}, {"label": "x", "scopes": ["root"]}, {"label": "x", "scopes": []},
+                        {"label": "x", "days": -1}, {"label": "x", "days": "9"}, {"label": "x", "days": True},
+                        {"label": "x", "save_to": "relative"}, {"label": "x", "save_to": "/a/../b"},
+                        {"label": "x", "save_to": "/a/b/"}, {"label": "x", "save_to": "/a b"},
+                        {"label": "x", "save_to": "/a\nb"}, {"label": "x", "scopes": ["write", "write"]}):
+                self.assertEqual(self.call("POST", base + "/tokens", bad)[0], 422, bad)
+            self.assertEqual(self.call("POST", base + "/tokens", {"x": 1})[0], 400)
+            calls = len(self.shell.calls)
+            self.assertEqual(self.call("DELETE", base + "/tokens/t0000000")[1]["revoked"], "t0000000")
+            self.assertTrue(self.call("GET", base + "/tokens")[1]["tokens"][0]["revoked"])
+            self.assertEqual(self.call("DELETE", base + "/tokens/t0000000;x")[0], 400)       # not a token id
+            self.assertEqual(self.call("DELETE", base + "/tokens/nope")[0], 502)             # tokens.sh refuses
+            self.assertEqual(self.shell.calls[calls][-3:], ["--tokens", "revoke", "t0000000"])
+            # a cluster without the tokens.sh yet: the reason, and no output quoted for a create
+            self.shell.tokens_error = "setup_tunnel: demo-tunnel has no tokens.sh on this cluster"
+            status, out = self.call("GET", base + "/tokens")
+            self.assertEqual(status, 502)
+            self.assertIn("no tokens.sh", out["error"])
+            self.shell.tokens_error = "pai_t1_LEAKED traceback"
+            status, out = self.call("POST", base + "/tokens", {"label": "x"})
+            self.assertEqual(status, 502)
+            self.assertNotIn("LEAKED", out["error"])
+        # an app without a `tokens` section has no panel and no routes
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.assertEqual(self.call("GET", f"/api/apps/vscode/{self.dead}/tokens")[0], 404)
+            self.assertEqual(self.call("POST", f"/api/apps/vscode/{self.dead}/tokens", {"label": "x"})[0], 404)
+
+    def test_tokens_manifest_checks(self):
+        files = dict(DEMO_FILES, **{"tunnels/demo-tunnel/tokens.sh": "#!/bin/bash\n"})
+        good = {"scopes": ["read", "write"], "default_scope": "write", "days": 30, "label": "Keys"}
+        def check(tokens, files=files):
+            return self._post(make_zip(dict(DEMO, apps={"demo": dict(DEMO["apps"]["demo"], tokens=tokens)}), files),
+                              dry_run=True)
+        self.assertEqual(check(good)[0], 200)
+        self.assertEqual(check({"scopes": ["read"]})[0], 200)                  # defaults: first scope, 90 days
+        for bad, why in (({"scopes": []}, "scopes"), ({"scopes": ["Read"]}, "scopes"), ({"scopes": ["a", "a"]}, "scopes"),
+                         ({}, "scopes"), (dict(good, default_scope="admin"), "default_scope"),
+                         (dict(good, days=-1), "days"), (dict(good, days=1.5), "days"), (dict(good, days=99999), "days"),
+                         (dict(good, extra=1), "tokens is"), ("yes", "tokens is")):
+            status, out = check(bad)
+            self.assertEqual(status, 422, bad)
+            self.assertIn(why, out["error"], bad)
+        status, out = check(good, DEMO_FILES)                                  # the tunnel has no tokens.sh
+        self.assertEqual(status, 422)
+        self.assertIn("tokens.sh", out["error"])
+
     def test_settings_package_for_an_hpclib_app(self):
         self.assertEqual(self._post(make_zip(LAB, LAB_FILES), dry_run=False)[0], 201)
         settings = self.call("GET", f"/api/apps/transfer/{self.dead}/settings")[1]
@@ -308,6 +391,47 @@ class TestClusterReceives(unittest.TestCase):
         tar = subprocess.run(["tar", "-c", "-f", "-", "-C", str(src), "."], capture_output=True, check=True).stdout
         return subprocess.run(["bash", str(HPCLIB / "tunnels" / "setup_tunnel.sh"), tunnel, "--receive", *args],
                               input=tar, capture_output=True, env=self.env, timeout=120)
+
+    def test_tokens_option(self):
+        """setup_tunnel.sh --tokens runs the tunnel's tokens.sh as `tokens.sh --json ACTION ...` and passes its JSON on."""
+        tunnel = self.tmp / "tunnels" / "demo-tunnel"
+        tunnel.mkdir(parents=True)
+        (tunnel / "sbatch_script.sh").write_text("true\n")
+        (tunnel / "tunnel_config.sh").write_text('TUNNEL_SETTINGS="DEMO_DIR"\n')
+        (tunnel / "tokens.sh").write_text(textwrap.dedent("""\
+            #!/bin/bash
+            echo "noise on stdout"
+            printf '%s\\n' "$*" > "$DEMO_DIR/args"
+            case "$2" in
+              list) [ -z "$DEMO_FAIL" ] || { echo "the directory of /x/y does not exist" >&2; exit 1; }
+                    echo '{"tokens": []}' ;;
+              create) echo '{"id": "ab", "token": "tok_secret"}' ;;
+              revoke) echo '{"revoked": "ab"}' ;;
+            esac
+            """))
+        env = dict(self.env, HPCLIB_TUNNEL_PATH=str(self.tmp / "tunnels") + ":" + str(HPCLIB / "tunnels"), DEMO_DIR=str(self.tmp))
+        def run(*args, **extra):
+            return subprocess.run(["bash", str(HPCLIB / "tunnels" / "setup_tunnel.sh"), "demo-tunnel", *args],
+                                  capture_output=True, text=True, env=dict(env, **extra), timeout=60)
+        out = run("--tokens", "list")
+        self.assertEqual((out.returncode, out.stdout.strip()), (0, 'HPCLIB_TOKENS {"tokens": []}'), out.stderr)
+        self.assertEqual((self.tmp / "args").read_text().strip(), "--json list")
+        out = run("--tokens", "create", "--label", "a b", "--scopes", "write", "--days", "5")
+        self.assertEqual(out.stdout.strip(), 'HPCLIB_TOKEN_CREATED {"id": "ab", "token": "tok_secret"}')
+        self.assertEqual((self.tmp / "args").read_text().strip(), "--json create --label a b --scopes write --days 5")
+        out = run("--tokens", "revoke", "ab")
+        self.assertEqual(out.stdout.strip(), "HPCLIB_TOKEN_REVOKED ab")
+        for args in (("--tokens", "nope"), ("--tokens",)):
+            out = run(*args)
+            self.assertNotEqual(out.returncode, 0, args)
+            self.assertNotIn("tok_secret", out.stdout + out.stderr)
+        # a failure says why, in tokens.sh's own words
+        self.assertIn("setup_tunnel: tokens.sh list failed: the directory of /x/y does not exist", run("--tokens", "list", DEMO_FAIL="1").stderr)
+        self.assertEqual(run("--tokens", "list", DEMO_FAIL="1").returncode, 1)
+        (tunnel / "tokens.sh").unlink()
+        out = run("--tokens", "list")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("no tokens.sh", out.stderr)
 
     def test_tunnel_and_settings_files(self):
         res = self.send("demo-tunnel", {"tunnel/sbatch_script.sh": "#!/bin/bash\n", "tunnel/tunnel_config.sh": "",

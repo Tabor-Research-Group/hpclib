@@ -126,6 +126,24 @@ values over ssh on standard input to `setup_tunnel.sh --secrets`, which stores e
 token=$(cat "${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/secrets/my-tunnel/MYAPP_TOKEN" 2>/dev/null)
 ```
 
+### App tokens
+
+An app that keeps its own bearer tokens (PAI's write API) can have the console manage them. Ship a `tokens.sh` in
+the tunnel and give the app a `tokens` section in the package manifest (`scopes`, `default_scope`, `days`, `label`,
+`description`). The settings panel then has a Tokens panel: it lists the tokens, makes one (label, scopes, lifetime;
+the secret is shown once, or written straight to a new file on the cluster with `save_to`), and revokes one. The
+console runs `setup_tunnel.sh TUNNEL --tokens ACTION ...` over its login, which runs `tokens.sh --json ACTION ...`
+in the installed tunnel with the tunnel's settings in the environment and relays the one line of JSON it prints:
+
+| Call | Prints |
+| --- | --- |
+| `tokens.sh --json list` | `{"tokens": [{"id", "label", "scopes", "created", "expires", "revoked"}]}` (never a hash) |
+| `tokens.sh --json create --label L --scopes a,b --days N [--save-to FILE]` | `{"id", "token", "label", "scopes", "expires"}`; with `--save-to` it writes the token to that new file (mode 600, never overwriting or following a link) and prints `"token": null, "saved_to": FILE` |
+| `tokens.sh --json revoke ID` | `{"revoked": ID}` |
+
+What a token allows is the app's business: it checks tokens itself, and the console only offers the manifest's
+scopes. The console keeps no token and logs none.
+
 ### clear_port.sh
 
 `start_tunnel.sh` runs `clear_port.sh PORT` before it checks the port, so a tunnel whose service hpclib can't
@@ -205,7 +223,9 @@ The page needs no change: it builds every app's Sessions page from `GET /api/app
 
 For an app that doesn't belong in hpclib (one group's server, a project's test instance), use a console package
 instead, described next. Package apps take a subset of these keys: `title`, `tunnel`, `description`, `open_path`,
-`health_path`, `token_regex` (a regular expression string with one group, the token), `settings` and `secrets`.
+`health_path`, `token_regex` (a regular expression string with one group, the token), `settings`, `secrets`, and for an
+app that one running job serves for everyone, `shared`, `instance_label` and `reinstall` (what Install is called once it is
+installed; PAI's is Update). An app with its own bearer tokens adds `tokens` (see App tokens).
 
 ## Console packages
 
@@ -248,7 +268,7 @@ our-lab/
 
 | Section | Meaning |
 | --- | --- |
-| `apps` | console apps: `title`, `tunnel` (one in the package or one of hpclib's), `description`, `open_path`, `health_path`, `token_regex`, `settings`, `secrets` |
+| `apps` | console apps: `title`, `tunnel` (one in the package or one of hpclib's), `description`, `open_path`, `health_path`, `token_regex`, `settings`, `secrets`; for a shared app (one job for everyone, see `SHARED_INSTANCE`): `shared`, `instance_label`, `reinstall` (`{label, title}`); `tokens` (`{scopes, default_scope, days, label, description}`, with `tokens.sh` in the tunnel: see App tokens) |
 | `tunnels` | tunnel folders in the zip, by name |
 | `settings.TUNNEL.values` | default settings; a user's own values (per cluster) win, and the form shows the package's as placeholders |
 | `settings.TUNNEL.files` | files placed in `~/.local/tunnels/settings/TUNNEL.d/` on the cluster (e.g. extra rclone remotes) |
