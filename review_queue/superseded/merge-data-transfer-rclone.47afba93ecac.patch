@@ -1,0 +1,996 @@
+diff --git a/README.md b/README.md
+index 651ff3b..e4773bb 100644
+--- a/README.md
++++ b/README.md
+@@ -225,7 +225,7 @@ terminal) cancels the job.
+ Each tunnel records itself under `~/.local/tunnels/sessions/ports/` by login node and port. A new tunnel on the
+ same port first stops anything an earlier one left behind on that login node: its script, its job, a stale
+ forward or waiting page. It also looks at what is actually listening on the port, so a piece that outlived
+-its tunnel some other way (rclone's web GUI from Data transfer, a podman pod's port forwarder) goes too: whatever
++its tunnel some other way (Data transfer's web GUI, a podman pod's port forwarder) goes too: whatever
+ hpclib starts for a port carries `HPCLIB_TUNNEL_PORT=PORT` in its environment, and a process of yours listening
+ on that port with that mark is stopped (TERM, then KILL after 5 s). `smbshell gui` clears its port the same way
+ before it starts, and stops rclone when its own session ends, even if the connection dropped without a hangup.
+@@ -599,7 +599,8 @@ which the tunnel prints (and the console offers to copy).
+ 
+ **Data transfer (SMB)**: `smbshell` moves files between a cluster and an SMB server with rclone from the
+ data-transfer-tools image. It isn't a port-forwarding tunnel; `tunnels/data-transfer/` holds the command, its
+-SLURM job and the image's `install.sh`.
++SLURM job and the image's `install.sh`. The console's **Data transfer** page puts it all on one row per cluster:
++the settings, Install, signing in, and a web GUI (below).
+ 
+ ```bash
+ tunnel_setup user@grace.hprc.tamu.edu data-transfer --set SMB_HOST=files.example.edu \
+@@ -616,25 +617,39 @@ smbshell sync pull proj/raw /scratch/user/me/raw --dry-run  # sync deletes what
+ smbshell submit --time=2:00:00 get proj/raw /scratch/user/me/raw   # the same, as a SLURM job
+ smbshell submit --manifest transfers.json                 # [["get", "proj/a", "/scratch/.../a"], ...]: an array job
+ smbshell --on user@grace.hprc.tamu.edu ls proj            # from your own machine, over ssh
+-smbshell gui --port 27555                                 # rclone's web GUI on the login node (see below)
++smbshell gui --port 27555                                 # a web GUI on the login node (see below)
+ ```
+ 
+-**Rclone** (a console app, like JupyterLab): rclone's own web GUI (`rclone rcd --rc-web-gui`) on the cluster's
+-login node, started by `smbshell gui` over the console's ssh login, which forwards its port; Open goes straight
+-in. Its remotes are `smb` (the server) and `cluster` (the node's files: home, `/scratch`), for browsing and
+-copying between them, plus any in `~/.local/tunnels/settings/data-transfer.d/rclone.conf` on the cluster (a
+-settings package puts them there, e.g. an alias for your group's folder; see Console packages below). Start asks for the SMB password (unless there is a Kerberos ticket or a saved
+-one), which rclone keeps only in a private in-memory file until Stop; nothing is saved. rclone runs without
+-retries, so a refused password is one refused logon. It uses Data transfer's image and settings; rclone fetches
+-the GUI itself from GitHub the first time (into `~/.cache/rclone`).
++**The GUI** (Data transfer's Start, Open and Stop): `smbshell gui` on the cluster's login node, over the
++console's ssh login, which forwards its port; Open goes straight in. By default (`SMB_GUI=rclone`) it is rclone's
++own web GUI (`rclone rcd --rc-web-gui`). Its remotes are `smb` (the server) and `cluster` (the node's files: home,
++`/scratch`), for browsing and copying between them, plus any in
++`~/.local/tunnels/settings/data-transfer.d/rclone.conf` on the cluster (a settings package puts them there, e.g.
++an alias for your group's folder; see Console packages below). Start asks for the SMB password (unless there is a
++Kerberos ticket or a saved one), which is kept only in a private in-memory file until Stop; nothing is saved.
++rclone runs without retries, so a refused password is one refused logon. rclone fetches the GUI itself from
++GitHub the first time (into `~/.cache/rclone`).
++
++A GUI of your own takes rclone's place with `SMB_GUI=NAME`, for `NAME.gui.sh` in `data-transfer.d/` (from a
++settings package's `files`), or `SMB_GUI=/path/to/program` on the cluster. `smbshell gui` signs in as above, then
++runs it with the port to serve on (`HPCLIB_GUI_PORT`, at 127.0.0.1), a random login for the session that it
++should require (`HPCLIB_GUI_USER`, `HPCLIB_GUI_PASS`: anyone on the login node can reach 127.0.0.1), the session's
++remotes (`RCLONE_CONFIG`), rclone in the image with them (`$SMBSHELL_RCLONE lsjson smb:SHARE`), and a private
++directory (`HPCLIB_GUI_DIR`). It prints where to open it, once, and serves until it gets TERM:
++
++```bash
++echo "HPCLIB_TRANSFER_GUI port=$HPCLIB_GUI_PORT path=/ user=$HPCLIB_GUI_USER pass=$HPCLIB_GUI_PASS"
++```
++
++(`path=`, `user=`/`pass=` and `query=`, already URL-encoded, are all optional; `smbshell --help` has the details.)
+ 
+ Signing in (`SMB_AUTH=auto`): a Kerberos ticket from `smbshell login` (kinit on the login node, or in the image
+ if the node has none; kept in `~/.config/hpclib/smb/krb5cc`, so jobs use it while it lasts), else a password
+ saved with `smbshell save-credentials` (`~/.config/hpclib/smb/credentials`, mode 600, in rclone's reversible
+ encoding), else `smbshell` asks. Jobs never ask: they need the ticket or the saved password. Kerberos needs an
+-rclone with SMB Kerberos support (`smbshell status` says). The console's **Data transfer** page does the
+-signing in: Kerberos log in (kinit) where the cluster has kinit, otherwise Save password for sync jobs, both
+-through its password dialog, plus Install/Check for the image and the settings above.
++rclone with SMB Kerberos support (`smbshell status` says). The console's **Data transfer** row does the
++signing in beside the GUI: Kerberos log in (kinit) where the cluster has kinit, otherwise Save password for sync
++jobs, both through its password dialog, plus Install/Check for the image and the settings above.
+ 
+ **Console packages**: apps and settings that don't belong in hpclib (one group's server, a project's test
+ instance) come as zip files, installed with the console's **Add App or Settings** button, which shows what a
+diff --git a/agent-console/README.md b/agent-console/README.md
+index fc1d185..ef90dc5 100644
+--- a/agent-console/README.md
++++ b/agent-console/README.md
+@@ -29,9 +29,10 @@ printed; VS Code shows a **Copy password** button. Once you're logged in, each r
+ installed on the cluster (its `install.sh --check`) and offers **Install** (or Reinstall), whose output shows
+ below the row. PAI's row says which job serves the shared database, and whether this tunnel started it or only
+ connected to it, and once PAI is installed its Install button is **Update**: it fast-forwards the
+-proto-auto-interface checkout and pulls the app's image again (its Image setting says from where). **Data transfer** isn't a tunnel: per cluster it installs the data-transfer-tools image and
+-signs you in to the SMB server for `smbshell` (Kerberos log in with kinit where the cluster has it, otherwise a
+-password saved for sync jobs), both through the password dialog. Agents keeps its addresses (`#/clusters`, `#/files?...`); other apps live under
++proto-auto-interface checkout and pulls the app's image again (its Image setting says from where). **Data transfer** runs on the login node, not in a job: per cluster it installs the
++data-transfer-tools image, starts a web GUI for the SMB server (rclone's, or the one its GUI setting names), and
++signs you in to the server for `smbshell` beside it (Kerberos log in with kinit where the cluster has it,
++otherwise a password saved for sync jobs), both through the password dialog. Agents keeps its addresses (`#/clusters`, `#/files?...`); other apps live under
+ `#/APP/PAGE`, e.g. `#/vscode/sessions`. A new tunnel app is an entry in `APPS` in
+ `hpclib/servers/agent_console.py`, or, for one that doesn't belong in hpclib, a package: **Add App or Settings**
+ (top right) checks a package zip, shows what it adds (apps, tunnels, settings and their values), installs it,
+diff --git a/agent-console/app.js b/agent-console/app.js
+index 7ef671c..68040ec 100644
+--- a/agent-console/app.js
++++ b/agent-console/app.js
+@@ -960,8 +960,9 @@ async function appSettingsForm(app, s, row) {
+     return "Removed.";
+   }, { result: true });
+   row.showDetail("settings", el("hpc-panel", { heading: `${APPS_UI[app].title} on ${s.cluster}`, dismissible: true },
+-    el("p", { class: "muted" }, "The tunnel's job (empty: its defaults):"),
+-    el("div", { class: "row" }, APP_TUNNEL_FIELDS.map(([k, label, hint]) => field(`Job: ${label}`, inputs[k], hint))),
++    conf.job === false ? null : [      // runs on the login node: no job, so no sbatch options
++      el("p", { class: "muted" }, "The tunnel's job (empty: its defaults):"),
++      el("div", { class: "row" }, APP_TUNNEL_FIELDS.map(([k, label, hint]) => field(`Job: ${label}`, inputs[k], hint)))],
+     conf.python_env ? [
+       el("p", { class: "muted" }, "Where jupyter comes from (any of these; it needs jupyterlab installed):"),
+       el("div", { class: "row" },
+@@ -970,7 +971,7 @@ async function appSettingsForm(app, s, row) {
+         field("uv or pixi project", project, "its .venv or .pixi/envs/default; Install puts jupyterlab there"))] : null,
+     conf.fields.length ? [
+       el("p", { class: "muted" }, "On the cluster (empty: an installed package's value, else the tunnel's default). " +
+-        "Install and the job both use these."),
++        (conf.job === false ? "Install and Start both use these." : "Install and the job both use these.")),
+       el("div", { class: "row" }, conf.fields.map((f) => field(f.label, own[f.name], f.hint)))] : null,
+     el("div", { class: "actions" }, save),
+     secrets.length ? el("section", { class: "secrets" },
+@@ -991,17 +992,11 @@ async function appPage(app) {
+     return row;
+   });
+   const { kind, description } = APPS_UI[app] || {};
+-  const tool = kind === "tool";
+   return [
+     el("h2", {}, title),
+-    el("p", { class: "muted" }, description ? description : tool
+-      ? "Files between each cluster and an SMB server, with rclone from the data-transfer-tools image: " +
+-        "smbshell on the cluster (smbshell --help), and smbshell submit for SLURM jobs. Sign in here once: " +
+-        "Kerberos (kinit) where the cluster has it, or a password saved for sync jobs. Settings… names the server."
+-      : kind === "login"
+-      ? "rclone's web GUI per cluster, on its login node, reached through the console's ssh login: browse the SMB " +
+-        "server (remote smb, plus any a settings package adds) and the cluster's files (cluster), and copy between them. Start asks for the " +
+-        "SMB password, kept only until Stop. It uses Data transfer's settings and image."
++    el("p", { class: "muted" }, description ? description : kind === "login"
++      ? `A ${title} session per cluster, on its login node, reached through the console's ssh login. ` +
++        "It runs as you, with your full permissions on the cluster (it is not the agents' sandbox)."
+       : `A ${title} session per cluster, in a SLURM job reached through its own tunnel. ` +
+         "It runs as you, with your full permissions on the cluster (it is not the agents' sandbox). " +
+         "What it needs on the cluster is checked once you're logged in, and Install sets it up there."),
+@@ -1028,7 +1023,7 @@ const APPS_UI = {
+ 
+ function addApp(id, title, kind = "tunnel", description = null) {
+   APPS_UI[id] = { title, kind, description, default: "sessions",
+-                  pages: { sessions: [kind === "tool" ? "Clusters" : "Sessions", () => appPage(id)] } };
++                  pages: { sessions: ["Sessions", () => appPage(id)] } };
+ }
+ addApp("jupyter", "JupyterLab");     // until the console says which it has
+ 
+diff --git a/agent-console/components.js b/agent-console/components.js
+index c3edba8..efdb105 100644
+--- a/agent-console/components.js
++++ b/agent-console/components.js
+@@ -814,7 +814,7 @@ export class HpcAppSession extends TunnelRow {
+ 
+   get busy() {
+     const s = this._data;
+-    return !!(s.prompt || ["starting", "queued", "working"].includes(s.state) || (s.started_here && s.state !== "up") ||
++    return !!(s.prompt || s.signing_in || ["starting", "queued"].includes(s.state) || (s.started_here && s.state !== "up") ||
+               LOGIN_BUSY.includes((s.login || {}).state) || (s.operation && s.operation.state === "running"));
+   }
+ 
+@@ -854,8 +854,9 @@ export class HpcAppSession extends TunnelRow {
+       this._checked = true;
+       this.buttons.check.run();
+     }
+-    // a tool (Data transfer): how it would sign in, asked once you're logged in, after the install check
+-    if (s.kind === "tool" && !s.auth && (s.login || {}).state === "connected" && !this._authAsked &&
++    // signing in to a server beside the session (Data transfer's SMB server): how it would, asked once you're
++    // logged in, after the install check
++    if ("auth" in s && !s.auth && (s.login || {}).state === "connected" && !this._authAsked &&
+         s.install && s.install.state !== "unchecked") {
+       this._authAsked = true;
+       this.runControl({ id: "status" }).catch(() => {});
+@@ -952,16 +953,6 @@ export class HpcAppSession extends TunnelRow {
+     const stateText = up ? `running${s.version ? ` (${s.version})` : ""}`
+       : (s.state === "queued" ? `queued: ${s.status}` : (APP_STATE_LABEL[s.state] || s.state));
+     const cluster = { name: s.cluster, host: s.host, connection_hours: lg.connection_hours };
+-    if (s.kind === "tool") {   // commands on the cluster, not a tunnel: no Open/Start/Stop
+-      return [
+-        s.cluster,
+-        this.loginCells(lg, cluster),
+-        [s.state === "working" ? el("hpc-state", { tone: "starting", label: "working…" }) : null,
+-         this.promptLine(`${this.appTitle} on ${s.cluster}`, this.base + "/answer", s.prompt),
+-         this.installLine(s, loggedIn)],
+-        [el("div", { class: "actions" }, b.log, b.settings), this.extras],
+-      ];
+-    }
+     return [
+       [s.cluster, el("div", { class: "muted" }, `port ${s.port}`)],
+       this.loginCells(lg, cluster),
+@@ -971,9 +962,10 @@ export class HpcAppSession extends TunnelRow {
+        up && "password" in s ? el("div", { class: "muted" }, s.password ? ["password ready ", b.copy]
+                                                                       : "password not seen yet; see Log") : null,
+        s.error ? el("div", { class: "muted" }, s.error) : null,
++       s.signing_in ? el("hpc-state", { tone: "starting", label: "signing in…" }) : null,
+        this.promptLine(`${this.appTitle} on ${s.cluster}`, this.base + "/answer", s.prompt),
+        this.installLine(s, loggedIn)],
+-      [el("div", { class: "actions" }, open, b.start, b.stop, b.log, s.kind === "login" ? null : b.settings), this.extras],
++      [el("div", { class: "actions" }, open, b.start, b.stop, b.log, b.settings), this.extras],
+     ];
+   }
+ 
+diff --git a/docs/cli/tunnels.md b/docs/cli/tunnels.md
+index 92264e6..4af24a1 100644
+--- a/docs/cli/tunnels.md
++++ b/docs/cli/tunnels.md
+@@ -191,9 +191,15 @@ smbshell put /scratch/user/me/results proj/results
+ smbshell sync pull proj/raw /scratch/user/me/raw --dry-run     # sync deletes what the source lacks
+ smbshell submit --time=2:00:00 get proj/raw /scratch/user/me/raw  # the same, as a SLURM job
+ smbshell submit --manifest transfers.json        # [["get", "proj/a", "/scratch/.../a"], ...]: a job array
+-smbshell gui --port 27555                        # rclone's web interface on the login node
++smbshell gui --port 27555                        # a web GUI on the login node: rclone's, or SMB_GUI's
+ smbshell status                                  # how it would sign in, and what rclone supports
+ ```
+ 
+ Paths are relative to `SMB_ROOT` when it is set; `/SHARE/PATH` and `//HOST/SHARE/PATH` are absolute. Signing in
+ uses a Kerberos ticket if there is one, else the saved password, else asks; jobs never ask.
++
++`SMB_GUI` picks what `smbshell gui` serves: `rclone` (the default), `NAME` for `NAME.gui.sh` in
++`~/.local/tunnels/settings/data-transfer.d/` (a settings package's file), or a program on the cluster. A program
++of your own is given the port, a session login to require, the signed-in rclone remotes and rclone in the image,
++and prints `HPCLIB_TRANSFER_GUI port=PORT [path=...] [user=... pass=...]` once it serves; `smbshell --help` lists
++the details.
+diff --git a/docs/extending.md b/docs/extending.md
+index d308933..0a92f0f 100644
+--- a/docs/extending.md
++++ b/docs/extending.md
+@@ -211,8 +211,9 @@ For a tunnel that ships with hpclib, add an entry to `APPS` in `hpclib/servers/a
+ | `token_re` / `password_re` | read a token (added to the URL) or a password (shown with a Copy button) from the log |
+ | `settings` | the tunnel's `TUNNEL_SETTINGS` the settings form edits: `(NAME, label, hint[, choices])` |
+ | `env_settings` | JupyterLab's conda environment, modules and project fields |
+-| `kind: "login"` | the service runs on the login node over the console's ssh login (like Rclone) |
+-| `kind: "tool"` | not a tunnel: the row runs commands instead (like Data transfer) |
++| `kind: "login"` | the service runs on the login node over the console's ssh login (like Data transfer's GUI) |
++| `gui_re` | with `kind: "login"`: the `HPCLIB_TRANSFER_GUI` line saying where to open it (`TRANSFER_GUI_RE`) |
++| `smb` | the row also signs in to the SMB server for `smbshell`, beside the session (Data transfer) |
+ | `shared`, `instance_label` | a shared-instance tunnel: the row names the job serving it and offers to end it |
+ | `reinstall` | `{"label", "title"}`: what the install button is called once installed (PAI: Update) |
+ 
+@@ -271,7 +272,7 @@ our-lab/
+ | `apps` | console apps: `title`, `tunnel` (one in the package or one of hpclib's), `description`, `open_path`, `health_path`, `token_regex`, `settings`, `secrets`; for a shared app (one job for everyone, see `SHARED_INSTANCE`): `shared`, `instance_label`, `reinstall` (`{label, title}`); `tokens` (`{scopes, default_scope, days, label, description}`, with `tokens.sh` in the tunnel: see App tokens) |
+ | `tunnels` | tunnel folders in the zip, by name |
+ | `settings.TUNNEL.values` | default settings; a user's own values (per cluster) win, and the form shows the package's as placeholders |
+-| `settings.TUNNEL.files` | files placed in `~/.local/tunnels/settings/TUNNEL.d/` on the cluster (e.g. extra rclone remotes) |
++| `settings.TUNNEL.files` | files placed in `~/.local/tunnels/settings/TUNNEL.d/` on the cluster (e.g. extra rclone remotes, or a `NAME.gui.sh` for Data transfer's `SMB_GUI`) |
+ | `secrets` | per app; each name must be in its tunnel's `TUNNEL_SECRETS` |
+ 
+ Build and check it, then install it from **Add App or Settings**:
+diff --git a/docs/interface/README.md b/docs/interface/README.md
+index a41e02d..5fb4e50 100644
+--- a/docs/interface/README.md
++++ b/docs/interface/README.md
+@@ -11,12 +11,12 @@ done from the page.
+ 
+ 1. [Getting started](getting-started.md): start the console, add a cluster, log in, connect an LLM client.
+ 2. [Agents](agents.md): the Clusters, Proposals, Activity, Files and Settings pages.
+-3. [Apps](apps.md): JupyterLab, VS Code, PAI, Data transfer, Rclone, and apps added from packages.
++3. [Apps](apps.md): JupyterLab, VS Code, PAI, Data transfer, and apps added from packages.
+ 
+ ## How the page is laid out
+ 
+ The **top bar** switches between apps. **Agents** is always first; then come the tunnel apps hpclib ships
+-(**JupyterLab**, **VS Code**, **Data transfer**, **Rclone**, **PAI**) and any added from packages. On the right,
++(**JupyterLab**, **VS Code**, **Data transfer**, **PAI**) and any added from packages. On the right,
+ **Add App or Settings** installs packages.
+ 
+ Each app has its own pages under its name. Agents has Clusters, Proposals, Activity, Files and Settings; the
+diff --git a/docs/interface/apps.md b/docs/interface/apps.md
+index 6b9f1da..ad4dea5 100644
+--- a/docs/interface/apps.md
++++ b/docs/interface/apps.md
+@@ -79,25 +79,24 @@ on, and **Bind source** (run your checkout's code instead of the image's).
+ 
+ ## Data transfer
+ 
+-Not a tunnel: tools for moving files between a cluster and an SMB file server with rclone. Per cluster:
++Moving files between a cluster and an SMB file server with rclone. Per cluster, one row:
+ 
+ - **Install** pulls the data-transfer-tools image.
+-- **Kerberos log in (kinit)** gets a ticket with `kinit`, where the cluster has Kerberos; jobs can use it while it lasts.
++- **Start** runs a web GUI on the cluster's **login node** (no job), reached through your login: by default
++  rclone's own, for browsing and copying between the SMB server (`smb`), the cluster's files (`cluster`), and any
++  remotes a settings package adds. **Open** signs you in to it automatically; **Copy username** and **Copy
++  password** are there if the browser asks anyway. **Stop** ends it.
++- **Kerberos log in (kinit)** gets a ticket with `kinit`, where the cluster has Kerberos; the GUI and jobs use it
++  while it lasts. It can run while the GUI does.
+ - Otherwise **Save password for sync jobs** stores the SMB password on the cluster (mode 600, in rclone's
+-  reversible encoding) so batch transfers can run unattended.
++  reversible encoding) so batch transfers (`smbshell submit`) can run unattended.
+ 
+-Settings: the SMB server, the share and folder paths are relative to, user name, domain, Kerberos realm, how to
+-sign in, and where the image is kept.
+-
+-## Rclone
++Without a ticket or a saved password, Start asks for the SMB password, which is kept only in memory until Stop.
+ 
+-rclone's own web interface, running on the cluster's **login node** (no job), for browsing and copying between
+-the SMB server (`smb`), the cluster's files (`cluster`), and any remotes a settings package adds. Start asks for
+-the SMB password unless a Kerberos ticket or a saved password is available; rclone keeps it only in memory until
+-Stop. **Open** signs you in to rclone's interface automatically; **Copy username** and **Copy password** are
+-there if the browser asks anyway.
+-
+-It uses Data transfer's image and settings, so install and configure Data transfer first.
++Settings: the SMB server, the share and folder paths are relative to, user name, domain, Kerberos realm, how to
++sign in, which **GUI** Start opens, and where the image is kept. GUI is `rclone` (the default), the name of a GUI
++a settings package provides, or a program on the cluster (see `smbshell --help`, and the README's Data transfer
++section, for what such a program gets and must print).
+ 
+ ## Adding apps and settings from packages
+ 
+diff --git a/docs/reference.md b/docs/reference.md
+index e006501..48814be 100644
+--- a/docs/reference.md
++++ b/docs/reference.md
+@@ -98,7 +98,7 @@
+ | `rest` | hpclib's REST server | 5000, 5000 | started by `agent_tunnel` |
+ | `pai` | proto-auto-interface | 8080, 3100 (or another free port the job picks) | shared instance |
+ | `ngl` | MDsrv | 8999, 8080 | `mdsrv` in the conda environment |
+-| `data-transfer` | `smbshell` and rclone's web GUI | | not a port-forwarding tunnel |
++| `data-transfer` | `smbshell` and its web GUI (rclone's, or `SMB_GUI`'s) | | `smbshell gui` on the login node |
+ 
+ ## Console HTTP API
+ 
+diff --git a/hpclib/servers/agent_console.py b/hpclib/servers/agent_console.py
+index b7cebd0..5c6ca5b 100644
+--- a/hpclib/servers/agent_console.py
++++ b/hpclib/servers/agent_console.py
+@@ -55,7 +55,8 @@ The front end depends only on the routes below; nothing here depends on it.
+   POST /api/apps/APP/NAME/check               is the tunnel installed? (its install.sh --check, on the cluster)
+   GET  /api/apps/APP/NAME/instances           a shared app's running instances on the cluster, with owners
+   POST /api/apps/APP/NAME/control/ID          one of the session's `controls`, e.g. stop_instance {"job": ...}:
+-                                              end the job serving a shared app (only yours, only a registered one)
++                                              end the job serving a shared app (only yours, only a registered one);
++                                              Data transfer's kinit or save_credentials, beside its GUI
+   POST /api/apps/APP/NAME/install             its install.sh ({"force": true}: e.g. pull the image again), as
+                                               the cluster's operation (GET /api/clusters/NAME/operation)
+   GET  /api/clusters/NAME/settings            this machine's tunnel settings for the cluster
+@@ -124,6 +125,10 @@ DEFAULT_PORT = 27180
+ CLUSTER_NAME_RE = re.compile(r"[A-Za-z0-9._@-]{1,120}")
+ STREAMED_ROUTES = ("files/content",)   # passed through in chunks rather than read whole
+ 
++# smbshell gui's line once its GUI serves: HPCLIB_TRANSFER_GUI port=P [path=/x] [user=U pass=P] [query=a=b&c=d]
++# (HPCLIB_RCLONE_GUI port=P user=U pass=P from an hpclib before SMB_GUI: rclone's, opened with its login_token)
++TRANSFER_GUI_RE = re.compile(r"^HPCLIB_(TRANSFER|RCLONE)_GUI((?: [a-z]+=\S*)+)\s*$", re.M)
++
+ # Tunnel apps the console runs besides the agents' REST tunnel, one panel each in the front end. Each is an
+ # hpclib tunnel (hpclib/tunnels/NAME) started with launch_tunnel over the cluster's ssh login, on ports of its
+ # own kept in the profile's "apps" section.
+@@ -136,9 +141,11 @@ STREAMED_ROUTES = ("files/content",)   # passed through in chunks rather than re
+ #                 edits (with choices: a select of those values); they are saved on the cluster
+ #                 (tunnels/setup_tunnel.sh --save) for its job and install.sh
+ #   kind "login"  runs on the cluster's login node over the console's ssh login, its port forwarded there,
+-#                 rather than in a SLURM job (Rclone: rclone's web GUI, signed in for the session only)
+-#   kind "tool"   not a port-forwarding tunnel but commands run on the cluster (Data transfer: smbshell); its
+-#                 row has no Open/Start/Stop, and its controls run them
++#                 rather than in a SLURM job (Data transfer: `smbshell gui`)
++#   gui_re        the line a login app prints once it serves (HPCLIB_TRANSFER_GUI key=value ...): where to open
++#                 it, and the login that gets in (see transfer_gui_url)
++#   smb           the row also signs you in to the SMB server for smbshell (TRANSFER_CONTROLS): Kerberos, or a
++#                 password saved for sync jobs. These run beside the GUI, never in its place
+ #   shared        the tunnel attaches to a running instance another job serves (SHARED_INSTANCE), and keeps
+ #                 the one it starts running after Stop (KEEP_INSTANCE); `instance_label` names that service,
+ #                 and its row gets a toolbar tool describing the job and a control that ends it
+@@ -175,7 +182,21 @@ APPS = {
+     "transfer": {
+         "title": "Data transfer",
+         "tunnel": "data-transfer",
+-        "kind": "tool",
++        "kind": "login",
++        "smb": True,
++        "description": "Files between each cluster and an SMB server, with rclone from the data-transfer-tools "
++                       "image. Start serves a web GUI on the cluster's login node, through the console's ssh "
++                       "login: rclone's by default (remotes smb, the server, and cluster, its files, plus any a "
++                       "settings package adds), or the one Settings… → GUI names. Sign in once beside it: "
++                       "Kerberos (kinit) where the cluster has it, or a password saved for sync jobs; without "
++                       "either, Start asks for the password and keeps it only until Stop. On the cluster: "
++                       "smbshell (smbshell --help), and smbshell submit for SLURM jobs.",
++        "open_path": "/",
++        "health_path": "/",                 # anything that answers (rclone rcd: 401 without its login) is up
++        # smbshell gui prints where to open the GUI, and its own random login, once (SMB_GUI picks which GUI)
++        "gui_re": TRANSFER_GUI_RE,
++        "note": "The SMB password for this session's GUI, on the cluster's login node: it is kept (in rclone's "
++                "reversible encoding) in a private in-memory file until you Stop it. Nothing is saved for later.",
+         "settings": [
+             ("SMB_HOST", "SMB server", "just the host, e.g. files.example.edu; //HOST/SHARE/FOLDER fills in the folder too"),
+             ("SMB_ROOT", "Folder", "SHARE/FOLDER that smbshell paths are relative to, e.g. research/our_group"),
+@@ -189,6 +210,8 @@ APPS = {
+                                                        "database\": smbshell find-spn shows the one it knows"),
+             ("SMB_AUTH", "Sign in with", "auto: a Kerberos ticket if you have one, else the saved password",
+              ("auto", "kerberos", "password")),
++            ("SMB_GUI", "GUI", "what Start opens: rclone (rclone's web GUI), NAME for NAME.gui.sh from a settings "
++                               "package, or a program on the cluster (smbshell --help); default rclone"),
+             ("SMB_IMAGE", "Image", "where data-transfer-tools.sif is kept; default /scratch/user/USER/images/"
+                                    "data-transfer-tools.sif"),
+             ("SMB_IMAGE_SOURCE", "Image source", "what Install pulls or builds it from (oras://, docker://, a .def "
+@@ -196,19 +219,6 @@ APPS = {
+                                                  "data-transfer-tools:latest"),
+         ],
+     },
+-    "rclone": {
+-        "title": "Rclone",
+-        "tunnel": "data-transfer",          # the data-transfer-tools image, and Data transfer's settings
+-        "kind": "login",
+-        "open_path": "/",
+-        "health_path": "/",                 # rclone rcd: 401 without its login, which says it's up
+-        # smbshell gui prints the GUI's own (random) login once; the page opens it with rclone's login_token
+-        "gui_re": re.compile(r"^HPCLIB_RCLONE_GUI port=\d+ user=(\S+) pass=(\S+)\s*$", re.M),
+-        "note": "The SMB password for this rclone web GUI session, on the cluster's login node: rclone keeps it "
+-                "(in rclone's reversible encoding) in a private in-memory file until you Stop it. Nothing is "
+-                "saved for later.",
+-        "settings": [],
+-    },
+ }
+ # hpclib's own apps; installed packages add theirs to APPS (load_package_apps)
+ BUILTIN_APPS = dict(APPS)
+@@ -720,6 +730,7 @@ class Clusters:
+         self.logins = logins or Logins()
+         self.ops = {}
+         self.app_procs = {}
++        self.control_procs = {}      # (name, app): a row's control that asks for a password (kinit), beside its GUI
+         self.packages = load_package_apps()
+         self.secret_runner = self._run_with_input
+ 
+@@ -891,6 +902,12 @@ class Clusters:
+     def prompt_of(proc):
+         return proc.waiting() if isinstance(proc, PtySession) and proc.poll() is None else None
+ 
++    def app_waiting(self, name, app):
++        """The app session's process that waits for an answer now: its control's (kinit), else its own."""
++        with self.lock:
++            procs = [self.control_procs.get((name, app)), self.app_procs.get((name, app))]
++        return next((p for p in procs if self.prompt_of(p)), procs[1])
++
+     def prompts(self):
+         """
+         Tunnels and app sessions started here that wait for a password now, and how many are still running.
+@@ -899,6 +916,7 @@ class Clusters:
+         with self.lock:
+             procs = [(name, None, proc) for name, proc in self.procs.items()]
+             procs += [(name, app, proc) for (name, app), proc in self.app_procs.items()]
++            procs += [(name, app, proc) for (name, app), proc in self.control_procs.items()]
+         waiting, running = [], 0
+         for name, app, proc in procs:
+             if proc.poll() is not None:
+@@ -914,12 +932,16 @@ class Clusters:
+                                 "prompt": prompt})
+         return {"prompts": waiting, "running": running}
+ 
+-    def _open_log(self, name, title, path=None):
++    def _open_log(self, name, title, path=None, mark="==="):
++        """
++        The log, with a header for what runs next: === for a launch (_last_launch reads from the newest one), ---
++        for a command run beside it (a sign-in control), which leaves the launch's lines where they are.
++        """
+         path = path or self.log_path(name)
+         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+         log = open(path, "ab", buffering=0)
+         os.chmod(path, 0o600)
+-        log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {title} ===\n".encode())
++        log.write(f"\n{mark} {time.strftime('%Y-%m-%d %H:%M:%S')} {title} {mark}\n".encode())
+         return log
+ 
+     # -- installing and setting up ------------------------------------------
+@@ -1064,6 +1086,7 @@ class Clusters:
+         _, conf = self.app_config(profile, app)
+         return {"app": app, "cluster": profile["name"], "port": conf["port"],
+                 "tunnel_args": conf.get("tunnel_args") or [],
++                "job": spec.get("kind", "tunnel") == "tunnel",    # a SLURM job: its sbatch options apply
+                 "python_env": "env_settings" in spec,       # JupyterLab's conda environment, modules and project
+                 "conda_env": conf.get("conda_env"),        # None: the tunnel's default ("default"); "": none
+                 "modules": conf.get("modules") or [],
+@@ -1170,7 +1193,7 @@ class Clusters:
+         if digest is not None or conf.get("pushed_package"):
+             args += ["--push", stage]
+         if not spec.get("settings") and "env_settings" not in spec:
+-            return args + list(actions)            # no settings of its own (Rclone shares Data transfer's)
++            return args + list(actions)            # no settings of its own: the cluster's stay as they are
+         for k, v in sorted(self.app_vars(spec, conf).items()):
+             args += ["--set", f"{k}={v}"]
+         return args + ["--save"] + list(actions)
+@@ -1201,7 +1224,8 @@ class Clusters:
+     def package_remove(self, name):
+         apps = [a for a, v in APPS.items() if v.get("package") == name]
+         with self.lock:
+-            running = sorted({a for (_, a), p in self.app_procs.items() if a in apps and p.poll() is None})
++            running = sorted({a for (_, a), p in list(self.app_procs.items()) + list(self.control_procs.items())
++                              if a in apps and p.poll() is None})
+             if running:
+                 raise ConsoleError(409, f"stop {', '.join(APPS[a]['title'] for a in running)} first")
+             try:
+@@ -1446,7 +1470,7 @@ class Clusters:
+ 
+     def app_extras(self, spec, state):
+         """The row's toolbar tools and extra controls (see APPS)."""
+-        if spec.get("kind") == "tool":
++        if spec.get("smb"):
+             return self.transfer_extras(state)
+         tools, controls = [], []
+         inst = state.get("instance")
+@@ -1468,7 +1492,7 @@ class Clusters:
+                               "text": f"none seen yet: Start connects to a running {what} job, or starts one"})
+         return tools, controls
+ 
+-    # -- Data transfer (smbshell): signing in to the SMB server --------------------------------
++    # -- Data transfer (smbshell): signing in to the SMB server, beside its GUI ----------------------
+ 
+     TRANSFER_CONTROLS = {
+         # id: (smbshell command, runs in a terminal that may ask for a password, note for the password dialog)
+@@ -1552,14 +1576,14 @@ class Clusters:
+         if not self.logins.alive(profile):
+             raise ConsoleError(409, f"log in to {name} first: this runs over the console's ssh login")
+         with self.lock:
+-            proc = self.app_procs.get((name, app))
++            proc = self.control_procs.get((name, app))
+             if proc is not None and proc.poll() is None:
+-                raise ConsoleError(409, f"{spec['title']} on {name} is already running something")
+-        self._open_log(name, " ".join(args + [command]), self.app_log_path(name, app)).close()
++                raise ConsoleError(409, f"{spec['title']} on {name} is already signing in")
++        self._open_log(name, " ".join(args + [command]), self.app_log_path(name, app), mark="---").close()
+         proc = self.tunnel_runner(args + [command], self.app_log_path(name, app))
+         proc.note = note
+         with self.lock:
+-            self.app_procs[(name, app)] = proc
++            self.control_procs[(name, app)] = proc
+ 
+         def then():                                   # once it's done, what the cluster says now
+             proc.wait()
+@@ -1607,7 +1631,7 @@ class Clusters:
+     def app_control(self, profile, app, control, body):
+         """One of the row's extra controls."""
+         spec = self.app_spec(app)
+-        if spec.get("kind") == "tool":
++        if spec.get("smb"):
+             return self.transfer_control(profile, app, control)
+         if control != "stop_instance" or not spec.get("shared"):
+             raise ConsoleError(404, f"{spec['title']} has no control {control!r}")
+@@ -1648,24 +1672,17 @@ class Clusters:
+         port = conf["port"]
+         with self.lock:
+             proc = self.app_procs.get((name, app))
+-        if spec.get("kind") == "tool":
+-            running = proc is not None and proc.poll() is None
+-            out = {"app": app, "cluster": name, "host": profile.get("host"), "kind": "tool", "port": None,
+-                   "started_here": running, "state": "working" if running else "ready", "url": None,
+-                   "prompt": self.prompt_of(proc), "auth": conf.get("auth"),
+-                   "install": (conf.get("install") or {"state": "unchecked"}) if self.app_installable(app)
+-                              else {"state": "nothing"}}
+-            with self.lock:
+-                op = self.ops.get(name)
+-                if op and op.get("app") == app:
+-                    out["operation"] = {k: op.get(k) for k in ("kind", "title", "app", "state", "exit_code",
+-                                                               "started", "finished")}
+-            return out
+         out = {"app": app, "cluster": name, "host": profile.get("host"), "port": port,
+                "started_here": proc is not None and proc.poll() is None, "url": None, "prompt": self.prompt_of(proc),
+                "install": (conf.get("install") or {"state": "unchecked"}) if self.app_installable(app)
+                           else {"state": "nothing"},
+                "shared": bool(spec.get("shared")), "kind": spec.get("kind", "tunnel")}
++        if spec.get("smb"):
++            with self.lock:
++                control = self.control_procs.get((name, app))
++            out["auth"] = conf.get("auth")
++            out["signing_in"] = control is not None and control.poll() is None
++            out["prompt"] = self.prompt_of(control) or out["prompt"]
+         with self.lock:
+             op = self.ops.get(name)
+             if op and op.get("app") == app:
+@@ -1698,21 +1715,33 @@ class Clusters:
+         if spec.get("gui_re") is not None:
+             found = spec["gui_re"].findall(self._last_launch(name, app))
+             if not found:
+-                return dict(out, state="starting", error="waiting for its login to be printed")
+-            user, password = found[-1]
+-            # As rclone rcd opens it itself: the login in the address answers the server's basic-auth prompt for
+-            # the page, and login_token gives the GUI the same login for its API calls.
+-            login = base64.urlsafe_b64encode(f"{user}:{password}".encode()).decode()
+-            q = urllib.parse.quote
+-            url = (f"http://{q(user, safe='')}:{q(password, safe='')}@127.0.0.1:{port}{spec['open_path']}"
+-                   f"?login_token={q(login, safe='')}")
+-            return dict(out, state="up", url=url, token_known=True, username=user, password=password)
++                return dict(out, state="starting", error="waiting for it to say where to open it")
++            return dict(out, state="up", token_known=True, **self.transfer_gui_url(port, spec, *found[-1]))
+         extra = {}
+         if spec.get("password_re") is not None:
+             extra["password"] = self._app_token(name, app, "password_re")
+         return dict(out, state="up", version=info.get("version"), url=url,
+                     token_known=token is not None or "token_re" not in spec, **extra)
+ 
++    @staticmethod
++    def transfer_gui_url(port, spec, which, fields):
++        """
++        Where Open goes for a GUI's HPCLIB_TRANSFER_GUI line (TRANSFER_GUI_RE): path= (default the app's
++        open_path), and query= as given (already URL-encoded); user= and pass= go in the address, answering the
++        server's basic-auth prompt for the page, and are shown in case it asks again. The port is the console's.
++        """
++        given = dict(f.split("=", 1) for f in fields.split())
++        user, password = given.get("user"), given.get("pass")
++        path, query = given.get("path") or spec["open_path"], given.get("query")
++        path = "/" + path.lstrip("/")             # on this port, whatever the GUI printed
++        if which == "RCLONE":       # an older smbshell: rclone's GUI takes the same login for its API calls
++            query = "login_token=" + urllib.parse.quote(
++                base64.urlsafe_b64encode(f"{user}:{password}".encode()).decode(), safe="")
++        q = urllib.parse.quote
++        login = f"{q(user, safe='')}:{q(password or '', safe='')}@" if user else ""
++        url = f"http://{login}127.0.0.1:{port}{path}" + (f"?{query}" if query else "")
++        return dict(url=url, **({"username": user, "password": password} if user else {}))
++
+     def app_sessions(self, app):
+         self.app_spec(app)
+         profiles = agent_profiles.all_profiles()
+@@ -1722,8 +1751,6 @@ class Clusters:
+ 
+     def app_start(self, profile, app):
+         spec = self.app_spec(app)
+-        if spec.get("kind") == "tool":
+-            raise ConsoleError(400, f"{spec['title']} has nothing to start; use smbshell, or its controls")
+         name = profile["name"]
+         _, conf = self.app_config(profile, app)
+         with self.lock:
+@@ -1744,7 +1771,8 @@ class Clusters:
+             if (conf.get("install") or {}).get("state") == "missing" and self.app_installable(app):
+                 raise ConsoleError(409, f"{spec['title']} isn't installed on {name} ({conf['install'].get('message')})")
+         if spec.get("kind") == "login":
+-            # smbshell gui on the login node; the console's ssh forwards the port (stop_tunnel cancels it)
++            # smbshell gui (the GUI SMB_GUI names) on the login node; the console's ssh forwards the port
++            # (stop_tunnel cancels it)
+             port = str(conf["port"])
+             args = (["smbshell", "--on", "-L", f"127.0.0.1:{port}:127.0.0.1:{port}"] + ssh_options(profile) +
+                     [profile["host"], "gui", "--port", port])
+@@ -2114,8 +2142,7 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
+         if action == ["stop"] and verb == "POST":
+             return 200, dict(c.app_stop(profile, app), ok=True)
+         if action == ["answer"] and verb == "POST":
+-            with c.lock:
+-                proc = c.app_procs.get((profile["name"], app))
++            proc = c.app_waiting(profile["name"], app)
+             return 200, dict(c.answer_prompt(proc, self.json_body().get("answer")), ok=True)
+         if action == ["log"] and verb == "GET":
+             return 200, dict(c.app_log(profile["name"], app, self.int_arg("lines", 200, 1, 5000)), ok=True)
+diff --git a/hpclib/tunnels/data-transfer/settings.sh b/hpclib/tunnels/data-transfer/settings.sh
+index f11af12..5728f08 100644
+--- a/hpclib/tunnels/data-transfer/settings.sh
++++ b/hpclib/tunnels/data-transfer/settings.sh
+@@ -6,6 +6,8 @@
+ #   SMB_SPN            the server's Kerberos name, if not cifs/SMB_HOST (smbshell find-spn finds it)
+ #   SMB_REALM          the Kerberos realm for kinit, e.g. AUTH.EXAMPLE.EDU (default: krb5.conf's default realm)
+ #   SMB_AUTH           auto (Kerberos when you have a ticket, else the saved password, else ask), kerberos or password
++#   SMB_GUI            what smbshell gui serves: rclone (default; rclone's web GUI), NAME for NAME.gui.sh in
++#                      settings/data-transfer.d/ (from a settings package), or a program (see smbshell --help)
+ #   SMB_IMAGE          the data-transfer-tools image (default /scratch/user/USER/images/data-transfer-tools.sif)
+ #   SMB_IMAGE_SOURCE   where install.sh gets it (default docker://ghcr.io/tabor-research-group/data-transfer-tools:latest):
+ #                      oras://..., docker://..., library://..., a .def file to build (singularity build --fakeroot),
+@@ -18,8 +20,9 @@ if [ -f "$_smb_settings" ]; then
+ fi
+ SMB_USER="${SMB_USER:-$(id -un)}"
+ SMB_AUTH="${SMB_AUTH:-auto}"
++SMB_GUI="${SMB_GUI:-rclone}"
+ SMB_IMAGE="${SMB_IMAGE:-/scratch/user/$(id -un)/images/data-transfer-tools.sif}"
+ SMB_IMAGE_SOURCE="${SMB_IMAGE_SOURCE:-docker://ghcr.io/tabor-research-group/data-transfer-tools:latest}"
+ SMB_CREDENTIALS="${SMB_CREDENTIALS:-$HOME/.config/hpclib/smb/credentials}"
+ SMB_KRB5CCNAME="${SMB_KRB5CCNAME:-$HOME/.config/hpclib/smb/krb5cc}"
+-export SMB_HOST SMB_ROOT SMB_SPN SMB_USER SMB_DOMAIN SMB_REALM SMB_AUTH SMB_IMAGE SMB_IMAGE_SOURCE SMB_CREDENTIALS SMB_KRB5CCNAME
++export SMB_HOST SMB_ROOT SMB_SPN SMB_USER SMB_DOMAIN SMB_REALM SMB_AUTH SMB_GUI SMB_IMAGE SMB_IMAGE_SOURCE SMB_CREDENTIALS SMB_KRB5CCNAME
+diff --git a/hpclib/tunnels/data-transfer/smbshell.sh b/hpclib/tunnels/data-transfer/smbshell.sh
+index aadd301..72d2cb5 100644
+--- a/hpclib/tunnels/data-transfer/smbshell.sh
++++ b/hpclib/tunnels/data-transfer/smbshell.sh
+@@ -17,14 +17,28 @@
+ #   smbshell save-credentials | forget-credentials  a saved password, for jobs where there is no Kerberos
+ #   smbshell status [--json]                        the image, and how it would sign in
+ #   smbshell shell                                  a shell in the image, with the server as rclone's "smb:"
+-#   smbshell gui --port PORT                        rclone's web GUI (rclone rcd --rc-web-gui) on 127.0.0.1:PORT
+-#                                                   of this node, signed in for this session only (the console's
+-#                                                   Rclone page forwards it to your browser)
++#   smbshell gui --port PORT                        a web GUI on 127.0.0.1:PORT of this node, signed in for this
++#                                                   session only (the console's Data transfer page forwards it to
++#                                                   your browser): rclone's (rclone rcd --rc-web-gui), or the one
++#                                                   SMB_GUI names (see "A GUI of your own" below)
+ #   smbshell rclone ARGS...                         rclone itself, likewise
+ #
+ # REMOTE is a path under SMB_ROOT (e.g. research/our_group) when that is set, else SHARE/PATH on
+ # SMB_HOST; /SHARE/PATH and //HOST/SHARE/PATH are absolute. Signing in (SMB_AUTH=auto): a Kerberos ticket from
+ # `smbshell login`, else the saved password, else it asks (never in a job). Settings: settings.sh here.
++#
++# A GUI of your own (SMB_GUI=NAME, for NAME.gui.sh in ~/.local/tunnels/settings/data-transfer.d/, where a settings
++# package puts it; or SMB_GUI=/path/to/program): `smbshell gui` signs in, then runs it (with bash, unless it is an
++# executable path) on this node with
++#   HPCLIB_GUI_PORT    the port to serve on, at 127.0.0.1 only
++#   HPCLIB_GUI_USER    a login made for this session (random): require it, since anyone on this node can reach
++#   HPCLIB_GUI_PASS    127.0.0.1:PORT
++#   HPCLIB_GUI_DIR     a private directory in memory, removed when it stops
++#   RCLONE_CONFIG      rclone's remotes, signed in: smb (the server), cluster (this node's files), and the extras
++#   SMBSHELL_RCLONE    rclone in the image with that config: "$SMBSHELL_RCLONE" lsjson smb:SHARE/DIR
++# It prints one line on standard output once it serves, saying where to open it:
++#   HPCLIB_TRANSFER_GUI port=PORT [path=/start] [user=USER pass=PASS] [query=a=1&b=2]   (values without spaces)
++# and runs until it gets TERM (Stop, or the session ending).
+ 
+ set -o pipefail
+ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+@@ -34,7 +48,7 @@ logdir="${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/sessions/data-transfer"
+ binds=()
+ 
+ die() { echo "smbshell: $*" >&2; exit 1; }
+-usage() { sed -n '2,24p' "$here/smbshell.sh" | sed 's/^# \{0,1\}//'; }
++usage() { sed -n '2,/^$/p' "$here/smbshell.sh" | sed 's/^# \{0,1\}//'; }   # the comment above
+ 
+ need_image() {
+   [ -n "$runtime" ] || die "neither singularity nor apptainer is on this node's PATH"
+@@ -418,6 +432,17 @@ PY
+       esac
+     done
+     case "$port" in ''|*[!0-9]*) die "usage: smbshell gui --port PORT" ;; esac
++    # which GUI (SMB_GUI): rclone's own, or a program of yours, found before asking for a password
++    gui="${SMB_GUI:-rclone}"
++    gui_prog=''
++    case "$gui" in
++      rclone) ;;
++      */*) gui_prog="$gui" ;;
++      *[!A-Za-z0-9_.-]*) die "SMB_GUI is rclone, a NAME (letters, digits, _ . -) or a path; not $gui" ;;
++      *) gui_prog="${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/settings/data-transfer.d/$gui.gui.sh" ;;
++    esac
++    [ -z "$gui_prog" ] || [ -f "$gui_prog" ] ||
++      die "no GUI $gui: $gui_prog doesn't exist (SMB_GUI: rclone, NAME for data-transfer.d/NAME.gui.sh, or a program)"
+     # marked as hpclib's for this port (see _hpclib_port_holders), and the port cleared of what an earlier GUI
+     # or tunnel of yours left on it, before asking for a password
+     export HPCLIB_TUNNEL_PORT="$port"
+@@ -475,10 +500,31 @@ PY
+       [ -n "$d" ] && [ -d "$d" ] && binds+=(--bind "$d")
+     done
+     binds+=(--bind "$run_dir")
+-    echo "HPCLIB_RCLONE_GUI port=$port user=$gui_user pass=$gui_pass"
+-    echo "smbshell: rclone's web GUI on 127.0.0.1:$port of $(hostname -s); remotes: smb, cluster${extra_names:+, ${extra_names% }}" >&2
+-    ( img_exec rclone rcd --config "$conf" --rc-web-gui --rc-web-gui-no-open-browser --rc-addr "127.0.0.1:$port" \
+-        --rc-user "$gui_user" --rc-pass "$gui_pass" --retries 1 --low-level-retries 1 < /dev/null ) &
++    if [ -z "$gui_prog" ]; then
++      # rclone's GUI takes its login in the address for the page, and again (login_token) for its API calls
++      token=$(printf '%s:%s' "$gui_user" "$gui_pass" | base64 | tr -d '\n' | tr '+/' '-_' | sed 's/=/%3D/g')
++      echo "HPCLIB_TRANSFER_GUI port=$port user=$gui_user pass=$gui_pass query=login_token=$token"
++      echo "smbshell: rclone's web GUI on 127.0.0.1:$port of $(hostname -s); remotes: smb, cluster${extra_names:+, ${extra_names% }}" >&2
++      ( img_exec rclone rcd --config "$conf" --rc-web-gui --rc-web-gui-no-open-browser --rc-addr "127.0.0.1:$port" \
++          --rc-user "$gui_user" --rc-pass "$gui_pass" --retries 1 --low-level-retries 1 < /dev/null ) &
++    else
++      # rclone in the image, with the session's remotes and sign-in, for the GUI to call
++      need_image
++      {
++        printf '#!/bin/bash\n'
++        [ -n "$krb5_conf" ] && printf 'export KRB5_CONFIG=/etc/hpclib-krb5.conf\n'
++        printf 'exec'
++        printf ' %q' "$runtime" exec "${binds[@]}" "$SMB_IMAGE" rclone --config "$conf"
++        printf ' "$@"\n'
++      } > "$run_dir/rclone"
++      chmod 700 "$run_dir/rclone"
++      run=(bash "$gui_prog")                     # a settings package's NAME.gui.sh isn't executable
++      [ "$gui_prog" = "$gui" ] && [ -x "$gui" ] && run=("$gui")
++      echo "smbshell: $gui on 127.0.0.1:$port of $(hostname -s); remotes: smb, cluster${extra_names:+, ${extra_names% }}" >&2
++      ( export HPCLIB_GUI_PORT="$port" HPCLIB_GUI_USER="$gui_user" HPCLIB_GUI_PASS="$gui_pass" \
++               HPCLIB_GUI_DIR="$run_dir" RCLONE_CONFIG="$conf" SMBSHELL_RCLONE="$run_dir/rclone"
++        exec "${run[@]}" < /dev/null ) &
++    fi
+     gui_pid=$!
+     # the session's parent (sshd, or the shell that ran this): when it is gone the session is, even if no hangup
+     # arrived (a dropped connection), so the GUI stops too
+diff --git a/hpclib/tunnels/data-transfer/tunnel_config.sh b/hpclib/tunnels/data-transfer/tunnel_config.sh
+index 0e8771b..5660db3 100644
+--- a/hpclib/tunnels/data-transfer/tunnel_config.sh
++++ b/hpclib/tunnels/data-transfer/tunnel_config.sh
+@@ -1,5 +1,6 @@
+ # Not a port-forwarding tunnel: SMB file transfers with rclone, from the data-transfer-tools container.
+ # `smbshell` (smbshell.sh here) runs them on the login node; `smbshell submit` runs them as SLURM jobs
+-# (sbatch_script.sh). Settings (setup_tunnel.sh --set, the console's Data transfer settings):
+-TUNNEL_SETTINGS="SMB_HOST SMB_ROOT SMB_USER SMB_DOMAIN SMB_REALM SMB_SPN SMB_AUTH SMB_IMAGE SMB_IMAGE_SOURCE"
++# (sbatch_script.sh); `smbshell gui` serves a web GUI on the login node (the console's Data transfer Start).
++# Settings (setup_tunnel.sh --set, the console's Data transfer settings):
++TUNNEL_SETTINGS="SMB_HOST SMB_ROOT SMB_USER SMB_DOMAIN SMB_REALM SMB_SPN SMB_AUTH SMB_GUI SMB_IMAGE SMB_IMAGE_SOURCE"
+ DEFAULT_SBATCH_ARGS="--time=0-4:00:00 --mem=2gb --ntasks=1 --cpus-per-task=2"
+diff --git a/tests/test_agent_console.py b/tests/test_agent_console.py
+index b62a2a6..8307407 100644
+--- a/tests/test_agent_console.py
++++ b/tests/test_agent_console.py
+@@ -603,8 +603,8 @@ class TestApps(ConsoleTestCase):
+ 
+     def test_listing_and_ports(self):
+         out = self.call("GET", "/api/apps")[1]
+-        self.assertEqual([a["id"] for a in out["apps"]], ["agents", "jupyter", "vscode", "transfer", "rclone"])   # PAI is a package now
+-        self.assertEqual({a["id"]: a.get("kind") for a in out["apps"]}["transfer"], "tool")
++        self.assertEqual([a["id"] for a in out["apps"]], ["agents", "jupyter", "vscode", "transfer"])   # PAI is a package now
++        self.assertEqual({a["id"]: a.get("kind") for a in out["apps"]}["transfer"], "login")
+         status, out = self.call("GET", "/api/apps/jupyter")
+         self.assertEqual(status, 200)
+         by_name = {x["cluster"]: x for x in out["sessions"]}
+@@ -865,6 +865,7 @@ FAKE_KINIT = textwrap.dedent("""\
+ 
+ class TestDataTransfer(ConsoleTestCase):
+     """The Data transfer page: signing in to the SMB server (kinit, or a password saved for jobs) for smbshell."""
++    serve = TestApps.serve
+ 
+     def setUp(self):
+         super().setUp()
+@@ -877,9 +878,12 @@ class TestDataTransfer(ConsoleTestCase):
+ 
+     def test_status_and_controls(self):
+         state = self.call("GET", self.route)[1]
+-        self.assertEqual((state["kind"], state["auth"], state["port"]), ("tool", None, None))
++        self.assertEqual((state["kind"], state["auth"], state["state"], state["signing_in"]), ("login", None, "down", False))
+         self.assertEqual([c["id"] for c in state["controls"]], ["status"])
+-        self.assertEqual(self.call("POST", self.route + "/start")[0], 400)
++        self.assertEqual(self.call("POST", self.route + "/start")[0], 409)                    # needs the login
++        settings = self.call("GET", self.route + "/settings")[1]
++        self.assertFalse(settings["job"])                                  # the login node's: no sbatch options
++        self.assertIn("SMB_GUI", [f["name"] for f in settings["fields"]])
+         self.assertEqual(self.call("POST", self.route + "/control/status", {})[0], 409)          # needs the login
+         with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+             status, out = self.call("POST", self.route + "/control/status", {})
+@@ -956,34 +960,92 @@ class TestDataTransfer(ConsoleTestCase):
+         self.assertNotIn("kerberos-pass", log)
+ 
+ 
+-class TestRcloneGui(ConsoleTestCase):
+-    """Rclone: rclone's web GUI on the login node, its port forwarded over the console's login."""
++class TestTransferGui(ConsoleTestCase):
++    """Data transfer's Start: a web GUI on the login node (rclone's, or SMB_GUI's), its port forwarded over the login."""
+     serve = TestApps.serve
+ 
++    def setUp(self):
++        super().setUp()
++        self.route = f"/api/apps/transfer/{self.dead}"
++        self.call("GET", self.route)          # picks its ports
++        self.shell.setup_status = "installed /x/data-transfer-tools.sif"    # Start checks first: settings unsent
++        self.port = agent_profiles.load(self.dead)["apps"]["transfer"]["port"]
++        self.host = agent_profiles.load(self.dead)["host"]
++        self.log = self.console / "logs" / f"{self.dead}.transfer.log"
++
++    def start(self):
++        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
++            status, out = self.call("POST", self.route + "/start")
++        self.assertEqual(status, 202, out)
++        self.assertEqual(self.shell.calls[-1], ["smbshell", "--on", "-L", f"127.0.0.1:{self.port}:127.0.0.1:{self.port}",
++                                                self.host, "gui", "--port", str(self.port)])
++
++    def printed(self, line):
++        self.log.write_text(self.log.read_text() + line + "\r\n")
++
+     def test_start_and_open(self):
+-        route = f"/api/apps/rclone/{self.dead}"
+-        state = self.call("GET", route)[1]
+-        self.assertEqual((state["kind"], state["state"]), ("login", "down"))
+-        port = agent_profiles.load(self.dead)["apps"]["rclone"]["port"]
+-        host = agent_profiles.load(self.dead)["host"]
++        self.assertEqual(self.call("GET", self.route)[1]["state"], "down")
++        self.start()
+         with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+-            status, out = self.call("POST", route + "/start")
+-            self.assertEqual(status, 202, out)
+-            self.assertEqual(self.shell.calls[-1], ["smbshell", "--on", "-L", f"127.0.0.1:{port}:127.0.0.1:{port}",
+-                                                    host, "gui", "--port", str(port)])
+-            # Check and Install use Data transfer's image, and never overwrite its settings
+-            self.call("POST", route + "/check")
+-            self.assertEqual(self.shell.calls[-1], ["tunnel_setup", host, "data-transfer", "--check"])
+-        # once it prints its login, Open goes straight in
+-        log = self.console / "logs" / f"{self.dead}.rclone.log"
+-        log.write_text(log.read_text() + "HPCLIB_RCLONE_GUI port=%d user=hpclib pass=0a1b2c\r\n" % port)
+-        self.serve(port)
+-        state = self.call("GET", route)[1]
++            # Check sends its settings, as for any app that has them
++            self.call("POST", self.route + "/check")
++            self.assertEqual(self.shell.calls[-1][:3], ["tunnel_setup", self.host, "data-transfer"])
++            self.assertEqual(self.shell.calls[-1][-2:], ["--save", "--check"])
++        self.serve(self.port)
++        state = self.call("GET", self.route)[1]
++        self.assertEqual((state["state"], state["url"]), ("starting", None), state)    # nothing printed yet
++        # once it says where, Open goes straight in: rclone's GUI with its login in the address and login_token
++        self.printed("HPCLIB_TRANSFER_GUI port=%d user=hpclib pass=0a1b2c query=login_token=aHBjbGliOjBhMWIyYw%%3D%%3D"
++                     % self.port)
++        state = self.call("GET", self.route)[1]
+         self.assertEqual(state["state"], "up", state)
+-        self.assertEqual(state["url"], f"http://hpclib:0a1b2c@127.0.0.1:{port}/?login_token=aHBjbGliOjBhMWIyYw%3D%3D")
++        self.assertEqual(state["url"], f"http://hpclib:0a1b2c@127.0.0.1:{self.port}/?login_token=aHBjbGliOjBhMWIyYw%3D%3D")
+         self.assertEqual((state["username"], state["password"]), ("hpclib", "0a1b2c"))
+-        self.call("POST", route + "/stop")
+-        self.assertEqual(self.shell.calls[-1], ["stop_tunnel", "-P", str(port), host])
++        self.call("POST", self.route + "/stop")
++        self.assertEqual(self.shell.calls[-1], ["stop_tunnel", "-P", str(self.port), self.host])
++
++    def test_other_guis(self):
++        self.start()
++        self.serve(self.port)
++        # a GUI of your own (SMB_GUI): where it starts, and no login in the address if it gives none
++        self.printed("HPCLIB_TRANSFER_GUI port=%d path=/browse query=root=research%%2Fours" % self.port)
++        state = self.call("GET", self.route)[1]
++        self.assertEqual(state["url"], f"http://127.0.0.1:{self.port}/browse?root=research%2Fours")
++        self.assertNotIn("username", state)
++        # an hpclib on the cluster from before SMB_GUI: rclone's line, opened as before
++        self.printed("HPCLIB_RCLONE_GUI port=%d user=hpclib pass=0a1b2c" % self.port)
++        self.assertEqual(self.call("GET", self.route)[1]["url"],
++                         f"http://hpclib:0a1b2c@127.0.0.1:{self.port}/?login_token=aHBjbGliOjBhMWIyYw%3D%3D")
++
++    def test_signing_in_beside_the_gui(self):
++        script = self.tmp / "fake-kinit"
++        script.write_text(FAKE_KINIT)
++        script.chmod(0o755)
++        self.start()
++        self.serve(self.port)
++        self.printed("HPCLIB_TRANSFER_GUI port=%d user=hpclib pass=0a1b2c" % self.port)
++        self.clusters.tunnel_runner = lambda args, log_path: agent_console.PtySession([str(script)], log_path, dict(os.environ))
++        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
++            self.assertEqual(self.call("POST", self.route + "/control/kinit", {})[0], 200)
++            for _ in range(50):
++                state = self.call("GET", self.route)[1]
++                if state["prompt"]:
++                    break
++                time.sleep(0.1)
++            # the GUI runs on: its process, and the login it printed, are its own
++            self.assertEqual((state["state"], state["signing_in"]), ("up", True), state)
++            self.assertTrue(state["url"].startswith("http://hpclib:0a1b2c@"))
++            self.assertIn("Kerberos", state["prompt"]["note"])
++            self.assertEqual(self.call("POST", self.route + "/answer", {"answer": "kerberos-pass"})[0], 200)
++            for _ in range(50):
++                if not self.call("GET", self.route)[1]["signing_in"]:
++                    break
++                time.sleep(0.1)
++        state = self.call("GET", self.route)[1]
++        self.assertEqual((state["state"], state["signing_in"]), ("up", False), state)
++        self.assertTrue(state["url"].startswith("http://hpclib:0a1b2c@"))
++        self.assertIsNotNone(self.clusters.app_procs.get((self.dead, "transfer")))
++        self.assertIn("signed in: me@AUTH.EXAMPLE.EDU", self.log.read_text())
+ 
+ 
+ class TestSecondLogin(ConsoleTestCase):
+diff --git a/tests/test_console_packages.py b/tests/test_console_packages.py
+index c514d2e..cafe706 100644
+--- a/tests/test_console_packages.py
++++ b/tests/test_console_packages.py
+@@ -344,9 +344,6 @@ class TestConsolePackages(ConsoleTestCase):
+             self.assertIn("SMB_HOST=files.example.edu", call)
+             stage = Path(call[call.index("--push") + 1])
+             self.assertEqual(os.listdir(stage), ["settings.d"])
+-            # Rclone shares the tunnel: its Check sends the same files (it has no settings of its own)
+-            self.call("POST", f"/api/apps/rclone/{self.dead}/check")
+-            self.assertIn("--push", self.shell.calls[-1])
+             # once removed, the next Check sends an empty settings.d, clearing the cluster's copy
+             self.call("DELETE", "/api/packages/our-lab")
+             self.call("POST", f"/api/apps/transfer/{self.dead}/check")
+diff --git a/tests/test_tunnel_management.sh b/tests/test_tunnel_management.sh
+index c3ad476..292b547 100644
+--- a/tests/test_tunnel_management.sh
++++ b/tests/test_tunnel_management.sh
+@@ -824,7 +824,14 @@ printf 'pass=OBS:hunter2\n' > "$sb/home/.config/hpclib/smb/credentials"
+ out=$(env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
+   XDG_RUNTIME_DIR="$sb/run" SMB_ROOT=research/our_group SMB_AUTH=password \
+   bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" gui --port 27555 2>/dev/null < /dev/null) || fail "gui: $out"
+-case "$out" in "HPCLIB_RCLONE_GUI port=27555 user=hpclib pass="[0-9a-f]*) ;; *) fail "gui login line: $out" ;; esac
++case "$out" in "HPCLIB_TRANSFER_GUI port=27555 user=hpclib pass="[0-9a-f]*" query=login_token="*) ;; *) fail "gui line: $out" ;; esac
++# rclone's GUI takes the login again as login_token: base64url of user:pass, URL-encoded
++python3 - "$out" <<'PY2' || fail "gui login_token: $out"
++import base64, sys, urllib.parse
++f = dict(x.split("=", 1) for x in sys.argv[1].split()[1:])
++token = urllib.parse.quote(base64.urlsafe_b64encode(f"{f['user']}:{f['pass']}".encode()).decode(), safe="")
++sys.exit(f["query"] != "login_token=" + token)
++PY2
+ grep -q -- '--rc-web-gui --rc-web-gui-no-open-browser --rc-addr 127.0.0.1:27555 --rc-user hpclib --rc-pass ' "$sb/log" ||
+   fail "rcd: $(cat "$sb/log")"
+ sed -n '/^--- config$/,/^--- end$/p' "$sb/log" > "$sb/gui.conf"
+@@ -833,6 +840,33 @@ for want in '[smb]' 'type = smb' 'host = files.example.edu' 'domain = EXAMPLE' '
+   grep -qxF "$want" "$sb/gui.conf" || fail "gui config lacks '$want': $(cat "$sb/gui.conf")"
+ done
+ grep -qF '[lab]' "$sb/gui.conf" && fail 'the gui config still has a [lab] remote of its own'
++# a GUI of your own (SMB_GUI=NAME: NAME.gui.sh, as a settings package leaves it, not executable): signed in, with
++# the session's remotes, a login to require, and rclone in the image to call; it says where to open it
++cat > "$sb/data/settings/data-transfer.d/mine.gui.sh" <<'SCRIPT'
++echo "HPCLIB_TRANSFER_GUI port=$HPCLIB_GUI_PORT path=/files user=$HPCLIB_GUI_USER pass=$HPCLIB_GUI_PASS"
++echo "mine port=$HPCLIB_GUI_PORT dir=$HPCLIB_GUI_DIR config=$RCLONE_CONFIG" >> "$TEST_SMB_LOG"
++[ "$(dirname "$RCLONE_CONFIG")" = "$HPCLIB_GUI_DIR" ] && grep -qxF '[ours]' "$RCLONE_CONFIG" ||
++  echo "mine: no session config" >> "$TEST_SMB_LOG"
++"$SMBSHELL_RCLONE" lsjson smb:research
++SCRIPT
++: > "$sb/log"
++out=$(env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
++  XDG_RUNTIME_DIR="$sb/run" SMB_AUTH=password SMB_GUI=mine \
++  bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" gui --port 27555 2>/dev/null < /dev/null) || fail "own gui: $out"
++case "$out" in "HPCLIB_TRANSFER_GUI port=27555 path=/files user=hpclib pass="[0-9a-f]*) ;; *) fail "own gui line: $out" ;; esac
++grep -q "^mine port=27555 dir=$sb/run/hpclib-rclone-gui\." "$sb/log" || fail "own gui's environment: $(cat "$sb/log")"
++grep -q 'mine: no session config' "$sb/log" && fail "own gui's config: $(cat "$sb/log")"
++grep -q "^rclone --config $sb/run/hpclib-rclone-gui\.[A-Za-z0-9]*/rclone.conf lsjson smb:research$" "$sb/log" ||
++  fail "own gui's rclone: $(cat "$sb/log")"
++grep -q "^binds=.*$sb/run/hpclib-rclone-gui\." "$sb/log" || fail "own gui's rclone sees no config: $(cat "$sb/log")"
++grep -q -- '--rc-web-gui' "$sb/log" && fail "rclone's GUI ran too: $(cat "$sb/log")"
++# one that isn't there, or isn't a name, stops before asking for a password
++for gui in nope 'a b'; do
++  out=$(env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
++    XDG_RUNTIME_DIR="$sb/run" SMB_GUI="$gui" bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" gui --port 27555 \
++    2>&1 < /dev/null) && fail "SMB_GUI=$gui ran"
++  case "$out" in *"no GUI nope"*|*"SMB_GUI is rclone, a NAME"*) ;; *) fail "SMB_GUI=$gui: $out" ;; esac
++done
+ # a settings file may add remotes, not replace smbshell's own
+ printf '[smb]\ntype = local\n' > "$sb/data/settings/data-transfer.d/rclone.conf"
+ if env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \

@@ -1,0 +1,1460 @@
+diff --git a/hpclib/servers/agent_console.py b/hpclib/servers/agent_console.py
+--- a/hpclib/servers/agent_console.py
++++ b/hpclib/servers/agent_console.py
+@@ -17,6 +17,8 @@
+ The front end depends only on the routes below; nothing here depends on it.
+ 
+   GET  /api/health
++  POST /api/styles/open                      create console/user.css from default-styles.css if absent,
++                                              then ask the OS to open it with its default CSS application
+   GET  /api/clusters                          profiles + tunnel state, no token values
+   GET  /api/clusters/NAME
+   GET  /api/clusters/NAME/mcp                 the MCP client entry setup_agents wrote
+@@ -308,6 +310,23 @@
+     return os.path.expanduser(os.environ.get("HPCLIB_CONSOLE_DIR") or "~/.config/hpclib/console")
+ 
+ 
++def open_with_default_application(path):
++    """Use the OS file association; never choose or look for an editor ourselves."""
++    if sys.platform == "win32":
++        os.startfile(path)
++        return
++    command = "/usr/bin/open" if sys.platform == "darwin" else "xdg-open"
++    proc = subprocess.Popen([command, path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
++                            stderr=subprocess.DEVNULL, start_new_session=True)
++    try:
++        status = proc.wait(timeout=2)
++    except subprocess.TimeoutExpired:
++        # Some desktop handlers stay running with the application. Leave them running.
++        return
++    if status:
++        raise OSError(f"the OS file opener exited with status {status}")
++
++
+ def write_private(path, text):
+     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp.")
+@@ -1927,6 +1946,7 @@
+         self.clusters = clusters
+         self.allow_origin = allow_origin.rstrip("/") if allow_origin else None
+         self.static_dir = os.path.realpath(static_dir) if static_dir else None
++        self.stylesheet_lock = threading.Lock()
+         self.max_body = max_body
+         super().__init__(address, ConsoleHandler)
+ 
+@@ -2060,6 +2080,8 @@
+     def route(self, verb, path):
+         parts = [urllib.parse.unquote(p) for p in path.strip("/").split("/")[1:]]  # without "api"
+         c = self.server.clusters
++        if parts == ["styles", "open"] and verb == "POST":
++            return 200, self.open_stylesheet()
+         if parts == ["health"] and verb == "GET":
+             return 200, {"ok": True, "console": VERSION, "clusters": len(c.names()), "pid": os.getpid(),
+                          "hpclib_version": local_hpclib_version()}
+@@ -2293,7 +2315,45 @@
+             raise ConsoleError(404, f"no mcp.json for {profile['name']}; rerun setup_agents")
+         return {"ok": True, "mcp": entry, "name": profile.get("mcp_name")}
+ 
++    def open_stylesheet(self):
++        path = os.path.abspath(os.path.join(console_dir(), "user.css"))
++        created = False
++        with self.server.stylesheet_lock:
++            if not os.path.lexists(path):
++                if not self.server.static_dir:
++                    raise ConsoleError(503, "default-styles.css is unavailable; run the console with --static")
++                defaults = os.path.join(self.server.static_dir, "default-styles.css")
++                try:
++                    with open(defaults, "rb") as f:
++                        content = f.read()
++                except OSError as e:
++                    raise ConsoleError(503, "could not read the bundled default-styles.css") from e
++                os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
++                try:
++                    # Exclusive creation also preserves a file another process just created.
++                    with open(path, "xb") as f:
++                        f.write(content)
++                    created = True
++                except FileExistsError:
++                    pass
++            if not os.path.isfile(path):
++                raise ConsoleError(409, "user.css exists but is not a file")
++        try:
++            open_with_default_application(path)
++        except (OSError, NotImplementedError) as e:
++            raise ConsoleError(503, f"could not open user.css with the OS default application: {e}", path=path) from e
++        return {"ok": True, "path": path, "created": created}
++
+     def serve_static(self, path):
++        # One optional user file outside --static; never expose the console's other files.
++        # Handle it before the SPA fallback, which would otherwise return HTML when it is absent.
++        if path == "/user.css":
++            try:
++                with open(os.path.join(console_dir(), "user.css"), "rb") as f:
++                    body = f.read()
++            except FileNotFoundError:
++                body = b""
++            return self.send_bytes(200, "text/css; charset=utf-8", body, cache=False)
+         root = self.server.static_dir
+         rel = urllib.parse.unquote(path).lstrip("/") or "index.html"
+         target = os.path.realpath(os.path.join(root, rel))
+diff --git a/agent-console/index.html b/agent-console/index.html
+--- a/agent-console/index.html
++++ b/agent-console/index.html
+@@ -6,10 +6,18 @@
+   <meta name="referrer" content="no-referrer">
+   <title>hpclib console</title>
+   <link rel="icon" type="image/x-icon" href="icon.png">
++  <link rel="stylesheet" href="default-styles.css">
+   <link rel="stylesheet" href="style.css">
++  <link rel="stylesheet" href="/user.css">
+ </head>
+ <body>
+   <div id="topbar">
++    <details id="console-menu">
++      <summary aria-label="Console menu" title="Console menu"><span aria-hidden="true">☰</span></summary>
++      <div id="console-menu-items">
++        <button id="open-stylesheet" type="button">Open Stylesheet</button>
++      </div>
++    </details>
+     <span class="brand">hpclib</span>
+     <nav id="apps"></nav>
+     <span id="topstatus" class="muted"></span>
+diff --git a/agent-console/app.js b/agent-console/app.js
+--- a/agent-console/app.js
++++ b/agent-console/app.js
+@@ -93,6 +93,34 @@
+ function alertError(err) {
+   main.prepend(el("hpc-panel", { dismissible: true }, errorBox(err)));
+ }
++
++// Native disclosure: Enter/Space toggles it, Tab reaches its action, Escape closes it.
++const consoleMenu = document.getElementById("console-menu");
++const menuToggle = consoleMenu.querySelector("summary");
++const openStylesheetButton = document.getElementById("open-stylesheet");
++openStylesheetButton.addEventListener("click", async () => {
++  if (openStylesheetButton.disabled) return;
++  openStylesheetButton.disabled = true;
++  consoleMenu.open = false;
++  menuToggle.focus();
++  try {
++    await api("styles/open", { method: "POST" });
++  } catch (err) {
++    alertError(err);
++  } finally {
++    openStylesheetButton.disabled = false;
++  }
++});
++document.addEventListener("pointerdown", (e) => {
++  if (!consoleMenu.contains(e.target)) consoleMenu.open = false;
++});
++document.addEventListener("keydown", (e) => {
++  if (e.key === "Escape" && consoleMenu.open) {
++    e.preventDefault();
++    consoleMenu.open = false;
++    menuToggle.focus();
++  }
++});
+ 
+ function diffView(text) {
+   return el("pre", {}, text.split("\n").map((line) => el("span", {
+diff --git a/agent-console/default-styles.css b/agent-console/default-styles.css
+new file mode 100644
+--- /dev/null
++++ b/agent-console/default-styles.css
+@@ -0,0 +1,156 @@
++/* Default console UI variables. Open Stylesheet copies this file to user.css once.
++   Keep both theme blocks when editing; changes apply after a browser reload. */
++:root {
++  /* Colours */
++  /* Page, inputs, panel and dialog background */
++  --bg: #ffffff;
++  /* Main text */
++  --fg: #1d1d1f;
++  /* Secondary text and hovered control borders */
++  --muted: #6e6e73;
++  /* Borders and table dividers */
++  --line: #e3e3e6;
++  /* Controls, logs and toolbar background */
++  --panel: #f6f6f8;
++  /* Primary actions, links and badges */
++  --accent: #2f6fdb;
++  /* Success, running states and additions */
++  --good: #1f8a4c;
++  /* Starting and queued states */
++  --warn: #b36b00;
++  /* Errors, failures and deletions */
++  --bad: #c62828;
++  /* Text on primary actions and badges */
++  --accent-fg: #fff;
++  /* Package, secret and token section dividers */
++  --separator: rgba(127, 127, 127, 0.25);
++  /* Image and HTML viewer background */
++  --viewer-bg: #fff;
++  /* Modal overlay colour */
++  --dialog-backdrop: rgb(0 0 0 / 0.35);
++  /* App bar background */
++  --topbar-bg: #16171a;
++  /* App bar text */
++  --topbar-fg: #e6e6e8;
++  /* Inactive app links */
++  --topbar-muted: #b8b8be;
++  /* Hovered app link and package button background */
++  --topbar-hover-bg: #2a2b30;
++  /* Active app link and hovered package button background */
++  --topbar-active-bg: #34363d;
++  /* Active and hovered app bar text */
++  --topbar-active-fg: #fff;
++  /* Package button text */
++  --topbar-button-fg: #e8e8ea;
++  /* Package button border */
++  --topbar-button-border: #44464e;
++
++  /* Typography */
++  /* UI and component close-button font family */
++  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
++  /* Logs, code, textareas, hashes and token values */
++  --font-mono: ui-monospace, Menlo, monospace;
++  /* Main UI and saved-result text size */
++  --font-size-base: 14px;
++  /* Badges, hints, errors and small text */
++  --font-size-small: 12px;
++  /* Preformatted text, textareas and hashes */
++  --font-size-code: 12px;
++  /* Page h2 headings */
++  --font-size-heading: 16px;
++  /* h3 headings, dialog headings and inline dismiss buttons */
++  --font-size-subheading: 15px;
++  /* h4 headings and app bar text */
++  --font-size-caption: 13px;
++  /* Tunnel toolbar labels */
++  --font-size-label: 11px;
++  /* Panel and dialog close symbols */
++  --close-font-size: 18px;
++  /* Main UI line height (unitless) */
++  --line-height-base: 1.45;
++  /* Code and textarea line height (unitless) */
++  --line-height-code: 1.4;
++  /* Table and field labels */
++  --font-weight-medium: 500;
++  /* Active links, states and panel headings */
++  --font-weight-semibold: 600;
++  /* App bar brand */
++  --font-weight-bold: 700;
++
++  /* Corners */
++  /* Buttons, inputs, logs, toolbars and close controls */
++  --radius-control: 6px;
++  /* Cards and panel frames */
++  --radius-panel: 8px;
++  /* Dialog frames */
++  --radius-dialog: 10px;
++  /* Count badges */
++  --radius-badge: 9px;
++
++  /* Spacing */
++  /* Small margins and row gaps */
++  --space-xs: 4px;
++  /* Small gaps and control spacing */
++  --space-sm: 6px;
++  /* Text, log and section spacing */
++  --space-md: 8px;
++  /* Toolbar gaps and section margins */
++  --space-lg: 12px;
++  /* Page padding, navigation gaps and large margins */
++  --space-xl: 16px;
++  /* Action-button and result gaps */
++  --action-gap: var(--space-sm);
++  /* Button and button-link padding */
++  --control-padding: 3px 10px;
++  /* Input and select padding */
++  --input-padding: 3px 6px;
++  /* Table cell padding */
++  --cell-padding: 6px 8px;
++  /* Panel frame padding */
++  --panel-padding: 10px 14px 12px;
++  /* Dialog frame padding */
++  --dialog-padding: 16px 18px;
++  /* Card padding */
++  --card-padding: 12px 16px;
++
++  /* Sizes and behaviour */
++  /* Main content width, including page padding */
++  --content-max-width: 1200px;
++  /* Dialog width before the viewport clamp */
++  --dialog-max-width: 440px;
++  /* Total horizontal clearance around dialogs */
++  --dialog-viewport-gap: 32px;
++  /* Close-button width, height and line height */
++  --close-size: 24px;
++  /* Ordinary preformatted blocks height cap */
++  --code-max-height: 420px;
++  /* Outer tunnel and operation log panel width cap (length or percentage) */
++  --log-max-width: 960px;
++  /* Log text area height cap */
++  --log-max-height: var(--code-max-height);
++  /* Use pre for internal horizontal scrolling or pre-wrap for wrapped logs */
++  --log-white-space: pre;
++  /* Use anywhere with pre-wrap to wrap unbroken log lines */
++  --log-overflow-wrap: normal;
++  /* HTML viewer height and text-file height cap */
++  --viewer-height: 70vh;
++  /* Inline action result width cap */
++  --action-result-max-width: 360px;
++  /* Disabled button opacity */
++  --disabled-opacity: 0.5;
++
++  color-scheme: light dark;
++}
++@media (prefers-color-scheme: dark) {
++  :root {
++    --bg: #18181a;
++    --fg: #ececee;
++    --muted: #9a9aa0;
++    --line: #333338;
++    --panel: #222226;
++    --accent: #6ea0ff;
++    --good: #4cc27f;
++    --warn: #e6a23c;
++    --bad: #ff6b6b;
++  }
++}
+diff --git a/agent-console/style.css b/agent-console/style.css
+--- a/agent-console/style.css
++++ b/agent-console/style.css
+@@ -1,215 +1,254 @@
+-:root {
+-  --bg: #ffffff;
+-  --fg: #1d1d1f;
+-  --muted: #6e6e73;
+-  --line: #e3e3e6;
+-  --panel: #f6f6f8;
+-  --accent: #2f6fdb;
+-  --good: #1f8a4c;
+-  --warn: #b36b00;
+-  --bad: #c62828;
+-  color-scheme: light dark;
+-}
+-@media (prefers-color-scheme: dark) {
+-  :root {
+-    --bg: #18181a;
+-    --fg: #ececee;
+-    --muted: #9a9aa0;
+-    --line: #333338;
+-    --panel: #222226;
+-    --accent: #6ea0ff;
+-    --good: #4cc27f;
+-    --warn: #e6a23c;
+-    --bad: #ff6b6b;
+-  }
+-}
++/* UI variable defaults live in default-styles.css; user.css is loaded last. */
+ 
+ * { box-sizing: border-box; }
+ body {
+   margin: 0;
+   background: var(--bg);
+   color: var(--fg);
+-  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
++  font: var(--font-size-base)/var(--line-height-base) var(--font-ui);
+ }
+ header {
+   display: flex;
+   align-items: center;
+   gap: 24px;
+-  padding: 10px 16px;
++  padding: 10px var(--space-xl);
+   border-bottom: 1px solid var(--line);
+ }
+-nav { display: flex; gap: 16px; flex: 1; }
++nav { display: flex; gap: var(--space-xl); flex: 1; }
+ nav a { color: var(--muted); text-decoration: none; }
+-nav a.active { color: var(--fg); font-weight: 600; }
+-main { padding: 16px; max-width: 1200px; }
+-h2 { font-size: 16px; margin: 4px 0 12px; }
++nav a.active { color: var(--fg); font-weight: var(--font-weight-semibold); }
++main { padding: var(--space-xl); max-width: var(--content-max-width); }
++h2 { font-size: var(--font-size-heading); margin: var(--space-xs) 0 var(--space-lg); }
+ 
+ table { border-collapse: collapse; width: 100%; }
+-th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+-th { color: var(--muted); font-weight: 500; }
++th, td { text-align: left; padding: var(--cell-padding); border-bottom: 1px solid var(--line); vertical-align: top; }
++th { color: var(--muted); font-weight: var(--font-weight-medium); }
+ td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+ 
+ button {
+   font: inherit;
+-  padding: 3px 10px;
+-  border: 1px solid var(--line);
+-  border-radius: 6px;
++  padding: var(--control-padding);
++  border: 1px solid var(--line);
++  border-radius: var(--radius-control);
+   background: var(--panel);
+   color: var(--fg);
+   cursor: pointer;
+ }
+ button:hover { border-color: var(--muted); }
+-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+-button:disabled { opacity: 0.5; cursor: default; }
+-.actions { display: flex; gap: 6px; flex-wrap: wrap; }
++button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
++button:disabled { opacity: var(--disabled-opacity); cursor: default; }
++.actions { display: flex; gap: var(--action-gap); flex-wrap: wrap; }
+ 
+ input, select {
+   font: inherit;
+-  padding: 3px 6px;
+-  border: 1px solid var(--line);
+-  border-radius: 6px;
+-  background: var(--bg);
+-  color: var(--fg);
+-}
+-.toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+-
+-.state { font-weight: 600; }
++  padding: var(--input-padding);
++  border: 1px solid var(--line);
++  border-radius: var(--radius-control);
++  background: var(--bg);
++  color: var(--fg);
++}
++.toolbar { display: flex; gap: var(--space-lg); align-items: center; margin-bottom: var(--space-lg); flex-wrap: wrap; }
++
++.state { font-weight: var(--font-weight-semibold); }
+ .state.up { color: var(--good); }
+ .state.starting { color: var(--warn); }
+ .state.down { color: var(--muted); }
+ .state.error { color: var(--bad); }
+ .muted { color: var(--muted); }
+-.error-box { color: var(--bad); margin: 8px 0; white-space: pre-wrap; }
++.error-box { color: var(--bad); margin: var(--space-md) 0; white-space: pre-wrap; }
+ .badge {
+   display: inline-block;
+   min-width: 18px;
+   padding: 0 5px;
+-  border-radius: 9px;
++  border-radius: var(--radius-badge);
+   background: var(--accent);
+-  color: #fff;
+-  font-size: 12px;
++  color: var(--accent-fg);
++  font-size: var(--font-size-small);
+   text-align: center;
+ }
+ 
+ pre {
+   background: var(--panel);
+   border: 1px solid var(--line);
+-  border-radius: 6px;
+-  padding: 8px;
++  border-radius: var(--radius-control);
++  padding: var(--space-md);
+   overflow: auto;
+-  max-height: 420px;
+-  font: 12px/1.4 ui-monospace, Menlo, monospace;
++  max-height: var(--code-max-height);
++  font: var(--font-size-code)/var(--line-height-code) var(--font-mono);
+   white-space: pre;
+ }
+ pre .add { color: var(--good); }
+ pre .del { color: var(--bad); }
+ pre .hunk { color: var(--accent); }
+-.detail { margin: 4px 0 12px; }
++.detail { margin: var(--space-xs) 0 var(--space-lg); }
+ 
+ /* custom elements (components.js); hpc-panel and hpc-dialog draw their frame in shadow DOM from the variables above */
+ hpc-panel, hpc-field, hpc-log { display: block; }
+ hpc-panel pre, hpc-log pre { margin: 0; }
+ hpc-panel > :first-child:not([slot]) { margin-top: 0; }
+ hpc-panel > :last-child { margin-bottom: 0; }
++/* Prevent unbroken output from determining an auto-layout table's intrinsic width.
++   The panel includes its frame; the text scrolls inside it. */
++hpc-panel.log-panel {
++  contain: inline-size;
++  width: 100%;
++  min-width: 0;
++  max-width: min(100%, var(--log-max-width), calc(100vw - 2 * var(--space-xl)));
++}
++hpc-log { contain: inline-size; min-width: 0; max-width: 100%; }
++pre.log {
++  width: 100%;
++  min-width: 0;
++  max-width: 100%;
++  max-height: var(--log-max-height);
++  white-space: var(--log-white-space);
++  overflow-wrap: var(--log-overflow-wrap);
++  overflow: auto;
++}
+ pre.log.error { color: var(--bad); }
+ hpc-dialog p:first-child { margin-top: 0; }
+-hpc-dialog input:not([type=checkbox]) { width: 100%; margin: 8px 0; }
+-hpc-dialog .actions { margin-top: 8px; }
++hpc-dialog input:not([type=checkbox]) { width: 100%; margin: var(--space-md) 0; }
++hpc-dialog .actions { margin-top: var(--space-md); }
+ hpc-cluster-row, hpc-app-session { display: table-row-group; }
+ hpc-cluster-row > tr:first-child > td, hpc-app-session > tr:first-child > td { border-top: 1px solid var(--line); }
+ table.rows td { border-bottom: none; }
+ table.rows .detail-row > td { padding-top: 0; }
+-hpc-action-button { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+-.action-out { display: inline-flex; align-items: center; gap: 2px; font-size: 12px; max-width: 360px; }
++hpc-action-button { display: inline-flex; align-items: center; gap: var(--action-gap); flex-wrap: wrap; }
++.action-out { display: inline-flex; align-items: center; gap: 2px; font-size: var(--font-size-small); max-width: var(--action-result-max-width); }
+ .action-out:empty { display: none; }
+ .action-out .error { color: var(--bad); white-space: pre-wrap; }
+-.action-out .saved { font-size: 14px; }
+-.action-out button.x { border: none; background: none; padding: 0 4px; color: var(--muted); font-size: 15px; line-height: 1; }
++.action-out .saved { font-size: var(--font-size-base); }
++.action-out button.x { border: none; background: none; padding: 0 var(--space-xs); color: var(--muted); font-size: var(--font-size-subheading); line-height: 1; }
+ hpc-cluster-picker select { min-width: 12em; }
+ hpc-env-editor { display: block; }
+ hpc-env-editor textarea[aria-invalid] { border-color: var(--bad); }
+-ul.env-errors { margin: 4px 0 0; padding-left: 18px; color: var(--bad); font-size: 12px; }
++ul.env-errors { margin: var(--space-xs) 0 0; padding-left: 18px; color: var(--bad); font-size: var(--font-size-small); }
+ ul.env-errors:empty { display: none; }
+ 
+-.card { border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; }
+-h3 { font-size: 15px; margin: 0 0 8px; }
+-h4 { font-size: 13px; margin: 16px 0 6px; }
++.card { border: 1px solid var(--line); border-radius: var(--radius-panel); padding: var(--card-padding); margin-bottom: var(--space-xl); }
++h3 { font-size: var(--font-size-subheading); margin: 0 0 var(--space-md); }
++h4 { font-size: var(--font-size-caption); margin: var(--space-xl) 0 var(--space-sm); }
+ .field { display: flex; flex-direction: column; gap: 3px; margin-bottom: 10px; }
+-.field > span { font-weight: 500; }
+-.field small { font-size: 12px; }
+-.row { display: flex; flex-wrap: wrap; gap: 4px 20px; }
++.field > span { font-weight: var(--font-weight-medium); }
++.field small { font-size: var(--font-size-small); }
++.row { display: flex; flex-wrap: wrap; gap: var(--space-xs) 20px; }
+ .row[hidden] { display: none; }
+ textarea {
+-  font: 12px/1.4 ui-monospace, Menlo, monospace;
++  font: var(--font-size-code)/var(--line-height-code) var(--font-mono);
+   width: 100%;
+   min-width: 280px;
+-  padding: 6px;
+-  border: 1px solid var(--line);
+-  border-radius: 6px;
++  padding: var(--space-sm);
++  border: 1px solid var(--line);
++  border-radius: var(--radius-control);
+   background: var(--bg);
+   color: var(--fg);
+ }
+ .saved { color: var(--good); }
+-details { margin-top: 12px; }
++details { margin-top: var(--space-lg); }
+ summary { cursor: pointer; color: var(--muted); }
+ .field select, .field input:not([size]) { align-self: flex-start; }
+ .badge[hidden] { display: none; }
+-.actions.second { margin-top: 4px; }
++.actions.second { margin-top: var(--space-xs); }
+ .toolbar h2 { margin: 0; }
+-.viewer img { max-width: 100%; height: auto; display: block; background: #fff; }
+-.viewer iframe { width: 100%; height: 70vh; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+-pre.file { max-height: 70vh; white-space: pre; }
++.viewer img { max-width: 100%; height: auto; display: block; background: var(--viewer-bg); }
++.viewer iframe { width: 100%; height: var(--viewer-height); border: 1px solid var(--line); border-radius: var(--radius-control); background: var(--viewer-bg); }
++pre.file { max-height: var(--viewer-height); white-space: pre; }
+ a.dir { color: var(--accent); text-decoration: none; }
+ 
+ #topbar {
+   display: flex;
+   align-items: center;
+   gap: 20px;
+-  padding: 6px 16px;
+-  background: #16171a;
+-  color: #e6e6e8;
+-  font-size: 13px;
+-}
+-#topbar .brand { font-weight: 700; letter-spacing: 0.02em; }
+-#topbar nav { display: flex; gap: 4px; flex: 1; }
+-#topbar nav a { color: #b8b8be; text-decoration: none; padding: 4px 10px; border-radius: 6px; }
+-#topbar nav a:hover { background: #2a2b30; color: #fff; }
+-#topbar nav a.active { background: #34363d; color: #fff; font-weight: 600; }
++  padding: var(--space-sm) var(--space-xl);
++  background: var(--topbar-bg);
++  color: var(--topbar-fg);
++  font-size: var(--font-size-caption);
++}
++#topbar .brand { font-weight: var(--font-weight-bold); letter-spacing: 0.02em; }
++#topbar nav { display: flex; gap: var(--space-xs); flex: 1; }
++#topbar nav a { color: var(--topbar-muted); text-decoration: none; padding: var(--space-xs) 10px; border-radius: var(--radius-control); }
++#topbar nav a:hover { background: var(--topbar-hover-bg); color: var(--topbar-active-fg); }
++#topbar nav a.active { background: var(--topbar-active-bg); color: var(--topbar-active-fg); font-weight: var(--font-weight-semibold); }
+ a.button {
+   display: inline-block;
+-  padding: 3px 10px;
+-  border: 1px solid var(--line);
+-  border-radius: 6px;
++  padding: var(--control-padding);
++  border: 1px solid var(--line);
++  border-radius: var(--radius-control);
+   text-decoration: none;
+   color: var(--fg);
+   background: var(--panel);
+ }
+-a.button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+-.small { font-size: 12px; }
+-.install-line { margin-top: 6px; }
++a.button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
++.small { font-size: var(--font-size-small); }
++.install-line { margin-top: var(--space-sm); }
+ .install-line .actions { margin-top: 3px; }
+ /* tunnel-specific tools under a row, and extra controls under its buttons */
+ hpclib-toolbar { display: flex; flex-wrap: wrap; gap: 10px 28px; align-items: flex-start;
+-                 padding: 6px 10px; border-left: 3px solid var(--line); background: var(--panel); border-radius: 6px; }
++                 padding: var(--space-sm) 10px; border-left: 3px solid var(--line); background: var(--panel); border-radius: var(--radius-control); }
+ hpclib-toolbar[hidden], hpclib-extra-controls[hidden] { display: none; }
+ table.rows .toolbar-row > td { padding-top: 0; }
+ hpclib-toolbar-tool { display: flex; flex-direction: column; gap: 2px; min-width: 12em; max-width: 60em; }
+-hpclib-toolbar-tool .tool-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
++hpclib-toolbar-tool .tool-label { font-size: var(--font-size-label); text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+ hpclib-toolbar-tool select { min-width: 16em; }
+-hpclib-extra-controls { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin-top: 6px;
+-                        padding-top: 6px; border-top: 1px dashed var(--line); }
++hpclib-extra-controls { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-xs); margin-top: var(--space-sm);
++                        padding-top: var(--space-sm); border-top: 1px dashed var(--line); }
+ hpclib-control { display: block; }
+ .control-hint { margin-top: 2px; }
+ 
+ /* Add App or Settings (packages) */
+-#topbar #add-package { background: #2a2b30; color: #e8e8ea; border: 1px solid #44464e; margin-left: 12px; }
+-#topbar #add-package:hover { background: #34363d; color: #fff; }
++#topbar #add-package { background: var(--topbar-hover-bg); color: var(--topbar-button-fg); border: 1px solid var(--topbar-button-border); margin-left: 12px; }
++#topbar #add-package:hover { background: var(--topbar-active-bg); color: var(--topbar-active-fg); }
+ ul.packages { list-style: none; padding: 0; }
+-ul.packages > li { margin: 10px 0; padding-bottom: 8px; border-bottom: 1px solid rgba(127, 127, 127, 0.25); }
+-ul.packages ul { margin: 4px 0 6px; }
+-p.hash { overflow-wrap: anywhere; font-family: ui-monospace, monospace; font-size: 12px; }
+-section.secrets { margin-top: 14px; padding-top: 10px; border-top: 1px solid rgba(127, 127, 127, 0.25); }
+-section.tokens { margin-top: 14px; padding-top: 10px; border-top: 1px solid rgba(127, 127, 127, 0.25); }
+-section.tokens .checks { display: flex; gap: 12px; flex-wrap: wrap; padding: 4px 0; }
+-section.tokens label.check { display: inline-flex; align-items: center; gap: 4px; }
+-.token-secret { font-family: ui-monospace, monospace; width: 100%; }
++ul.packages > li { margin: 10px 0; padding-bottom: var(--space-md); border-bottom: 1px solid var(--separator); }
++ul.packages ul { margin: var(--space-xs) 0 var(--space-sm); }
++p.hash { overflow-wrap: anywhere; font-family: var(--font-mono); font-size: var(--font-size-code); }
++section.secrets { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--separator); }
++section.tokens { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--separator); }
++section.tokens .checks { display: flex; gap: var(--space-lg); flex-wrap: wrap; padding: var(--space-xs) 0; }
++section.tokens label.check { display: inline-flex; align-items: center; gap: var(--space-xs); }
++.token-secret { font-family: var(--font-mono); width: 100%; }
++
++/* Top-left console menu: native disclosure and one OS stylesheet action. */
++#console-menu { position: relative; flex: none; }
++#console-menu > summary {
++  display: grid;
++  place-items: center;
++  list-style: none;
++  min-width: 32px;
++  min-height: 32px;
++  padding: var(--space-xs);
++  border-radius: var(--radius-control);
++  color: var(--topbar-fg);
++  font-size: var(--close-font-size);
++  line-height: 1;
++}
++#console-menu > summary::-webkit-details-marker { display: none; }
++#console-menu > summary:hover, #console-menu[open] > summary {
++  background: var(--topbar-hover-bg);
++  color: var(--topbar-active-fg);
++}
++#console-menu > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
++#console-menu-items {
++  position: absolute;
++  top: calc(100% + var(--space-xs));
++  left: 0;
++  z-index: 20;
++  min-width: 11rem;
++  max-width: calc(100vw - 2 * var(--space-xl));
++  padding: var(--space-xs);
++  border: 1px solid var(--line);
++  border-radius: var(--radius-panel);
++  background: var(--bg);
++  color: var(--fg);
++}
++#open-stylesheet {
++  display: block;
++  width: 100%;
++  padding: var(--space-md) var(--space-lg);
++  border: none;
++  background: none;
++  color: var(--fg);
++  text-align: left;
++  white-space: nowrap;
++}
++#open-stylesheet:hover { background: var(--panel); }
+diff --git a/agent-console/components.js b/agent-console/components.js
+--- a/agent-console/components.js
++++ b/agent-console/components.js
+@@ -63,42 +63,49 @@
+   return sheet;
+ };
+ 
++// Close controls share their shape and typography; each component sets its position.
++const CLOSE_CSS = css(`
++  button.close {
++    position: absolute;
++    width: var(--close-size, 24px);
++    height: var(--close-size, 24px);
++    padding: 0;
++    border: none;
++    border-radius: var(--radius-control, 6px);
++    background: none;
++    color: var(--muted);
++    font: var(--close-font-size, 18px)/var(--close-size, 24px) var(--font-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
++    cursor: pointer;
++  }
++  button.close:hover { background: var(--panel); color: var(--fg); }
++  button.close[hidden] { display: none; }
++`);
++
+ // ------------------------------------------------------------------ <hpc-panel>
+ 
+ const PANEL_CSS = css(`
+-  :host { display: block; margin: 4px 0 12px; }
++  :host { display: block; min-width: 0; margin: var(--space-xs, 4px) 0 var(--space-lg, 12px); }
+   :host([hidden]) { display: none; }
+   section {
+     position: relative;
+     border: 1px solid var(--line);
+-    border-radius: 8px;
+-    padding: 10px 14px 12px;
++    border-radius: var(--radius-panel, 8px);
++    padding: var(--panel-padding, 10px 14px 12px);
++    box-sizing: border-box;
++    min-width: 0;
++    max-width: 100%;
+     background: var(--bg);
+   }
+-  header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-height: 24px; padding-right: 28px; }
++  header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-height: var(--close-size, 24px); padding-right: calc(var(--close-size, 24px) + var(--space-xs, 4px)); }
+   header:not(.has-content) { display: none; }
+-  .heading { font-weight: 600; }
++  .heading { font-weight: var(--font-weight-semibold, 600); }
++  .heading, .status { min-width: 0; overflow-wrap: anywhere; }
+   .status { color: var(--muted); }
+   .status.error { color: var(--bad); }
+   .status.ok { color: var(--good); }
+-  .body { margin-top: 8px; }
++  .body { min-width: 0; max-width: 100%; margin-top: var(--space-md, 8px); }
+   header:not(.has-content) + .body { margin-top: 0; }
+-  button.close {
+-    position: absolute;
+-    top: 6px;
+-    right: 8px;
+-    width: 24px;
+-    height: 24px;
+-    padding: 0;
+-    border: none;
+-    border-radius: 6px;
+-    background: none;
+-    color: var(--muted);
+-    font: 18px/24px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+-    cursor: pointer;
+-  }
+-  button.close:hover { background: var(--panel); color: var(--fg); }
+-  button.close[hidden] { display: none; }
++  button.close { top: var(--space-sm, 6px); right: var(--space-md, 8px); }
+   ::slotted([slot="actions"]) { margin-left: 2px; }
+ `);
+ 
+@@ -108,7 +115,7 @@
+   constructor() {
+     super();
+     const root = this.attachShadow({ mode: "open" });
+-    root.adoptedStyleSheets = [PANEL_CSS];
++    root.adoptedStyleSheets = [CLOSE_CSS, PANEL_CSS];
+     root.innerHTML = `<section part="panel">
+         <header part="header"><span class="heading" part="heading"></span><span class="status" part="status"></span>
+           <slot name="actions"></slot></header>
+@@ -216,22 +223,18 @@
+ const DIALOG_CSS = css(`
+   dialog {
+     position: relative;
+-    width: min(440px, calc(100vw - 32px));
++    width: min(var(--dialog-max-width, 440px), calc(100vw - var(--dialog-viewport-gap, 32px)));
++    box-sizing: border-box;
+     border: 1px solid var(--line);
+-    border-radius: 10px;
+-    padding: 16px 18px;
++    border-radius: var(--radius-dialog, 10px);
++    padding: var(--dialog-padding, 16px 18px);
+     background: var(--bg);
+     color: var(--fg);
+   }
+-  dialog::backdrop { background: rgb(0 0 0 / 0.35); }
+-  h3 { font-size: 15px; margin: 0 28px 10px 0; }
++  dialog::backdrop { background: var(--dialog-backdrop, rgb(0 0 0 / 0.35)); }
++  h3 { font-size: var(--font-size-subheading, 15px); margin: 0 calc(var(--close-size, 24px) + var(--space-xs, 4px)) 10px 0; }
+   h3:empty { display: none; }
+-  button.close {
+-    position: absolute; top: 10px; right: 10px; width: 24px; height: 24px; padding: 0;
+-    border: none; border-radius: 6px; background: none; color: var(--muted);
+-    font: 18px/24px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; cursor: pointer;
+-  }
+-  button.close:hover { background: var(--panel); color: var(--fg); }
++  button.close { top: 10px; right: 10px; }
+ `);
+ 
+ export class HpcDialog extends HTMLElement {
+@@ -241,8 +244,8 @@
+   constructor() {
+     super();
+     const root = this.attachShadow({ mode: "open" });
+-    root.adoptedStyleSheets = [DIALOG_CSS];
+-    root.innerHTML = `<dialog part="dialog"><button class="close" type="button" aria-label="Close" title="Close">×</button>
++    root.adoptedStyleSheets = [CLOSE_CSS, DIALOG_CSS];
++    root.innerHTML = `<dialog part="dialog"><button class="close" part="close" type="button" aria-label="Close" title="Close">×</button>
+       <h3 part="heading"></h3><slot></slot></dialog>`;
+     this._dialog = root.querySelector("dialog");
+     this._heading = root.querySelector("h3");
+@@ -651,7 +654,7 @@
+     // the operation's log, refreshing while it runs; the row refreshes too, so its buttons follow
+     this._opShown = id;
+     const log = el("hpc-log", { src: `clusters/${enc(this.name)}/operation?lines=400`, field: "log", every: 2 });
+-    const panel = el("hpc-panel", { heading: "hpclib", dismissible: true }, log);
++    const panel = el("hpc-panel", { heading: "hpclib", dismissible: true, class: "log-panel" }, log);
+     log.addEventListener("update", ({ detail: op }) => {
+       panel.setAttribute("heading", op.title || op.kind);
+       panel.setAttribute("status", { running: "running…", succeeded: "finished",
+@@ -695,7 +698,7 @@
+   }
+   toggleLog() {
+     if (this.detailKind === "log") return this.hideDetail();
+-    this.showDetail("log", el("hpc-panel", { heading: this.logHeading, dismissible: true },
++    this.showDetail("log", el("hpc-panel", { heading: this.logHeading, dismissible: true, class: "log-panel" },
+       el("hpc-log", { src: this.logSrc, every: 3, empty: "(no log yet)" })));
+     TunnelRow.openLogs.add(this.key);
+   }
+diff --git a/agent-console/README.md b/agent-console/README.md
+--- a/agent-console/README.md
++++ b/agent-console/README.md
+@@ -59,6 +59,57 @@
+ name (`hpclib-grace`). The session key is kept for the console's address (localStorage), so links work in new
+ tabs; after the console restarts, the page asks for the new key once.
+ 
++## User styling
++
++The top-left hamburger menu has **Open Stylesheet**. On its first use, the console copies the
++bundled [`default-styles.css`](default-styles.css) to `~/.config/hpclib/console/user.css`, then asks
++the operating system to open it with the default application associated with CSS files. If
++`HPCLIB_CONSOLE_DIR` is set, the destination is `$HPCLIB_CONSOLE_DIR/user.css` instead.
++An existing `user.css` is always preserved, including an empty one. The console does not select or
++detect an editor. Saving changes and reloading the browser applies them.
++
++With `launch-tunnel-manager` or `agent_console --static ...`, the page loads `default-styles.css`
++(the complete default variable inventory), then `style.css` (the UI rules), then the optional `user.css`.
++Keep personal styling in `user.css` so it survives updates to hpclib. You can also create it yourself:
++
++```bash
++mkdir -p "${HPCLIB_CONSOLE_DIR:-$HOME/.config/hpclib/console}"
++# edit user.css in that directory, then reload the browser page
++```
++
++For example, `user.css` can contain:
++
++```css
++:root {
++  --accent: #7c3aed;
++  --font-size-base: 16px;
++  --content-max-width: 1500px;
++  --radius-panel: 12px;
++  --dialog-max-width: 640px;
++  --log-max-width: 800px;
++}
++@media (prefers-color-scheme: dark) {
++  :root { --accent: #a78bfa; }
++}
++```
++
++The [complete UI variable reference](UI_VARIABLES.md) lists every variable, its default and its purpose,
++including dark-theme defaults and component parts. Variables also reach panel and dialog shadow DOM.
++Log panels default to a maximum width of `960px` and stay within their container and viewport.
++Long lines scroll inside the log; to wrap them instead, set `--log-white-space: pre-wrap` and
++`--log-overflow-wrap: anywhere`. Tunnel/app logs and installation/setup output share these settings.
++
++Opening the stylesheet uses authenticated `POST /api/styles/open`; it always opens the fixed local
++`user.css` path on the machine running the console. On macOS it uses `open`, on Windows `os.startfile`,
++and on Linux `xdg-open`, leaving the CSS file association to the OS.
++
++The console serves only this file at `/user.css`, without a session key, just like its bundled static
++assets. An absent file returns an empty stylesheet. It reads the file on each request and sends
++`Cache-Control: no-store`, so edits take effect after a full browser reload (the console's **Refresh**
++button refreshes page data only). The rest of the console directory is not served.
++This automatic loading applies to the page served by `agent_console --static`; a separately hosted
++front end must arrange to serve its own `user.css` at the same URL on its own origin.
++
+ ## Components
+ 
+ `components.js` defines the page's building blocks as native custom elements (no library, no build step);
+@@ -96,7 +147,7 @@
+ started is running, so the dialog opens on whatever page you're on. "Not now" leaves the request on the cluster's
+ row ("Enter password…") until it asks again.
+ 
+-Panels and dialogs draw their frames in shadow DOM; colours come from the CSS variables in `style.css`, so the
++Panels and dialogs draw their frames in shadow DOM; colours come from the CSS variables in `default-styles.css`, so the
+ light and dark themes reach inside. Install and setup output, tunnel and app logs, the file viewer, the setup and
+ app settings forms, and errors are all dismissible panels; a closed install/setup panel stays closed (this browser
+ remembers it), and an open log stays open while you move between pages.
+diff --git a/agent-console/UI_VARIABLES.md b/agent-console/UI_VARIABLES.md
+new file mode 100644
+--- /dev/null
++++ b/agent-console/UI_VARIABLES.md
+@@ -0,0 +1,152 @@
++# UI variables
++
++Choose **Open Stylesheet** from the top-left hamburger menu to create and open your `user.css`.
++The console copies [`default-styles.css`](default-styles.css) only when your file is absent;
++an existing file is preserved. Your operating system chooses its default CSS application.
++
++Set these custom properties on `:root` in `~/.config/hpclib/console/user.css`
++(or `$HPCLIB_CONSOLE_DIR/user.css`). This lists every UI variable used by the bundled console.
++Fonts must already be installed or supplied by your stylesheet; a font-family setting does not install a font.
++
++## Log panels
++
++`--log-max-width` defaults to `960px` and caps the **whole panel**, including its frame.
++Panels are also clamped to their container and viewport; increasing this value cannot force them wider.
++Tunnel/app logs and installation/setup output use the same constraint.
++Long lines scroll horizontally inside the log by default. To wrap them, use both wrapping settings:
++
++```css
++:root {
++  --log-max-width: 800px;
++  --log-max-height: 360px;
++  --log-white-space: pre-wrap;
++  --log-overflow-wrap: anywhere;
++}
++```
++
++Reload the browser page after editing. The console's Refresh button refreshes data only.
++
++## Defaults
++
++The defaults are defined in `default-styles.css`, loaded before the UI rules in `style.css` and your overrides.
++Values below are the light-theme defaults. Aliases such as `var(--space-sm)` follow the referenced variable
++unless you override the alias separately. Spacing, radii and font sizes remain independent.
++
++### Colours
++
++| Variable | Default | Controls |
++| --- | --- | --- |
++| `--bg` | `#ffffff` | Page, inputs, panel and dialog background |
++| `--fg` | `#1d1d1f` | Main text |
++| `--muted` | `#6e6e73` | Secondary text and hovered control borders |
++| `--line` | `#e3e3e6` | Borders and table dividers |
++| `--panel` | `#f6f6f8` | Controls, logs and toolbar background |
++| `--accent` | `#2f6fdb` | Primary actions, links and badges |
++| `--good` | `#1f8a4c` | Success, running states and additions |
++| `--warn` | `#b36b00` | Starting and queued states |
++| `--bad` | `#c62828` | Errors, failures and deletions |
++| `--accent-fg` | `#fff` | Text on primary actions and badges |
++| `--separator` | `rgba(127, 127, 127, 0.25)` | Package, secret and token section dividers |
++| `--viewer-bg` | `#fff` | Image and HTML viewer background |
++| `--dialog-backdrop` | `rgb(0 0 0 / 0.35)` | Modal overlay colour |
++| `--topbar-bg` | `#16171a` | App bar background |
++| `--topbar-fg` | `#e6e6e8` | App bar text |
++| `--topbar-muted` | `#b8b8be` | Inactive app links |
++| `--topbar-hover-bg` | `#2a2b30` | Hovered app link and package button background |
++| `--topbar-active-bg` | `#34363d` | Active app link and hovered package button background |
++| `--topbar-active-fg` | `#fff` | Active and hovered app bar text |
++| `--topbar-button-fg` | `#e8e8ea` | Package button text |
++| `--topbar-button-border` | `#44464e` | Package button border |
++
++### Typography
++
++| Variable | Default | Controls |
++| --- | --- | --- |
++| `--font-ui` | `-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif` | UI and component close-button font family |
++| `--font-mono` | `ui-monospace, Menlo, monospace` | Logs, code, textareas, hashes and token values |
++| `--font-size-base` | `14px` | Main UI and saved-result text size |
++| `--font-size-small` | `12px` | Badges, hints, errors and small text |
++| `--font-size-code` | `12px` | Preformatted text, textareas and hashes |
++| `--font-size-heading` | `16px` | Page h2 headings |
++| `--font-size-subheading` | `15px` | h3 headings, dialog headings and inline dismiss buttons |
++| `--font-size-caption` | `13px` | h4 headings and app bar text |
++| `--font-size-label` | `11px` | Tunnel toolbar labels |
++| `--close-font-size` | `18px` | Panel and dialog close symbols |
++| `--line-height-base` | `1.45` | Main UI line height (unitless) |
++| `--line-height-code` | `1.4` | Code and textarea line height (unitless) |
++| `--font-weight-medium` | `500` | Table and field labels |
++| `--font-weight-semibold` | `600` | Active links, states and panel headings |
++| `--font-weight-bold` | `700` | App bar brand |
++
++### Corners
++
++| Variable | Default | Controls |
++| --- | --- | --- |
++| `--radius-control` | `6px` | Buttons, inputs, logs, toolbars and close controls |
++| `--radius-panel` | `8px` | Cards and panel frames |
++| `--radius-dialog` | `10px` | Dialog frames |
++| `--radius-badge` | `9px` | Count badges |
++
++### Spacing
++
++| Variable | Default | Controls |
++| --- | --- | --- |
++| `--space-xs` | `4px` | Small margins and row gaps |
++| `--space-sm` | `6px` | Small gaps and control spacing |
++| `--space-md` | `8px` | Text, log and section spacing |
++| `--space-lg` | `12px` | Toolbar gaps and section margins |
++| `--space-xl` | `16px` | Page padding, navigation gaps and large margins |
++| `--action-gap` | `var(--space-sm)` | Action-button and result gaps |
++| `--control-padding` | `3px 10px` | Button and button-link padding |
++| `--input-padding` | `3px 6px` | Input and select padding |
++| `--cell-padding` | `6px 8px` | Table cell padding |
++| `--panel-padding` | `10px 14px 12px` | Panel frame padding |
++| `--dialog-padding` | `16px 18px` | Dialog frame padding |
++| `--card-padding` | `12px 16px` | Card padding |
++
++### Sizes and behaviour
++
++| Variable | Default | Controls |
++| --- | --- | --- |
++| `--content-max-width` | `1200px` | Main content width, including page padding |
++| `--dialog-max-width` | `440px` | Dialog width before the viewport clamp |
++| `--dialog-viewport-gap` | `32px` | Total horizontal clearance around dialogs |
++| `--close-size` | `24px` | Close-button width, height and line height |
++| `--code-max-height` | `420px` | Ordinary preformatted blocks height cap |
++| `--log-max-width` | `960px` | Outer tunnel and operation log panel width cap (length or percentage) |
++| `--log-max-height` | `var(--code-max-height)` | Log text area height cap |
++| `--log-white-space` | `pre` | Use pre for internal horizontal scrolling or pre-wrap for wrapped logs |
++| `--log-overflow-wrap` | `normal` | Use anywhere with pre-wrap to wrap unbroken log lines |
++| `--viewer-height` | `70vh` | HTML viewer height and text-file height cap |
++| `--action-result-max-width` | `360px` | Inline action result width cap |
++| `--disabled-opacity` | `0.5` | Disabled button opacity |
++
++### Dark theme overrides
++
++The following variables change when the operating system prefers dark mode.
++All other defaults stay the same. A later `:root` declaration in `user.css` overrides either theme;
++use your own dark-mode media query when you want distinct light and dark values.
++
++| Variable | Dark default |
++| --- | --- |
++| `--bg` | `#18181a` |
++| `--fg` | `#ececee` |
++| `--muted` | `#9a9aa0` |
++| `--line` | `#333338` |
++| `--panel` | `#222226` |
++| `--accent` | `#6ea0ff` |
++| `--good` | `#4cc27f` |
++| `--warn` | `#e6a23c` |
++| `--bad` | `#ff6b6b` |
++
++## Component styling
++
++Variables inherit into panel and dialog shadow DOM. Component defaults have fallbacks when
++the main stylesheet is absent. For changes beyond these variables, use normal selectors or these parts:
++
++- `hpc-panel::part(...)`: `panel`, `header`, `heading`, `status`, `body`, `close`.
++- `hpc-dialog::part(...)`: `dialog`, `heading`, `close`.
++
++Other structural CSS (display modes, alignment and table layout) remains in `style.css`.
++The log width constraint prevents log content from widening a table; unrelated wide table columns
++can still need scrolling on a small screen.
+diff --git a/tests/test_agent_console.py b/tests/test_agent_console.py
+--- a/tests/test_agent_console.py
++++ b/tests/test_agent_console.py
+@@ -225,11 +225,51 @@
+         self.assertIn(b"<title>console", self.call("GET", "/jobs/123", key=None, raw=True)[1])  # SPA fallback
+         self.assertNotIn(b"secret", self.call("GET", "/../agents/x", key=None, raw=True)[1])
+ 
++    def test_user_stylesheet_optional_and_reloaded(self):
++        # No file yet: CSS, not the HTML SPA fallback, and no session key needed.
++        status, content, headers = self.call("GET", "/user.css", key=None, raw=True)
++        self.assertEqual((status, content), (200, b""))
++        self.assertEqual(headers.get("Content-Type"), "text/css; charset=utf-8")
++        self.assertEqual(headers.get("Cache-Control"), "no-store")
++        self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff")
++
++        # The fixture uses HPCLIB_CONSOLE_DIR; a file in --static must not replace it.
++        (Path(self.console_server.static_dir) / "user.css").write_text("body { color: red; }")
++        self.console.mkdir(parents=True, exist_ok=True)
++        stylesheet = self.console / "user.css"
++        for css in (b":root { --accent: purple; }\n", b"main { max-width: 1500px; }\n"):
++            stylesheet.write_bytes(css)
++            status, content, headers = self.call("GET", "/user.css", key=None, raw=True)
++            self.assertEqual((status, content), (200, css))
++            self.assertEqual(headers.get("Cache-Control"), "no-store")
++        stylesheet.unlink()
++        self.assertEqual(self.call("GET", "/user.css", key=None, raw=True)[:2], (200, b""))
++
++    def test_user_stylesheet_keeps_console_files_private(self):
++        self.console.mkdir(parents=True, exist_ok=True)
++        (self.console / "session").write_text("PRIVATE_SESSION_KEY")
++        css = b":root { --accent: purple; }"
++        (self.console / "user.css").write_bytes(css)
++        self.assertEqual(self.call("GET", "/user.css?file=session", key=None, raw=True)[:2], (200, css))
++        for route in ("/session", "/console/session", "/user.css/session", "/user.css/../session",
++                      "/user.css%2f..%2fsession", "/../console/session"):
++            status, content, _ = self.call("GET", route, key=None, raw=True)
++            self.assertIn(status, (200, 404))
++            self.assertNotIn(b"PRIVATE_SESSION_KEY", content)
++        self.assertEqual(self.call("GET", "/user.css", key=None, raw=True,
++                                   headers={"Host": "evil.example:80"})[0], 421)
++        self.assertEqual(self.call("GET", "/api/health", key=None)[0], 401)
++
+     def test_serves_the_bundled_front_end(self):
+         ui = Path(__file__).resolve().parents[1] / "agent-console"
+         self.console_server.static_dir = str(ui)
+         status, content, _ = self.call("GET", "/", key=None, raw=True)
+         self.assertIn(b'src="app.js"', content)
++        self.assertLess(content.index(b'href="default-styles.css"'), content.index(b'href="style.css"'))
++        self.assertGreater(content.index(b'href="/user.css"'), content.index(b'href="style.css"'))
++        status, asset, headers = self.call("GET", "/default-styles.css", key=None, raw=True)
++        self.assertEqual((status, headers.get("Content-Type")), (200, "text/css"))
++        self.assertIn(b"--log-max-width: 960px", asset)
+         status, content, headers = self.call("GET", "/app.js", key=None, raw=True)
+         self.assertEqual(status, 200)
+         self.assertIn("javascript", headers.get("Content-Type"))  # module scripts need a JS type
+@@ -244,6 +284,103 @@
+         with self.assertRaises(SystemExit):
+             agent_console.parse_args(["--allow-origin", "*"])
+         self.assertEqual(agent_console.parse_args(["--port", "1234"]).port, 1234)
++
++
++class TestStylesheets(ConsoleTestCase):
++
++    def test_open_creates_exact_defaults_and_preserves_existing_file(self):
++        ui = Path(__file__).resolve().parents[1] / "agent-console"
++        self.console_server.static_dir = str(ui)
++        destination = self.console / "user.css"
++        with mock.patch.object(agent_console, "open_with_default_application") as opener:
++            status, out = self.call("POST", "/api/styles/open")
++            self.assertEqual(status, 200)
++            self.assertEqual(out, {"ok": True, "path": str(destination), "created": True})
++            self.assertEqual(destination.read_bytes(), (ui / "default-styles.css").read_bytes())
++            opener.assert_called_once_with(str(destination))
++            self.assertEqual(self.call("GET", "/user.css", key=None, raw=True)[1], destination.read_bytes())
++            for existing in (b":root { --accent: purple; }", b""):
++                destination.write_bytes(existing)
++                status, out = self.call("POST", "/api/styles/open", {"path": "elsewhere.css"})
++                self.assertEqual((status, out["created"]), (200, False))
++                self.assertEqual(out["path"], str(destination))
++                self.assertEqual(destination.read_bytes(), existing)
++                self.assertFalse((self.console / "elsewhere.css").exists())
++            self.assertEqual(opener.call_count, 3)
++
++    def test_open_requires_key_and_post(self):
++        with mock.patch.object(agent_console, "open_with_default_application") as opener:
++            for key in (None, "wrong"):
++                self.assertEqual(self.call("POST", "/api/styles/open", key=key)[0], 401)
++            self.assertEqual(self.call("GET", "/api/styles/open")[0], 404)
++            self.assertEqual(self.call("POST", "/api/styles/open", headers={"Host": "evil.example:80"})[0], 421)
++            self.assertFalse((self.console / "user.css").exists())
++            opener.assert_not_called()
++
++    def test_missing_defaults_does_not_create_an_empty_stylesheet(self):
++        with mock.patch.object(agent_console, "open_with_default_application") as opener:
++            self.assertEqual(self.call("POST", "/api/styles/open")[0], 503)
++            self.assertFalse((self.console / "user.css").exists())
++            self.console_server.static_dir = None
++            self.assertEqual(self.call("POST", "/api/styles/open")[0], 503)
++            opener.assert_not_called()
++
++    def test_existing_stylesheet_can_open_without_static_assets(self):
++        self.console.mkdir(parents=True, exist_ok=True)
++        destination = self.console / "user.css"
++        destination.write_bytes(b"/* personal styles */")
++        self.console_server.static_dir = None
++        with mock.patch.object(agent_console, "open_with_default_application") as opener:
++            status, out = self.call("POST", "/api/styles/open")
++            self.assertEqual((status, out["created"]), (200, False))
++            opener.assert_called_once_with(str(destination))
++
++    def test_opener_error_preserves_new_file_and_reports_failure(self):
++        self.console_server.static_dir = str(Path(__file__).resolve().parents[1] / "agent-console")
++        with mock.patch.object(agent_console, "open_with_default_application", side_effect=OSError("no CSS association")):
++            status, out = self.call("POST", "/api/styles/open")
++            self.assertEqual(status, 503)
++            self.assertIn("OS default application", out["error"])
++            self.assertTrue((self.console / "user.css").is_file())
++            self.assertEqual(out["path"], str(self.console / "user.css"))
++
++    def test_non_file_destination_is_preserved(self):
++        (self.console / "user.css").mkdir(parents=True)
++        with mock.patch.object(agent_console, "open_with_default_application") as opener:
++            self.assertEqual(self.call("POST", "/api/styles/open")[0], 409)
++            self.assertTrue((self.console / "user.css").is_dir())
++            opener.assert_not_called()
++
++
++class TestDefaultApplication(unittest.TestCase):
++
++    def test_delegates_to_os_without_selecting_an_editor(self):
++        path = "/tmp/styles with spaces/user.css"
++        for platform, command in (("darwin", "/usr/bin/open"), ("linux", "xdg-open")):
++            with self.subTest(platform=platform), mock.patch.object(agent_console.sys, "platform", platform), \
++                    mock.patch.object(agent_console.subprocess, "Popen") as launch:
++                launch.return_value.wait.return_value = 0
++                agent_console.open_with_default_application(path)
++                self.assertEqual(launch.call_args.args, ([command, path],))
++                self.assertNotIn("shell", launch.call_args.kwargs)
++        with mock.patch.object(agent_console.sys, "platform", "win32"), \
++                mock.patch.object(agent_console.os, "startfile", create=True) as startfile, \
++                mock.patch.object(agent_console.subprocess, "Popen") as launch:
++            agent_console.open_with_default_application(path)
++            startfile.assert_called_once_with(path)
++            launch.assert_not_called()
++
++    def test_running_handler_is_not_terminated_and_failure_is_reported(self):
++        with mock.patch.object(agent_console.sys, "platform", "linux"), \
++                mock.patch.object(agent_console.subprocess, "Popen") as launch:
++            launch.return_value.wait.side_effect = subprocess.TimeoutExpired("xdg-open", 2)
++            agent_console.open_with_default_application("/tmp/user.css")
++            launch.return_value.terminate.assert_not_called()
++            launch.return_value.kill.assert_not_called()
++            launch.return_value.wait.side_effect = None
++            launch.return_value.wait.return_value = 1
++            with self.assertRaises(OSError):
++                agent_console.open_with_default_application("/tmp/user.css")
+ 
+ 
+ class TestClusters(ConsoleTestCase):
+diff --git a/tests/test_agent_console_ui.py b/tests/test_agent_console_ui.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_agent_console_ui.py
+@@ -0,0 +1,239 @@
++"""Optional browser regression tests for console styling (Playwright + Chromium).
++
++Run: PYTHONPATH=tests python -m unittest test_agent_console_ui -v
++No cluster or external network is used; the API responses are test fixtures.
++"""
++import os
++import json
++import sys
++import tempfile
++import threading
++import unittest
++from pathlib import Path
++from unittest import mock
++
++try:
++    from playwright.sync_api import sync_playwright
++except ImportError:
++    sync_playwright = None
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / "hpclib" / "servers"))
++import agent_console  # noqa: E402
++
++FIXTURE = """<!doctype html><html><head>
++  <meta name="viewport" content="width=device-width, initial-scale=1">
++  <link rel="stylesheet" href="/default-styles.css">
++  <link rel="stylesheet" href="/style.css">
++  <link rel="stylesheet" href="/user.css">
++</head><body>
++  <main><table id="sessions" class="rows"></table>
++    <button id="sample" class="primary">Action</button><span id="hint" class="small">Hint</span>
++    <div class="actions"><button>One</button><button>Two</button></div>
++    <hpc-dialog id="dialog" heading="Settings"><p>Example settings</p></hpc-dialog>
++  </main>
++  <script type="module">
++    import { configure, el } from "/components.js";
++    const long = "x".repeat(10000);
++    const lines = [long, ...Array.from({ length: 60 }, (_, n) => `line ${n}`)];
++    const state = { cluster: "demo", host: "demo", port: 1234, state: "down", login: {state: "none"} };
++    configure({ api: async (path) => path.includes("/operation?")
++      ? { state: "succeeded", title: "Installation log", log: lines }
++      : path.includes("/log?") ? { lines } : state });
++    // Insert the custom row programmatically, as app.js does. HTML table parsing
++    // would otherwise move an unknown element outside the table before upgrade.
++    window.row = el("hpc-app-session", { app: "vscode", "app-title": "VS Code", cluster: "demo" });
++    row.data = state;
++    document.getElementById("sessions").append(row);
++    window.ready = true;
++  </script>
++</body></html>"""
++
++
++@unittest.skipUnless(sync_playwright, "optional Playwright dependency is not installed")
++class TestConsoleUI(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.tmp = tempfile.TemporaryDirectory()
++        cls.addClassCleanup(cls.tmp.cleanup)
++        cls.console = Path(cls.tmp.name)
++        env = mock.patch.dict(os.environ, {"HPCLIB_CONSOLE_DIR": str(cls.console)})
++        env.start()
++        cls.addClassCleanup(env.stop)
++        log = mock.patch.object(agent_console.ConsoleHandler, "log_message", lambda *args: None)
++        log.start()
++        cls.addClassCleanup(log.stop)
++        cls.server = agent_console.ConsoleServer(("127.0.0.1", 0), "ui-test-key", None,
++                                                  static_dir=str(ROOT / "agent-console"))
++        cls.addClassCleanup(cls.server.server_close)
++        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
++        cls.addClassCleanup(cls.server.shutdown)
++        cls.base = f"http://127.0.0.1:{cls.server.port}"
++        cls.playwright = sync_playwright().start()
++        cls.addClassCleanup(cls.playwright.stop)
++        try:
++            cls.browser = cls.playwright.chromium.launch()
++        except Exception as exc:
++            if "Executable doesn't exist" in str(exc):
++                raise unittest.SkipTest("install Playwright's Chromium browser to run UI tests") from exc
++            raise
++        cls.addClassCleanup(cls.browser.close)
++
++    def setUp(self):
++        (self.console / "user.css").unlink(missing_ok=True)
++        self.page = self.browser.new_page(viewport={"width": 1440, "height": 900})
++        self.addCleanup(self.page.close)
++        self.errors = []
++        self.page.on("pageerror", lambda error: self.errors.append(str(error)))
++        self.page.route("**/fixture.html", lambda route: route.fulfill(body=FIXTURE, content_type="text/html"))
++
++    def load(self):
++        self.page.goto(self.base + "/fixture.html")
++        self.page.wait_for_function("window.ready === true")
++
++    def metrics(self):
++        self.page.wait_for_function("document.querySelector('pre.log')?.textContent.startsWith('xxxx')")
++        return self.page.evaluate("""() => {
++          const panel = document.querySelector('hpc-panel.log-panel');
++          const log = panel.querySelector('pre.log');
++          return { page: document.documentElement.scrollWidth, viewport: innerWidth,
++                   table: document.querySelector('table').getBoundingClientRect().width,
++                   panel: panel.getBoundingClientRect().width,
++                   log: log.getBoundingClientRect().width, client: log.clientWidth,
++                   scroll: log.scrollWidth, height: log.getBoundingClientRect().height,
++                   clientHeight: log.clientHeight, scrollHeight: log.scrollHeight };
++        }""")
++
++    def test_long_logs_do_not_widen_tables_or_the_page(self):
++        for width in (1440, 900, 480):
++            with self.subTest(viewport=width):
++                self.page.set_viewport_size({"width": width, "height": 900})
++                self.load()
++                before = self.page.locator("table").bounding_box()["width"]
++                for kind in ("tunnel", "operation"):
++                    with self.subTest(kind=kind):
++                        self.page.evaluate("row.toggleLog()" if kind == "tunnel" else "row.showOperation('test')")
++                        sizes = self.metrics()
++                        self.assertLessEqual(sizes["page"], width + 1, sizes)
++                        self.assertLessEqual(sizes["table"], before + 1, sizes)
++                        self.assertLessEqual(sizes["panel"], min(960, width - 32) + 1, sizes)
++                        self.assertLessEqual(sizes["log"], sizes["panel"], sizes)
++                        self.assertGreater(sizes["scroll"], sizes["client"], sizes)
++                        self.assertGreater(sizes["scrollHeight"], sizes["clientHeight"], sizes)
++                self.assertEqual(self.errors, [])
++
++    def test_user_variables_reach_logs_and_shadow_components(self):
++        (self.console / "user.css").write_text(""":root {
++          --log-max-width: 540px; --log-max-height: 100px;
++          --font-size-base: 16px; --font-size-small: 13px; --font-ui: monospace;
++          --radius-control: 9px; --radius-panel: 13px; --radius-dialog: 15px;
++          --close-size: 32px; --close-font-size: 22px; --dialog-max-width: 620px;
++          --space-sm: 12px; --accent: #123456;
++        }""")
++        self.load()
++        self.page.evaluate("row.toggleLog()")
++        sizes = self.metrics()
++        self.assertAlmostEqual(sizes["panel"], 540, delta=1)
++        self.assertLessEqual(sizes["height"], 101)
++        self.assertEqual(self.page.locator("body").evaluate("e => getComputedStyle(e).fontSize"), "16px")
++        self.assertEqual(self.page.locator("#hint").evaluate("e => getComputedStyle(e).fontSize"), "13px")
++        self.assertEqual(self.page.locator("#sample").evaluate("e => getComputedStyle(e).borderRadius"), "9px")
++        self.assertEqual(self.page.locator("#sample").evaluate("e => getComputedStyle(e).backgroundColor"), "rgb(18, 52, 86)")
++        self.assertEqual(self.page.locator("main > .actions").evaluate("e => getComputedStyle(e).gap"), "12px")
++        self.assertEqual(self.page.locator("hpc-panel").evaluate("e => getComputedStyle(e.shadowRoot.querySelector('section')).borderRadius"), "13px")
++        for selector in ("hpc-panel", "hpc-dialog"):
++            close = self.page.locator(selector).evaluate("""e => {
++              const s = getComputedStyle(e.shadowRoot.querySelector('button.close'));
++              return { width: s.width, fontSize: s.fontSize, family: s.fontFamily };
++            }""")
++            self.assertEqual(close, {"width": "32px", "fontSize": "22px", "family": "monospace"})
++        self.page.locator("#dialog").evaluate("e => e.showModal()")
++        dialog = self.page.locator("#dialog").evaluate("""e => {
++          const d = e.shadowRoot.querySelector('dialog');
++          return { width: d.getBoundingClientRect().width, radius: getComputedStyle(d).borderRadius };
++        }""")
++        self.assertEqual(dialog, {"width": 620, "radius": "15px"})
++        self.page.locator("#dialog").evaluate("e => e.close()")
++        # Optional wrapping handles even an unbroken 10,000-character line.
++        self.page.evaluate("""() => {
++          document.documentElement.style.setProperty('--log-white-space', 'pre-wrap');
++          document.documentElement.style.setProperty('--log-overflow-wrap', 'anywhere');
++        }""")
++        sizes = self.metrics()
++        self.assertLessEqual(sizes["scroll"], sizes["client"] + 1, sizes)
++        self.assertLessEqual(sizes["page"], sizes["viewport"] + 1, sizes)
++        # An oversized configured cap still respects a smaller viewport.
++        self.page.evaluate("document.documentElement.style.setProperty('--log-max-width', '9999px')")
++        self.page.set_viewport_size({"width": 480, "height": 900})
++        sizes = self.metrics()
++        self.assertLessEqual(sizes["page"], 481, sizes)
++        self.assertLessEqual(sizes["panel"], 449, sizes)
++        self.assertEqual(self.errors, [])
++
++    def load_console(self):
++        def api_fixture(route):
++            path = route.request.url.split("/api/", 1)[1].split("?", 1)[0]
++            if path == "styles/open":
++                route.continue_()  # Exercise the real authenticated file-copy endpoint.
++                return
++            answers = {"apps": {"apps": [{"id": "agents", "title": "Agents"}]},
++                       "clusters": {"clusters": []}, "proposals": {"proposals": []},
++                       "prompts": {"prompts": [], "running": False}}
++            route.fulfill(body=json.dumps(answers.get(path, {})), content_type="application/json")
++        self.page.route("**/api/**", api_fixture)
++        self.page.goto(self.base + "/#key=ui-test-key")
++        self.page.wait_for_function("document.querySelector('#apps a') !== null")
++
++    def test_console_menu_opens_and_preserves_user_stylesheet(self):
++        with mock.patch.object(agent_console, "open_with_default_application") as opener:
++            self.load_console()
++            toggle = self.page.locator("#console-menu > summary")
++            self.assertLess(toggle.bounding_box()["x"], self.page.locator(".brand").bounding_box()["x"])
++            toggle.focus()
++            self.page.keyboard.press("Enter")
++            self.assertTrue(self.page.locator("#console-menu").evaluate("e => e.open"))
++            self.page.keyboard.press("Tab")
++            self.assertEqual(self.page.evaluate("document.activeElement.id"), "open-stylesheet")
++            self.page.keyboard.press("Escape")
++            self.assertFalse(self.page.locator("#console-menu").evaluate("e => e.open"))
++            self.assertEqual(self.page.evaluate("document.activeElement.tagName"), "SUMMARY")
++            toggle.click()
++            self.page.locator(".brand").click()
++            self.assertFalse(self.page.locator("#console-menu").evaluate("e => e.open"))
++            toggle.click()
++            with self.page.expect_response(lambda r: r.url.endswith("/api/styles/open")) as result:
++                self.page.get_by_role("button", name="Open Stylesheet", exact=True).click()
++            self.assertEqual(result.value.status, 200)
++            self.assertTrue(result.value.json()["created"])
++            destination = self.console / "user.css"
++            self.assertEqual(destination.read_bytes(), (ROOT / "agent-console/default-styles.css").read_bytes())
++            opener.assert_called_once_with(str(destination))
++            self.assertFalse(self.page.locator("#console-menu").evaluate("e => e.open"))
++            destination.write_text(":root { --log-max-width: 720px; }")
++            toggle.click()
++            with self.page.expect_response(lambda r: r.url.endswith("/api/styles/open")) as result:
++                self.page.get_by_role("button", name="Open Stylesheet", exact=True).click()
++            self.assertFalse(result.value.json()["created"])
++            self.assertEqual(destination.read_text(), ":root { --log-max-width: 720px; }")
++            self.assertEqual(opener.call_count, 2)
++            snapshot = os.environ.get("HPCLIB_UI_TEST_SCREENSHOT")
++            if snapshot:
++                toggle.click()
++                self.page.screenshot(path=snapshot, full_page=True)
++            self.assertEqual(self.errors, [])
++
++    def test_console_menu_reports_os_open_failure(self):
++        with mock.patch.object(agent_console, "open_with_default_application", side_effect=OSError("no CSS association")):
++            self.load_console()
++            self.page.locator("#console-menu > summary").click()
++            with self.page.expect_response(lambda r: r.url.endswith("/api/styles/open")) as result:
++                self.page.get_by_role("button", name="Open Stylesheet", exact=True).click()
++            self.assertEqual(result.value.status, 503)
++            self.page.get_by_text("could not open user.css with the OS default application", exact=False).wait_for()
++            self.assertFalse(self.page.locator("#open-stylesheet").is_disabled())
++            self.assertTrue((self.console / "user.css").is_file())
++            self.assertEqual(self.errors, [])
++
++
++if __name__ == "__main__":
++    unittest.main()

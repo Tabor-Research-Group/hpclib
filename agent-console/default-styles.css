@@ -1,0 +1,156 @@
+/* Default console UI variables. Open Stylesheet copies this file to user.css once.
+   Keep both theme blocks when editing; changes apply after a browser reload. */
+:root {
+  /* Colours */
+  /* Page, inputs, panel and dialog background */
+  --bg: #ffffff;
+  /* Main text */
+  --fg: #1d1d1f;
+  /* Secondary text and hovered control borders */
+  --muted: #6e6e73;
+  /* Borders and table dividers */
+  --line: #e3e3e6;
+  /* Controls, logs and toolbar background */
+  --panel: #f6f6f8;
+  /* Primary actions, links and badges */
+  --accent: #2f6fdb;
+  /* Success, running states and additions */
+  --good: #1f8a4c;
+  /* Starting and queued states */
+  --warn: #b36b00;
+  /* Errors, failures and deletions */
+  --bad: #c62828;
+  /* Text on primary actions and badges */
+  --accent-fg: #fff;
+  /* Package, secret and token section dividers */
+  --separator: rgba(127, 127, 127, 0.25);
+  /* Image and HTML viewer background */
+  --viewer-bg: #fff;
+  /* Modal overlay colour */
+  --dialog-backdrop: rgb(0 0 0 / 0.35);
+  /* App bar background */
+  --topbar-bg: #16171a;
+  /* App bar text */
+  --topbar-fg: #e6e6e8;
+  /* Inactive app links */
+  --topbar-muted: #b8b8be;
+  /* Hovered app link and package button background */
+  --topbar-hover-bg: #2a2b30;
+  /* Active app link and hovered package button background */
+  --topbar-active-bg: #34363d;
+  /* Active and hovered app bar text */
+  --topbar-active-fg: #fff;
+  /* Package button text */
+  --topbar-button-fg: #e8e8ea;
+  /* Package button border */
+  --topbar-button-border: #44464e;
+
+  /* Typography */
+  /* UI and component close-button font family */
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  /* Logs, code, textareas, hashes and token values */
+  --font-mono: ui-monospace, Menlo, monospace;
+  /* Main UI and saved-result text size */
+  --font-size-base: 14px;
+  /* Badges, hints, errors and small text */
+  --font-size-small: 12px;
+  /* Preformatted text, textareas and hashes */
+  --font-size-code: 12px;
+  /* Page h2 headings */
+  --font-size-heading: 16px;
+  /* h3 headings, dialog headings and inline dismiss buttons */
+  --font-size-subheading: 15px;
+  /* h4 headings and app bar text */
+  --font-size-caption: 13px;
+  /* Tunnel toolbar labels */
+  --font-size-label: 11px;
+  /* Panel and dialog close symbols */
+  --close-font-size: 18px;
+  /* Main UI line height (unitless) */
+  --line-height-base: 1.45;
+  /* Code and textarea line height (unitless) */
+  --line-height-code: 1.4;
+  /* Table and field labels */
+  --font-weight-medium: 500;
+  /* Active links, states and panel headings */
+  --font-weight-semibold: 600;
+  /* App bar brand */
+  --font-weight-bold: 700;
+
+  /* Corners */
+  /* Buttons, inputs, logs, toolbars and close controls */
+  --radius-control: 6px;
+  /* Cards and panel frames */
+  --radius-panel: 8px;
+  /* Dialog frames */
+  --radius-dialog: 10px;
+  /* Count badges */
+  --radius-badge: 9px;
+
+  /* Spacing */
+  /* Small margins and row gaps */
+  --space-xs: 4px;
+  /* Small gaps and control spacing */
+  --space-sm: 6px;
+  /* Text, log and section spacing */
+  --space-md: 8px;
+  /* Toolbar gaps and section margins */
+  --space-lg: 12px;
+  /* Page padding, navigation gaps and large margins */
+  --space-xl: 16px;
+  /* Action-button and result gaps */
+  --action-gap: var(--space-sm);
+  /* Button and button-link padding */
+  --control-padding: 3px 10px;
+  /* Input and select padding */
+  --input-padding: 3px 6px;
+  /* Table cell padding */
+  --cell-padding: 6px 8px;
+  /* Panel frame padding */
+  --panel-padding: 10px 14px 12px;
+  /* Dialog frame padding */
+  --dialog-padding: 16px 18px;
+  /* Card padding */
+  --card-padding: 12px 16px;
+
+  /* Sizes and behaviour */
+  /* Main content width, including page padding */
+  --content-max-width: 1200px;
+  /* Dialog width before the viewport clamp */
+  --dialog-max-width: 440px;
+  /* Total horizontal clearance around dialogs */
+  --dialog-viewport-gap: 32px;
+  /* Close-button width, height and line height */
+  --close-size: 24px;
+  /* Ordinary preformatted blocks height cap */
+  --code-max-height: 420px;
+  /* Outer tunnel and operation log panel width cap (length or percentage) */
+  --log-max-width: 960px;
+  /* Log text area height cap */
+  --log-max-height: var(--code-max-height);
+  /* Use pre for internal horizontal scrolling or pre-wrap for wrapped logs */
+  --log-white-space: pre;
+  /* Use anywhere with pre-wrap to wrap unbroken log lines */
+  --log-overflow-wrap: normal;
+  /* HTML viewer height and text-file height cap */
+  --viewer-height: 70vh;
+  /* Inline action result width cap */
+  --action-result-max-width: 360px;
+  /* Disabled button opacity */
+  --disabled-opacity: 0.5;
+
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #18181a;
+    --fg: #ececee;
+    --muted: #9a9aa0;
+    --line: #333338;
+    --panel: #222226;
+    --accent: #6ea0ff;
+    --good: #4cc27f;
+    --warn: #e6a23c;
+    --bad: #ff6b6b;
+  }
+}

@@ -17,6 +17,8 @@ there is no owner token).
 The front end depends only on the routes below; nothing here depends on it.
 
   GET  /api/health
+  POST /api/styles/open                      create console/user.css from default-styles.css if absent,
+                                              then ask the OS to open it with its default CSS application
   GET  /api/clusters                          profiles + tunnel state, no token values
   GET  /api/clusters/NAME
   GET  /api/clusters/NAME/mcp                 the MCP client entry setup_agents wrote
@@ -55,7 +57,8 @@ The front end depends only on the routes below; nothing here depends on it.
   POST /api/apps/APP/NAME/check               is the tunnel installed? (its install.sh --check, on the cluster)
   GET  /api/apps/APP/NAME/instances           a shared app's running instances on the cluster, with owners
   POST /api/apps/APP/NAME/control/ID          one of the session's `controls`, e.g. stop_instance {"job": ...}:
-                                              end the job serving a shared app (only yours, only a registered one)
+                                              end the job serving a shared app (only yours, only a registered one);
+                                              Data transfer's kinit or save_credentials, beside its GUI
   POST /api/apps/APP/NAME/install             its install.sh ({"force": true}: e.g. pull the image again), as
                                               the cluster's operation (GET /api/clusters/NAME/operation)
   GET  /api/clusters/NAME/settings            this machine's tunnel settings for the cluster
@@ -124,6 +127,10 @@ DEFAULT_PORT = 27180
 CLUSTER_NAME_RE = re.compile(r"[A-Za-z0-9._@-]{1,120}")
 STREAMED_ROUTES = ("files/content",)   # passed through in chunks rather than read whole
 
+# smbshell gui's line once its GUI serves: HPCLIB_TRANSFER_GUI port=P [path=/x] [user=U pass=P] [query=a=b&c=d]
+# (HPCLIB_RCLONE_GUI port=P user=U pass=P from an hpclib before SMB_GUI: rclone's, opened with its login_token)
+TRANSFER_GUI_RE = re.compile(r"^HPCLIB_(TRANSFER|RCLONE)_GUI((?: [a-z]+=\S*)+)\s*$", re.M)
+
 # Tunnel apps the console runs besides the agents' REST tunnel, one panel each in the front end. Each is an
 # hpclib tunnel (hpclib/tunnels/NAME) started with launch_tunnel over the cluster's ssh login, on ports of its
 # own kept in the profile's "apps" section.
@@ -136,9 +143,11 @@ STREAMED_ROUTES = ("files/content",)   # passed through in chunks rather than re
 #                 edits (with choices: a select of those values); they are saved on the cluster
 #                 (tunnels/setup_tunnel.sh --save) for its job and install.sh
 #   kind "login"  runs on the cluster's login node over the console's ssh login, its port forwarded there,
-#                 rather than in a SLURM job (Rclone: rclone's web GUI, signed in for the session only)
-#   kind "tool"   not a port-forwarding tunnel but commands run on the cluster (Data transfer: smbshell); its
-#                 row has no Open/Start/Stop, and its controls run them
+#                 rather than in a SLURM job (Data transfer: `smbshell gui`)
+#   gui_re        the line a login app prints once it serves (HPCLIB_TRANSFER_GUI key=value ...): where to open
+#                 it, and the login that gets in (see transfer_gui_url)
+#   smb           the row also signs you in to the SMB server for smbshell (TRANSFER_CONTROLS): Kerberos, or a
+#                 password saved for sync jobs. These run beside the GUI, never in its place
 #   shared        the tunnel attaches to a running instance another job serves (SHARED_INSTANCE), and keeps
 #                 the one it starts running after Stop (KEEP_INSTANCE); `instance_label` names that service,
 #                 and its row gets a toolbar tool describing the job and a control that ends it
@@ -175,7 +184,21 @@ APPS = {
     "transfer": {
         "title": "Data transfer",
         "tunnel": "data-transfer",
-        "kind": "tool",
+        "kind": "login",
+        "smb": True,
+        "description": "Files between each cluster and an SMB server, with rclone from the data-transfer-tools "
+                       "image. Start serves a web GUI on the cluster's login node, through the console's ssh "
+                       "login: rclone's by default (remotes smb, the server, and cluster, its files, plus any a "
+                       "settings package adds), or the one Settings… → GUI names. Sign in once beside it: "
+                       "Kerberos (kinit) where the cluster has it, or a password saved for sync jobs; without "
+                       "either, Start asks for the password and keeps it only until Stop. On the cluster: "
+                       "smbshell (smbshell --help), and smbshell submit for SLURM jobs.",
+        "open_path": "/",
+        "health_path": "/",                 # anything that answers (rclone rcd: 401 without its login) is up
+        # smbshell gui prints where to open the GUI, and its own random login, once (SMB_GUI picks which GUI)
+        "gui_re": TRANSFER_GUI_RE,
+        "note": "The SMB password for this session's GUI, on the cluster's login node: it is kept (in rclone's "
+                "reversible encoding) in a private in-memory file until you Stop it. Nothing is saved for later.",
         "settings": [
             ("SMB_HOST", "SMB server", "just the host, e.g. files.example.edu; //HOST/SHARE/FOLDER fills in the folder too"),
             ("SMB_ROOT", "Folder", "SHARE/FOLDER that smbshell paths are relative to, e.g. research/our_group"),
@@ -189,25 +212,14 @@ APPS = {
                                                        "database\": smbshell find-spn shows the one it knows"),
             ("SMB_AUTH", "Sign in with", "auto: a Kerberos ticket if you have one, else the saved password",
              ("auto", "kerberos", "password")),
+            ("SMB_GUI", "GUI", "what Start opens: rclone (rclone's web GUI), NAME for NAME.gui.sh from a settings "
+                               "package, or a program on the cluster (smbshell --help); default rclone"),
             ("SMB_IMAGE", "Image", "where data-transfer-tools.sif is kept; default /scratch/user/USER/images/"
                                    "data-transfer-tools.sif"),
             ("SMB_IMAGE_SOURCE", "Image source", "what Install pulls or builds it from (oras://, docker://, a .def "
                                                  "or a .sif); default docker://ghcr.io/tabor-research-group/"
                                                  "data-transfer-tools:latest"),
         ],
-    },
-    "rclone": {
-        "title": "Rclone",
-        "tunnel": "data-transfer",          # the data-transfer-tools image, and Data transfer's settings
-        "kind": "login",
-        "open_path": "/",
-        "health_path": "/",                 # rclone rcd: 401 without its login, which says it's up
-        # smbshell gui prints the GUI's own (random) login once; the page opens it with rclone's login_token
-        "gui_re": re.compile(r"^HPCLIB_RCLONE_GUI port=\d+ user=(\S+) pass=(\S+)\s*$", re.M),
-        "note": "The SMB password for this rclone web GUI session, on the cluster's login node: rclone keeps it "
-                "(in rclone's reversible encoding) in a private in-memory file until you Stop it. Nothing is "
-                "saved for later.",
-        "settings": [],
     },
 }
 # hpclib's own apps; installed packages add theirs to APPS (load_package_apps)
@@ -296,6 +308,23 @@ class ConsoleError(Exception):
 
 def console_dir():
     return os.path.expanduser(os.environ.get("HPCLIB_CONSOLE_DIR") or "~/.config/hpclib/console")
+
+
+def open_with_default_application(path):
+    """Use the OS file association; never choose or look for an editor ourselves."""
+    if sys.platform == "win32":
+        os.startfile(path)
+        return
+    command = "/usr/bin/open" if sys.platform == "darwin" else "xdg-open"
+    proc = subprocess.Popen([command, path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        status = proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        # Some desktop handlers stay running with the application. Leave them running.
+        return
+    if status:
+        raise OSError(f"the OS file opener exited with status {status}")
 
 
 def write_private(path, text):
@@ -720,6 +749,7 @@ class Clusters:
         self.logins = logins or Logins()
         self.ops = {}
         self.app_procs = {}
+        self.control_procs = {}      # (name, app): a row's control that asks for a password (kinit), beside its GUI
         self.packages = load_package_apps()
         self.secret_runner = self._run_with_input
 
@@ -891,6 +921,12 @@ class Clusters:
     def prompt_of(proc):
         return proc.waiting() if isinstance(proc, PtySession) and proc.poll() is None else None
 
+    def app_waiting(self, name, app):
+        """The app session's process that waits for an answer now: its control's (kinit), else its own."""
+        with self.lock:
+            procs = [self.control_procs.get((name, app)), self.app_procs.get((name, app))]
+        return next((p for p in procs if self.prompt_of(p)), procs[1])
+
     def prompts(self):
         """
         Tunnels and app sessions started here that wait for a password now, and how many are still running.
@@ -899,6 +935,7 @@ class Clusters:
         with self.lock:
             procs = [(name, None, proc) for name, proc in self.procs.items()]
             procs += [(name, app, proc) for (name, app), proc in self.app_procs.items()]
+            procs += [(name, app, proc) for (name, app), proc in self.control_procs.items()]
         waiting, running = [], 0
         for name, app, proc in procs:
             if proc.poll() is not None:
@@ -914,12 +951,16 @@ class Clusters:
                                 "prompt": prompt})
         return {"prompts": waiting, "running": running}
 
-    def _open_log(self, name, title, path=None):
+    def _open_log(self, name, title, path=None, mark="==="):
+        """
+        The log, with a header for what runs next: === for a launch (_last_launch reads from the newest one), ---
+        for a command run beside it (a sign-in control), which leaves the launch's lines where they are.
+        """
         path = path or self.log_path(name)
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         log = open(path, "ab", buffering=0)
         os.chmod(path, 0o600)
-        log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {title} ===\n".encode())
+        log.write(f"\n{mark} {time.strftime('%Y-%m-%d %H:%M:%S')} {title} {mark}\n".encode())
         return log
 
     # -- installing and setting up ------------------------------------------
@@ -1064,6 +1105,7 @@ class Clusters:
         _, conf = self.app_config(profile, app)
         return {"app": app, "cluster": profile["name"], "port": conf["port"],
                 "tunnel_args": conf.get("tunnel_args") or [],
+                "job": spec.get("kind", "tunnel") == "tunnel",    # a SLURM job: its sbatch options apply
                 "python_env": "env_settings" in spec,       # JupyterLab's conda environment, modules and project
                 "conda_env": conf.get("conda_env"),        # None: the tunnel's default ("default"); "": none
                 "modules": conf.get("modules") or [],
@@ -1170,7 +1212,7 @@ class Clusters:
         if digest is not None or conf.get("pushed_package"):
             args += ["--push", stage]
         if not spec.get("settings") and "env_settings" not in spec:
-            return args + list(actions)            # no settings of its own (Rclone shares Data transfer's)
+            return args + list(actions)            # no settings of its own: the cluster's stay as they are
         for k, v in sorted(self.app_vars(spec, conf).items()):
             args += ["--set", f"{k}={v}"]
         return args + ["--save"] + list(actions)
@@ -1201,7 +1243,8 @@ class Clusters:
     def package_remove(self, name):
         apps = [a for a, v in APPS.items() if v.get("package") == name]
         with self.lock:
-            running = sorted({a for (_, a), p in self.app_procs.items() if a in apps and p.poll() is None})
+            running = sorted({a for (_, a), p in list(self.app_procs.items()) + list(self.control_procs.items())
+                              if a in apps and p.poll() is None})
             if running:
                 raise ConsoleError(409, f"stop {', '.join(APPS[a]['title'] for a in running)} first")
             try:
@@ -1446,7 +1489,7 @@ class Clusters:
 
     def app_extras(self, spec, state):
         """The row's toolbar tools and extra controls (see APPS)."""
-        if spec.get("kind") == "tool":
+        if spec.get("smb"):
             return self.transfer_extras(state)
         tools, controls = [], []
         inst = state.get("instance")
@@ -1468,7 +1511,7 @@ class Clusters:
                               "text": f"none seen yet: Start connects to a running {what} job, or starts one"})
         return tools, controls
 
-    # -- Data transfer (smbshell): signing in to the SMB server --------------------------------
+    # -- Data transfer (smbshell): signing in to the SMB server, beside its GUI ----------------------
 
     TRANSFER_CONTROLS = {
         # id: (smbshell command, runs in a terminal that may ask for a password, note for the password dialog)
@@ -1552,14 +1595,14 @@ class Clusters:
         if not self.logins.alive(profile):
             raise ConsoleError(409, f"log in to {name} first: this runs over the console's ssh login")
         with self.lock:
-            proc = self.app_procs.get((name, app))
+            proc = self.control_procs.get((name, app))
             if proc is not None and proc.poll() is None:
-                raise ConsoleError(409, f"{spec['title']} on {name} is already running something")
-        self._open_log(name, " ".join(args + [command]), self.app_log_path(name, app)).close()
+                raise ConsoleError(409, f"{spec['title']} on {name} is already signing in")
+        self._open_log(name, " ".join(args + [command]), self.app_log_path(name, app), mark="---").close()
         proc = self.tunnel_runner(args + [command], self.app_log_path(name, app))
         proc.note = note
         with self.lock:
-            self.app_procs[(name, app)] = proc
+            self.control_procs[(name, app)] = proc
 
         def then():                                   # once it's done, what the cluster says now
             proc.wait()
@@ -1607,7 +1650,7 @@ class Clusters:
     def app_control(self, profile, app, control, body):
         """One of the row's extra controls."""
         spec = self.app_spec(app)
-        if spec.get("kind") == "tool":
+        if spec.get("smb"):
             return self.transfer_control(profile, app, control)
         if control != "stop_instance" or not spec.get("shared"):
             raise ConsoleError(404, f"{spec['title']} has no control {control!r}")
@@ -1648,24 +1691,17 @@ class Clusters:
         port = conf["port"]
         with self.lock:
             proc = self.app_procs.get((name, app))
-        if spec.get("kind") == "tool":
-            running = proc is not None and proc.poll() is None
-            out = {"app": app, "cluster": name, "host": profile.get("host"), "kind": "tool", "port": None,
-                   "started_here": running, "state": "working" if running else "ready", "url": None,
-                   "prompt": self.prompt_of(proc), "auth": conf.get("auth"),
-                   "install": (conf.get("install") or {"state": "unchecked"}) if self.app_installable(app)
-                              else {"state": "nothing"}}
-            with self.lock:
-                op = self.ops.get(name)
-                if op and op.get("app") == app:
-                    out["operation"] = {k: op.get(k) for k in ("kind", "title", "app", "state", "exit_code",
-                                                               "started", "finished")}
-            return out
         out = {"app": app, "cluster": name, "host": profile.get("host"), "port": port,
                "started_here": proc is not None and proc.poll() is None, "url": None, "prompt": self.prompt_of(proc),
                "install": (conf.get("install") or {"state": "unchecked"}) if self.app_installable(app)
                           else {"state": "nothing"},
                "shared": bool(spec.get("shared")), "kind": spec.get("kind", "tunnel")}
+        if spec.get("smb"):
+            with self.lock:
+                control = self.control_procs.get((name, app))
+            out["auth"] = conf.get("auth")
+            out["signing_in"] = control is not None and control.poll() is None
+            out["prompt"] = self.prompt_of(control) or out["prompt"]
         with self.lock:
             op = self.ops.get(name)
             if op and op.get("app") == app:
@@ -1698,20 +1734,32 @@ class Clusters:
         if spec.get("gui_re") is not None:
             found = spec["gui_re"].findall(self._last_launch(name, app))
             if not found:
-                return dict(out, state="starting", error="waiting for its login to be printed")
-            user, password = found[-1]
-            # As rclone rcd opens it itself: the login in the address answers the server's basic-auth prompt for
-            # the page, and login_token gives the GUI the same login for its API calls.
-            login = base64.urlsafe_b64encode(f"{user}:{password}".encode()).decode()
-            q = urllib.parse.quote
-            url = (f"http://{q(user, safe='')}:{q(password, safe='')}@127.0.0.1:{port}{spec['open_path']}"
-                   f"?login_token={q(login, safe='')}")
-            return dict(out, state="up", url=url, token_known=True, username=user, password=password)
+                return dict(out, state="starting", error="waiting for it to say where to open it")
+            return dict(out, state="up", token_known=True, **self.transfer_gui_url(port, spec, *found[-1]))
         extra = {}
         if spec.get("password_re") is not None:
             extra["password"] = self._app_token(name, app, "password_re")
         return dict(out, state="up", version=info.get("version"), url=url,
                     token_known=token is not None or "token_re" not in spec, **extra)
+
+    @staticmethod
+    def transfer_gui_url(port, spec, which, fields):
+        """
+        Where Open goes for a GUI's HPCLIB_TRANSFER_GUI line (TRANSFER_GUI_RE): path= (default the app's
+        open_path), and query= as given (already URL-encoded); user= and pass= go in the address, answering the
+        server's basic-auth prompt for the page, and are shown in case it asks again. The port is the console's.
+        """
+        given = dict(f.split("=", 1) for f in fields.split())
+        user, password = given.get("user"), given.get("pass")
+        path, query = given.get("path") or spec["open_path"], given.get("query")
+        path = "/" + path.lstrip("/")             # on this port, whatever the GUI printed
+        if which == "RCLONE":       # an older smbshell: rclone's GUI takes the same login for its API calls
+            query = "login_token=" + urllib.parse.quote(
+                base64.urlsafe_b64encode(f"{user}:{password}".encode()).decode(), safe="")
+        q = urllib.parse.quote
+        login = f"{q(user, safe='')}:{q(password or '', safe='')}@" if user else ""
+        url = f"http://{login}127.0.0.1:{port}{path}" + (f"?{query}" if query else "")
+        return dict(url=url, **({"username": user, "password": password} if user else {}))
 
     def app_sessions(self, app):
         self.app_spec(app)
@@ -1722,8 +1770,6 @@ class Clusters:
 
     def app_start(self, profile, app):
         spec = self.app_spec(app)
-        if spec.get("kind") == "tool":
-            raise ConsoleError(400, f"{spec['title']} has nothing to start; use smbshell, or its controls")
         name = profile["name"]
         _, conf = self.app_config(profile, app)
         with self.lock:
@@ -1744,7 +1790,8 @@ class Clusters:
             if (conf.get("install") or {}).get("state") == "missing" and self.app_installable(app):
                 raise ConsoleError(409, f"{spec['title']} isn't installed on {name} ({conf['install'].get('message')})")
         if spec.get("kind") == "login":
-            # smbshell gui on the login node; the console's ssh forwards the port (stop_tunnel cancels it)
+            # smbshell gui (the GUI SMB_GUI names) on the login node; the console's ssh forwards the port
+            # (stop_tunnel cancels it)
             port = str(conf["port"])
             args = (["smbshell", "--on", "-L", f"127.0.0.1:{port}:127.0.0.1:{port}"] + ssh_options(profile) +
                     [profile["host"], "gui", "--port", port])
@@ -1899,6 +1946,7 @@ class ConsoleServer(http.server.ThreadingHTTPServer):
         self.clusters = clusters
         self.allow_origin = allow_origin.rstrip("/") if allow_origin else None
         self.static_dir = os.path.realpath(static_dir) if static_dir else None
+        self.stylesheet_lock = threading.Lock()
         self.max_body = max_body
         super().__init__(address, ConsoleHandler)
 
@@ -2032,6 +2080,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
     def route(self, verb, path):
         parts = [urllib.parse.unquote(p) for p in path.strip("/").split("/")[1:]]  # without "api"
         c = self.server.clusters
+        if parts == ["styles", "open"] and verb == "POST":
+            return 200, self.open_stylesheet()
         if parts == ["health"] and verb == "GET":
             return 200, {"ok": True, "console": VERSION, "clusters": len(c.names()), "pid": os.getpid(),
                          "hpclib_version": local_hpclib_version()}
@@ -2114,8 +2164,7 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         if action == ["stop"] and verb == "POST":
             return 200, dict(c.app_stop(profile, app), ok=True)
         if action == ["answer"] and verb == "POST":
-            with c.lock:
-                proc = c.app_procs.get((profile["name"], app))
+            proc = c.app_waiting(profile["name"], app)
             return 200, dict(c.answer_prompt(proc, self.json_body().get("answer")), ok=True)
         if action == ["log"] and verb == "GET":
             return 200, dict(c.app_log(profile["name"], app, self.int_arg("lines", 200, 1, 5000)), ok=True)
@@ -2266,7 +2315,45 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             raise ConsoleError(404, f"no mcp.json for {profile['name']}; rerun setup_agents")
         return {"ok": True, "mcp": entry, "name": profile.get("mcp_name")}
 
+    def open_stylesheet(self):
+        path = os.path.abspath(os.path.join(console_dir(), "user.css"))
+        created = False
+        with self.server.stylesheet_lock:
+            if not os.path.lexists(path):
+                if not self.server.static_dir:
+                    raise ConsoleError(503, "default-styles.css is unavailable; run the console with --static")
+                defaults = os.path.join(self.server.static_dir, "default-styles.css")
+                try:
+                    with open(defaults, "rb") as f:
+                        content = f.read()
+                except OSError as e:
+                    raise ConsoleError(503, "could not read the bundled default-styles.css") from e
+                os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+                try:
+                    # Exclusive creation also preserves a file another process just created.
+                    with open(path, "xb") as f:
+                        f.write(content)
+                    created = True
+                except FileExistsError:
+                    pass
+            if not os.path.isfile(path):
+                raise ConsoleError(409, "user.css exists but is not a file")
+        try:
+            open_with_default_application(path)
+        except (OSError, NotImplementedError) as e:
+            raise ConsoleError(503, f"could not open user.css with the OS default application: {e}", path=path) from e
+        return {"ok": True, "path": path, "created": created}
+
     def serve_static(self, path):
+        # One optional user file outside --static; never expose the console's other files.
+        # Handle it before the SPA fallback, which would otherwise return HTML when it is absent.
+        if path == "/user.css":
+            try:
+                with open(os.path.join(console_dir(), "user.css"), "rb") as f:
+                    body = f.read()
+            except FileNotFoundError:
+                body = b""
+            return self.send_bytes(200, "text/css; charset=utf-8", body, cache=False)
         root = self.server.static_dir
         rel = urllib.parse.unquote(path).lstrip("/") or "index.html"
         target = os.path.realpath(os.path.join(root, rel))

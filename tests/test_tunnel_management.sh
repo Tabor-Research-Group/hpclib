@@ -824,7 +824,14 @@ printf 'pass=OBS:hunter2\n' > "$sb/home/.config/hpclib/smb/credentials"
 out=$(env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
   XDG_RUNTIME_DIR="$sb/run" SMB_ROOT=research/our_group SMB_AUTH=password \
   bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" gui --port 27555 2>/dev/null < /dev/null) || fail "gui: $out"
-case "$out" in "HPCLIB_RCLONE_GUI port=27555 user=hpclib pass="[0-9a-f]*) ;; *) fail "gui login line: $out" ;; esac
+case "$out" in "HPCLIB_TRANSFER_GUI port=27555 user=hpclib pass="[0-9a-f]*" query=login_token="*) ;; *) fail "gui line: $out" ;; esac
+# rclone's GUI takes the login again as login_token: base64url of user:pass, URL-encoded
+python3 - "$out" <<'PY2' || fail "gui login_token: $out"
+import base64, sys, urllib.parse
+f = dict(x.split("=", 1) for x in sys.argv[1].split()[1:])
+token = urllib.parse.quote(base64.urlsafe_b64encode(f"{f['user']}:{f['pass']}".encode()).decode(), safe="")
+sys.exit(f["query"] != "login_token=" + token)
+PY2
 grep -q -- '--rc-web-gui --rc-web-gui-no-open-browser --rc-addr 127.0.0.1:27555 --rc-user hpclib --rc-pass ' "$sb/log" ||
   fail "rcd: $(cat "$sb/log")"
 sed -n '/^--- config$/,/^--- end$/p' "$sb/log" > "$sb/gui.conf"
@@ -833,6 +840,33 @@ for want in '[smb]' 'type = smb' 'host = files.example.edu' 'domain = EXAMPLE' '
   grep -qxF "$want" "$sb/gui.conf" || fail "gui config lacks '$want': $(cat "$sb/gui.conf")"
 done
 grep -qF '[lab]' "$sb/gui.conf" && fail 'the gui config still has a [lab] remote of its own'
+# a GUI of your own (SMB_GUI=NAME: NAME.gui.sh, as a settings package leaves it, not executable): signed in, with
+# the session's remotes, a login to require, and rclone in the image to call; it says where to open it
+cat > "$sb/data/settings/data-transfer.d/mine.gui.sh" <<'SCRIPT'
+echo "HPCLIB_TRANSFER_GUI port=$HPCLIB_GUI_PORT path=/files user=$HPCLIB_GUI_USER pass=$HPCLIB_GUI_PASS"
+echo "mine port=$HPCLIB_GUI_PORT dir=$HPCLIB_GUI_DIR config=$RCLONE_CONFIG" >> "$TEST_SMB_LOG"
+[ "$(dirname "$RCLONE_CONFIG")" = "$HPCLIB_GUI_DIR" ] && grep -qxF '[ours]' "$RCLONE_CONFIG" ||
+  echo "mine: no session config" >> "$TEST_SMB_LOG"
+"$SMBSHELL_RCLONE" lsjson smb:research
+SCRIPT
+: > "$sb/log"
+out=$(env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
+  XDG_RUNTIME_DIR="$sb/run" SMB_AUTH=password SMB_GUI=mine \
+  bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" gui --port 27555 2>/dev/null < /dev/null) || fail "own gui: $out"
+case "$out" in "HPCLIB_TRANSFER_GUI port=27555 path=/files user=hpclib pass="[0-9a-f]*) ;; *) fail "own gui line: $out" ;; esac
+grep -q "^mine port=27555 dir=$sb/run/hpclib-rclone-gui\." "$sb/log" || fail "own gui's environment: $(cat "$sb/log")"
+grep -q 'mine: no session config' "$sb/log" && fail "own gui's config: $(cat "$sb/log")"
+grep -q "^rclone --config $sb/run/hpclib-rclone-gui\.[A-Za-z0-9]*/rclone.conf lsjson smb:research$" "$sb/log" ||
+  fail "own gui's rclone: $(cat "$sb/log")"
+grep -q "^binds=.*$sb/run/hpclib-rclone-gui\." "$sb/log" || fail "own gui's rclone sees no config: $(cat "$sb/log")"
+grep -q -- '--rc-web-gui' "$sb/log" && fail "rclone's GUI ran too: $(cat "$sb/log")"
+# one that isn't there, or isn't a name, stops before asking for a password
+for gui in nope 'a b'; do
+  out=$(env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
+    XDG_RUNTIME_DIR="$sb/run" SMB_GUI="$gui" bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" gui --port 27555 \
+    2>&1 < /dev/null) && fail "SMB_GUI=$gui ran"
+  case "$out" in *"no GUI nope"*|*"SMB_GUI is rclone, a NAME"*) ;; *) fail "SMB_GUI=$gui: $out" ;; esac
+done
 # a settings file may add remotes, not replace smbshell's own
 printf '[smb]\ntype = local\n' > "$sb/data/settings/data-transfer.d/rclone.conf"
 if env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \

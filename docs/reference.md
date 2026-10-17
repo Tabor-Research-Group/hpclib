@@ -98,7 +98,7 @@
 | `rest` | hpclib's REST server | 5000, 5000 | started by `agent_tunnel` |
 | `pai` | proto-auto-interface | 8080, 3100 (or another free port the job picks) | shared instance |
 | `ngl` | MDsrv | 8999, 8080 | `mdsrv` in the conda environment |
-| `data-transfer` | `smbshell` and rclone's web GUI | | not a port-forwarding tunnel |
+| `data-transfer` | `smbshell` and its web GUI (rclone's, or `SMB_GUI`'s) | | `smbshell gui` on the login node |
 
 ## Console HTTP API
 

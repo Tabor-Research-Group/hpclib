@@ -6,10 +6,18 @@
   <meta name="referrer" content="no-referrer">
   <title>hpclib console</title>
   <link rel="icon" type="image/x-icon" href="icon.png">
+  <link rel="stylesheet" href="default-styles.css">
   <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="/user.css">
 </head>
 <body>
   <div id="topbar">
+    <details id="console-menu">
+      <summary aria-label="Console menu" title="Console menu"><span aria-hidden="true">☰</span></summary>
+      <div id="console-menu-items">
+        <button id="open-stylesheet" type="button">Open Stylesheet</button>
+      </div>
+    </details>
     <span class="brand">hpclib</span>
     <nav id="apps"></nav>
     <span id="topstatus" class="muted"></span>

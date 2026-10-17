@@ -191,9 +191,15 @@ smbshell put /scratch/user/me/results proj/results
 smbshell sync pull proj/raw /scratch/user/me/raw --dry-run     # sync deletes what the source lacks
 smbshell submit --time=2:00:00 get proj/raw /scratch/user/me/raw  # the same, as a SLURM job
 smbshell submit --manifest transfers.json        # [["get", "proj/a", "/scratch/.../a"], ...]: a job array
-smbshell gui --port 27555                        # rclone's web interface on the login node
+smbshell gui --port 27555                        # a web GUI on the login node: rclone's, or SMB_GUI's
 smbshell status                                  # how it would sign in, and what rclone supports
 ```
 
 Paths are relative to `SMB_ROOT` when it is set; `/SHARE/PATH` and `//HOST/SHARE/PATH` are absolute. Signing in
 uses a Kerberos ticket if there is one, else the saved password, else asks; jobs never ask.
+
+`SMB_GUI` picks what `smbshell gui` serves: `rclone` (the default), `NAME` for `NAME.gui.sh` in
+`~/.local/tunnels/settings/data-transfer.d/` (a settings package's file), or a program on the cluster. A program
+of your own is given the port, a session login to require, the signed-in rclone remotes and rclone in the image,
+and prints `HPCLIB_TRANSFER_GUI port=PORT [path=...] [user=... pass=...]` once it serves; `smbshell --help` lists
+the details.

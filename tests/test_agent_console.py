@@ -225,11 +225,51 @@ class TestSecurity(ConsoleTestCase):
         self.assertIn(b"<title>console", self.call("GET", "/jobs/123", key=None, raw=True)[1])  # SPA fallback
         self.assertNotIn(b"secret", self.call("GET", "/../agents/x", key=None, raw=True)[1])
 
+    def test_user_stylesheet_optional_and_reloaded(self):
+        # No file yet: CSS, not the HTML SPA fallback, and no session key needed.
+        status, content, headers = self.call("GET", "/user.css", key=None, raw=True)
+        self.assertEqual((status, content), (200, b""))
+        self.assertEqual(headers.get("Content-Type"), "text/css; charset=utf-8")
+        self.assertEqual(headers.get("Cache-Control"), "no-store")
+        self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff")
+
+        # The fixture uses HPCLIB_CONSOLE_DIR; a file in --static must not replace it.
+        (Path(self.console_server.static_dir) / "user.css").write_text("body { color: red; }")
+        self.console.mkdir(parents=True, exist_ok=True)
+        stylesheet = self.console / "user.css"
+        for css in (b":root { --accent: purple; }\n", b"main { max-width: 1500px; }\n"):
+            stylesheet.write_bytes(css)
+            status, content, headers = self.call("GET", "/user.css", key=None, raw=True)
+            self.assertEqual((status, content), (200, css))
+            self.assertEqual(headers.get("Cache-Control"), "no-store")
+        stylesheet.unlink()
+        self.assertEqual(self.call("GET", "/user.css", key=None, raw=True)[:2], (200, b""))
+
+    def test_user_stylesheet_keeps_console_files_private(self):
+        self.console.mkdir(parents=True, exist_ok=True)
+        (self.console / "session").write_text("PRIVATE_SESSION_KEY")
+        css = b":root { --accent: purple; }"
+        (self.console / "user.css").write_bytes(css)
+        self.assertEqual(self.call("GET", "/user.css?file=session", key=None, raw=True)[:2], (200, css))
+        for route in ("/session", "/console/session", "/user.css/session", "/user.css/../session",
+                      "/user.css%2f..%2fsession", "/../console/session"):
+            status, content, _ = self.call("GET", route, key=None, raw=True)
+            self.assertIn(status, (200, 404))
+            self.assertNotIn(b"PRIVATE_SESSION_KEY", content)
+        self.assertEqual(self.call("GET", "/user.css", key=None, raw=True,
+                                   headers={"Host": "evil.example:80"})[0], 421)
+        self.assertEqual(self.call("GET", "/api/health", key=None)[0], 401)
+
     def test_serves_the_bundled_front_end(self):
         ui = Path(__file__).resolve().parents[1] / "agent-console"
         self.console_server.static_dir = str(ui)
         status, content, _ = self.call("GET", "/", key=None, raw=True)
         self.assertIn(b'src="app.js"', content)
+        self.assertLess(content.index(b'href="default-styles.css"'), content.index(b'href="style.css"'))
+        self.assertGreater(content.index(b'href="/user.css"'), content.index(b'href="style.css"'))
+        status, asset, headers = self.call("GET", "/default-styles.css", key=None, raw=True)
+        self.assertEqual((status, headers.get("Content-Type")), (200, "text/css"))
+        self.assertIn(b"--log-max-width: 960px", asset)
         status, content, headers = self.call("GET", "/app.js", key=None, raw=True)
         self.assertEqual(status, 200)
         self.assertIn("javascript", headers.get("Content-Type"))  # module scripts need a JS type
@@ -244,6 +284,103 @@ class TestSecurity(ConsoleTestCase):
         with self.assertRaises(SystemExit):
             agent_console.parse_args(["--allow-origin", "*"])
         self.assertEqual(agent_console.parse_args(["--port", "1234"]).port, 1234)
+
+
+class TestStylesheets(ConsoleTestCase):
+
+    def test_open_creates_exact_defaults_and_preserves_existing_file(self):
+        ui = Path(__file__).resolve().parents[1] / "agent-console"
+        self.console_server.static_dir = str(ui)
+        destination = self.console / "user.css"
+        with mock.patch.object(agent_console, "open_with_default_application") as opener:
+            status, out = self.call("POST", "/api/styles/open")
+            self.assertEqual(status, 200)
+            self.assertEqual(out, {"ok": True, "path": str(destination), "created": True})
+            self.assertEqual(destination.read_bytes(), (ui / "default-styles.css").read_bytes())
+            opener.assert_called_once_with(str(destination))
+            self.assertEqual(self.call("GET", "/user.css", key=None, raw=True)[1], destination.read_bytes())
+            for existing in (b":root { --accent: purple; }", b""):
+                destination.write_bytes(existing)
+                status, out = self.call("POST", "/api/styles/open", {"path": "elsewhere.css"})
+                self.assertEqual((status, out["created"]), (200, False))
+                self.assertEqual(out["path"], str(destination))
+                self.assertEqual(destination.read_bytes(), existing)
+                self.assertFalse((self.console / "elsewhere.css").exists())
+            self.assertEqual(opener.call_count, 3)
+
+    def test_open_requires_key_and_post(self):
+        with mock.patch.object(agent_console, "open_with_default_application") as opener:
+            for key in (None, "wrong"):
+                self.assertEqual(self.call("POST", "/api/styles/open", key=key)[0], 401)
+            self.assertEqual(self.call("GET", "/api/styles/open")[0], 404)
+            self.assertEqual(self.call("POST", "/api/styles/open", headers={"Host": "evil.example:80"})[0], 421)
+            self.assertFalse((self.console / "user.css").exists())
+            opener.assert_not_called()
+
+    def test_missing_defaults_does_not_create_an_empty_stylesheet(self):
+        with mock.patch.object(agent_console, "open_with_default_application") as opener:
+            self.assertEqual(self.call("POST", "/api/styles/open")[0], 503)
+            self.assertFalse((self.console / "user.css").exists())
+            self.console_server.static_dir = None
+            self.assertEqual(self.call("POST", "/api/styles/open")[0], 503)
+            opener.assert_not_called()
+
+    def test_existing_stylesheet_can_open_without_static_assets(self):
+        self.console.mkdir(parents=True, exist_ok=True)
+        destination = self.console / "user.css"
+        destination.write_bytes(b"/* personal styles */")
+        self.console_server.static_dir = None
+        with mock.patch.object(agent_console, "open_with_default_application") as opener:
+            status, out = self.call("POST", "/api/styles/open")
+            self.assertEqual((status, out["created"]), (200, False))
+            opener.assert_called_once_with(str(destination))
+
+    def test_opener_error_preserves_new_file_and_reports_failure(self):
+        self.console_server.static_dir = str(Path(__file__).resolve().parents[1] / "agent-console")
+        with mock.patch.object(agent_console, "open_with_default_application", side_effect=OSError("no CSS association")):
+            status, out = self.call("POST", "/api/styles/open")
+            self.assertEqual(status, 503)
+            self.assertIn("OS default application", out["error"])
+            self.assertTrue((self.console / "user.css").is_file())
+            self.assertEqual(out["path"], str(self.console / "user.css"))
+
+    def test_non_file_destination_is_preserved(self):
+        (self.console / "user.css").mkdir(parents=True)
+        with mock.patch.object(agent_console, "open_with_default_application") as opener:
+            self.assertEqual(self.call("POST", "/api/styles/open")[0], 409)
+            self.assertTrue((self.console / "user.css").is_dir())
+            opener.assert_not_called()
+
+
+class TestDefaultApplication(unittest.TestCase):
+
+    def test_delegates_to_os_without_selecting_an_editor(self):
+        path = "/tmp/styles with spaces/user.css"
+        for platform, command in (("darwin", "/usr/bin/open"), ("linux", "xdg-open")):
+            with self.subTest(platform=platform), mock.patch.object(agent_console.sys, "platform", platform), \
+                    mock.patch.object(agent_console.subprocess, "Popen") as launch:
+                launch.return_value.wait.return_value = 0
+                agent_console.open_with_default_application(path)
+                self.assertEqual(launch.call_args.args, ([command, path],))
+                self.assertNotIn("shell", launch.call_args.kwargs)
+        with mock.patch.object(agent_console.sys, "platform", "win32"), \
+                mock.patch.object(agent_console.os, "startfile", create=True) as startfile, \
+                mock.patch.object(agent_console.subprocess, "Popen") as launch:
+            agent_console.open_with_default_application(path)
+            startfile.assert_called_once_with(path)
+            launch.assert_not_called()
+
+    def test_running_handler_is_not_terminated_and_failure_is_reported(self):
+        with mock.patch.object(agent_console.sys, "platform", "linux"), \
+                mock.patch.object(agent_console.subprocess, "Popen") as launch:
+            launch.return_value.wait.side_effect = subprocess.TimeoutExpired("xdg-open", 2)
+            agent_console.open_with_default_application("/tmp/user.css")
+            launch.return_value.terminate.assert_not_called()
+            launch.return_value.kill.assert_not_called()
+            launch.return_value.wait.side_effect = None
+            launch.return_value.wait.return_value = 1
+            with self.assertRaises(OSError):
+                agent_console.open_with_default_application("/tmp/user.css")
 
 
 class TestClusters(ConsoleTestCase):
@@ -603,8 +740,8 @@ class TestApps(ConsoleTestCase):
 
     def test_listing_and_ports(self):
         out = self.call("GET", "/api/apps")[1]
-        self.assertEqual([a["id"] for a in out["apps"]], ["agents", "jupyter", "vscode", "transfer", "rclone"])   # PAI is a package now
-        self.assertEqual({a["id"]: a.get("kind") for a in out["apps"]}["transfer"], "tool")
+        self.assertEqual([a["id"] for a in out["apps"]], ["agents", "jupyter", "vscode", "transfer"])   # PAI is a package now
+        self.assertEqual({a["id"]: a.get("kind") for a in out["apps"]}["transfer"], "login")
         status, out = self.call("GET", "/api/apps/jupyter")
         self.assertEqual(status, 200)
         by_name = {x["cluster"]: x for x in out["sessions"]}
@@ -865,6 +1002,7 @@ FAKE_KINIT = textwrap.dedent("""\
 
 class TestDataTransfer(ConsoleTestCase):
     """The Data transfer page: signing in to the SMB server (kinit, or a password saved for jobs) for smbshell."""
+    serve = TestApps.serve
 
     def setUp(self):
         super().setUp()
@@ -877,9 +1015,12 @@ class TestDataTransfer(ConsoleTestCase):
 
     def test_status_and_controls(self):
         state = self.call("GET", self.route)[1]
-        self.assertEqual((state["kind"], state["auth"], state["port"]), ("tool", None, None))
+        self.assertEqual((state["kind"], state["auth"], state["state"], state["signing_in"]), ("login", None, "down", False))
         self.assertEqual([c["id"] for c in state["controls"]], ["status"])
-        self.assertEqual(self.call("POST", self.route + "/start")[0], 400)
+        self.assertEqual(self.call("POST", self.route + "/start")[0], 409)                    # needs the login
+        settings = self.call("GET", self.route + "/settings")[1]
+        self.assertFalse(settings["job"])                                  # the login node's: no sbatch options
+        self.assertIn("SMB_GUI", [f["name"] for f in settings["fields"]])
         self.assertEqual(self.call("POST", self.route + "/control/status", {})[0], 409)          # needs the login
         with mock.patch.object(self.clusters.logins, "alive", return_value=True):
             status, out = self.call("POST", self.route + "/control/status", {})
@@ -956,34 +1097,92 @@ class TestDataTransfer(ConsoleTestCase):
         self.assertNotIn("kerberos-pass", log)
 
 
-class TestRcloneGui(ConsoleTestCase):
-    """Rclone: rclone's web GUI on the login node, its port forwarded over the console's login."""
+class TestTransferGui(ConsoleTestCase):
+    """Data transfer's Start: a web GUI on the login node (rclone's, or SMB_GUI's), its port forwarded over the login."""
     serve = TestApps.serve
 
-    def test_start_and_open(self):
-        route = f"/api/apps/rclone/{self.dead}"
-        state = self.call("GET", route)[1]
-        self.assertEqual((state["kind"], state["state"]), ("login", "down"))
-        port = agent_profiles.load(self.dead)["apps"]["rclone"]["port"]
-        host = agent_profiles.load(self.dead)["host"]
+    def setUp(self):
+        super().setUp()
+        self.route = f"/api/apps/transfer/{self.dead}"
+        self.call("GET", self.route)          # picks its ports
+        self.shell.setup_status = "installed /x/data-transfer-tools.sif"    # Start checks first: settings unsent
+        self.port = agent_profiles.load(self.dead)["apps"]["transfer"]["port"]
+        self.host = agent_profiles.load(self.dead)["host"]
+        self.log = self.console / "logs" / f"{self.dead}.transfer.log"
+
+    def start(self):
         with mock.patch.object(self.clusters.logins, "alive", return_value=True):
-            status, out = self.call("POST", route + "/start")
-            self.assertEqual(status, 202, out)
-            self.assertEqual(self.shell.calls[-1], ["smbshell", "--on", "-L", f"127.0.0.1:{port}:127.0.0.1:{port}",
-                                                    host, "gui", "--port", str(port)])
-            # Check and Install use Data transfer's image, and never overwrite its settings
-            self.call("POST", route + "/check")
-            self.assertEqual(self.shell.calls[-1], ["tunnel_setup", host, "data-transfer", "--check"])
-        # once it prints its login, Open goes straight in
-        log = self.console / "logs" / f"{self.dead}.rclone.log"
-        log.write_text(log.read_text() + "HPCLIB_RCLONE_GUI port=%d user=hpclib pass=0a1b2c\r\n" % port)
-        self.serve(port)
-        state = self.call("GET", route)[1]
+            status, out = self.call("POST", self.route + "/start")
+        self.assertEqual(status, 202, out)
+        self.assertEqual(self.shell.calls[-1], ["smbshell", "--on", "-L", f"127.0.0.1:{self.port}:127.0.0.1:{self.port}",
+                                                self.host, "gui", "--port", str(self.port)])
+
+    def printed(self, line):
+        self.log.write_text(self.log.read_text() + line + "\r\n")
+
+    def test_start_and_open(self):
+        self.assertEqual(self.call("GET", self.route)[1]["state"], "down")
+        self.start()
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            # Check sends its settings, as for any app that has them
+            self.call("POST", self.route + "/check")
+            self.assertEqual(self.shell.calls[-1][:3], ["tunnel_setup", self.host, "data-transfer"])
+            self.assertEqual(self.shell.calls[-1][-2:], ["--save", "--check"])
+        self.serve(self.port)
+        state = self.call("GET", self.route)[1]
+        self.assertEqual((state["state"], state["url"]), ("starting", None), state)    # nothing printed yet
+        # once it says where, Open goes straight in: rclone's GUI with its login in the address and login_token
+        self.printed("HPCLIB_TRANSFER_GUI port=%d user=hpclib pass=0a1b2c query=login_token=aHBjbGliOjBhMWIyYw%%3D%%3D"
+                     % self.port)
+        state = self.call("GET", self.route)[1]
         self.assertEqual(state["state"], "up", state)
-        self.assertEqual(state["url"], f"http://hpclib:0a1b2c@127.0.0.1:{port}/?login_token=aHBjbGliOjBhMWIyYw%3D%3D")
+        self.assertEqual(state["url"], f"http://hpclib:0a1b2c@127.0.0.1:{self.port}/?login_token=aHBjbGliOjBhMWIyYw%3D%3D")
         self.assertEqual((state["username"], state["password"]), ("hpclib", "0a1b2c"))
-        self.call("POST", route + "/stop")
-        self.assertEqual(self.shell.calls[-1], ["stop_tunnel", "-P", str(port), host])
+        self.call("POST", self.route + "/stop")
+        self.assertEqual(self.shell.calls[-1], ["stop_tunnel", "-P", str(self.port), self.host])
+
+    def test_other_guis(self):
+        self.start()
+        self.serve(self.port)
+        # a GUI of your own (SMB_GUI): where it starts, and no login in the address if it gives none
+        self.printed("HPCLIB_TRANSFER_GUI port=%d path=/browse query=root=research%%2Fours" % self.port)
+        state = self.call("GET", self.route)[1]
+        self.assertEqual(state["url"], f"http://127.0.0.1:{self.port}/browse?root=research%2Fours")
+        self.assertNotIn("username", state)
+        # an hpclib on the cluster from before SMB_GUI: rclone's line, opened as before
+        self.printed("HPCLIB_RCLONE_GUI port=%d user=hpclib pass=0a1b2c" % self.port)
+        self.assertEqual(self.call("GET", self.route)[1]["url"],
+                         f"http://hpclib:0a1b2c@127.0.0.1:{self.port}/?login_token=aHBjbGliOjBhMWIyYw%3D%3D")
+
+    def test_signing_in_beside_the_gui(self):
+        script = self.tmp / "fake-kinit"
+        script.write_text(FAKE_KINIT)
+        script.chmod(0o755)
+        self.start()
+        self.serve(self.port)
+        self.printed("HPCLIB_TRANSFER_GUI port=%d user=hpclib pass=0a1b2c" % self.port)
+        self.clusters.tunnel_runner = lambda args, log_path: agent_console.PtySession([str(script)], log_path, dict(os.environ))
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.assertEqual(self.call("POST", self.route + "/control/kinit", {})[0], 200)
+            for _ in range(50):
+                state = self.call("GET", self.route)[1]
+                if state["prompt"]:
+                    break
+                time.sleep(0.1)
+            # the GUI runs on: its process, and the login it printed, are its own
+            self.assertEqual((state["state"], state["signing_in"]), ("up", True), state)
+            self.assertTrue(state["url"].startswith("http://hpclib:0a1b2c@"))
+            self.assertIn("Kerberos", state["prompt"]["note"])
+            self.assertEqual(self.call("POST", self.route + "/answer", {"answer": "kerberos-pass"})[0], 200)
+            for _ in range(50):
+                if not self.call("GET", self.route)[1]["signing_in"]:
+                    break
+                time.sleep(0.1)
+        state = self.call("GET", self.route)[1]
+        self.assertEqual((state["state"], state["signing_in"]), ("up", False), state)
+        self.assertTrue(state["url"].startswith("http://hpclib:0a1b2c@"))
+        self.assertIsNotNone(self.clusters.app_procs.get((self.dead, "transfer")))
+        self.assertIn("signed in: me@AUTH.EXAMPLE.EDU", self.log.read_text())
 
 
 class TestSecondLogin(ConsoleTestCase):

@@ -94,6 +94,34 @@ function alertError(err) {
   main.prepend(el("hpc-panel", { dismissible: true }, errorBox(err)));
 }
 
+// Native disclosure: Enter/Space toggles it, Tab reaches its action, Escape closes it.
+const consoleMenu = document.getElementById("console-menu");
+const menuToggle = consoleMenu.querySelector("summary");
+const openStylesheetButton = document.getElementById("open-stylesheet");
+openStylesheetButton.addEventListener("click", async () => {
+  if (openStylesheetButton.disabled) return;
+  openStylesheetButton.disabled = true;
+  consoleMenu.open = false;
+  menuToggle.focus();
+  try {
+    await api("styles/open", { method: "POST" });
+  } catch (err) {
+    alertError(err);
+  } finally {
+    openStylesheetButton.disabled = false;
+  }
+});
+document.addEventListener("pointerdown", (e) => {
+  if (!consoleMenu.contains(e.target)) consoleMenu.open = false;
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && consoleMenu.open) {
+    e.preventDefault();
+    consoleMenu.open = false;
+    menuToggle.focus();
+  }
+});
+
 function diffView(text) {
   return el("pre", {}, text.split("\n").map((line) => el("span", {
     class: line.startsWith("@@") ? "hunk" : line.startsWith("+") ? "add" : line.startsWith("-") ? "del" : null,
@@ -960,8 +988,9 @@ async function appSettingsForm(app, s, row) {
     return "Removed.";
   }, { result: true });
   row.showDetail("settings", el("hpc-panel", { heading: `${APPS_UI[app].title} on ${s.cluster}`, dismissible: true },
-    el("p", { class: "muted" }, "The tunnel's job (empty: its defaults):"),
-    el("div", { class: "row" }, APP_TUNNEL_FIELDS.map(([k, label, hint]) => field(`Job: ${label}`, inputs[k], hint))),
+    conf.job === false ? null : [      // runs on the login node: no job, so no sbatch options
+      el("p", { class: "muted" }, "The tunnel's job (empty: its defaults):"),
+      el("div", { class: "row" }, APP_TUNNEL_FIELDS.map(([k, label, hint]) => field(`Job: ${label}`, inputs[k], hint)))],
     conf.python_env ? [
       el("p", { class: "muted" }, "Where jupyter comes from (any of these; it needs jupyterlab installed):"),
       el("div", { class: "row" },
@@ -970,7 +999,7 @@ async function appSettingsForm(app, s, row) {
         field("uv or pixi project", project, "its .venv or .pixi/envs/default; Install puts jupyterlab there"))] : null,
     conf.fields.length ? [
       el("p", { class: "muted" }, "On the cluster (empty: an installed package's value, else the tunnel's default). " +
-        "Install and the job both use these."),
+        (conf.job === false ? "Install and Start both use these." : "Install and the job both use these.")),
       el("div", { class: "row" }, conf.fields.map((f) => field(f.label, own[f.name], f.hint)))] : null,
     el("div", { class: "actions" }, save),
     secrets.length ? el("section", { class: "secrets" },
@@ -991,17 +1020,11 @@ async function appPage(app) {
     return row;
   });
   const { kind, description } = APPS_UI[app] || {};
-  const tool = kind === "tool";
   return [
     el("h2", {}, title),
-    el("p", { class: "muted" }, description ? description : tool
-      ? "Files between each cluster and an SMB server, with rclone from the data-transfer-tools image: " +
-        "smbshell on the cluster (smbshell --help), and smbshell submit for SLURM jobs. Sign in here once: " +
-        "Kerberos (kinit) where the cluster has it, or a password saved for sync jobs. Settings… names the server."
-      : kind === "login"
-      ? "rclone's web GUI per cluster, on its login node, reached through the console's ssh login: browse the SMB " +
-        "server (remote smb, plus any a settings package adds) and the cluster's files (cluster), and copy between them. Start asks for the " +
-        "SMB password, kept only until Stop. It uses Data transfer's settings and image."
+    el("p", { class: "muted" }, description ? description : kind === "login"
+      ? `A ${title} session per cluster, on its login node, reached through the console's ssh login. ` +
+        "It runs as you, with your full permissions on the cluster (it is not the agents' sandbox)."
       : `A ${title} session per cluster, in a SLURM job reached through its own tunnel. ` +
         "It runs as you, with your full permissions on the cluster (it is not the agents' sandbox). " +
         "What it needs on the cluster is checked once you're logged in, and Install sets it up there."),
@@ -1028,7 +1051,7 @@ const APPS_UI = {
 
 function addApp(id, title, kind = "tunnel", description = null) {
   APPS_UI[id] = { title, kind, description, default: "sessions",
-                  pages: { sessions: [kind === "tool" ? "Clusters" : "Sessions", () => appPage(id)] } };
+                  pages: { sessions: ["Sessions", () => appPage(id)] } };
 }
 addApp("jupyter", "JupyterLab");     // until the console says which it has
 

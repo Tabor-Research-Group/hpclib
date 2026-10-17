@@ -344,9 +344,6 @@ class TestConsolePackages(ConsoleTestCase):
             self.assertIn("SMB_HOST=files.example.edu", call)
             stage = Path(call[call.index("--push") + 1])
             self.assertEqual(os.listdir(stage), ["settings.d"])
-            # Rclone shares the tunnel: its Check sends the same files (it has no settings of its own)
-            self.call("POST", f"/api/apps/rclone/{self.dead}/check")
-            self.assertIn("--push", self.shell.calls[-1])
             # once removed, the next Check sends an empty settings.d, clearing the cluster's copy
             self.call("DELETE", "/api/packages/our-lab")
             self.call("POST", f"/api/apps/transfer/{self.dead}/check")

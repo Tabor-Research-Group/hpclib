@@ -11,12 +11,12 @@ done from the page.
 
 1. [Getting started](getting-started.md): start the console, add a cluster, log in, connect an LLM client.
 2. [Agents](agents.md): the Clusters, Proposals, Activity, Files and Settings pages.
-3. [Apps](apps.md): JupyterLab, VS Code, PAI, Data transfer, Rclone, and apps added from packages.
+3. [Apps](apps.md): JupyterLab, VS Code, PAI, Data transfer, and apps added from packages.
 
 ## How the page is laid out
 
 The **top bar** switches between apps. **Agents** is always first; then come the tunnel apps hpclib ships
-(**JupyterLab**, **VS Code**, **Data transfer**, **Rclone**, **PAI**) and any added from packages. On the right,
+(**JupyterLab**, **VS Code**, **Data transfer**, **PAI**) and any added from packages. On the right,
 **Add App or Settings** installs packages.
 
 Each app has its own pages under its name. Agents has Clusters, Proposals, Activity, Files and Settings; the

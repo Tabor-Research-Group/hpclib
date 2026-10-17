@@ -63,42 +63,49 @@ const css = (text) => {
   return sheet;
 };
 
-// ------------------------------------------------------------------ <hpc-panel>
-
-const PANEL_CSS = css(`
-  :host { display: block; margin: 4px 0 12px; }
-  :host([hidden]) { display: none; }
-  section {
-    position: relative;
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 10px 14px 12px;
-    background: var(--bg);
-  }
-  header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-height: 24px; padding-right: 28px; }
-  header:not(.has-content) { display: none; }
-  .heading { font-weight: 600; }
-  .status { color: var(--muted); }
-  .status.error { color: var(--bad); }
-  .status.ok { color: var(--good); }
-  .body { margin-top: 8px; }
-  header:not(.has-content) + .body { margin-top: 0; }
+// Close controls share their shape and typography; each component sets its position.
+const CLOSE_CSS = css(`
   button.close {
     position: absolute;
-    top: 6px;
-    right: 8px;
-    width: 24px;
-    height: 24px;
+    width: var(--close-size, 24px);
+    height: var(--close-size, 24px);
     padding: 0;
     border: none;
-    border-radius: 6px;
+    border-radius: var(--radius-control, 6px);
     background: none;
     color: var(--muted);
-    font: 18px/24px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font: var(--close-font-size, 18px)/var(--close-size, 24px) var(--font-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
     cursor: pointer;
   }
   button.close:hover { background: var(--panel); color: var(--fg); }
   button.close[hidden] { display: none; }
+`);
+
+// ------------------------------------------------------------------ <hpc-panel>
+
+const PANEL_CSS = css(`
+  :host { display: block; min-width: 0; margin: var(--space-xs, 4px) 0 var(--space-lg, 12px); }
+  :host([hidden]) { display: none; }
+  section {
+    position: relative;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-panel, 8px);
+    padding: var(--panel-padding, 10px 14px 12px);
+    box-sizing: border-box;
+    min-width: 0;
+    max-width: 100%;
+    background: var(--bg);
+  }
+  header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-height: var(--close-size, 24px); padding-right: calc(var(--close-size, 24px) + var(--space-xs, 4px)); }
+  header:not(.has-content) { display: none; }
+  .heading { font-weight: var(--font-weight-semibold, 600); }
+  .heading, .status { min-width: 0; overflow-wrap: anywhere; }
+  .status { color: var(--muted); }
+  .status.error { color: var(--bad); }
+  .status.ok { color: var(--good); }
+  .body { min-width: 0; max-width: 100%; margin-top: var(--space-md, 8px); }
+  header:not(.has-content) + .body { margin-top: 0; }
+  button.close { top: var(--space-sm, 6px); right: var(--space-md, 8px); }
   ::slotted([slot="actions"]) { margin-left: 2px; }
 `);
 
@@ -108,7 +115,7 @@ export class HpcPanel extends HTMLElement {
   constructor() {
     super();
     const root = this.attachShadow({ mode: "open" });
-    root.adoptedStyleSheets = [PANEL_CSS];
+    root.adoptedStyleSheets = [CLOSE_CSS, PANEL_CSS];
     root.innerHTML = `<section part="panel">
         <header part="header"><span class="heading" part="heading"></span><span class="status" part="status"></span>
           <slot name="actions"></slot></header>
@@ -216,22 +223,18 @@ export class HpcLog extends HTMLElement {
 const DIALOG_CSS = css(`
   dialog {
     position: relative;
-    width: min(440px, calc(100vw - 32px));
+    width: min(var(--dialog-max-width, 440px), calc(100vw - var(--dialog-viewport-gap, 32px)));
+    box-sizing: border-box;
     border: 1px solid var(--line);
-    border-radius: 10px;
-    padding: 16px 18px;
+    border-radius: var(--radius-dialog, 10px);
+    padding: var(--dialog-padding, 16px 18px);
     background: var(--bg);
     color: var(--fg);
   }
-  dialog::backdrop { background: rgb(0 0 0 / 0.35); }
-  h3 { font-size: 15px; margin: 0 28px 10px 0; }
+  dialog::backdrop { background: var(--dialog-backdrop, rgb(0 0 0 / 0.35)); }
+  h3 { font-size: var(--font-size-subheading, 15px); margin: 0 calc(var(--close-size, 24px) + var(--space-xs, 4px)) 10px 0; }
   h3:empty { display: none; }
-  button.close {
-    position: absolute; top: 10px; right: 10px; width: 24px; height: 24px; padding: 0;
-    border: none; border-radius: 6px; background: none; color: var(--muted);
-    font: 18px/24px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; cursor: pointer;
-  }
-  button.close:hover { background: var(--panel); color: var(--fg); }
+  button.close { top: 10px; right: 10px; }
 `);
 
 export class HpcDialog extends HTMLElement {
@@ -241,8 +244,8 @@ export class HpcDialog extends HTMLElement {
   constructor() {
     super();
     const root = this.attachShadow({ mode: "open" });
-    root.adoptedStyleSheets = [DIALOG_CSS];
-    root.innerHTML = `<dialog part="dialog"><button class="close" type="button" aria-label="Close" title="Close">×</button>
+    root.adoptedStyleSheets = [CLOSE_CSS, DIALOG_CSS];
+    root.innerHTML = `<dialog part="dialog"><button class="close" part="close" type="button" aria-label="Close" title="Close">×</button>
       <h3 part="heading"></h3><slot></slot></dialog>`;
     this._dialog = root.querySelector("dialog");
     this._heading = root.querySelector("h3");
@@ -651,7 +654,7 @@ class TunnelRow extends HTMLElement {
     // the operation's log, refreshing while it runs; the row refreshes too, so its buttons follow
     this._opShown = id;
     const log = el("hpc-log", { src: `clusters/${enc(this.name)}/operation?lines=400`, field: "log", every: 2 });
-    const panel = el("hpc-panel", { heading: "hpclib", dismissible: true }, log);
+    const panel = el("hpc-panel", { heading: "hpclib", dismissible: true, class: "log-panel" }, log);
     log.addEventListener("update", ({ detail: op }) => {
       panel.setAttribute("heading", op.title || op.kind);
       panel.setAttribute("status", { running: "running…", succeeded: "finished",
@@ -695,7 +698,7 @@ class TunnelRow extends HTMLElement {
   }
   toggleLog() {
     if (this.detailKind === "log") return this.hideDetail();
-    this.showDetail("log", el("hpc-panel", { heading: this.logHeading, dismissible: true },
+    this.showDetail("log", el("hpc-panel", { heading: this.logHeading, dismissible: true, class: "log-panel" },
       el("hpc-log", { src: this.logSrc, every: 3, empty: "(no log yet)" })));
     TunnelRow.openLogs.add(this.key);
   }
@@ -814,7 +817,7 @@ export class HpcAppSession extends TunnelRow {
 
   get busy() {
     const s = this._data;
-    return !!(s.prompt || ["starting", "queued", "working"].includes(s.state) || (s.started_here && s.state !== "up") ||
+    return !!(s.prompt || s.signing_in || ["starting", "queued"].includes(s.state) || (s.started_here && s.state !== "up") ||
               LOGIN_BUSY.includes((s.login || {}).state) || (s.operation && s.operation.state === "running"));
   }
 
@@ -854,8 +857,9 @@ export class HpcAppSession extends TunnelRow {
       this._checked = true;
       this.buttons.check.run();
     }
-    // a tool (Data transfer): how it would sign in, asked once you're logged in, after the install check
-    if (s.kind === "tool" && !s.auth && (s.login || {}).state === "connected" && !this._authAsked &&
+    // signing in to a server beside the session (Data transfer's SMB server): how it would, asked once you're
+    // logged in, after the install check
+    if ("auth" in s && !s.auth && (s.login || {}).state === "connected" && !this._authAsked &&
         s.install && s.install.state !== "unchecked") {
       this._authAsked = true;
       this.runControl({ id: "status" }).catch(() => {});
@@ -952,16 +956,6 @@ export class HpcAppSession extends TunnelRow {
     const stateText = up ? `running${s.version ? ` (${s.version})` : ""}`
       : (s.state === "queued" ? `queued: ${s.status}` : (APP_STATE_LABEL[s.state] || s.state));
     const cluster = { name: s.cluster, host: s.host, connection_hours: lg.connection_hours };
-    if (s.kind === "tool") {   // commands on the cluster, not a tunnel: no Open/Start/Stop
-      return [
-        s.cluster,
-        this.loginCells(lg, cluster),
-        [s.state === "working" ? el("hpc-state", { tone: "starting", label: "working…" }) : null,
-         this.promptLine(`${this.appTitle} on ${s.cluster}`, this.base + "/answer", s.prompt),
-         this.installLine(s, loggedIn)],
-        [el("div", { class: "actions" }, b.log, b.settings), this.extras],
-      ];
-    }
     return [
       [s.cluster, el("div", { class: "muted" }, `port ${s.port}`)],
       this.loginCells(lg, cluster),
@@ -971,9 +965,10 @@ export class HpcAppSession extends TunnelRow {
        up && "password" in s ? el("div", { class: "muted" }, s.password ? ["password ready ", b.copy]
                                                                       : "password not seen yet; see Log") : null,
        s.error ? el("div", { class: "muted" }, s.error) : null,
+       s.signing_in ? el("hpc-state", { tone: "starting", label: "signing in…" }) : null,
        this.promptLine(`${this.appTitle} on ${s.cluster}`, this.base + "/answer", s.prompt),
        this.installLine(s, loggedIn)],
-      [el("div", { class: "actions" }, open, b.start, b.stop, b.log, s.kind === "login" ? null : b.settings), this.extras],
+      [el("div", { class: "actions" }, open, b.start, b.stop, b.log, b.settings), this.extras],
     ];
   }
 

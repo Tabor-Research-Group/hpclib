@@ -1,0 +1,130 @@
+diff --git a/hpclib/servers/agent_console.py b/hpclib/servers/agent_console.py
+--- a/hpclib/servers/agent_console.py
++++ b/hpclib/servers/agent_console.py
+@@ -2294,6 +2294,15 @@
+         return {"ok": True, "mcp": entry, "name": profile.get("mcp_name")}
+ 
+     def serve_static(self, path):
++        # One optional user file outside --static; never expose the console's other files.
++        # Handle it before the SPA fallback, which would otherwise return HTML when it is absent.
++        if path == "/user.css":
++            try:
++                with open(os.path.join(console_dir(), "user.css"), "rb") as f:
++                    body = f.read()
++            except FileNotFoundError:
++                body = b""
++            return self.send_bytes(200, "text/css; charset=utf-8", body, cache=False)
+         root = self.server.static_dir
+         rel = urllib.parse.unquote(path).lstrip("/") or "index.html"
+         target = os.path.realpath(os.path.join(root, rel))
+diff --git a/agent-console/index.html b/agent-console/index.html
+--- a/agent-console/index.html
++++ b/agent-console/index.html
+@@ -7,6 +7,7 @@
+   <title>hpclib console</title>
+   <link rel="icon" type="image/x-icon" href="icon.png">
+   <link rel="stylesheet" href="style.css">
++  <link rel="stylesheet" href="/user.css">
+ </head>
+ <body>
+   <div id="topbar">
+diff --git a/agent-console/README.md b/agent-console/README.md
+--- a/agent-console/README.md
++++ b/agent-console/README.md
+@@ -59,6 +59,45 @@
+ name (`hpclib-grace`). The session key is kept for the console's address (localStorage), so links work in new
+ tabs; after the console restarts, the page asks for the new key once.
+ 
++## User styling
++
++With `launch-tunnel-manager` or `agent_console --static ...`, the page loads an optional
++`~/.config/hpclib/console/user.css` after the bundled `style.css`. If `HPCLIB_CONSOLE_DIR` is set,
++the file belongs in `$HPCLIB_CONSOLE_DIR/user.css` instead. Keep personal styling here so it survives
++updates to hpclib. Create the directory and file yourself; the console does not create or overwrite it.
++
++```bash
++mkdir -p "${HPCLIB_CONSOLE_DIR:-$HOME/.config/hpclib/console}"
++# edit user.css in that directory, then reload the browser page
++```
++
++For example, `user.css` can contain:
++
++```css
++:root { --accent: #7c3aed; }
++@media (prefers-color-scheme: dark) {
++  :root { --accent: #a78bfa; }
++}
++body { font-size: 16px; }
++main { max-width: 1500px; }
++hpc-panel::part(panel) { border-radius: 12px; }
++hpc-dialog::part(dialog) { width: min(640px, calc(100vw - 32px)); }
++```
++
++Use the variables in `style.css` for colours: `--bg`, `--fg`, `--muted`, `--line`, `--panel`,
++`--accent`, `--good`, `--warn` and `--bad`. They also reach the panels' and dialogs' shadow DOM.
++For their internal layout, use the exposed `::part(...)` selectors instead of descendant selectors:
++`hpc-panel` exposes `panel`, `header`, `heading`, `status`, `body` and `close`; `hpc-dialog`
++exposes `dialog` and `heading`. Other elements can be styled with ordinary selectors.
++Normal CSS specificity still applies; later rules win when specificity is equal.
++
++The console serves only this file at `/user.css`, without a session key, just like its bundled static
++assets. An absent file returns an empty stylesheet. It reads the file on each request and sends
++`Cache-Control: no-store`, so edits take effect after a full browser reload (the console's **Refresh**
++button refreshes page data only). The rest of the console directory is not served.
++This automatic loading applies to the page served by `agent_console --static`; a separately hosted
++front end must arrange to serve its own `user.css` at the same URL on its own origin.
++
+ ## Components
+ 
+ `components.js` defines the page's building blocks as native custom elements (no library, no build step);
+diff --git a/tests/test_agent_console.py b/tests/test_agent_console.py
+--- a/tests/test_agent_console.py
++++ b/tests/test_agent_console.py
+@@ -225,11 +225,47 @@
+         self.assertIn(b"<title>console", self.call("GET", "/jobs/123", key=None, raw=True)[1])  # SPA fallback
+         self.assertNotIn(b"secret", self.call("GET", "/../agents/x", key=None, raw=True)[1])
+ 
++    def test_user_stylesheet_optional_and_reloaded(self):
++        # No file yet: CSS, not the HTML SPA fallback, and no session key needed.
++        status, content, headers = self.call("GET", "/user.css", key=None, raw=True)
++        self.assertEqual((status, content), (200, b""))
++        self.assertEqual(headers.get("Content-Type"), "text/css; charset=utf-8")
++        self.assertEqual(headers.get("Cache-Control"), "no-store")
++        self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff")
++
++        # The fixture uses HPCLIB_CONSOLE_DIR; a file in --static must not replace it.
++        (Path(self.console_server.static_dir) / "user.css").write_text("body { color: red; }")
++        self.console.mkdir(parents=True, exist_ok=True)
++        stylesheet = self.console / "user.css"
++        for css in (b":root { --accent: purple; }\n", b"main { max-width: 1500px; }\n"):
++            stylesheet.write_bytes(css)
++            status, content, headers = self.call("GET", "/user.css", key=None, raw=True)
++            self.assertEqual((status, content), (200, css))
++            self.assertEqual(headers.get("Cache-Control"), "no-store")
++        stylesheet.unlink()
++        self.assertEqual(self.call("GET", "/user.css", key=None, raw=True)[:2], (200, b""))
++
++    def test_user_stylesheet_keeps_console_files_private(self):
++        self.console.mkdir(parents=True, exist_ok=True)
++        (self.console / "session").write_text("PRIVATE_SESSION_KEY")
++        css = b":root { --accent: purple; }"
++        (self.console / "user.css").write_bytes(css)
++        self.assertEqual(self.call("GET", "/user.css?file=session", key=None, raw=True)[:2], (200, css))
++        for route in ("/session", "/console/session", "/user.css/session", "/user.css/../session",
++                      "/user.css%2f..%2fsession", "/../console/session"):
++            status, content, _ = self.call("GET", route, key=None, raw=True)
++            self.assertIn(status, (200, 404))
++            self.assertNotIn(b"PRIVATE_SESSION_KEY", content)
++        self.assertEqual(self.call("GET", "/user.css", key=None, raw=True,
++                                   headers={"Host": "evil.example:80"})[0], 421)
++        self.assertEqual(self.call("GET", "/api/health", key=None)[0], 401)
++
+     def test_serves_the_bundled_front_end(self):
+         ui = Path(__file__).resolve().parents[1] / "agent-console"
+         self.console_server.static_dir = str(ui)
+         status, content, _ = self.call("GET", "/", key=None, raw=True)
+         self.assertIn(b'src="app.js"', content)
++        self.assertGreater(content.index(b'href="/user.css"'), content.index(b'href="style.css"'))
+         status, content, headers = self.call("GET", "/app.js", key=None, raw=True)
+         self.assertEqual(status, 200)
+         self.assertIn("javascript", headers.get("Content-Type"))  # module scripts need a JS type

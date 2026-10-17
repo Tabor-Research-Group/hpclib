@@ -211,8 +211,9 @@ For a tunnel that ships with hpclib, add an entry to `APPS` in `hpclib/servers/a
 | `token_re` / `password_re` | read a token (added to the URL) or a password (shown with a Copy button) from the log |
 | `settings` | the tunnel's `TUNNEL_SETTINGS` the settings form edits: `(NAME, label, hint[, choices])` |
 | `env_settings` | JupyterLab's conda environment, modules and project fields |
-| `kind: "login"` | the service runs on the login node over the console's ssh login (like Rclone) |
-| `kind: "tool"` | not a tunnel: the row runs commands instead (like Data transfer) |
+| `kind: "login"` | the service runs on the login node over the console's ssh login (like Data transfer's GUI) |
+| `gui_re` | with `kind: "login"`: the `HPCLIB_TRANSFER_GUI` line saying where to open it (`TRANSFER_GUI_RE`) |
+| `smb` | the row also signs in to the SMB server for `smbshell`, beside the session (Data transfer) |
 | `shared`, `instance_label` | a shared-instance tunnel: the row names the job serving it and offers to end it |
 | `reinstall` | `{"label", "title"}`: what the install button is called once installed (PAI: Update) |
 
@@ -271,7 +272,7 @@ our-lab/
 | `apps` | console apps: `title`, `tunnel` (one in the package or one of hpclib's), `description`, `open_path`, `health_path`, `token_regex`, `settings`, `secrets`; for a shared app (one job for everyone, see `SHARED_INSTANCE`): `shared`, `instance_label`, `reinstall` (`{label, title}`); `tokens` (`{scopes, default_scope, days, label, description}`, with `tokens.sh` in the tunnel: see App tokens) |
 | `tunnels` | tunnel folders in the zip, by name |
 | `settings.TUNNEL.values` | default settings; a user's own values (per cluster) win, and the form shows the package's as placeholders |
-| `settings.TUNNEL.files` | files placed in `~/.local/tunnels/settings/TUNNEL.d/` on the cluster (e.g. extra rclone remotes) |
+| `settings.TUNNEL.files` | files placed in `~/.local/tunnels/settings/TUNNEL.d/` on the cluster (e.g. extra rclone remotes, or a `NAME.gui.sh` for Data transfer's `SMB_GUI`) |
 | `secrets` | per app; each name must be in its tunnel's `TUNNEL_SECRETS` |
 
 Build and check it, then install it from **Add App or Settings**:

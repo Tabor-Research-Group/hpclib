@@ -29,9 +29,10 @@ printed; VS Code shows a **Copy password** button. Once you're logged in, each r
 installed on the cluster (its `install.sh --check`) and offers **Install** (or Reinstall), whose output shows
 below the row. PAI's row says which job serves the shared database, and whether this tunnel started it or only
 connected to it, and once PAI is installed its Install button is **Update**: it fast-forwards the
-proto-auto-interface checkout and pulls the app's image again (its Image setting says from where). **Data transfer** isn't a tunnel: per cluster it installs the data-transfer-tools image and
-signs you in to the SMB server for `smbshell` (Kerberos log in with kinit where the cluster has it, otherwise a
-password saved for sync jobs), both through the password dialog. Agents keeps its addresses (`#/clusters`, `#/files?...`); other apps live under
+proto-auto-interface checkout and pulls the app's image again (its Image setting says from where). **Data transfer** runs on the login node, not in a job: per cluster it installs the
+data-transfer-tools image, starts a web GUI for the SMB server (rclone's, or the one its GUI setting names), and
+signs you in to the server for `smbshell` beside it (Kerberos log in with kinit where the cluster has it,
+otherwise a password saved for sync jobs), both through the password dialog. Agents keeps its addresses (`#/clusters`, `#/files?...`); other apps live under
 `#/APP/PAGE`, e.g. `#/vscode/sessions`. A new tunnel app is an entry in `APPS` in
 `hpclib/servers/agent_console.py`, or, for one that doesn't belong in hpclib, a package: **Add App or Settings**
 (top right) checks a package zip, shows what it adds (apps, tunnels, settings and their values), installs it,
@@ -57,6 +58,57 @@ A file opens in the viewer inside its folder, with the same size rules as clicki
 asks above 25 MB); a folder opens that folder. `cluster` may be the profile name, the login host or the MCP
 name (`hpclib-grace`). The session key is kept for the console's address (localStorage), so links work in new
 tabs; after the console restarts, the page asks for the new key once.
+
+## User styling
+
+The top-left hamburger menu has **Open Stylesheet**. On its first use, the console copies the
+bundled [`default-styles.css`](default-styles.css) to `~/.config/hpclib/console/user.css`, then asks
+the operating system to open it with the default application associated with CSS files. If
+`HPCLIB_CONSOLE_DIR` is set, the destination is `$HPCLIB_CONSOLE_DIR/user.css` instead.
+An existing `user.css` is always preserved, including an empty one. The console does not select or
+detect an editor. Saving changes and reloading the browser applies them.
+
+With `launch-tunnel-manager` or `agent_console --static ...`, the page loads `default-styles.css`
+(the complete default variable inventory), then `style.css` (the UI rules), then the optional `user.css`.
+Keep personal styling in `user.css` so it survives updates to hpclib. You can also create it yourself:
+
+```bash
+mkdir -p "${HPCLIB_CONSOLE_DIR:-$HOME/.config/hpclib/console}"
+# edit user.css in that directory, then reload the browser page
+```
+
+For example, `user.css` can contain:
+
+```css
+:root {
+  --accent: #7c3aed;
+  --font-size-base: 16px;
+  --content-max-width: 1500px;
+  --radius-panel: 12px;
+  --dialog-max-width: 640px;
+  --log-max-width: 800px;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --accent: #a78bfa; }
+}
+```
+
+The [complete UI variable reference](UI_VARIABLES.md) lists every variable, its default and its purpose,
+including dark-theme defaults and component parts. Variables also reach panel and dialog shadow DOM.
+Log panels default to a maximum width of `960px` and stay within their container and viewport.
+Long lines scroll inside the log; to wrap them instead, set `--log-white-space: pre-wrap` and
+`--log-overflow-wrap: anywhere`. Tunnel/app logs and installation/setup output share these settings.
+
+Opening the stylesheet uses authenticated `POST /api/styles/open`; it always opens the fixed local
+`user.css` path on the machine running the console. On macOS it uses `open`, on Windows `os.startfile`,
+and on Linux `xdg-open`, leaving the CSS file association to the OS.
+
+The console serves only this file at `/user.css`, without a session key, just like its bundled static
+assets. An absent file returns an empty stylesheet. It reads the file on each request and sends
+`Cache-Control: no-store`, so edits take effect after a full browser reload (the console's **Refresh**
+button refreshes page data only). The rest of the console directory is not served.
+This automatic loading applies to the page served by `agent_console --static`; a separately hosted
+front end must arrange to serve its own `user.css` at the same URL on its own origin.
 
 ## Components
 
@@ -95,7 +147,7 @@ ssh to the compute node). The page asks the console's local `GET /api/prompts` e
 started is running, so the dialog opens on whatever page you're on. "Not now" leaves the request on the cluster's
 row ("Enter password…") until it asks again.
 
-Panels and dialogs draw their frames in shadow DOM; colours come from the CSS variables in `style.css`, so the
+Panels and dialogs draw their frames in shadow DOM; colours come from the CSS variables in `default-styles.css`, so the
 light and dark themes reach inside. Install and setup output, tunnel and app logs, the file viewer, the setup and
 app settings forms, and errors are all dismissible panels; a closed install/setup panel stays closed (this browser
 remembers it), and an open log stays open while you move between pages.

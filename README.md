@@ -225,7 +225,7 @@ terminal) cancels the job.
 Each tunnel records itself under `~/.local/tunnels/sessions/ports/` by login node and port. A new tunnel on the
 same port first stops anything an earlier one left behind on that login node: its script, its job, a stale
 forward or waiting page. It also looks at what is actually listening on the port, so a piece that outlived
-its tunnel some other way (rclone's web GUI from Data transfer, a podman pod's port forwarder) goes too: whatever
+its tunnel some other way (Data transfer's web GUI, a podman pod's port forwarder) goes too: whatever
 hpclib starts for a port carries `HPCLIB_TUNNEL_PORT=PORT` in its environment, and a process of yours listening
 on that port with that mark is stopped (TERM, then KILL after 5 s). `smbshell gui` clears its port the same way
 before it starts, and stops rclone when its own session ends, even if the connection dropped without a hangup.
@@ -600,7 +600,8 @@ which the tunnel prints (and the console offers to copy).
 
 **Data transfer (SMB)**: `smbshell` moves files between a cluster and an SMB server with rclone from the
 data-transfer-tools image. It isn't a port-forwarding tunnel; `tunnels/data-transfer/` holds the command, its
-SLURM job and the image's `install.sh`.
+SLURM job and the image's `install.sh`. The console's **Data transfer** page puts it all on one row per cluster:
+the settings, Install, signing in, and a web GUI (below).
 
 ```bash
 tunnel_setup user@grace.hprc.tamu.edu data-transfer --set SMB_HOST=files.example.edu \
@@ -617,25 +618,39 @@ smbshell sync pull proj/raw /scratch/user/me/raw --dry-run  # sync deletes what 
 smbshell submit --time=2:00:00 get proj/raw /scratch/user/me/raw   # the same, as a SLURM job
 smbshell submit --manifest transfers.json                 # [["get", "proj/a", "/scratch/.../a"], ...]: an array job
 smbshell --on user@grace.hprc.tamu.edu ls proj            # from your own machine, over ssh
-smbshell gui --port 27555                                 # rclone's web GUI on the login node (see below)
+smbshell gui --port 27555                                 # a web GUI on the login node (see below)
 ```
 
-**Rclone** (a console app, like JupyterLab): rclone's own web GUI (`rclone rcd --rc-web-gui`) on the cluster's
-login node, started by `smbshell gui` over the console's ssh login, which forwards its port; Open goes straight
-in. Its remotes are `smb` (the server) and `cluster` (the node's files: home, `/scratch`), for browsing and
-copying between them, plus any in `~/.local/tunnels/settings/data-transfer.d/rclone.conf` on the cluster (a
-settings package puts them there, e.g. an alias for your group's folder; see Console packages below). Start asks for the SMB password (unless there is a Kerberos ticket or a saved
-one), which rclone keeps only in a private in-memory file until Stop; nothing is saved. rclone runs without
-retries, so a refused password is one refused logon. It uses Data transfer's image and settings; rclone fetches
-the GUI itself from GitHub the first time (into `~/.cache/rclone`).
+**The GUI** (Data transfer's Start, Open and Stop): `smbshell gui` on the cluster's login node, over the
+console's ssh login, which forwards its port; Open goes straight in. By default (`SMB_GUI=rclone`) it is rclone's
+own web GUI (`rclone rcd --rc-web-gui`). Its remotes are `smb` (the server) and `cluster` (the node's files: home,
+`/scratch`), for browsing and copying between them, plus any in
+`~/.local/tunnels/settings/data-transfer.d/rclone.conf` on the cluster (a settings package puts them there, e.g.
+an alias for your group's folder; see Console packages below). Start asks for the SMB password (unless there is a
+Kerberos ticket or a saved one), which is kept only in a private in-memory file until Stop; nothing is saved.
+rclone runs without retries, so a refused password is one refused logon. rclone fetches the GUI itself from
+GitHub the first time (into `~/.cache/rclone`).
+
+A GUI of your own takes rclone's place with `SMB_GUI=NAME`, for `NAME.gui.sh` in `data-transfer.d/` (from a
+settings package's `files`), or `SMB_GUI=/path/to/program` on the cluster. `smbshell gui` signs in as above, then
+runs it with the port to serve on (`HPCLIB_GUI_PORT`, at 127.0.0.1), a random login for the session that it
+should require (`HPCLIB_GUI_USER`, `HPCLIB_GUI_PASS`: anyone on the login node can reach 127.0.0.1), the session's
+remotes (`RCLONE_CONFIG`), rclone in the image with them (`$SMBSHELL_RCLONE lsjson smb:SHARE`), and a private
+directory (`HPCLIB_GUI_DIR`). It prints where to open it, once, and serves until it gets TERM:
+
+```bash
+echo "HPCLIB_TRANSFER_GUI port=$HPCLIB_GUI_PORT path=/ user=$HPCLIB_GUI_USER pass=$HPCLIB_GUI_PASS"
+```
+
+(`path=`, `user=`/`pass=` and `query=`, already URL-encoded, are all optional; `smbshell --help` has the details.)
 
 Signing in (`SMB_AUTH=auto`): a Kerberos ticket from `smbshell login` (kinit on the login node, or in the image
 if the node has none; kept in `~/.config/hpclib/smb/krb5cc`, so jobs use it while it lasts), else a password
 saved with `smbshell save-credentials` (`~/.config/hpclib/smb/credentials`, mode 600, in rclone's reversible
 encoding), else `smbshell` asks. Jobs never ask: they need the ticket or the saved password. Kerberos needs an
-rclone with SMB Kerberos support (`smbshell status` says). The console's **Data transfer** page does the
-signing in: Kerberos log in (kinit) where the cluster has kinit, otherwise Save password for sync jobs, both
-through its password dialog, plus Install/Check for the image and the settings above.
+rclone with SMB Kerberos support (`smbshell status` says). The console's **Data transfer** row does the
+signing in beside the GUI: Kerberos log in (kinit) where the cluster has kinit, otherwise Save password for sync
+jobs, both through its password dialog, plus Install/Check for the image and the settings above.
 
 **Console packages**: apps and settings that don't belong in hpclib (one group's server, a project's test
 instance) come as zip files, installed with the console's **Add App or Settings** button, which shows what a

@@ -17,14 +17,28 @@
 #   smbshell save-credentials | forget-credentials  a saved password, for jobs where there is no Kerberos
 #   smbshell status [--json]                        the image, and how it would sign in
 #   smbshell shell                                  a shell in the image, with the server as rclone's "smb:"
-#   smbshell gui --port PORT                        rclone's web GUI (rclone rcd --rc-web-gui) on 127.0.0.1:PORT
-#                                                   of this node, signed in for this session only (the console's
-#                                                   Rclone page forwards it to your browser)
+#   smbshell gui --port PORT                        a web GUI on 127.0.0.1:PORT of this node, signed in for this
+#                                                   session only (the console's Data transfer page forwards it to
+#                                                   your browser): rclone's (rclone rcd --rc-web-gui), or the one
+#                                                   SMB_GUI names (see "A GUI of your own" below)
 #   smbshell rclone ARGS...                         rclone itself, likewise
 #
 # REMOTE is a path under SMB_ROOT (e.g. research/our_group) when that is set, else SHARE/PATH on
 # SMB_HOST; /SHARE/PATH and //HOST/SHARE/PATH are absolute. Signing in (SMB_AUTH=auto): a Kerberos ticket from
 # `smbshell login`, else the saved password, else it asks (never in a job). Settings: settings.sh here.
+#
+# A GUI of your own (SMB_GUI=NAME, for NAME.gui.sh in ~/.local/tunnels/settings/data-transfer.d/, where a settings
+# package puts it; or SMB_GUI=/path/to/program): `smbshell gui` signs in, then runs it (with bash, unless it is an
+# executable path) on this node with
+#   HPCLIB_GUI_PORT    the port to serve on, at 127.0.0.1 only
+#   HPCLIB_GUI_USER    a login made for this session (random): require it, since anyone on this node can reach
+#   HPCLIB_GUI_PASS    127.0.0.1:PORT
+#   HPCLIB_GUI_DIR     a private directory in memory, removed when it stops
+#   RCLONE_CONFIG      rclone's remotes, signed in: smb (the server), cluster (this node's files), and the extras
+#   SMBSHELL_RCLONE    rclone in the image with that config: "$SMBSHELL_RCLONE" lsjson smb:SHARE/DIR
+# It prints one line on standard output once it serves, saying where to open it:
+#   HPCLIB_TRANSFER_GUI port=PORT [path=/start] [user=USER pass=PASS] [query=a=1&b=2]   (values without spaces)
+# and runs until it gets TERM (Stop, or the session ending).
 
 set -o pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,7 +48,7 @@ logdir="${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/sessions/data-transfer"
 binds=()
 
 die() { echo "smbshell: $*" >&2; exit 1; }
-usage() { sed -n '2,24p' "$here/smbshell.sh" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^$/p' "$here/smbshell.sh" | sed 's/^# \{0,1\}//'; }   # the comment above
 
 need_image() {
   [ -n "$runtime" ] || die "neither singularity nor apptainer is on this node's PATH"
@@ -418,6 +432,17 @@ PY
       esac
     done
     case "$port" in ''|*[!0-9]*) die "usage: smbshell gui --port PORT" ;; esac
+    # which GUI (SMB_GUI): rclone's own, or a program of yours, found before asking for a password
+    gui="${SMB_GUI:-rclone}"
+    gui_prog=''
+    case "$gui" in
+      rclone) ;;
+      */*) gui_prog="$gui" ;;
+      *[!A-Za-z0-9_.-]*) die "SMB_GUI is rclone, a NAME (letters, digits, _ . -) or a path; not $gui" ;;
+      *) gui_prog="${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/settings/data-transfer.d/$gui.gui.sh" ;;
+    esac
+    [ -z "$gui_prog" ] || [ -f "$gui_prog" ] ||
+      die "no GUI $gui: $gui_prog doesn't exist (SMB_GUI: rclone, NAME for data-transfer.d/NAME.gui.sh, or a program)"
     # marked as hpclib's for this port (see _hpclib_port_holders), and the port cleared of what an earlier GUI
     # or tunnel of yours left on it, before asking for a password
     export HPCLIB_TUNNEL_PORT="$port"
@@ -475,10 +500,31 @@ PY
       [ -n "$d" ] && [ -d "$d" ] && binds+=(--bind "$d")
     done
     binds+=(--bind "$run_dir")
-    echo "HPCLIB_RCLONE_GUI port=$port user=$gui_user pass=$gui_pass"
-    echo "smbshell: rclone's web GUI on 127.0.0.1:$port of $(hostname -s); remotes: smb, cluster${extra_names:+, ${extra_names% }}" >&2
-    ( img_exec rclone rcd --config "$conf" --rc-web-gui --rc-web-gui-no-open-browser --rc-addr "127.0.0.1:$port" \
-        --rc-user "$gui_user" --rc-pass "$gui_pass" --retries 1 --low-level-retries 1 < /dev/null ) &
+    if [ -z "$gui_prog" ]; then
+      # rclone's GUI takes its login in the address for the page, and again (login_token) for its API calls
+      token=$(printf '%s:%s' "$gui_user" "$gui_pass" | base64 | tr -d '\n' | tr '+/' '-_' | sed 's/=/%3D/g')
+      echo "HPCLIB_TRANSFER_GUI port=$port user=$gui_user pass=$gui_pass query=login_token=$token"
+      echo "smbshell: rclone's web GUI on 127.0.0.1:$port of $(hostname -s); remotes: smb, cluster${extra_names:+, ${extra_names% }}" >&2
+      ( img_exec rclone rcd --config "$conf" --rc-web-gui --rc-web-gui-no-open-browser --rc-addr "127.0.0.1:$port" \
+          --rc-user "$gui_user" --rc-pass "$gui_pass" --retries 1 --low-level-retries 1 < /dev/null ) &
+    else
+      # rclone in the image, with the session's remotes and sign-in, for the GUI to call
+      need_image
+      {
+        printf '#!/bin/bash\n'
+        [ -n "$krb5_conf" ] && printf 'export KRB5_CONFIG=/etc/hpclib-krb5.conf\n'
+        printf 'exec'
+        printf ' %q' "$runtime" exec "${binds[@]}" "$SMB_IMAGE" rclone --config "$conf"
+        printf ' "$@"\n'
+      } > "$run_dir/rclone"
+      chmod 700 "$run_dir/rclone"
+      run=(bash "$gui_prog")                     # a settings package's NAME.gui.sh isn't executable
+      [ "$gui_prog" = "$gui" ] && [ -x "$gui" ] && run=("$gui")
+      echo "smbshell: $gui on 127.0.0.1:$port of $(hostname -s); remotes: smb, cluster${extra_names:+, ${extra_names% }}" >&2
+      ( export HPCLIB_GUI_PORT="$port" HPCLIB_GUI_USER="$gui_user" HPCLIB_GUI_PASS="$gui_pass" \
+               HPCLIB_GUI_DIR="$run_dir" RCLONE_CONFIG="$conf" SMBSHELL_RCLONE="$run_dir/rclone"
+        exec "${run[@]}" < /dev/null ) &
+    fi
     gui_pid=$!
     # the session's parent (sshd, or the shell that ran this): when it is gone the session is, even if no hangup
     # arrived (a dropped connection), so the GUI stops too

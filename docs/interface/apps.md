@@ -79,25 +79,24 @@ on, and **Bind source** (run your checkout's code instead of the image's).
 
 ## Data transfer
 
-Not a tunnel: tools for moving files between a cluster and an SMB file server with rclone. Per cluster:
+Moving files between a cluster and an SMB file server with rclone. Per cluster, one row:
 
 - **Install** pulls the data-transfer-tools image.
-- **Kerberos log in (kinit)** gets a ticket with `kinit`, where the cluster has Kerberos; jobs can use it while it lasts.
+- **Start** runs a web GUI on the cluster's **login node** (no job), reached through your login: by default
+  rclone's own, for browsing and copying between the SMB server (`smb`), the cluster's files (`cluster`), and any
+  remotes a settings package adds. **Open** signs you in to it automatically; **Copy username** and **Copy
+  password** are there if the browser asks anyway. **Stop** ends it.
+- **Kerberos log in (kinit)** gets a ticket with `kinit`, where the cluster has Kerberos; the GUI and jobs use it
+  while it lasts. It can run while the GUI does.
 - Otherwise **Save password for sync jobs** stores the SMB password on the cluster (mode 600, in rclone's
-  reversible encoding) so batch transfers can run unattended.
+  reversible encoding) so batch transfers (`smbshell submit`) can run unattended.
+
+Without a ticket or a saved password, Start asks for the SMB password, which is kept only in memory until Stop.
 
 Settings: the SMB server, the share and folder paths are relative to, user name, domain, Kerberos realm, how to
-sign in, and where the image is kept.
-
-## Rclone
-
-rclone's own web interface, running on the cluster's **login node** (no job), for browsing and copying between
-the SMB server (`smb`), the cluster's files (`cluster`), and any remotes a settings package adds. Start asks for
-the SMB password unless a Kerberos ticket or a saved password is available; rclone keeps it only in memory until
-Stop. **Open** signs you in to rclone's interface automatically; **Copy username** and **Copy password** are
-there if the browser asks anyway.
-
-It uses Data transfer's image and settings, so install and configure Data transfer first.
+sign in, which **GUI** Start opens, and where the image is kept. GUI is `rclone` (the default), the name of a GUI
+a settings package provides, or a program on the cluster (see `smbshell --help`, and the README's Data transfer
+section, for what such a program gets and must print).
 
 ## Adding apps and settings from packages
 
