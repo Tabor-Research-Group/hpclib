@@ -20,7 +20,7 @@ and the audit log work unchanged:
     separate processes and carry on if the server stops; it picks them
     up again when it restarts. Ask the admin for `loginctl enable-linger`
     so they also outlive your logins;
-  - --partition, --account, --qos and --constraint mean nothing here and
+  - --partition, --account, --qos, --constraint, --exclude and --nodelist mean nothing here and
     are ignored; more than one node, or GPUs through --gres, are refused
     (give the sandbox the device flags instead, for every job, e.g.
     "flags": ["--device", "nvidia.com/gpu=all"]);
@@ -62,7 +62,7 @@ SCHEDULER_TYPES = ("slurm", "local")
 CONFIG_KEYS = {"type", "cpus", "memory", "default_memory", "default_time", "max_time", "enforce_limits"}
 # Above SLURM's default MaxJobId (67043328), so an id can't be confused with one from a SLURM era of the same data
 FIRST_ID = 70_000_001
-IGNORED = ("--partition", "--account", "--qos", "--constraint")
+IGNORED = ("--partition", "--account", "--qos", "--constraint", "--exclude", "--nodelist")
 ARRAY_RE = re.compile(r"0-(\d+)(?:%(\d+))?")
 OUTPUT_RE = re.compile(r"%(%|j|A|a|x|u)")
 

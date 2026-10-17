@@ -375,7 +375,8 @@ on your machine as MCP tools.
   description, typed parameters, default resources, and which resources a client may override) and a
   `script.sh` (the job body, with no `#SBATCH` lines). Parameters reach the script as shell-quoted
   `HPC_PARAM_<NAME>` environment variables, never by text substitution, and resources become sbatch
-  options only after validation. Examples are in `hpclib/tunnels/rest/templates/`; copy the ones you want.
+  options only after validation. Any submission may keep its job off nodes (`{"exclude": "c03"}`) or pick them
+  by feature (`constraint`) or name (`nodelist`, one node): see "Choosing nodes" in `docs/extending.md`. Examples are in `hpclib/tunnels/rest/templates/`; copy the ones you want.
   Templates are re-read on each request. Without a sandbox (below), a template that runs code a client wrote
   (like `python_script`), or a program whose input a client wrote (ORCA can write its output files to any
   path named in the input), runs with your account's full permissions on the cluster.

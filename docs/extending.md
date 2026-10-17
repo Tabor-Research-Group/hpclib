@@ -316,12 +316,26 @@ orca/
 | --- | --- |
 | `description` | one or two sentences the model reads |
 | `parameters` | typed inputs; see below |
-| `resources` | default sbatch resources: `time`, `mem`, `cpus_per_task`, `ntasks`, `nodes`, `partition`, `account`, `qos`, `gres`, `constraint`; values may refer to parameters as `${name}` |
-| `overridable` | resources a submission may change (default `time` and `mem`); always within the server's limits |
+| `resources` | default sbatch resources: `time`, `mem`, `cpus_per_task`, `ntasks`, `nodes`, `partition`, `account`, `qos`, `gres`, `constraint`, `exclude`, `nodelist`; values may refer to parameters as `${name}` |
+| `overridable` | resources a submission may change (default `time` and `mem`); always within the server's limits. Where a job runs is open to every submission (see below) |
 | `modules` | modules loaded in order before the body |
 | `array` | `task_parameters` for one array task per input, given as `tasks` or read from a manifest with `tasks_from` |
 | `environment` | `{"manager": "auto", "project": "${project}"}`: run the body in a uv or pixi project's environment |
 | `workdir` | the job's working directory, if not the submission's |
+
+**Choosing nodes.** A submission may always keep its job off nodes, and pick nodes by feature or name, because
+these only narrow where SLURM may run it inside the partition and limits it already has:
+
+| Resource | sbatch | Value | Open to submissions |
+| --- | --- | --- | --- |
+| `exclude` | `--exclude` | a hostlist: `c03`, `c[03-05],gpu1` | always; added to the template's own `exclude`, unless `overridable` lists it |
+| `constraint` | `--constraint` | node features joined by `&` or `\|`: `icelake\|cascadelake` | unless the template sets one |
+| `nodelist` | `--nodelist` | one node: `c04` | unless the template sets one |
+
+`nodelist` takes one node, since SLURM gives a job every node listed, past `max_nodes`; `constraint` takes no
+counts or brackets (`[a*2&b*2]`), which ask for nodes too. Options that would get round the limits aren't
+accepted at all: `--exclusive` (a whole node, past `max_cpus` and `max_mem`), `--mem-per-cpu`, `--reservation`,
+`--dependency`, `--mail-user`, `--output`, `--chdir`, `--export`.
 
 Parameter types:
 

@@ -81,6 +81,12 @@ The agent has as many jobs running as `max_concurrent_jobs` allows (array jobs c
 The requested resources exceed the server's limits (`max_time`, `max_mem`, ...). Ask for less, or raise the
 limits on the Settings page.
 
+**An agent can't keep its jobs off a bad node** ("does not allow overriding 'exclude'", or a constraint that
+"failed validation").
+The REST server on the cluster is older than 0.2.58: update hpclib there (**Update** on the Clusters page) and
+restart the tunnel. Then `{"exclude": "c03"}` works with every template. A `constraint` names node *features*
+(`sinfo -o "%N %f"` lists them), not nodes, and is refused if the template fixes its own.
+
 **A proposal didn't become a template.**
 Proposals are approved automatically only while jobs are sandboxed and the policy allows it. Look at
 **Proposals** in the console; `cluster_info` tells the agent which policy applies.

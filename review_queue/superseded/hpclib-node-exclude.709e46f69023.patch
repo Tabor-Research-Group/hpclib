@@ -1,0 +1,360 @@
+From ad4b536ea68a00492e9f95d0c9bbb8b7ba4dd286 Mon Sep 17 00:00:00 2001
+From: Mark Boyer <maboyer@tamu.edu>
+Date: Fri, 16 Oct 2026 17:40:49 -0500
+Subject: [PATCH] Let agents keep jobs off nodes: exclude, constraint, nodelist
+ (0.2.58)
+
+A submission may now choose where its job runs inside the partition and limits it
+already has, with any template:
+
+- exclude (--exclude): a hostlist, c03 or c[03-05],gpu1; always open, and added to
+  a template's own exclude unless the template lists it as overridable
+- constraint (--constraint): features joined by & or |; open unless the template
+  sets one
+- nodelist (--nodelist): one node; open unless the template sets one
+
+Values are checked strictly: nodelist takes a single node (several would make SLURM
+allocate them all, past max_nodes), constraint takes no counts or brackets, and none
+may hold "/" (sbatch reads a hostlist with one from a file). Options that would get
+round the limits stay refused (--exclusive, --mem-per-cpu, --reservation, ...).
+list_templates reports the effective overridable resources; the local scheduler
+ignores the three; docs and the MCP tool description say how to use them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013ZLu6cEyb2p1AYFvTvF7Vh
+---
+ README.md                                     |  3 +-
+ docs/extending.md                             | 18 ++++-
+ docs/mcp-server.md                            |  4 ++
+ docs/troubleshooting.md                       |  6 ++
+ hpclib/hpclib.sh                              |  2 +-
+ hpclib/servers/rest_jobs.py                   | 66 +++++++++++++++++--
+ hpclib/servers/rest_local.py                  |  4 +-
+ hpclib/servers/rest_mcp.py                    |  5 +-
+ .../rest/templates/writing_templates/guide.md |  3 +-
+ tests/test_rest_jobs.py                       | 40 +++++++++++
+ 10 files changed, 137 insertions(+), 14 deletions(-)
+
+diff --git a/README.md b/README.md
+index 651ff3b..622020c 100644
+--- a/README.md
++++ b/README.md
+@@ -375,7 +375,8 @@ on your machine as MCP tools.
+   description, typed parameters, default resources, and which resources a client may override) and a
+   `script.sh` (the job body, with no `#SBATCH` lines). Parameters reach the script as shell-quoted
+   `HPC_PARAM_<NAME>` environment variables, never by text substitution, and resources become sbatch
+-  options only after validation. Examples are in `hpclib/tunnels/rest/templates/`; copy the ones you want.
++  options only after validation. Any submission may keep its job off nodes (`{"exclude": "c03"}`) or pick them
++  by feature (`constraint`) or name (`nodelist`, one node): see "Choosing nodes" in `docs/extending.md`. Examples are in `hpclib/tunnels/rest/templates/`; copy the ones you want.
+   Templates are re-read on each request. Without a sandbox (below), a template that runs code a client wrote
+   (like `python_script`), or a program whose input a client wrote (ORCA can write its output files to any
+   path named in the input), runs with your account's full permissions on the cluster.
+diff --git a/docs/extending.md b/docs/extending.md
+index d308933..1335b10 100644
+--- a/docs/extending.md
++++ b/docs/extending.md
+@@ -316,13 +316,27 @@ orca/
+ | --- | --- |
+ | `description` | one or two sentences the model reads |
+ | `parameters` | typed inputs; see below |
+-| `resources` | default sbatch resources: `time`, `mem`, `cpus_per_task`, `ntasks`, `nodes`, `partition`, `account`, `qos`, `gres`, `constraint`; values may refer to parameters as `${name}` |
+-| `overridable` | resources a submission may change (default `time` and `mem`); always within the server's limits |
++| `resources` | default sbatch resources: `time`, `mem`, `cpus_per_task`, `ntasks`, `nodes`, `partition`, `account`, `qos`, `gres`, `constraint`, `exclude`, `nodelist`; values may refer to parameters as `${name}` |
++| `overridable` | resources a submission may change (default `time` and `mem`); always within the server's limits. Where a job runs is open to every submission (see below) |
+ | `modules` | modules loaded in order before the body |
+ | `array` | `task_parameters` for one array task per input, given as `tasks` or read from a manifest with `tasks_from` |
+ | `environment` | `{"manager": "auto", "project": "${project}"}`: run the body in a uv or pixi project's environment |
+ | `workdir` | the job's working directory, if not the submission's |
+ 
++**Choosing nodes.** A submission may always keep its job off nodes, and pick nodes by feature or name, because
++these only narrow where SLURM may run it inside the partition and limits it already has:
++
++| Resource | sbatch | Value | Open to submissions |
++| --- | --- | --- | --- |
++| `exclude` | `--exclude` | a hostlist: `c03`, `c[03-05],gpu1` | always; added to the template's own `exclude`, unless `overridable` lists it |
++| `constraint` | `--constraint` | node features joined by `&` or `\|`: `icelake\|cascadelake` | unless the template sets one |
++| `nodelist` | `--nodelist` | one node: `c04` | unless the template sets one |
++
++`nodelist` takes one node, since SLURM gives a job every node listed, past `max_nodes`; `constraint` takes no
++counts or brackets (`[a*2&b*2]`), which ask for nodes too. Options that would get round the limits aren't
++accepted at all: `--exclusive` (a whole node, past `max_cpus` and `max_mem`), `--mem-per-cpu`, `--reservation`,
++`--dependency`, `--mail-user`, `--output`, `--chdir`, `--export`.
++
+ Parameter types:
+ 
+ | Type | Extra keys |
+diff --git a/docs/mcp-server.md b/docs/mcp-server.md
+index 9c9de9b..cc3e08d 100644
+--- a/docs/mcp-server.md
++++ b/docs/mcp-server.md
+@@ -108,6 +108,10 @@ a Python environment) and `script.sh` (the job body, no `#SBATCH` lines). A fold
+ the model reads before planning, and `examples/*.json`. A folder with only a `guide.md` is a planning guide for a
+ multi-step workflow. The format is in [Extending hpclib](extending.md#writing-job-templates).
+ 
++Any submission may keep its job off nodes with `{"exclude": "c03"}` (or `c[03-05],gpu1`), and choose nodes with
++`constraint` (features) or `nodelist` (one node) unless the template sets those itself; see
++[Choosing nodes](extending.md#writing-job-templates).
++
+ ### Proposals
+ 
+ When no template fits, the model can draft one with `propose_template`. The proposal is validated like a real
+diff --git a/docs/troubleshooting.md b/docs/troubleshooting.md
+index 185dd4d..d68630f 100644
+--- a/docs/troubleshooting.md
++++ b/docs/troubleshooting.md
+@@ -81,6 +81,12 @@ The agent has as many jobs running as `max_concurrent_jobs` allows (array jobs c
+ The requested resources exceed the server's limits (`max_time`, `max_mem`, ...). Ask for less, or raise the
+ limits on the Settings page.
+ 
++**An agent can't keep its jobs off a bad node** ("does not allow overriding 'exclude'", or a constraint that
++"failed validation").
++The REST server on the cluster is older than 0.2.58: update hpclib there (**Update** on the Clusters page) and
++restart the tunnel. Then `{"exclude": "c03"}` works with every template. A `constraint` names node *features*
++(`sinfo -o "%N %f"` lists them), not nodes, and is refused if the template fixes its own.
++
+ **A proposal didn't become a template.**
+ Proposals are approved automatically only while jobs are sandboxed and the policy allows it. Look at
+ **Proposals** in the console; `cluster_info` tells the agent which policy applies.
+diff --git a/hpclib/hpclib.sh b/hpclib/hpclib.sh
+index 89d48b9..7a18591 100644
+--- a/hpclib/hpclib.sh
++++ b/hpclib/hpclib.sh
+@@ -5,7 +5,7 @@ fi
+ 
+ # Bump on every release: install_hpclib only replaces a remote copy
+ # whose HPCLIB_VERSION is older than this one. setup.py reads it too.
+-HPCLIB_VERSION="0.2.57"
++HPCLIB_VERSION="0.2.58"
+ 
+ MAIN_USER=$(whoami)
+ MAIN_PARTITION=""
+diff --git a/hpclib/servers/rest_jobs.py b/hpclib/servers/rest_jobs.py
+index 3df0dca..1ddfcc4 100644
+--- a/hpclib/servers/rest_jobs.py
++++ b/hpclib/servers/rest_jobs.py
+@@ -192,10 +192,29 @@ RESOURCE_FLAGS = {
+     "nodes": "--nodes",
+     "gres": "--gres",
+     "constraint": "--constraint",
++    "exclude": "--exclude",
++    "nodelist": "--nodelist",
+ }
+ # resource values become sbatch arguments; keep them to plain tokens
+ SAFE_RESOURCE_VALUE = re.compile(r"[A-Za-z0-9_.:,=+@/-]{1,200}")
+ 
++# Where a job may run inside its partition. These only narrow the nodes SLURM can choose, so a
++# submission may set them whenever the template doesn't (see JobTemplate.overridable): `exclude`
++# always (added to the template's own), `constraint` and `nodelist` unless the template fixes them.
++# Their values are checked more strictly than other resources:
++#   exclude     a hostlist: c03, c[03-05],gpu1
++#   nodelist    one node: a list of several would make SLURM allocate them all, past max_nodes
++#   constraint  node features joined by & (and) or | (or); no counts or brackets, which ask for nodes
++_HOST = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"
++_HOST_RANGE = _HOST + r"(?:\[\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*\][A-Za-z0-9_.-]*)?"
++_FEATURE = r"[A-Za-z0-9_.-]{1,64}"
++PLACEMENT_VALUE = {
++    "exclude": re.compile(rf"(?=.{{1,200}}$){_HOST_RANGE}(?:,{_HOST_RANGE})*"),
++    "nodelist": re.compile(_HOST),
++    "constraint": re.compile(rf"(?=.{{1,200}}$){_FEATURE}(?:[&|]{_FEATURE})*"),
++}
++PLACEMENT = tuple(PLACEMENT_VALUE)
++
+ 
+ class ResourceLimits:
+     """
+@@ -307,6 +326,11 @@ class JobTemplate:
+     ENVIRONMENT_KEYS = {"manager", "project", "name", "required"}
+     ARRAY_KEYS = {"task_parameters", "max_tasks"}
+     DEFAULT_OVERRIDABLE = ("time", "mem")
++    PLACEMENT_HINT = {
++        "exclude": "give node names or ranges, e.g. c03 or c[03-05],gpu1",
++        "nodelist": "give one node name; to keep off nodes, use exclude",
++        "constraint": "give node features joined by & or |, e.g. avx512 or icelake|cascadelake",
++    }
+     ENV_PREFIX = "HPC_PARAM_"
+     TASK_ENV_PREFIX = "HPC_TASK_"
+     GUIDE_FILE = "guide.md"
+@@ -369,6 +393,10 @@ class JobTemplate:
+             if key not in RESOURCE_FLAGS:
+                 raise ValueError(f"unknown resource {key!r}; known: {sorted(RESOURCE_FLAGS)}")
+         spec.setdefault("overridable", list(self.DEFAULT_OVERRIDABLE))
++        for key in PLACEMENT:
++            value = resources.get(key)
++            if value is not None and "$" not in str(value) and not PLACEMENT_VALUE[key].fullmatch(str(value)):
++                raise ValueError(f"resource {key} has an invalid value {value!r}; {self.PLACEMENT_HINT[key]}")
+         modules = spec.setdefault("modules", [])
+         if not isinstance(modules, list) or not all(isinstance(m, str) and self.MODULE_RE.fullmatch(m)
+                                                     for m in modules):
+@@ -425,7 +453,7 @@ class JobTemplate:
+             "description": self.spec["description"],
+             "parameters": self.parameter_schema(),
+             "resources": self.spec["resources"],
+-            "overridable_resources": self.spec["overridable"],
++            "overridable_resources": self.overridable,
+             "modules": self.spec["modules"],
+             "environment": self.spec.get("environment"),
+             "array": None,
+@@ -561,17 +589,34 @@ class JobTemplate:
+                 raise ValueError(f"{pname}: {real} is not a directory")
+         return real
+ 
++    @property
++    def overridable(self):
++        """
++        Resources a submission may set: the template's `overridable`, plus where the job may run
++        (`exclude` always; `constraint` and `nodelist` when the template sets no value of its own).
++        """
++        out = list(self.spec["overridable"])
++        for key in PLACEMENT:
++            if key not in out and (key == "exclude" or key not in self.spec["resources"]):
++                out.append(key)
++        return out
++
+     def resources(self, values, overrides=None):
+         overrides = overrides or {}
+         if not isinstance(overrides, dict):
+             raise RESTError(400, "`resources` must be an object")
++        overrides = dict(overrides)
+         problems = []
+-        for key in overrides:
++        overridable = self.overridable
++        for key in list(overrides):
+             if key not in RESOURCE_FLAGS:
+                 problems.append(f"unknown resource {key!r}")
+-            elif key not in self.spec["overridable"]:
++            elif key not in overridable:
+                 problems.append(f"template {self.name} does not allow overriding {key!r}; "
+-                                f"overridable: {self.spec['overridable']}")
++                                f"overridable: {overridable}")
++        # nodes the template keeps off stay off (unless it lets submissions change them); a submission's are added
++        keep_excluded = "exclude" in overrides and "exclude" in self.spec["resources"] \
++            and "exclude" not in self.spec["overridable"]
+         merged = {}
+         str_values = {k: self._env_value(v) for k, v in values.items()}
+         for key, value in dict(self.spec["resources"], **overrides).items():
+@@ -585,8 +630,17 @@ class JobTemplate:
+                 except (KeyError, ValueError) as e:
+                     problems.append(f"resource {key}: bad parameter reference {e}")
+                     continue
+-            if not SAFE_RESOURCE_VALUE.fullmatch(value):
+-                problems.append(f"resource {key} has an invalid value {value!r}")
++            if key == "exclude" and keep_excluded:
++                try:
++                    value = string.Template(str(self.spec["resources"]["exclude"])).substitute(str_values) \
++                        + "," + value
++                except (KeyError, ValueError) as e:
++                    problems.append(f"resource exclude: bad parameter reference {e}")
++                    continue
++            ok = PLACEMENT_VALUE[key].fullmatch(value) if key in PLACEMENT else SAFE_RESOURCE_VALUE.fullmatch(value)
++            if not ok:
++                problems.append(f"resource {key} has an invalid value {value!r}"
++                                + (f"; {self.PLACEMENT_HINT[key]}" if key in PLACEMENT else ""))
+                 continue
+             merged[key] = value
+         if problems:
+diff --git a/hpclib/servers/rest_local.py b/hpclib/servers/rest_local.py
+index b32b6e2..0b06a48 100644
+--- a/hpclib/servers/rest_local.py
++++ b/hpclib/servers/rest_local.py
+@@ -20,7 +20,7 @@ and the audit log work unchanged:
+     separate processes and carry on if the server stops; it picks them
+     up again when it restarts. Ask the admin for `loginctl enable-linger`
+     so they also outlive your logins;
+-  - --partition, --account, --qos and --constraint mean nothing here and
++  - --partition, --account, --qos, --constraint, --exclude and --nodelist mean nothing here and
+     are ignored; more than one node, or GPUs through --gres, are refused
+     (give the sandbox the device flags instead, for every job, e.g.
+     "flags": ["--device", "nvidia.com/gpu=all"]);
+@@ -62,7 +62,7 @@ SCHEDULER_TYPES = ("slurm", "local")
+ CONFIG_KEYS = {"type", "cpus", "memory", "default_memory", "default_time", "max_time", "enforce_limits"}
+ # Above SLURM's default MaxJobId (67043328), so an id can't be confused with one from a SLURM era of the same data
+ FIRST_ID = 70_000_001
+-IGNORED = ("--partition", "--account", "--qos", "--constraint")
++IGNORED = ("--partition", "--account", "--qos", "--constraint", "--exclude", "--nodelist")
+ ARRAY_RE = re.compile(r"0-(\d+)(?:%(\d+))?")
+ OUTPUT_RE = re.compile(r"%(%|j|A|a|x|u)")
+ 
+diff --git a/hpclib/servers/rest_mcp.py b/hpclib/servers/rest_mcp.py
+index c3b7f6c..72fccde 100644
+--- a/hpclib/servers/rest_mcp.py
++++ b/hpclib/servers/rest_mcp.py
+@@ -133,7 +133,10 @@ def build_server(client: RESTClient, enable_file_writes=False, local_roots=None)
+         params: Annotated[Optional[dict[str, Any]],
+                           Field(description="template parameters, matching its schema")] = None,
+         resources: Annotated[Optional[dict[str, str]], Field(
+-            description='overrides for the template\'s overridable resources, e.g. {"time": "02:00:00"}')] = None,
++            description='overrides for the template\'s overridable resources, e.g. {"time": "02:00:00"}. '
++                        'To keep a job off nodes (a node that fails your jobs, say) set "exclude", e.g. '
++                        '{"exclude": "c03"} or "c[03-05],gpu1"; "constraint" picks nodes by feature '
++                        '("icelake|cascadelake") and "nodelist" one node, unless the template fixes them')] = None,
+         workdir: Annotated[Optional[str], Field(
+             description="directory to run in (default: the template's or the base directory)")] = None,
+         idempotency_key: Annotated[Optional[str], Field(max_length=128)] = None,
+diff --git a/hpclib/tunnels/rest/templates/writing_templates/guide.md b/hpclib/tunnels/rest/templates/writing_templates/guide.md
+index 7d999d2..18f63b4 100644
+--- a/hpclib/tunnels/rest/templates/writing_templates/guide.md
++++ b/hpclib/tunnels/rest/templates/writing_templates/guide.md
+@@ -32,7 +32,8 @@ that is still waiting, propose it again under the same name.
+ - Give every parameter the narrowest type and bounds that work. Prefer an `enum` of known methods over a free
+   string.
+ - Resources can refer to parameters (`"${nprocs}"`). Keep the defaults small, and list in `overridable` only what
+-  a user should change.
++  a user should change. Don't add `exclude`, `constraint` or `nodelist` for that: every submission may already
++  keep its job off nodes (`{"exclude": "c03"}`) and choose them by feature or name, unless the template sets them.
+ - Include `array` only when the job runs once per input; the tasks then come from `tasks` or `tasks_from`.
+ - For Python packages, don't install anything in the script: add `"environment": {"manager": "auto", "project":
+   "${project}"}` (with a `project` path parameter), and the body runs in that uv or pixi project's environment,
+diff --git a/tests/test_rest_jobs.py b/tests/test_rest_jobs.py
+index 8880581..9d415b9 100644
+--- a/tests/test_rest_jobs.py
++++ b/tests/test_rest_jobs.py
+@@ -337,6 +337,46 @@ class TestSubmit(JobServerTestCase):
+         self.expect_error(422, self.llm.submit_job, "hello", resources={"time": "1;rm -rf /"})
+         self.expect_error(400, self.llm.submit_job, "hello", resources="lots")
+ 
++    def test_node_placement(self):
++        """exclude, constraint and nodelist narrow where a job runs, so a submission may set them"""
++        overridable = {t["name"]: t for t in self.llm.templates()["templates"]}["hello"]["overridable_resources"]
++        self.assertTrue({"exclude", "constraint", "nodelist"} <= set(overridable))
++        out = self.llm.submit_job("hello", resources={"exclude": "c03,gpu[01-02,05]", "constraint": "icelake|skylake"},
++                                  dry_run=True)
++        self.assertIn("--exclude=c03,gpu[01-02,05]", out["sbatch_args"])
++        self.assertIn("--constraint=icelake|skylake", out["sbatch_args"])
++        out = self.llm.submit_job("hello", resources={"nodelist": "c04"})
++        self.assertIn("--nodelist=c04", fake_job(self.slurm, out["job_id"])["args"])
++        for key, value in (("nodelist", "c04,c05"),        # several nodes: SLURM would allocate them all
++                           ("nodelist", "c[04-05]"),
++                           ("constraint", "[a*2&b*2]"),     # counts ask for nodes too
++                           ("constraint", "a&b;rm"),
++                           ("exclude", "c03 --exclusive"),
++                           ("exclude", "c[03-"),
++                           ("exclude", "-c03"),
++                           ("exclusive", "1"),              # whole nodes: past the CPU and memory caps
++                           ("mem_per_cpu", "100G")):
++            p = self.expect_error(422, self.llm.submit_job, "hello", resources={key: value})
++            self.assertTrue(p["violations"], (key, value))
++
++    def test_template_placement_is_kept(self):
++        spec_path = self.templates / "hello" / "template.json"
++        spec = json.loads(spec_path.read_text())
++        spec["resources"].update(exclude="bad1", constraint="avx512")
++        spec_path.write_text(json.dumps(spec))
++        hello = {t["name"]: t for t in self.llm.templates()["templates"]}["hello"]
++        self.assertIn("exclude", hello["overridable_resources"])
++        self.assertNotIn("constraint", hello["overridable_resources"])
++        out = self.llm.submit_job("hello", resources={"exclude": "c03"}, dry_run=True)
++        self.assertIn("--exclude=bad1,c03", out["sbatch_args"])
++        self.assertIn("--constraint=avx512", out["sbatch_args"])
++        p = self.expect_error(422, self.llm.submit_job, "hello", resources={"constraint": "icelake"})
++        self.assertTrue(any("does not allow overriding" in v for v in p["violations"]))
++        # a template may not pin several nodes either
++        spec["resources"]["nodelist"] = "c01,c02"
++        spec_path.write_text(json.dumps(spec))
++        self.assertIn("one node name", self.owner.templates()["errors"]["hello"])
++
+     def test_workdir(self):
+         (self.llm_root / "sub").mkdir()
+         out = self.llm.submit_job("hello", workdir="sub", dry_run=True)
+-- 
+2.43.0
+

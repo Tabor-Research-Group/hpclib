@@ -108,6 +108,10 @@ a Python environment) and `script.sh` (the job body, no `#SBATCH` lines). A fold
 the model reads before planning, and `examples/*.json`. A folder with only a `guide.md` is a planning guide for a
 multi-step workflow. The format is in [Extending hpclib](extending.md#writing-job-templates).
 
+Any submission may keep its job off nodes with `{"exclude": "c03"}` (or `c[03-05],gpu1`), and choose nodes with
+`constraint` (features) or `nodelist` (one node) unless the template sets those itself; see
+[Choosing nodes](extending.md#writing-job-templates).
+
 ### Proposals
 
 When no template fits, the model can draft one with `propose_template`. The proposal is validated like a real

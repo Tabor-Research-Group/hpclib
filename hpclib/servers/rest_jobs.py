@@ -192,9 +192,28 @@ RESOURCE_FLAGS = {
     "nodes": "--nodes",
     "gres": "--gres",
     "constraint": "--constraint",
+    "exclude": "--exclude",
+    "nodelist": "--nodelist",
 }
 # resource values become sbatch arguments; keep them to plain tokens
 SAFE_RESOURCE_VALUE = re.compile(r"[A-Za-z0-9_.:,=+@/-]{1,200}")
+
+# Where a job may run inside its partition. These only narrow the nodes SLURM can choose, so a
+# submission may set them whenever the template doesn't (see JobTemplate.overridable): `exclude`
+# always (added to the template's own), `constraint` and `nodelist` unless the template fixes them.
+# Their values are checked more strictly than other resources:
+#   exclude     a hostlist: c03, c[03-05],gpu1
+#   nodelist    one node: a list of several would make SLURM allocate them all, past max_nodes
+#   constraint  node features joined by & (and) or | (or); no counts or brackets, which ask for nodes
+_HOST = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"
+_HOST_RANGE = _HOST + r"(?:\[\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*\][A-Za-z0-9_.-]*)?"
+_FEATURE = r"[A-Za-z0-9_.-]{1,64}"
+PLACEMENT_VALUE = {
+    "exclude": re.compile(rf"(?=.{{1,200}}$){_HOST_RANGE}(?:,{_HOST_RANGE})*"),
+    "nodelist": re.compile(_HOST),
+    "constraint": re.compile(rf"(?=.{{1,200}}$){_FEATURE}(?:[&|]{_FEATURE})*"),
+}
+PLACEMENT = tuple(PLACEMENT_VALUE)
 
 
 class ResourceLimits:
@@ -307,6 +326,11 @@ class JobTemplate:
     ENVIRONMENT_KEYS = {"manager", "project", "name", "required"}
     ARRAY_KEYS = {"task_parameters", "max_tasks"}
     DEFAULT_OVERRIDABLE = ("time", "mem")
+    PLACEMENT_HINT = {
+        "exclude": "give node names or ranges, e.g. c03 or c[03-05],gpu1",
+        "nodelist": "give one node name; to keep off nodes, use exclude",
+        "constraint": "give node features joined by & or |, e.g. avx512 or icelake|cascadelake",
+    }
     ENV_PREFIX = "HPC_PARAM_"
     TASK_ENV_PREFIX = "HPC_TASK_"
     GUIDE_FILE = "guide.md"
@@ -369,6 +393,10 @@ class JobTemplate:
             if key not in RESOURCE_FLAGS:
                 raise ValueError(f"unknown resource {key!r}; known: {sorted(RESOURCE_FLAGS)}")
         spec.setdefault("overridable", list(self.DEFAULT_OVERRIDABLE))
+        for key in PLACEMENT:
+            value = resources.get(key)
+            if value is not None and "$" not in str(value) and not PLACEMENT_VALUE[key].fullmatch(str(value)):
+                raise ValueError(f"resource {key} has an invalid value {value!r}; {self.PLACEMENT_HINT[key]}")
         modules = spec.setdefault("modules", [])
         if not isinstance(modules, list) or not all(isinstance(m, str) and self.MODULE_RE.fullmatch(m)
                                                     for m in modules):
@@ -425,7 +453,7 @@ class JobTemplate:
             "description": self.spec["description"],
             "parameters": self.parameter_schema(),
             "resources": self.spec["resources"],
-            "overridable_resources": self.spec["overridable"],
+            "overridable_resources": self.overridable,
             "modules": self.spec["modules"],
             "environment": self.spec.get("environment"),
             "array": None,
@@ -561,17 +589,34 @@ class JobTemplate:
                 raise ValueError(f"{pname}: {real} is not a directory")
         return real
 
+    @property
+    def overridable(self):
+        """
+        Resources a submission may set: the template's `overridable`, plus where the job may run
+        (`exclude` always; `constraint` and `nodelist` when the template sets no value of its own).
+        """
+        out = list(self.spec["overridable"])
+        for key in PLACEMENT:
+            if key not in out and (key == "exclude" or key not in self.spec["resources"]):
+                out.append(key)
+        return out
+
     def resources(self, values, overrides=None):
         overrides = overrides or {}
         if not isinstance(overrides, dict):
             raise RESTError(400, "`resources` must be an object")
+        overrides = dict(overrides)
         problems = []
-        for key in overrides:
+        overridable = self.overridable
+        for key in list(overrides):
             if key not in RESOURCE_FLAGS:
                 problems.append(f"unknown resource {key!r}")
-            elif key not in self.spec["overridable"]:
+            elif key not in overridable:
                 problems.append(f"template {self.name} does not allow overriding {key!r}; "
-                                f"overridable: {self.spec['overridable']}")
+                                f"overridable: {overridable}")
+        # nodes the template keeps off stay off (unless it lets submissions change them); a submission's are added
+        keep_excluded = "exclude" in overrides and "exclude" in self.spec["resources"] \
+            and "exclude" not in self.spec["overridable"]
         merged = {}
         str_values = {k: self._env_value(v) for k, v in values.items()}
         for key, value in dict(self.spec["resources"], **overrides).items():
@@ -585,8 +630,17 @@ class JobTemplate:
                 except (KeyError, ValueError) as e:
                     problems.append(f"resource {key}: bad parameter reference {e}")
                     continue
-            if not SAFE_RESOURCE_VALUE.fullmatch(value):
-                problems.append(f"resource {key} has an invalid value {value!r}")
+            if key == "exclude" and keep_excluded:
+                try:
+                    value = string.Template(str(self.spec["resources"]["exclude"])).substitute(str_values) \
+                        + "," + value
+                except (KeyError, ValueError) as e:
+                    problems.append(f"resource exclude: bad parameter reference {e}")
+                    continue
+            ok = PLACEMENT_VALUE[key].fullmatch(value) if key in PLACEMENT else SAFE_RESOURCE_VALUE.fullmatch(value)
+            if not ok:
+                problems.append(f"resource {key} has an invalid value {value!r}"
+                                + (f"; {self.PLACEMENT_HINT[key]}" if key in PLACEMENT else ""))
                 continue
             merged[key] = value
         if problems:

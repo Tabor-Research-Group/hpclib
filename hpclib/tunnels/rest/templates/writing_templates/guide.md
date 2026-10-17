@@ -32,7 +32,8 @@ that is still waiting, propose it again under the same name.
 - Give every parameter the narrowest type and bounds that work. Prefer an `enum` of known methods over a free
   string.
 - Resources can refer to parameters (`"${nprocs}"`). Keep the defaults small, and list in `overridable` only what
-  a user should change.
+  a user should change. Don't add `exclude`, `constraint` or `nodelist` for that: every submission may already
+  keep its job off nodes (`{"exclude": "c03"}`) and choose them by feature or name, unless the template sets them.
 - Include `array` only when the job runs once per input; the tasks then come from `tasks` or `tasks_from`.
 - For Python packages, don't install anything in the script: add `"environment": {"manager": "auto", "project":
   "${project}"}` (with a `project` path parameter), and the body runs in that uv or pixi project's environment,

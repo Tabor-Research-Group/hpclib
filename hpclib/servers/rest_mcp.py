@@ -133,7 +133,10 @@ def build_server(client: RESTClient, enable_file_writes=False, local_roots=None)
         params: Annotated[Optional[dict[str, Any]],
                           Field(description="template parameters, matching its schema")] = None,
         resources: Annotated[Optional[dict[str, str]], Field(
-            description='overrides for the template\'s overridable resources, e.g. {"time": "02:00:00"}')] = None,
+            description='overrides for the template\'s overridable resources, e.g. {"time": "02:00:00"}. '
+                        'To keep a job off nodes (a node that fails your jobs, say) set "exclude", e.g. '
+                        '{"exclude": "c03"} or "c[03-05],gpu1"; "constraint" picks nodes by feature '
+                        '("icelake|cascadelake") and "nodelist" one node, unless the template fixes them')] = None,
         workdir: Annotated[Optional[str], Field(
             description="directory to run in (default: the template's or the base directory)")] = None,
         idempotency_key: Annotated[Optional[str], Field(max_length=128)] = None,

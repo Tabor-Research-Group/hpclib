@@ -337,6 +337,46 @@ class TestSubmit(JobServerTestCase):
         self.expect_error(422, self.llm.submit_job, "hello", resources={"time": "1;rm -rf /"})
         self.expect_error(400, self.llm.submit_job, "hello", resources="lots")
 
+    def test_node_placement(self):
+        """exclude, constraint and nodelist narrow where a job runs, so a submission may set them"""
+        overridable = {t["name"]: t for t in self.llm.templates()["templates"]}["hello"]["overridable_resources"]
+        self.assertTrue({"exclude", "constraint", "nodelist"} <= set(overridable))
+        out = self.llm.submit_job("hello", resources={"exclude": "c03,gpu[01-02,05]", "constraint": "icelake|skylake"},
+                                  dry_run=True)
+        self.assertIn("--exclude=c03,gpu[01-02,05]", out["sbatch_args"])
+        self.assertIn("--constraint=icelake|skylake", out["sbatch_args"])
+        out = self.llm.submit_job("hello", resources={"nodelist": "c04"})
+        self.assertIn("--nodelist=c04", fake_job(self.slurm, out["job_id"])["args"])
+        for key, value in (("nodelist", "c04,c05"),        # several nodes: SLURM would allocate them all
+                           ("nodelist", "c[04-05]"),
+                           ("constraint", "[a*2&b*2]"),     # counts ask for nodes too
+                           ("constraint", "a&b;rm"),
+                           ("exclude", "c03 --exclusive"),
+                           ("exclude", "c[03-"),
+                           ("exclude", "-c03"),
+                           ("exclusive", "1"),              # whole nodes: past the CPU and memory caps
+                           ("mem_per_cpu", "100G")):
+            p = self.expect_error(422, self.llm.submit_job, "hello", resources={key: value})
+            self.assertTrue(p["violations"], (key, value))
+
+    def test_template_placement_is_kept(self):
+        spec_path = self.templates / "hello" / "template.json"
+        spec = json.loads(spec_path.read_text())
+        spec["resources"].update(exclude="bad1", constraint="avx512")
+        spec_path.write_text(json.dumps(spec))
+        hello = {t["name"]: t for t in self.llm.templates()["templates"]}["hello"]
+        self.assertIn("exclude", hello["overridable_resources"])
+        self.assertNotIn("constraint", hello["overridable_resources"])
+        out = self.llm.submit_job("hello", resources={"exclude": "c03"}, dry_run=True)
+        self.assertIn("--exclude=bad1,c03", out["sbatch_args"])
+        self.assertIn("--constraint=avx512", out["sbatch_args"])
+        p = self.expect_error(422, self.llm.submit_job, "hello", resources={"constraint": "icelake"})
+        self.assertTrue(any("does not allow overriding" in v for v in p["violations"]))
+        # a template may not pin several nodes either
+        spec["resources"]["nodelist"] = "c01,c02"
+        spec_path.write_text(json.dumps(spec))
+        self.assertIn("one node name", self.owner.templates()["errors"]["hello"])
+
     def test_workdir(self):
         (self.llm_root / "sub").mkdir()
         out = self.llm.submit_job("hello", workdir="sub", dry_run=True)
