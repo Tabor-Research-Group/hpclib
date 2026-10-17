@@ -12,7 +12,7 @@ Fonts must already be installed or supplied by your stylesheet; a font-family se
 
 `--log-max-width` defaults to `960px` and caps the **whole panel**, including its frame.
 Panels are also clamped to their container and viewport; increasing this value cannot force them wider.
-Tunnel/app logs and installation/setup output use the same constraint.
+Tunnel/app logs, installation/setup output, and Activity job output previews use the same constraint.
 Long lines scroll horizontally inside the log by default. To wrap them, use both wrapping settings:
 
 ```css

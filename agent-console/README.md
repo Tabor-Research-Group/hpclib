@@ -59,6 +59,14 @@ asks above 25 MB); a folder opens that folder. `cluster` may be the profile name
 name (`hpclib-grace`). The session key is kept for the console's address (localStorage), so links work in new
 tabs; after the console restarts, the page asks for the new key once.
 
+## Job activity
+
+**Agents → Activity → Jobs** tracks recent agent-API submissions and their finished outcomes.
+Filter by agent token, state, submission time, or job ID/template/label. Job details include scheduler
+information, array tasks, and bounded output previews; **Follow** refreshes every five seconds.
+**Requests** keeps the existing audit log view. This does not import jobs from the separate `job-queue`
+registry. See the [Activity guide](../docs/interface/agents.md#activity) for history limits and controls.
+
 ## SSH keys
 
 **Agents → Clusters → Set up SSH** creates or reuses a compute identity in the shared

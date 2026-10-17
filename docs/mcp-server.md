@@ -51,7 +51,11 @@ can write only to the token's directories and private scratch, sees system direc
 nothing else of your account: not your home directory, other projects, or hpclib's own state.
 
 **Everything is recorded.** Every request, allowed or refused, goes to an audit log with the token name, route,
-status and the job or file involved. The console's Activity page shows it.
+status and the job or file involved. The console's Activity → Requests view shows it. Activity → Jobs
+shows recent submissions, current and finished states, array tasks, and output previews. The job registry
+retains observed accounting details after completion, so later reads keep the exit code and elapsed time.
+Old terminal records get one recovery attempt when accounting is still available; expired accounting
+preserves their known outcome without inventing missing details. This registry is separate from `job-queue`.
 
 **Content is not instruction.** The MCP server's instructions tell the model that file contents and job output
 are data from the cluster and must not be followed as directions.

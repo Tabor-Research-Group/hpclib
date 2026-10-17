@@ -49,6 +49,21 @@ input, select {
 }
 .toolbar { display: flex; gap: var(--space-lg); align-items: center; margin-bottom: var(--space-lg); flex-wrap: wrap; }
 
+/* Activity keeps wide job tables and output within their own scroll areas. */
+.activity-page { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.activity-page .activity-pane[hidden] { display: none; }
+.activity-filter { display: inline-flex; flex-direction: column; gap: var(--space-xs); }
+.activity-summary { display: flex; flex-wrap: wrap; gap: var(--space-md); }
+.activity-count { display: flex; flex-direction: column; text-align: left; min-width: 110px; gap: var(--space-xs); }
+.activity-count strong { font-size: var(--font-size-subheading); }
+.activity-page button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.activity-table { max-width: 100%; overflow: auto; }
+.activity-page table { width: 100%; }
+.activity-page td { overflow-wrap: anywhere; }
+.activity-details { display: grid; grid-template-columns: minmax(100px, max-content) minmax(0, 1fr); gap: var(--space-xs) var(--space-lg); }
+.activity-details dt { color: var(--muted); }
+.activity-details dd { margin: 0; min-width: 0; }
+
 .state { font-weight: var(--font-weight-semibold); }
 .state.up { color: var(--good); }
 .state.starting { color: var(--warn); }

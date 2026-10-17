@@ -34,6 +34,7 @@
 | `~/.local/tunnels/rest/templates/` | job templates; `.replaced/` holds replaced ones |
 | `~/.local/tunnels/rest/proposals/` | template proposals; `.rejected/`, `.superseded/` |
 | `~/.local/tunnels/rest/audit.log` | every REST request |
+| `~/.local/tunnels/rest/jobs.sqlite` | agent-API job history, token/label attribution and observed scheduler details; configurable with `jobs_db` |
 | `~/.local/tunnels/rest/python` | the Python launcher `setup_agents` chose |
 | `~/.local/share/hpclib/tunnels/` | installed tunnels (`HPCLIB_TUNNEL_INSTALL_LOCATION`) |
 | `~/.config/hpclib/smb/` | `smbshell`'s Kerberos ticket and saved password |

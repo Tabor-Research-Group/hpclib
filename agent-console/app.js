@@ -7,6 +7,7 @@
 
 // The page's building blocks are custom elements, in components.js (see its header).
 import { configure, el, action, confirmDialog, LOGIN_BUSY, LOGIN_LABEL, HpcClusterPicker } from "./components.js";
+import { activityPage as buildActivity } from "./activity.js";
 
 const params = new URLSearchParams(location.search);
 const API = (params.get("api") || "").replace(/\/$/, "");
@@ -500,70 +501,10 @@ async function proposalsPage() {
 }
 
 async function activityPage() {
-  const { clusters } = await api("clusters");
-  const pick = el("hpc-cluster-picker", { live: true });
-  pick.clusters = clusters;
-  if (!pick.options.length) {
-    return [el("h2", {}, "Activity"), el("p", { class: "muted" }, "No cluster with a live tunnel and an owner token.")];
-  }
-  const token = el("input", { placeholder: "token name", size: 14 });
-  const errorsOnly = el("input", { type: "checkbox" });
-  const follow = el("input", { type: "checkbox" });
-  const body = el("tbody");
-  const status = el("span", { class: "muted" });
-  let entries = [];
-  let latest = null;
-
-  const draw = () => {
-    const shown = entries.filter((e) => !errorsOnly.checked || (e.status || 0) >= 400);
-    body.replaceChildren(...shown.slice().reverse().map((e) => el("tr", {},
-      el("td", { class: "num" }, new Date(e.time * 1000).toLocaleString()),
-      el("td", {}, e.token || ""),
-      el("td", {}, `${e.verb} ${e.path}`),
-      el("td", { class: "num" }, (e.status || 0) >= 400 ? el("hpc-state", { tone: "error", label: e.status }) : (e.status ?? "")),
-      el("td", { class: "muted" }, e.detail ? JSON.stringify(e.detail) : ""))));
-    status.textContent = `${shown.length} entries`;
-  };
-  const query = (since) => {
-    const q = new URLSearchParams({ limit: "500" });
-    if (token.value.trim()) q.set("token", token.value.trim());
-    if (since) q.set("since", since);
-    return cluster(pick.value) + "/rest/admin/audit?" + q;
-  };
-  const load = async () => {
-    const out = await api(query(null));
-    entries = out.entries;
-    latest = out.latest;
-    draw();
-  };
-  const poll = async () => {
-    if (!document.body.contains(body)) return stopFollowing();
-    try {
-      const out = await api(query(latest));
-      if (out.entries.length) {
-        entries = entries.concat(out.entries).slice(-2000);
-        latest = out.latest;
-        draw();
-      }
-    } catch (err) { status.textContent = err.message; }
-  };
-  pick.addEventListener("change", load);
-  token.addEventListener("change", load);
-  errorsOnly.addEventListener("change", draw);
-  follow.addEventListener("change", () => {
+  return buildActivity({ api, filesHash, setFollowing: (callback) => {
     stopFollowing();
-    if (follow.checked) followTimer = setInterval(poll, 5000);
-  });
-  await load();
-  return [
-    el("h2", {}, "Activity"),
-    el("div", { class: "toolbar" }, pick, token,
-      el("label", {}, errorsOnly, " errors only"),
-      el("label", {}, follow, " follow"), status),
-    el("table", {},
-      el("thead", {}, el("tr", {}, ["Time", "Token", "Request", "Status", "Detail"].map((h) => el("th", {}, h)))),
-      body),
-  ];
+    if (callback) followTimer = setInterval(callback, 5000);
+  } });
 }
 
 // ---------------------------------------------------------------- files

@@ -415,6 +415,40 @@ class TestSubmit(JobServerTestCase):
 
 class TestJobTracking(JobServerTestCase):
 
+    def test_terminal_accounting_details_survive_later_reads_and_registry_reopen(self):
+        job_id = self.llm.submit_job("hello")["job_id"]
+        set_state(self.slurm, job_id, "FAILED")
+        first = self.llm.job_status(job_id)
+        self.assertEqual(first["exit_code"], "1:0")
+        self.jobs.registry = rest_jobs.JobRegistry(self.jobs.registry.path)
+        with mock.patch.object(self.jobs.runner, "run", side_effect=AssertionError("terminal job was re-polled")):
+            status = self.llm.job_status(job_id)
+            listed = self.llm.jobs()["jobs"][0]
+        for value in (status, listed):
+            self.assertEqual((value["state"], value["exit_code"], value["elapsed"]),
+                             (first["state"], first["exit_code"], first["elapsed"]))
+
+    def test_old_terminal_records_recover_details_or_preserve_known_outcomes(self):
+        job_id = self.llm.submit_job("hello")["job_id"]
+        set_state(self.slurm, job_id, "COMPLETED")
+        # Model a registry from before status_details was introduced.
+        self.jobs.registry.update_states({job_id: "COMPLETED"})
+        self.assertEqual(self.llm.job_status(job_id)["exit_code"], "0:0")
+        with self.jobs.registry.connect() as db:
+            db.execute("UPDATE jobs SET status_details = NULL WHERE job_id = ?", (job_id,))
+        with mock.patch.object(self.jobs.runner, "query_states", return_value={job_id: {"state": "UNKNOWN"}}):
+            self.assertEqual(self.llm.job_status(job_id)["state"], "COMPLETED")
+        with mock.patch.object(self.jobs.runner, "run", side_effect=AssertionError("expired accounting was re-polled")):
+            self.assertEqual(self.llm.job_status(job_id)["state"], "COMPLETED")
+
+    def test_finished_history_survives_an_unavailable_scheduler(self):
+        job_id = self.llm.submit_job("hello")["job_id"]
+        self.jobs.registry.update_states({job_id: "COMPLETED"})
+        with mock.patch.object(self.jobs.runner, "query_states", side_effect=rest_jobs.RESTError(503, "scheduler unavailable")):
+            job = self.llm.job_status(job_id)
+        self.assertEqual((job["state"], job["terminal"]), ("COMPLETED", True))
+        self.assertNotIn("exit_code", job)
+
     def test_status_follows_slurm(self):
         job_id = self.llm.submit_job("hello")["job_id"]
         self.assertEqual(self.llm.job_status(job_id)["reason"], "(Priority)")

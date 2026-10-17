@@ -1366,6 +1366,25 @@ class TestSecondLogin(ConsoleTestCase):
 
 class TestProxy(ConsoleTestCase):
 
+    def test_delete_ssh_keys_forwards_the_targeted_body(self):
+        from ssh_keys import SSHKeyStore
+        self.server.ssh_keys = SSHKeyStore(self.tmp / "shared-home")
+        base = f"/api/clusters/{self.live}/rest/admin/ssh/"
+        status, out = self.call("POST", base + "keys", {"name": "github"})
+        self.assertEqual(status, 200, out)
+        status, authorized = self.call("POST", base + "authorized", {"line": out["key"]["public_key"]})
+        self.assertEqual(status, 200, authorized)
+        status, hosts = self.call("PUT", base + "hosts", {"host": "github.com", "key": "github", "user": "git"})
+        self.assertEqual(status, 200, hosts)
+        for route, body in (("hosts", {"host": "github.com", "revision": hosts["revision"]}),
+                            ("authorized", {"id": authorized["entries"][0]["id"], "revision": authorized["revision"]}),
+                            ("keys", {"name": "github"})):
+            status, out = self.call("DELETE", base + route, body)
+            self.assertEqual(status, 200, out)
+        self.assertEqual(self.server.ssh_keys.keys()["keys"], [])
+        self.assertEqual(self.server.ssh_keys.authorized()["entries"], [])
+        self.assertFalse(any(h["managed"] for h in self.server.ssh_keys.hosts()["hosts"]))
+
     def test_owner_token_by_default(self):
         status, out = self.call("GET", f"/api/clusters/{self.live}/rest/health")
         self.assertEqual((status, out["token"]["name"]), (200, "owner"))

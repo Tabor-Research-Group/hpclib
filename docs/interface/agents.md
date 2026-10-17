@@ -54,10 +54,31 @@ for you regardless of the mode.
 
 ## Activity
 
-Every request an agent (or the console) makes to a cluster's REST server is written to an audit log. This page
-shows one cluster's log, newest first: the time, the token, the route, the status and the job or file involved.
-Filter by token or to **errors only**, and tick **follow** to refresh every five seconds while you watch an agent
-work.
+Choose a live cluster with an owner token. Activity has **Jobs** and **Requests** views, with an
+agent-token filter shared between them. **Check now** refreshes the history; **Follow every 5 seconds**
+updates jobs, an open job detail, and the request log. Changing clusters clears the previous details.
+
+**Jobs** lists agent-API submissions newest first, including finished outcomes. Summary buttons count
+waiting, running, completed, and failed/stopped jobs. Filter by state, submission time, or job ID,
+template, and label. Load the newest 100, 250, 500, or 1000 jobs; filters apply to the loaded history,
+so increase the history size when looking further back. An agent is identified by its token name;
+agents sharing that token need distinct submission labels to tell their work apart.
+
+**Details** shows parameters, resources, working directory, output path, and available scheduler
+information such as elapsed time, exit code, node, and start/end time. Arrays also show task counts
+and individual task states and outputs, with a task-state filter (up to 500 matching tasks displayed).
+**Preview output** reads at most the last 200 lines / 64 KiB into a log panel using your log size
+settings. **Open in Files** opens the full output. Output may not exist yet for a waiting job; array
+output previews use the selected task's actual output filename.
+
+If a refresh fails, an error identifies jobs or requests and marks retained history as possibly stale.
+Job history and the audit log can fail independently. These controls are read-only; they do not submit,
+cancel, restart, or resubmit jobs. Jobs managed only through `job-queue`, or submitted outside the
+agent template API, do not appear in this registry.
+
+**Requests** retains the audit view: request time, token, route, status, and job or file involved,
+newest first. Filter by agent or **Errors only**. It loads the latest 500 matching requests and
+keeps at most 2000 while following.
 
 ## Files
 

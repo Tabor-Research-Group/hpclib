@@ -2210,7 +2210,7 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         as_agent = self.query.get("as", [""])[-1] == "agent"
         if verb == "GET" and route in STREAMED_ROUTES:
             return self.proxy_stream(profile, route, query, as_agent)
-        data = self.body(self.server.max_body) if verb in ("POST", "PUT") else None
+        data = self.body(self.server.max_body) if verb in ("POST", "PUT", "DELETE") else None
         headers = {}
         if self.headers.get("Content-Type"):
             headers["Content-Type"] = self.headers["Content-Type"]

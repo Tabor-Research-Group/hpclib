@@ -1018,8 +1018,9 @@ class JobRegistry:
         "tasks": "TEXT",
         "task_states": "TEXT",
         "label": "TEXT",
+        "status_details": "TEXT",
     }
-    JSON_COLUMNS = ("params", "resources", "tasks", "task_states")
+    JSON_COLUMNS = ("params", "resources", "tasks", "task_states", "status_details")
 
     def __init__(self, path):
         self.path = os.path.expanduser(path)
@@ -1085,7 +1086,7 @@ class JobRegistry:
         with closing(self.connect()) as db:
             return [self._row(r) for r in db.execute(query, args).fetchall()]
 
-    def update_states(self, states, task_states=None):
+    def update_states(self, states, task_states=None, status_details=None):
         now = time.time()
         task_states = task_states or {}
         with closing(self.connect()) as db, db:
@@ -1093,6 +1094,8 @@ class JobRegistry:
                            [(s, now, j, s) for j, s in states.items()])
             db.executemany("UPDATE jobs SET task_states = ?, updated = ? WHERE job_id = ?",
                            [(json.dumps(t, sort_keys=True), now, j) for j, t in task_states.items()])
+            db.executemany("UPDATE jobs SET status_details = ? WHERE job_id = ?",
+                           [(json.dumps(s, sort_keys=True), j) for j, s in (status_details or {}).items()])
 
 
 ################################################################################
@@ -1785,6 +1788,8 @@ class JobManager:
         return 201, dict(self.job_view(self.registry.get(job_id)), duplicate=False, sandbox=sandbox_plan)
 
     def job_view(self, job, status=None, include_tasks=False):
+        if status is None:
+            status = job.get("status_details")
         view = {k: job.get(k) for k in ("job_id", "template", "params", "resources", "workdir",
                                         "output", "submitted", "token", "label")}
         view["state"] = job["state"]
@@ -1808,16 +1813,30 @@ class JobManager:
         return view
 
     def refresh(self, jobs, include_tasks=False):
-        live = [j for j in jobs if j["state"] not in SlurmRunner.TERMINAL_STATES]
+        # Keep terminal details after the first accounting read. Older registry
+        # rows get one attempt to recover details when accounting still has them.
+        live = [j for j in jobs if j["state"] not in SlurmRunner.TERMINAL_STATES
+                or j.get("status_details") is None]
         arrays = {j["job_id"]: j["array_size"] for j in live if j.get("array_size")}
-        states = self.runner.query_states([j["job_id"] for j in live if not j.get("array_size")], arrays)
+        try:
+            states = self.runner.query_states([j["job_id"] for j in live if not j.get("array_size")], arrays)
+        except RESTError:
+            if any(j["state"] not in SlurmRunner.TERMINAL_STATES for j in live):
+                raise
+            # An archive remains useful even when the scheduler is unavailable.
+            states = {j["job_id"]: {"state": "UNKNOWN"} for j in live}
         self.registry.update_states(
             {j: s["state"] for j, s in states.items() if s["state"] != "UNKNOWN"},
-            {j: states[j]["tasks"] for j in arrays if j in states},
+            {j: states[j]["tasks"] for j in arrays if j in states and states[j]["state"] != "UNKNOWN"},
+            {job["job_id"]: ({k: v for k, v in states[job["job_id"]].items() if k != "tasks"}
+                             if states[job["job_id"]]["state"] != "UNKNOWN" else {})
+             for job in live if job["job_id"] in states},
         )
         out = []
         for job in jobs:
             status = states.get(job["job_id"])
+            if status and status["state"] == "UNKNOWN" and job["state"] in SlurmRunner.TERMINAL_STATES:
+                status = None  # preserve a known outcome after accounting retention expires
             if status and status["state"] != "UNKNOWN":
                 job = dict(job, state=status["state"])
             out.append(self.job_view(job, status, include_tasks=include_tasks))
