@@ -19,6 +19,9 @@
 | --- | --- |
 | `~/hpclib/` | hpclib (`HPCLIB_REMOTE_INSTALL_LOCATION`); the previous copy is `~/hpclib.previous` |
 | `~/.local/tunnels/config.sh` | your defaults for every tunnel |
+| `~/.ssh/id_ed25519_hpclib_compute`, `.pub` | login-to-compute identity created by `setup_cluster_ssh`, in the shared home |
+| `~/.ssh/authorized_keys` | incoming public-key authorizations, managed one entry at a time |
+| `~/.ssh/hpclib_keys.conf` | console-managed host identity bindings included from `~/.ssh/config` |
 | `~/.local/tunnels/settings/TUNNEL.sh` | a tunnel's saved settings |
 | `~/.local/tunnels/settings/TUNNEL.d/` | settings files from packages (e.g. `data-transfer.d/rclone.conf`) |
 | `~/.local/tunnels/secrets/TUNNEL/NAME` | secrets sent from the console (mode 600) |
@@ -60,12 +63,14 @@
 | `HPCTUNNELS_DATA_DIR` | `~/.local/tunnels` | hpclib's state directory |
 | `HPCSESSIONS_DIR` | `$HPCTUNNELS_DATA_DIR/sessions` | tunnel session logs and port records |
 | `HPCLIB_COMPUTE_HOST_KEYS` | ask | `accept-new`: trust new compute nodes' host keys without asking |
+| `HPCLIB_COMPUTE_IDENTITY_FILE` | `~/.ssh/id_ed25519_hpclib_compute` when it exists | automatic compute identity; empty disables; caller `-i` takes precedence |
+| `CONNECT_TO_JOB_SSH_ARGS` | unset | Bash array of extra SSH options; preserves spaces in option values |
 | `CONDA_MODULE`, `REQUIRE_CONDA` | | load conda from a module; fail without it |
 | `HPCLIB_PYTHON_NAMES` | `python3` and `python3.X` | Python names `setup_agents` tries |
 | `HPC_REST_PYTHON` | the launcher | the Python the REST tunnel runs |
 | `HPC_REST_TOKEN_FILE` | `~/.local/tunnels/rest_token` | the REST owner token file |
 | `HPC_REST_AUTO_APPROVE_TEMPLATES` | | the proposal policy for a server started by hand |
-| `HPC_REST_DISABLE_FILE_CHANGES` | | `1`: refuse uploads, `mkdir`, deletes and environment syncs |
+| `HPC_REST_DISABLE_FILE_CHANGES` | | `1`: refuse uploads, `mkdir`, deletes, environment syncs, and SSH management mutations |
 | `PROCESS_PORT_WAIT` | `900` | seconds a tunnel waits for a job to register its port |
 
 ### Set by hpclib

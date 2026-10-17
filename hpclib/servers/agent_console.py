@@ -31,7 +31,7 @@ The front end depends only on the routes below; nothing here depends on it.
   POST /api/clusters/NAME/install             install_hpclib over the login ({"force": true} reinstalls)
   POST /api/clusters/NAME/setup               setup_agents ({"work_dirs": [...], "binds": [...],
                                               "templates": "...", "rebuild": false})
-  GET  /api/clusters/NAME/operation           the running or last install/setup, with its log
+  GET  /api/clusters/NAME/operation           the running or last install/setup/SSH setup, with its log
   GET  /api/apps                              the console's apps: agents, and tunnel apps (JupyterLab), with
                                               the package each came from (null: hpclib's own)
   GET  /api/packages                          apps and settings installed from packages (console_packages.py)
@@ -66,6 +66,8 @@ The front end depends only on the routes below; nothing here depends on it.
                                                "tunnel_args": ["--time=12:00:00", ...],
                                                "connection_hours": 12, "rest_on": job|login}
   POST /api/clusters/NAME/tunnel/start        runs agent_tunnel NAME ({"auto_approve_templates": all|new|review})
+  POST /api/clusters/NAME/ssh/setup           initialize shared-home compute SSH via the active login;
+                                              tracked ssh_setup operation, body {}
   POST /api/clusters/NAME/tunnel/stop         runs agent_stop NAME
   GET  /api/clusters/NAME/tunnel/log?lines=N  the console's log of that tunnel
   POST /api/clusters/NAME/tunnel/answer       {"answer": ...}: a password the tunnel's ssh asks for (its
@@ -965,13 +967,13 @@ class Clusters:
 
     # -- installing and setting up ------------------------------------------
 
-    OPERATIONS = ("install", "setup")
+    OPERATIONS = ("install", "setup", "ssh_setup")
 
     def ops_log_path(self, name):
         return os.path.join(console_dir(), "logs", f"{name}.ops.log")
 
     def run_operation(self, profile, kind, args, title=None, app=None):
-        """Run install_hpclib or setup_agents for a cluster in the background, over its ssh login."""
+        """Run a cluster setup/installation operation in the background over its ssh login."""
         name = profile["name"]
         with self.lock:
             current = self.ops.get(name)
@@ -1025,6 +1027,15 @@ class Clusters:
         if profile.get("host") not in login:
             login.append(profile["host"])
         return self.run_operation(profile, "install", ["install_hpclib"] + (["--force"] if force else []) + login)
+
+    def setup_ssh(self, profile, body):
+        if body:
+            raise ConsoleError(422, "SSH setup takes no key paths or private-key contents")
+        login = list(profile.get("login") or [])
+        if profile.get("host") not in login:
+            login.append(profile["host"])
+        return self.run_operation(profile, "ssh_setup", ["setup_cluster_ssh"] + login,
+                                  title="Set up cluster SSH")
 
     def setup(self, profile, body):
         unknown = set(body) - {"work_dirs", "binds", "templates", "rebuild"}
@@ -2121,6 +2132,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 return 202, dict(c.install(profile, self.json_body()), ok=True)
             if rest == ["setup"] and verb == "POST":
                 return 202, dict(c.setup(profile, self.json_body()), ok=True)
+            if rest == ["ssh", "setup"] and verb == "POST":
+                return 202, dict(c.setup_ssh(profile, self.json_body()), ok=True)
             if rest == ["operation"] and verb == "GET":
                 return 200, dict(c.operation(profile["name"], self.int_arg("lines", 200, 1, 5000)), ok=True)
             if rest == ["login"] and verb == "GET":

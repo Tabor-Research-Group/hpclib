@@ -204,6 +204,9 @@ port serves the waiting page instead, so clients should wait for `GET /health` t
 | raw SLURM (`slurm` scope) | `POST /slurm/{sbatch,squeue,sacct,scontrol,scancel}`, `GET /slurm/{squeue,sacct}` |
 | owner only | `GET /admin/proposals`, `GET /admin/proposals/diff`, `POST /admin/proposals/approve`, `POST /admin/proposals/reject`, `GET /admin/audit`, `GET`/`PUT /admin/config`, `GET /admin/tokens`, `POST /admin/tokens/revoke` |
 
+SSH identity management is owner-only through `/admin/ssh/{setup,keys,authorized,hosts}`;
+it is not exposed as an MCP tool. See the [SSH key API reference](ssh-keys.md#rest-interface).
+
 ## Adding an MCP tool
 
 Tools are defined in `build_server()` in `rest_mcp.py`, each a thin async wrapper over a `RESTClient` method:

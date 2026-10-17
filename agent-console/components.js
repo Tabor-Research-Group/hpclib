@@ -754,6 +754,10 @@ export class HpcClusterRow extends TunnelRow {
         if (this.detailKind === "setup") return this.hideDetail();
         ask(this, "hpc-setup", { cluster: this._data, row: this });
       }),
+      ssh: action("Set up SSH", async () => {
+        await fetcher(path("ssh/setup"), { method: "POST", body: {} });
+        await this.refresh();
+      }),
       copyUser: action("Copy username", async () => {
         await navigator.clipboard.writeText(this._data.username || "");
         return "Copied.";
@@ -762,7 +766,7 @@ export class HpcClusterRow extends TunnelRow {
     };
   }
 
-  opMine(op) { return op.kind === "install" || op.kind === "setup"; }
+  opMine(op) { return ["install", "setup", "ssh_setup"].includes(op.kind); }
   updated() { this.syncOperation(this._data.operation); }
 
   cells() {
@@ -778,7 +782,7 @@ export class HpcClusterRow extends TunnelRow {
     b.start.title = !c.set_up ? "set it up first" : (loggedIn ? "" : "log in first");
     b.stop.disabled = t.state === "down" && !t.started_here;
     b.setup.setAttribute("label", c.set_up ? "Setup…" : "Set up…");
-    for (const x of [b.install, b.setup]) {
+    for (const x of [b.install, b.setup, b.ssh]) {
       x.disabled = !loggedIn || running;
       x.title = loggedIn ? "" : "log in first";
     }
@@ -794,7 +798,7 @@ export class HpcClusterRow extends TunnelRow {
       c.port,
       !c.set_up ? el("span", { class: "muted" }, "not set up") :
         (c.has_owner_token ? "owner" : el("span", { class: "muted" }, "agent only")),
-      [el("div", { class: "actions" }, b.start, b.stop, b.log), el("div", { class: "actions second" }, b.install, b.setup)],
+      [el("div", { class: "actions" }, b.start, b.stop, b.log), el("div", { class: "actions second" }, b.install, b.setup, b.ssh)],
     ];
   }
 }
@@ -804,8 +808,9 @@ const APP_STATE_LABEL = { up: "running", queued: "queued", starting: "starting",
 export class HpcAppSession extends TunnelRow {
   // A tunnel app's session on one cluster (GET /api/apps/APP/NAME): the login, the session's state, and Open,
   // Start, Stop, Log, Settings. app: the app's id; app-title: its name (JupyterLab); cluster: the profile name.
-  // For a tunnel with an install.sh: whether it is installed on the cluster (checked once you're logged in),
-  // and Install, whose output shows below the row. A shared app (PAI) says which job serves it.
+  // For a tunnel with an install.sh: whether it is installed on the cluster (checked once you're logged in): the
+  // row says "not installed" until it is; what the cluster says, Check and Install (whose output shows below the
+  // row) are in the settings panel (installBox). A shared app (PAI) says which job serves it.
   get app() { return this.getAttribute("app"); }
   get appTitle() { return this.getAttribute("app-title") || this.app; }
   get name() { return this.getAttribute("cluster") || (this._data && this._data.cluster); }
@@ -834,7 +839,7 @@ export class HpcAppSession extends TunnelRow {
         await fetcher(this.base + "/install", { method: "POST", body: { force: this._data.install.state === "installed" } });
         await this.refresh();
       }),
-      check: action("Check", async () => { await fetcher(this.base + "/check", { method: "POST" }); await this.refresh(); }),
+      check: action("Check", () => this.check()),
       copy: action("Copy password", async () => {
         await navigator.clipboard.writeText(this._data.password || "");
         return "Copied.";
@@ -855,7 +860,7 @@ export class HpcAppSession extends TunnelRow {
     // whether it is installed: asked once you're logged in (it runs install.sh --check on the cluster)
     if (s.install && s.install.state === "unchecked" && (s.login || {}).state === "connected" && !this._checked) {
       this._checked = true;
-      this.buttons.check.run();
+      this.check().catch(() => {});      // its error shows in the row: the Check button is in the settings panel
     }
     // signing in to a server beside the session (Data transfer's SMB server): how it would, asked once you're
     // logged in, after the install check
@@ -865,6 +870,22 @@ export class HpcAppSession extends TunnelRow {
       this.runControl({ id: "status" }).catch(() => {});
     }
   }
+
+  // Whether the app is installed, asked of the cluster; the row shows only the error if that failed
+  async check() {
+    try {
+      await fetcher(this.base + "/check", { method: "POST" });
+      this._checkError = null;
+    } catch (err) {
+      this._checkError = err.message;
+      this._draw();
+      throw err;
+    }
+    await this.refresh();
+  }
+
+  // What the cluster says about the install, with Check and Install: drawn with the row, shown in its settings panel
+  get installBox() { return this._installBox || (this._installBox = el("div", { class: "install-box" })); }
 
   installLine(s, loggedIn) {
     const inst = s.install || { state: "nothing" };
@@ -882,7 +903,7 @@ export class HpcAppSession extends TunnelRow {
     if (!text) return null;
     return el("div", { class: "install-line" },
       el("hpc-state", { tone: { installed: "up", missing: "starting" }[inst.state] || "down", label: text }),
-      inst.message ? el("span", { class: "muted small" }, ` ${inst.message.replace(/^(not )?installed:\s*/, "")}`) : null,
+      inst.message ? el("p", { class: "install-message" }, inst.message.replace(/^(not )?installed:\s*/, "")) : null,
       el("div", { class: "actions" }, inst.state === "installed" ? null : b.install, b.check,
          inst.state === "installed" ? b.install : null));
   }
@@ -953,21 +974,24 @@ export class HpcAppSession extends TunnelRow {
     const open = up && s.url
       ? el("a", { class: "button primary", href: s.url, target: "_blank", rel: "noopener noreferrer" }, `Open ${this.appTitle}`)
       : null;
-    const stateText = up ? `running${s.version ? ` (${s.version})` : ""}`
+    const notInstalled = missing && s.state === "down";       // nothing to start until Install (in Settings…)
+    const stateText = notInstalled ? "not installed" : up ? `running${s.version ? ` (${s.version})` : ""}`
       : (s.state === "queued" ? `queued: ${s.status}` : (APP_STATE_LABEL[s.state] || s.state));
+    const line = this.installLine(s, loggedIn);
+    this.installBox.replaceChildren(...(line ? [line] : []));
     const cluster = { name: s.cluster, host: s.host, connection_hours: lg.connection_hours };
     return [
       [s.cluster, el("div", { class: "muted" }, `port ${s.port}`)],
       this.loginCells(lg, cluster),
-      [el("hpc-state", { state: s.state, label: stateText }),
+      [el("hpc-state", { state: s.state, label: stateText, ...(notInstalled ? { tone: "starting" } : {}) }),
        up && !s.token_known ? el("div", { class: "muted" }, "token not seen yet; see Log") : null,
        up && "username" in s ? el("div", { class: "muted" }, [`if asked to sign in: user ${s.username} `, b.copyUser]) : null,
        up && "password" in s ? el("div", { class: "muted" }, s.password ? ["password ready ", b.copy]
                                                                       : "password not seen yet; see Log") : null,
        s.error ? el("div", { class: "muted" }, s.error) : null,
+       this._checkError ? el("div", { class: "error-box small" }, `install check failed: ${this._checkError}`) : null,
        s.signing_in ? el("hpc-state", { tone: "starting", label: "signing in…" }) : null,
-       this.promptLine(`${this.appTitle} on ${s.cluster}`, this.base + "/answer", s.prompt),
-       this.installLine(s, loggedIn)],
+       this.promptLine(`${this.appTitle} on ${s.cluster}`, this.base + "/answer", s.prompt)],
       [el("div", { class: "actions" }, open, b.start, b.stop, b.log, b.settings), this.extras],
     ];
   }

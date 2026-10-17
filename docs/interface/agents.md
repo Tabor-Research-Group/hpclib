@@ -1,7 +1,7 @@
 # Agents in the interface
 
 The **Agents** app manages the clusters your LLM clients use. Its pages are Clusters, Proposals, Activity,
-Files and Settings. Pages that read from a cluster (everything but Clusters) need that cluster's agent tunnel
+Files, SSH keys and Settings. Pages that read from a cluster (everything but Clusters) need that cluster's agent tunnel
 to be **up**, since they talk to its REST server.
 
 ## Clusters
@@ -27,6 +27,7 @@ and these actions:
 | **Log** | the tunnel's output, refreshed while open |
 | **Update hpclib** | copy this machine's hpclib to the cluster (`install_hpclib`); a newer copy there is left alone |
 | **Set up…** (**Setup…** once set up) | rerun `setup_agents` with its work directories, read-only directories and the Rebuild option |
+| **Set up SSH** | initialize or reuse the shared-home compute key and its authorization; login required, REST tunnel not required |
 
 When hpclib on the cluster is older than yours, **Update hpclib**, then **Stop** and **Start** the tunnel so the
 REST server runs the new code.
@@ -77,6 +78,13 @@ http://127.0.0.1:27180/#/files?cluster=hpclib-grace&path=/scratch/user/me/llm/ru
 ```
 
 `cluster` may be the profile name, the login host or the MCP name.
+
+## SSH keys
+
+Choose a live owner cluster to list and create identity keys, copy their public keys, edit public
+comments, manage individual authorized-key entries, and bind keys to SSH hosts such as GitHub.
+Private keys remain on the cluster. See [Cluster SSH keys](../ssh-keys.md) for file behavior,
+compute connection settings, and the REST API.
 
 ## Settings
 

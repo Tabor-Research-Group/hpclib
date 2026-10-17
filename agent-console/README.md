@@ -26,8 +26,8 @@ REST tunnels: the pages below) and the tunnel apps the console lists (`GET /api/
 Settings: the job's time/memory/CPUs/partition, JupyterLab's conda environment, modules or uv/pixi project, and
 the tunnel's own settings such as VS Code's container path). Open goes straight in, with the token JupyterLab
 printed; VS Code shows a **Copy password** button. Once you're logged in, each row checks whether the tunnel is
-installed on the cluster (its `install.sh --check`) and offers **Install** (or Reinstall), whose output shows
-below the row. PAI's row says which job serves the shared database, and whether this tunnel started it or only
+installed on the cluster (its `install.sh --check`) and says **not installed** until it is; **Settings…** has what
+the cluster reported, **Check**, and **Install** (or Reinstall), whose output shows below the row. PAI's row says which job serves the shared database, and whether this tunnel started it or only
 connected to it, and once PAI is installed its Install button is **Update**: it fast-forwards the
 proto-auto-interface checkout and pulls the app's image again (its Image setting says from where). **Data transfer** runs on the login node, not in a job: per cluster it installs the
 data-transfer-tools image, starts a web GUI for the SMB server (rclone's, or the one its GUI setting names), and
@@ -58,6 +58,14 @@ A file opens in the viewer inside its folder, with the same size rules as clicki
 asks above 25 MB); a folder opens that folder. `cluster` may be the profile name, the login host or the MCP
 name (`hpclib-grace`). The session key is kept for the console's address (localStorage), so links work in new
 tabs; after the console restarts, the page asks for the new key once.
+
+## SSH keys
+
+**Agents → Clusters → Set up SSH** creates or reuses a compute identity in the shared
+cluster home after login. **Agents → SSH keys** lists identities and provides public-key
+copying, key creation/deletion, targeted authorization editing, and host identity bindings.
+General management requires a live REST tunnel and owner token. Private key contents stay
+on the cluster. See the [SSH key guide and REST reference](../docs/ssh-keys.md).
 
 ## User styling
 

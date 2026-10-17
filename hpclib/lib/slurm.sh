@@ -180,49 +180,73 @@ CONNECT_TO_JOB_OPTS="46AaCfGgKkMNnqsTtVvXxYyfnb:B:c:e:E:L:l:i:J:F:D:o:O:Q:w:W:S:
 CONNECT_TO_JOB_LONG_OPTS=""
 CONNECT_TO_JOB_SSH_OPTS="-o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=4"
 function connect_to_job {
-  local job_id;
-  local forwarding;
-  local fwd;
-  local wait_opts;
-  local ssh_args;
-  local ssh_opts;
-  local post_args;
-  local pause_time;
-
-  forwarding=$(mcoptvalue "$CONNECT_TO_JOB_OPTS" "$CONNECT_TO_JOB_LONG_OPTS" "P" $@)
-  if [ "$forwarding" != "" ]; then
-    ssh_args=$(multi_fwd_spec "L" "$forwarding")
+  local opt flags flag value job_id job_node forwarding pause_time=0 identity explicit_identity
+  local single_quote="'" escaped_quote="'\\''"
+  local -a ssh_args wait_args extra_args forwards command_args
+  ssh_args=(); wait_args=(); command_args=()
+  # Bash 3.2 arrays retain each caller-supplied SSH option value intact.
+  while [ "$#" -gt 0 ]; do
+    opt="$1"; shift
+    case "$opt" in
+      --) break ;;
+      -?*)
+        flags="${opt#-}"
+        while [ -n "$flags" ]; do
+          flag="${flags:0:1}"; flags="${flags:1}"
+          case "$flag" in
+            b|B|c|e|E|L|l|i|J|F|D|o|O|Q|w|W|S|R|P|I|p|m)
+              if [ -n "$flags" ]; then value="$flags"; flags=""
+              elif [ "$#" -gt 0 ]; then value="$1"; shift
+              else echo "Missing value for -$flag" >&2; return 2; fi
+              case "$flag" in
+                P) forwarding="$value" ;;
+                R|S) wait_args+=("-$flag" "$value") ;;
+                I) pause_time="$value" ;;
+                i) explicit_identity=true; ssh_args+=(-i "$value") ;;
+                *) ssh_args+=("-$flag" "$value") ;;
+              esac ;;
+            *) ssh_args+=("-$flag") ;;
+          esac
+        done ;;
+      *) job_id="$opt"; break ;;
+    esac
+  done
+  if [ -z "$job_id" ] && [ "$#" -gt 0 ]; then job_id="$1"; shift; fi
+  if [ -z "$job_id" ]; then echo 'No job ID provided' >&2; return 2; fi
+  if [ -n "$forwarding" ]; then
+    IFS=',' read -r -a forwards <<< "$forwarding"
+    for value in "${forwards[@]}"; do ssh_args+=(-L "$(fwd_spec "$value")"); done
   fi
-
-  job_id=($(mcargs "$CONNECT_TO_JOB_OPTS" "$CONNECT_TO_JOB_LONG_OPTS" $@))
-  if [ "$job_id" = "" ];
-    then echo "No job ID provided"
-    else
-      post_args="${job_id[@]:1}"
-      job_id="${job_id[0]}"
-      wait_opts=$(mcoptsfrom "$CONNECT_TO_JOB_OPTS" "$CONNECT_TO_JOB_LONG_OPTS" "S|R" $@)
-      job_node=$(wait_for_job_node $wait_opts $job_id)
-      if [ "$job_node" = "" ]
-        then
-            echo "Timed out while waiting for job to start, canceling requested job"
-            scancel $job_id
-        else
-            ssh_opts=$(mcopts "$CONNECT_TO_JOB_OPTS" "$CONNECT_TO_JOB_LONG_OPTS" "S|R|P|I" $@)
-            ssh_args=$(_build_argstr "$ssh_args" "$ssh_opts")
-            pause_time=$(mcoptvalue "$CONNECT_TO_JOB_OPTS" "$CONNECT_TO_JOB_LONG_OPTS" "I" $@)
-            sleep $pause_time
-            # fail rather than run without the forward (e.g. the port is
-            # taken), and notice a dead connection instead of hanging
-            ssh_args=$(_build_argstr "$ssh_args" "$CONNECT_TO_JOB_SSH_OPTS")
-            # HPCLIB_COMPUTE_HOST_KEYS=accept-new (e.g. in ~/.local/tunnels/config.sh): take the key of a compute
-            # node seen for the first time without asking; a changed key is still refused
-            if [ "${HPCLIB_COMPUTE_HOST_KEYS:-ask}" = accept-new ]; then
-              ssh_args=$(_build_argstr "$ssh_args" "-o StrictHostKeyChecking=accept-new")
-            fi
-            printf "%s\n" "ssh $ssh_args $job_node $post_args"
-            ssh $ssh_args $job_node "$post_args"
-      fi
+  # ssh treats one command argument as shell source. For multiple arguments,
+  # quote each before SSH joins them into the remote shell command.
+  if [ "$#" -eq 1 ]; then command_args=("$1")
+  elif [ "$#" -gt 1 ]; then
+    value=""
+    for opt in "$@"; do
+      opt="${opt//$single_quote/$escaped_quote}"
+      value="$value${value:+ }'$opt'"
+    done
+    command_args=("$value")
   fi
+  job_node=$(wait_for_job_node "${wait_args[@]}" "$job_id")
+  if [ -z "$job_node" ]; then
+    echo 'Timed out while waiting for job to start, canceling requested job'
+    scancel "$job_id"
+    return 1
+  fi
+  sleep "$pause_time" || return
+  read -r -a extra_args <<< "$CONNECT_TO_JOB_SSH_OPTS"
+  ssh_args+=("${extra_args[@]}" "${CONNECT_TO_JOB_SSH_ARGS[@]}")
+  # ~ is the same shared home on login and compute nodes. No key is copied.
+  identity="${HPCLIB_COMPUTE_IDENTITY_FILE-$HOME/.ssh/id_ed25519_hpclib_compute}"
+  if [ -z "$explicit_identity" ] && [ -n "$identity" ] && [ -f "$identity" ]; then
+    ssh_args+=(-i "$identity" -o IdentitiesOnly=yes)
+  fi
+  if [ "${HPCLIB_COMPUTE_HOST_KEYS:-ask}" = accept-new ]; then
+    ssh_args+=(-o StrictHostKeyChecking=accept-new)
+  fi
+  printf '%q ' ssh "${ssh_args[@]}" "$job_node" "${command_args[@]}"; printf '\n'
+  ssh "${ssh_args[@]}" "$job_node" "${command_args[@]}"
 }
 
 function slurm_job_script {

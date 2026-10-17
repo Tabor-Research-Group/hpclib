@@ -25,6 +25,7 @@ Run on **your machine**:
 | `tunnel_setup HOST TUNNEL ...` | save a tunnel's settings on the cluster, install what it needs, check it |
 | `smbshell --on HOST ...` | SMB file transfers, run on the cluster |
 | `setup_agents HOST` | set a cluster up for an LLM client (REST server, templates, sandbox, tokens) |
+| `setup_cluster_ssh HOST` | initialize shared-home login-to-compute key authentication; [SSH key guide](../ssh-keys.md) |
 | `agent_tunnel HOST`, `agent_stop HOST` | start or stop the agents' REST tunnel |
 | `agent_list`, `agent_env HOST` | the clusters set up on this machine; environment variables for scripts |
 | `agent_console`, `launch-tunnel-manager` | the web interface's backend (see [Using the interface](../interface/README.md)) |

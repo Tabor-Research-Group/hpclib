@@ -21,47 +21,49 @@ HPCLIB_SSH_KEEPALIVE="${HPCLIB_SSH_KEEPALIVE--o ServerAliveInterval=30 -o Server
 HPCLIB_SSH_PERSIST="${HPCLIB_SSH_PERSIST:-12h}"
 SSH_LONG_FLAGS=""
 function _ssh_like {
-  local cmd="$1";
-  local args;
-  local server;
-  local base_opts;
-  local conn_opt;
-  local socket;
-  local exists;
-  local connected;
-  local restart;
+  local cmd="$1" opt flag value flags restart server servername
+  local -a args keepalive
+  args=()
   shift
-
-  base_opts=$(mcopts "$SSH_FLAGS" "$SSH_LONG_FLAGS" "o|R" $@);
-  conn_opt=$(mcoptvalue "$SSH_FLAGS" "$SSH_LONG_FLAGS" "o" $@);
-  restart=$(mcoptvalue "$SSH_FLAGS" "$SSH_LONG_FLAGS" "R" $@);
-  args=($(mcargs "$SSH_FLAGS" "$SSH_LONG_FLAGS" $@));
-  server=${args[0]}
+  # Preserve argv, including spaces in IdentityFile/ProxyCommand and commands.
+  # -R is hpclib's restart flag; all other options go to the native client.
+  while [ "$#" -gt 0 ]; do
+    opt="$1"; shift
+    case "$opt" in
+      --) break ;;
+      -?*)
+        flags="${opt#-}"
+        while [ -n "$flags" ]; do
+          flag="${flags:0:1}"; flags="${flags:1}"
+          case "$flag" in
+            R) restart=true ;;
+            b|c|D|E|e|F|i|I|J|L|l|m|O|o|p|Q|S|W|w|B)
+              if [ -n "$flags" ]; then value="$flags"; flags=""
+              elif [ "$#" -gt 0 ]; then value="$1"; shift
+              else echo "Missing value for -$flag" >&2; return 2; fi
+              args+=("-$flag" "$value") ;;
+            *) args+=("-$flag") ;;
+          esac
+        done ;;
+      *) server="$opt"; break ;;
+    esac
+  done
+  if [ -z "$server" ] && [ "$#" -gt 0 ]; then server="$1"; shift; fi
+  if [ -z "$server" ]; then echo 'No SSH host provided' >&2; return 2; fi
+  args+=(-o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o "ControlPersist=$HPCLIB_SSH_PERSIST")
+  read -r -a keepalive <<< "$HPCLIB_SSH_KEEPALIVE"
+  args+=("${keepalive[@]}" "$server" "$@")
+  # Retain the historical per-host restart marker behavior.
   server=${server%:*}
   servername=${server#*@}
-
-  SOCKET_DIR=~/.ssh/connections
-  mkdir -p $SOCKET_DIR
-  socket="$SOCKET_DIR/$servername"
+  mkdir -p "$HOME/.ssh/connections"
   if [ "$restart" ]; then
-    rm "$socket" 2> /dev/null
+    rm -f "$HOME/.ssh/connections/$servername"
   fi
-  # connected=$(_ssh_connected "$socket")
-  # conn_opt=$(_build_argstr "$conn_opt" "ControlMaster=auto")
-  # conn_opt=$(_build_argstr "$conn_opt" "ControlPersist=4h")
-  # conn_opt=$(_build_argstr "$conn_opt" "ControlPath=$socket")
-
-  # if [[ "$connected" == "false" ]]; then
-  #   ssh -M -f -N $base_opts -o $conn_opt $server
-  # fi
-
-  # echo "$cmd $base_opts -o $conn_opt ${args[@]}"
-  mkdir -p ~/.ssh/connections
   if [ "$HPCLIB_ECHO_COMMANDS" ]; then
-    echo $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o "ControlPersist=$HPCLIB_SSH_PERSIST" $HPCLIB_SSH_KEEPALIVE ${args[@]}
+    printf '%q ' "$cmd" "${args[@]}"; printf '\n'
   fi
-  $cmd $base_opts -o 'ControlMaster=auto' -o 'ControlPath=~/.ssh/connections/%r@%h:%p' -o "ControlPersist=$HPCLIB_SSH_PERSIST" $HPCLIB_SSH_KEEPALIVE ${args[@]}
-
+  "$cmd" "${args[@]}"
 }
 
 SCP_FLAGS="UEZ:u:s:346BCpqrvF:i:l:o:P:S:R:";
@@ -154,13 +156,26 @@ function _rsync_like {
 }
 
 function pssh {
-  _ssh_like ssh $@
+  _ssh_like ssh "$@"
+}
+
+# Initialize login-to-compute authentication in the cluster's shared home.
+# The local helper is shipped over the existing login: no REST tunnel or newer
+# remote hpclib install is needed, and no private keys come back to this machine.
+function setup_cluster_ssh {
+  if [ "$#" -eq 0 ]; then
+    echo 'usage: setup_cluster_ssh [ssh options] [user@]host' >&2
+    return 2
+  fi
+  local helper="$HPCLIB_DIR/servers/ssh_keys.py"
+  local remote='if [ -x "${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/rest/python" ]; then exec "${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/rest/python" - --setup; else exec python3 - --setup; fi'
+  HPCLIB_ECHO_COMMANDS= pssh "$@" "$remote" < "$helper"
 }
 function pscp {
   _scp_like scp $@
 }
 function psftp {
-  _ssh_like sftp $@
+  _ssh_like sftp "$@"
 }
 function psync {
   _rsync_like rsync $@

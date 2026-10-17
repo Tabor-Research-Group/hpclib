@@ -689,6 +689,19 @@ class TestManage(TestLogin):
             self.clusters.ops[name]["state"] = "running"                 # one at a time
             self.assertEqual(self.call("POST", f"/api/clusters/{name}/install", {})[0], 409)
 
+    def test_setup_cluster_ssh_uses_saved_login_without_a_rest_tunnel(self):
+        route = f"/api/clusters/{self.dead}/ssh/setup"
+        self.assertEqual(self.call("POST", route, {}, key=None)[0], 401)
+        self.assertEqual(self.call("POST", route, {})[0], 409)
+        agent_profiles.cmd_set(self.dead, "login=-p", "login+=2222", "login+=-i", "login+=/keys/my key", f"login+={self.host}")
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.assertEqual(self.call("POST", route, {"path": "/arbitrary"})[0], 422)
+            status, out = self.call("POST", route, {})
+            self.assertEqual((status, out["kind"]), (202, "ssh_setup"), out)
+            self.assertEqual(self.shell.calls[-1], ["setup_cluster_ssh", "-p", "2222", "-i", "/keys/my key", self.host])
+            done = self.wait_op(self.dead)
+            self.assertEqual((done["state"], done["exit_code"]), ("succeeded", 0))
+
     def test_versions(self):
         local = agent_console.local_hpclib_version()
         self.assertRegex(local, r"^\d+\.\d+\.\d+$")

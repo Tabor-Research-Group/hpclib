@@ -9,17 +9,25 @@ You don't need to set a cluster up for agents to use its apps.
 
 | Element | What it does |
 | --- | --- |
-| state | **stopped**, **starting**, **queued** (with SLURM's reason), **running**, **error** |
-| install line | whether what the app needs is installed on the cluster: **installed**, **not installed**, **install status unknown**; checked automatically once you are logged in |
-| **Check** | check again (runs the tunnel's `install.sh --check` on the cluster) |
-| **Install** / **Reinstall** | install what the app needs; its output appears under the row. Some apps call this **Update** once installed |
+| state | **not installed** (until **Install** in Settings…), **stopped**, **starting**, **queued** (with SLURM's reason), **running**, **error** |
 | **Start** | start the app's tunnel; for most apps this submits a SLURM job |
 | **Open** | open the app in a new browser tab, signed in where the app allows it |
 | **Stop** | end the tunnel and cancel its job |
 | **Log** | the tunnel's and the job's output |
-| **Settings…** | the job's resources and the app's own settings for this cluster |
+| **Settings…** | whether the app is installed (with **Check** and **Install**), the job's resources and the app's own settings for this cluster |
 
-**Start** is refused while the app is known to be missing on the cluster; **Install** first.
+**Start** is refused while the app is known to be missing on the cluster: open **Settings…** and **Install** first.
+
+### Install
+
+The top of the Settings panel says whether what the app needs is installed on the cluster (**installed**, **not
+installed**, **install status unknown**) and what the cluster reported, such as the image's path. It is checked
+automatically once you are logged in.
+
+| Button | What it does |
+| --- | --- |
+| **Check** | check again (runs the tunnel's `install.sh --check` on the cluster) |
+| **Install** / **Reinstall** | install what the app needs; its output appears under the row. Some apps call this **Update** once installed |
 
 Each app on each cluster gets ports of its own, chosen once and kept, so apps never collide with each other,
 with the agents' tunnel or with other users. Starting an app on a port an earlier session left behind clears

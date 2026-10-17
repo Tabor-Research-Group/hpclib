@@ -601,7 +601,7 @@ which the tunnel prints (and the console offers to copy).
 **Data transfer (SMB)**: `smbshell` moves files between a cluster and an SMB server with rclone from the
 data-transfer-tools image. It isn't a port-forwarding tunnel; `tunnels/data-transfer/` holds the command, its
 SLURM job and the image's `install.sh`. The console's **Data transfer** page puts it all on one row per cluster:
-the settings, Install, signing in, and a web GUI (below).
+the settings (with Install), signing in, and a web GUI (below).
 
 ```bash
 tunnel_setup user@grace.hprc.tamu.edu data-transfer --set SMB_HOST=files.example.edu \

@@ -170,9 +170,11 @@ class TestConsoleUI(unittest.TestCase):
         self.assertLessEqual(sizes["panel"], 449, sizes)
         self.assertEqual(self.errors, [])
 
-    def load_console(self):
+    def load_console(self, handler=None):
         def api_fixture(route):
             path = route.request.url.split("/api/", 1)[1].split("?", 1)[0]
+            if handler and handler(route, path):
+                return
             if path == "styles/open":
                 route.continue_()  # Exercise the real authenticated file-copy endpoint.
                 return
@@ -183,6 +185,95 @@ class TestConsoleUI(unittest.TestCase):
         self.page.route("**/api/**", api_fixture)
         self.page.goto(self.base + "/#key=ui-test-key")
         self.page.wait_for_function("document.querySelector('#apps a') !== null")
+
+    def test_ssh_keys_page_manages_public_keys_authorizations_and_host_bindings(self):
+        from ssh_keys import SSHKeyError, SSHKeyStore
+        store = SSHKeyStore(self.console / 'cluster shared home')
+        mutations = []
+        cluster = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234,
+                   'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up'}}
+        def handler(route, path):
+            if path in ('clusters', 'clusters/demo'):
+                route.fulfill(body=json.dumps({'clusters': [cluster]} if path == 'clusters' else cluster), content_type='application/json')
+                return True
+            if path == 'health':
+                route.fulfill(body=json.dumps({'hpclib_version': '0.2.59'}), content_type='application/json')
+                return True
+            if path == 'clusters/demo/ssh/setup':
+                mutations.append((route.request.method, path, route.request.post_data_json))
+                route.fulfill(body=json.dumps({'ok': True}), content_type='application/json')
+                return True
+            prefix = 'clusters/demo/rest/admin/ssh/'
+            if not path.startswith(prefix):
+                return False
+            verb = route.request.method
+            resource = path[len(prefix):]
+            data = route.request.post_data_json if verb != 'GET' else {}
+            try:
+                if verb != 'GET':
+                    mutations.append((verb, resource, data))
+                if resource == 'keys':
+                    if verb == 'GET': result = store.keys()
+                    elif verb == 'POST': result = store.create(data['name'], data['algorithm'], data['comment'])
+                    elif verb == 'PUT': result = store.update_comment(data['name'], data['comment'])
+                    else: result = store.delete(data['name'])
+                elif resource == 'authorized':
+                    result = store.authorized() if verb == 'GET' else store.change_authorized(
+                        data.get('line'), data.get('id'), data.get('revision'), verb == 'DELETE')
+                else:
+                    result = store.hosts() if verb == 'GET' else store.set_host(
+                        data['host'], data.get('key'), data.get('user', ''), data.get('hostname', ''),
+                        data.get('port'), data.get('revision'), verb == 'DELETE')
+                route.fulfill(body=json.dumps(result), content_type='application/json')
+            except SSHKeyError as e:
+                route.fulfill(status=e.status, body=json.dumps({'error': str(e)}), content_type='application/json')
+            return True
+        self.load_console(handler)
+        def save(label):
+            button = self.page.get_by_role('button', name=label, exact=True)
+            old = button.element_handle()
+            button.click()
+            self.page.wait_for_function('(node) => !node.isConnected', arg=old)
+        self.page.get_by_role('button', name='Set up SSH', exact=True).click()
+        self.page.wait_for_function("document.querySelector('hpc-action-button[label=\"Set up SSH\"]')?.button.disabled === false")
+        self.assertTrue(any(path.endswith('/ssh/setup') for _, path, _ in mutations))
+        self.page.get_by_role('link', name='SSH keys', exact=True).click()
+        self.page.get_by_label('Key name', exact=True).fill('github')
+        self.page.get_by_label('New key comment').fill('Research GitHub')
+        save('Create key')
+        public = self.page.get_by_label('Public key github', exact=True)
+        public.wait_for()
+        self.assertTrue(public.input_value().startswith('ssh-ed25519 '))
+        self.page.context.grant_permissions(['clipboard-read', 'clipboard-write'])
+        self.page.get_by_role('button', name='Copy public key', exact=True).click()
+        self.page.wait_for_function("navigator.clipboard.readText().then(s => s.startsWith('ssh-ed25519 '))")
+        self.page.get_by_label('Comment github', exact=True).fill('Edited comment')
+        save('Save comment')
+        self.page.wait_for_function("document.querySelector('input[aria-label=\"Comment github\"]')?.value === 'Edited comment'")
+        self.page.get_by_label('New authorized key', exact=True).fill(store.key('github')['public_key'])
+        save('Add authorized key')
+        authorized = self.page.locator('textarea[aria-label^="Authorized key "]')
+        authorized.wait_for()
+        authorized.fill('restrict ' + store.key('github')['public_key'])
+        save('Save authorized key')
+        self.page.wait_for_function("document.querySelector('textarea[aria-label^=\"Authorized key \"]')?.value.startsWith('restrict ')")
+        self.page.get_by_label('SSH host', exact=True).fill('github.com')
+        self.page.get_by_label('SSH user', exact=True).fill('git')
+        save('Save host binding')
+        self.page.get_by_role('button', name='Edit binding', exact=True).wait_for()
+        self.page.get_by_role('button', name='Edit binding', exact=True).click()
+        self.assertEqual(self.page.get_by_label('SSH user', exact=True).input_value(), 'git')
+        self.page.get_by_label('SSH port', exact=True).fill('2222')
+        save('Save host binding')
+        self.page.get_by_text('User git · Port 2222 · Managed binding', exact=True).wait_for()
+        for button, title in (('Remove binding', 'Remove github.com?'), ('Remove authorization', 'Remove this authorization?'), ('Delete key', 'Delete github?')):
+            self.page.get_by_role('button', name=button, exact=True).click()
+            self.page.get_by_role('dialog').wait_for()
+            self.page.get_by_role('button', name='OK', exact=True).click()
+            self.page.get_by_role('button', name=button, exact=True).wait_for(state='detached')
+        self.assertEqual(store.keys()['keys'], [])
+        self.assertEqual(store.authorized()['entries'], [])
+        self.assertEqual(self.errors, [])
 
     def test_console_menu_opens_and_preserves_user_stylesheet(self):
         with mock.patch.object(agent_console, "open_with_default_application") as opener:

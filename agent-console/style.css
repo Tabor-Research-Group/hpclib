@@ -182,6 +182,11 @@ a.button.primary { background: var(--accent); border-color: var(--accent); color
 .small { font-size: var(--font-size-small); }
 .install-line { margin-top: var(--space-sm); }
 .install-line .actions { margin-top: 3px; }
+/* in the settings panel: what the cluster says about the install, in normal type, then Check and Install */
+.install-box { margin-bottom: var(--space-md); }
+.install-box:empty { display: none; }
+.install-box .install-line { margin-top: 0; }
+.install-message { margin: var(--space-xs) 0; }
 /* tunnel-specific tools under a row, and extra controls under its buttons */
 hpclib-toolbar { display: flex; flex-wrap: wrap; gap: 10px 28px; align-items: flex-start;
                  padding: var(--space-sm) 10px; border-left: 3px solid var(--line); background: var(--panel); border-radius: var(--radius-control); }
@@ -209,7 +214,11 @@ section.tokens label.check { display: inline-flex; align-items: center; gap: var
 .token-secret { font-family: var(--font-mono); width: 100%; }
 
 /* Top-left console menu: native disclosure and one OS stylesheet action. */
-#console-menu { position: relative; flex: none; }
+#console-menu { position: relative; flex: none; margin: 0; }
+
+.ssh-manager { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.ssh-manager textarea { box-sizing: border-box; width: 100%; max-width: 100%; overflow-wrap: anywhere; }
+.ssh-manager .small { overflow-wrap: anywhere; }
 #console-menu > summary {
   display: grid;
   place-items: center;

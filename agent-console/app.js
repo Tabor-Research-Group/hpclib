@@ -340,6 +340,115 @@ async function clustersPage() {
   ];
 }
 
+async function sshKeysPage() {
+  const { clusters } = await api("clusters");
+  const pick = el("hpc-cluster-picker", { live: true });
+  pick.clusters = clusters;
+  const body = el("div", { class: "ssh-manager" });
+  const status = el("span", { class: "muted", role: "status" });
+  let generation = 0;
+  const load = async () => {
+    const current = ++generation;
+    const name = pick.value;
+    if (!name) return;
+    const base = cluster(name) + "/rest/admin/ssh/";
+    const mutate = async (resource, method, data) => {
+      await api(base + resource, { method, body: data });
+      // A selection made while saving keeps its own data and target.
+      if (pick.value === name) await load();
+      return "Saved.";
+    };
+    status.textContent = "Loading keys…";
+    try {
+      const [keys, authorized, hosts] = await Promise.all(
+        ["keys", "authorized", "hosts"].map((resource) => api(base + resource)));
+      if (current !== generation || pick.value !== name) return;
+      const input = (label, attrs = {}) => el("input", { "aria-label": label, ...attrs });
+      const keyName = input("Key name", { placeholder: "id_ed25519_github" });
+      const type = el("select", { "aria-label": "Key type" },
+        ["ed25519", "rsa"].map((value) => el("option", { value }, value)));
+      const comment = input("New key comment", { placeholder: "GitHub on this cluster" });
+      const keyRows = keys.keys.map((key) => {
+        const value = el("textarea", { "aria-label": `Public key ${key.name}`, readonly: true, rows: 3 }, key.public_key || "");
+        const edit = input(`Comment ${key.name}`, { value: key.comment || "" });
+        return el("hpc-panel", { heading: key.name },
+          el("p", { class: "small" }, key.error || `${key.algorithm} · ${key.fingerprint}`),
+          el("p", { class: "muted" }, key.compute ? "Compute-node identity" : key.private_available ? "Private key available on this cluster" : "Public key only"),
+          value, field("Public key comment", edit),
+          el("div", { class: "actions" },
+            action("Copy public key", async () => { await navigator.clipboard.writeText(key.public_key); return "Copied."; },
+              { result: true, disabled: !key.public_key }),
+            action("Save comment", () => mutate("keys", "PUT", { name: key.name, comment: edit.value }),
+              { disabled: !key.public_key }),
+            action("Delete key", async () => {
+              if (await confirmDialog(`Delete ${key.name}?`, "Both key files are removed from the shared cluster home. Remove host bindings first. Keys registered with GitHub or in authorized_keys must be removed separately."))
+                return mutate("keys", "DELETE", { name: key.name });
+            })));
+      });
+      const authorizedLine = el("textarea", { "aria-label": "New authorized key", rows: 3,
+        placeholder: "ssh-ed25519 AAAA… comment (optional SSH restrictions before the key)" });
+      const authorizedRows = authorized.entries.map((entry) => {
+        const line = el("textarea", { "aria-label": `Authorized key ${entry.id}`, rows: 3 }, entry.line);
+        return el("hpc-panel", { heading: entry.comment || entry.fingerprint },
+          el("p", { class: "small" }, entry.fingerprint), line,
+          el("div", { class: "actions" },
+            action("Save authorized key", () => mutate("authorized", "PUT", { id: entry.id, line: line.value, revision: authorized.revision })),
+            action("Remove authorization", async () => {
+              if (await confirmDialog("Remove this authorization?", "This key will no longer grant login access through the shared authorized_keys file."))
+                return mutate("authorized", "DELETE", { id: entry.id, revision: authorized.revision });
+            })));
+      });
+      const host = input("SSH host", { placeholder: "github.com" });
+      const user = input("SSH user", { placeholder: "git" });
+      const hostname = input("SSH hostname", { placeholder: "Optional; defaults to host" });
+      const port = input("SSH port", { type: "number", min: 1, max: 65535, placeholder: "22" });
+      const identity = el("select", { "aria-label": "Host identity" }, keys.keys.filter((k) => k.private_available)
+        .map((k) => el("option", { value: k.name }, k.name)));
+      const hostRows = hosts.hosts.map((binding) => el("hpc-panel", { heading: binding.host },
+        el("p", { class: "small" }, binding.identity_files.length ? binding.identity_files.join(", ") : "No explicit identity"),
+        el("p", { class: "muted" }, [binding.user && `User ${binding.user}`, binding.hostname && `Hostname ${binding.hostname}`,
+          binding.port && `Port ${binding.port}`, binding.managed ? "Managed binding" : "Existing SSH config (view only)"].filter(Boolean).join(" · ")),
+        binding.managed ? el("div", { class: "actions" },
+          action("Edit binding", () => { host.value = binding.host; identity.value = binding.key || "";
+            user.value = binding.user || ""; hostname.value = binding.hostname || ""; port.value = binding.port || "";
+            host.focus(); }),
+          action("Remove binding", async () => {
+            if (await confirmDialog(`Remove ${binding.host}?`, "Only this managed host binding is removed. The key files remain."))
+              return mutate("hosts", "DELETE", { host: binding.host, revision: hosts.revision });
+          })) : null));
+      body.replaceChildren(
+        el("p", { class: "muted" }, `Shared SSH directory: ${keys.directory}. Private key contents stay on the cluster.`),
+        el("hpc-panel", { heading: "Identity keys" },
+          el("p", {}, "New keys have no passphrase so cluster services can use them unattended. Existing key files are preserved."),
+          el("div", { class: "actions" }, field("Key name", keyName), field("Type", type), field("Comment", comment),
+            action("Create key", () => mutate("keys", "POST", { name: keyName.value, algorithm: type.value, comment: comment.value }))),
+          el("p", {}, "For GitHub, copy the public key into ", el("a", { href: "https://github.com/settings/keys", target: "_blank", rel: "noopener noreferrer" }, "your GitHub SSH keys"), "."),
+          keyRows, keys.errors.map((error) => el("p", { class: "error-box" }, `${error.name}: ${error.error}`))),
+        el("hpc-panel", { heading: "Authorized keys" },
+          el("p", { class: "muted" }, "These public keys grant access to this cluster account. Each edit preserves other entries, comments, and restrictions."),
+          authorizedRows, authorizedLine,
+          action("Add authorized key", () => mutate("authorized", "POST", { line: authorizedLine.value, revision: authorized.revision })),
+          authorized.errors.map((error) => el("p", { class: "muted" }, `Line ${error.line_number}: ${error.error}`))),
+        el("hpc-panel", { heading: "Host identities" },
+          el("p", { class: "muted" }, "Choose which identity SSH uses for GitHub or another host. Bindings are stored in hpclib_keys.conf and included by your SSH config."),
+          hostRows, el("div", { class: "actions" }, field("Host or patterns", host), field("Identity key", identity),
+            field("User", user), field("Hostname", hostname), field("Port", port)),
+          action("Save host binding", () => mutate("hosts", "PUT", { host: host.value, key: identity.value,
+            user: user.value, hostname: hostname.value, port: port.value ? Number(port.value) : null, revision: hosts.revision }),
+            { disabled: !identity.options.length })));
+      status.textContent = "";
+    } catch (err) {
+      if (current === generation) { status.textContent = err.message; body.replaceChildren(); }
+      throw err;
+    }
+  };
+  pick.addEventListener("change", () => load().catch(() => {}));
+  if (pick.options.length) await load().catch(() => {});
+  else status.textContent = "Start a cluster REST tunnel with an owner token to manage keys. Set up compute SSH from the Clusters page.";
+  return [el("div", { class: "toolbar" }, el("h2", {}, "SSH keys"), pick,
+    action("Reload keys", load, { disabled: !pick.options.length }), status), body];
+}
+
 async function proposalsPage() {
   const { proposals, clusters } = await api("proposals");
   setBadge(proposals.length);
@@ -988,6 +1097,7 @@ async function appSettingsForm(app, s, row) {
     return "Removed.";
   }, { result: true });
   row.showDetail("settings", el("hpc-panel", { heading: `${APPS_UI[app].title} on ${s.cluster}`, dismissible: true },
+    row.installBox,      // what the cluster says about the install, Check and Install: kept current by the row
     conf.job === false ? null : [      // runs on the login node: no job, so no sbatch options
       el("p", { class: "muted" }, "The tunnel's job (empty: its defaults):"),
       el("div", { class: "row" }, APP_TUNNEL_FIELDS.map(([k, label, hint]) => field(`Job: ${label}`, inputs[k], hint)))],
@@ -1027,7 +1137,7 @@ async function appPage(app) {
         "It runs as you, with your full permissions on the cluster (it is not the agents' sandbox)."
       : `A ${title} session per cluster, in a SLURM job reached through its own tunnel. ` +
         "It runs as you, with your full permissions on the cluster (it is not the agents' sandbox). " +
-        "What it needs on the cluster is checked once you're logged in, and Install sets it up there."),
+        "What it needs on the cluster is checked once you're logged in, and Install (under Settings…) sets it up there."),
     sessions.length ? el("table", { class: "rows" },
       el("thead", {}, el("tr", {}, ["Cluster", "Login", title, ""].map((h) => el("th", {}, h)))),
       rows)
@@ -1044,7 +1154,7 @@ const APPS_UI = {
     title: "Agents",
     default: "clusters",
     pages: { clusters: ["Clusters", clustersPage], proposals: ["Proposals", proposalsPage],
-             activity: ["Activity", activityPage], files: ["Files", filesPage], settings: ["Settings", settingsPage] },
+             activity: ["Activity", activityPage], files: ["Files", filesPage], keys: ["SSH keys", sshKeysPage], settings: ["Settings", settingsPage] },
   },
   // the tunnel apps (JupyterLab, VS Code, PAI, ...) come from GET /api/apps, each with a Sessions page
 };

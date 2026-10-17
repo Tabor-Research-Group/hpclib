@@ -131,12 +131,13 @@ import traceback
 import urllib.parse
 
 try:
-    from . import rest_envs, rest_jobs, rest_local, rest_sandbox
+    from . import rest_envs, rest_jobs, rest_local, rest_sandbox, ssh_keys
 except ImportError:  # run as a script from the servers directory
     import rest_envs
     import rest_jobs
     import rest_local
     import rest_sandbox
+    import ssh_keys
 RESTError = rest_jobs.RESTError  # re-exported
 
 __all__ = [
@@ -510,6 +511,7 @@ class RESTServer(http.server.ThreadingHTTPServer):
         self.disable_file_changes = disable_file_changes
         self.jobs = jobs
         self.audit = audit
+        self.ssh_keys = ssh_keys.SSHKeyStore()
         self.sandbox_prober = None
         if jobs is not None:
             probe_dir = os.path.join(jobs.sandbox.data_dir or tempfile.gettempdir(), "sandbox", "probe")
@@ -698,6 +700,15 @@ class HPCRESTHandler(RESTHandler):
     SLURM_COMMANDS = ('sbatch', 'squeue', 'sacct', 'scontrol', 'scancel')
     READ_ONLY_COMMANDS = ('squeue', 'sacct')  # also exposed over GET
     FILE_CHANGE_ROUTES = (
+        ("POST", "/admin/ssh/setup"),
+        ("POST", "/admin/ssh/keys"),
+        ("PUT", "/admin/ssh/keys"),
+        ("DELETE", "/admin/ssh/keys"),
+        ("POST", "/admin/ssh/authorized"),
+        ("PUT", "/admin/ssh/authorized"),
+        ("DELETE", "/admin/ssh/authorized"),
+        ("PUT", "/admin/ssh/hosts"),
+        ("DELETE", "/admin/ssh/hosts"),
         ("POST", "/envs/sync"),
         ("PUT", "/files/content"),
         ("POST", "/files/mkdir"),
@@ -772,12 +783,67 @@ class HPCRESTHandler(RESTHandler):
             ("POST", "/admin/tokens/revoke"): self.do_admin_revoke_token,
             ("GET", "/admin/config"): self.do_admin_config,
             ("PUT", "/admin/config"): self.do_admin_update_config,
+            ("POST", "/admin/ssh/setup"): self.do_admin_ssh,
+            ("GET", "/admin/ssh/keys"): self.do_admin_ssh,
+            ("POST", "/admin/ssh/keys"): self.do_admin_ssh,
+            ("PUT", "/admin/ssh/keys"): self.do_admin_ssh,
+            ("DELETE", "/admin/ssh/keys"): self.do_admin_ssh,
+            ("GET", "/admin/ssh/authorized"): self.do_admin_ssh,
+            ("POST", "/admin/ssh/authorized"): self.do_admin_ssh,
+            ("PUT", "/admin/ssh/authorized"): self.do_admin_ssh,
+            ("DELETE", "/admin/ssh/authorized"): self.do_admin_ssh,
+            ("GET", "/admin/ssh/hosts"): self.do_admin_ssh,
+            ("PUT", "/admin/ssh/hosts"): self.do_admin_ssh,
+            ("DELETE", "/admin/ssh/hosts"): self.do_admin_ssh,
         }
         for cmd in self.SLURM_COMMANDS:
             routes[("POST", f"/slurm/{cmd}")] = self._slurm_route(cmd)
             if cmd in self.READ_ONLY_COMMANDS:
                 routes[("GET", f"/slurm/{cmd}")] = self._slurm_route(cmd)
         return routes
+
+    def do_admin_ssh(self):
+        """Owner-only targeted SSH operations; private key bytes never leave the store."""
+        route = urllib.parse.urlsplit(self.path).path.rstrip("/").rsplit("/", 1)[-1]
+        verb = self.command
+        store = self.server.ssh_keys
+        allowed = {"setup": set(), "keys": {"name", "algorithm", "comment"},
+                   "authorized": {"line", "id", "revision"},
+                   "hosts": {"host", "key", "user", "hostname", "port", "revision"}}
+        body = self.read_json() if verb != "GET" else {}
+        if not isinstance(body, dict) or set(body) - allowed[route]:
+            raise RESTError(422, "unsupported SSH fields")
+        try:
+            if route == "setup":
+                result = store.setup_cluster()
+            elif route == "keys":
+                if verb == "GET":
+                    result = store.keys()
+                elif verb == "POST":
+                    result = {"key": store.create(body.get("name"), body.get("algorithm", "ed25519"), body.get("comment", ""))}
+                elif verb == "PUT":
+                    result = {"key": store.update_comment(body.get("name"), body.get("comment", ""))}
+                else:
+                    result = store.delete(body.get("name"))
+            elif route == "authorized":
+                if verb == "GET":
+                    result = store.authorized()
+                else:
+                    if verb in ("PUT", "DELETE") and not body.get("id"):
+                        raise ssh_keys.SSHKeyError(422, "entry id is required")
+                    result = store.change_authorized(body.get("line"), body.get("id"), body.get("revision"), verb == "DELETE")
+            elif route == "hosts":
+                if verb == "GET":
+                    result = store.hosts()
+                else:
+                    result = store.set_host(body.get("host"), body.get("key"), body.get("user", ""),
+                                            body.get("hostname", ""), body.get("port"), body.get("revision"),
+                                            verb == "DELETE")
+        except ssh_keys.SSHKeyError as e:
+            raise RESTError(e.status, str(e)) from e
+        if verb != "GET":
+            self.audit_detail = {"ssh": route, "operation": verb}
+        return 200, dict(result, ok=True)
 
     def do_health(self):
         wl = self.whitelist
