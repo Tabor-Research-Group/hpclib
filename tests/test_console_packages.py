@@ -6,6 +6,7 @@ Run with:  python -m unittest tests.test_console_packages -v
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_agent_console import ConsoleTestCase  # noqa: E402
+import test_agent_console  # noqa: E402
 import agent_console  # noqa: E402
 import agent_profiles  # noqa: E402
 import console_packages  # noqa: E402
@@ -117,6 +119,12 @@ class TestPackageStore(unittest.TestCase):
              "neither in this package"),
             (make_zip(dict(DEMO, apps={"demo": dict(DEMO["apps"]["demo"], token_regex="(")}), DEMO_FILES),
              "token_regex"),
+            (make_zip(dict(DEMO, apps={"demo": dict(DEMO["apps"]["demo"], password_regex="(a)(b)")}), DEMO_FILES),
+             "password_regex needs exactly one group"),
+            (make_zip(dict(DEMO, apps={"demo": dict(DEMO["apps"]["demo"], login_user="demo")}), DEMO_FILES),
+             "login_user needs password_regex"),
+            (make_zip(dict(DEMO, apps={"demo": dict(DEMO["apps"]["demo"], password_regex="(x)", login_user="a b")}),
+                      DEMO_FILES), "login_user is a user name"),
             (make_zip(dict(LAB, settings={"data-transfer": {"files": {"rclone.conf": "missing.conf"}}}), LAB_FILES),
              "not in the zip"),
             (make_zip(dict(LAB, settings={"data-transfer": {"values": {"SMB_HOST": "a\nb"}}}), LAB_FILES),
@@ -209,6 +217,37 @@ class TestConsolePackages(ConsoleTestCase):
         self.assertEqual((status, out["apps"]), (200, ["demo"]), out)
         self.assertNotIn("demo", [a["id"] for a in self.call("GET", "/api/apps")[1]["apps"]])
         self.assertEqual(self.call("DELETE", "/api/packages/demo")[0], 404)
+
+    def test_password_regex(self):
+        """an app that prints a password (OpenCode's basic-auth login) gets VS Code's Copy password"""
+        manifest = dict(DEMO, apps={"demo": dict(DEMO["apps"]["demo"], password_regex=r"^demo password: (\S+)$")})
+        status, out = self._post(make_zip(manifest, DEMO_FILES), dry_run=False)
+        self.assertEqual(status, 201, out)
+        pattern = agent_console.APPS["demo"]["password_re"]
+        self.assertEqual(pattern.findall("starting\ndemo password: s3cret\nready\n"), ["s3cret"])
+        self.call("DELETE", "/api/packages/demo")
+
+    def test_login_user(self):
+        """with login_user, Open signs in to the app's basic-auth login itself"""
+        manifest = dict(DEMO, apps={"demo": dict(DEMO["apps"]["demo"], password_regex=r"^demo password: (\S+)$",
+                                                 login_user="demo")})
+        self.assertEqual(self._post(make_zip(manifest, DEMO_FILES), dry_run=False)[0], 201)
+        base = f"/api/apps/demo/{self.dead}"
+        self.call("GET", base)
+        port = agent_profiles.load(self.dead)["apps"]["demo"]["port"]
+        logs = self.console / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        log = logs / f"{self.dead}.demo.log"
+        log.write_text("\n=== launch ===\nstarting\n")
+        test_agent_console.TestApps.serve(self, port)   # a fake app answering on its port
+        state = self.call("GET", base)[1]
+        self.assertEqual((state["state"], state["username"], state["password"]), ("up", "demo", None))
+        self.assertEqual(state["url"], f"http://127.0.0.1:{port}/")       # nothing to sign in with yet
+        log.write_text("\n=== launch ===\ndemo password: s3/cr@t\n")
+        state = self.call("GET", base)[1]
+        self.assertEqual(state["password"], "s3/cr@t")
+        self.assertEqual(state["url"], f"http://demo:s3%2Fcr%40t@127.0.0.1:{port}/")
+        self.call("DELETE", "/api/packages/demo")
 
     def test_secrets(self):
         manifest = dict(DEMO, apps={"demo": dict(DEMO["apps"]["demo"], secrets=[
@@ -314,6 +353,86 @@ class TestConsolePackages(ConsoleTestCase):
         with mock.patch.object(self.clusters.logins, "alive", return_value=True):
             self.assertEqual(self.call("GET", f"/api/apps/vscode/{self.dead}/tokens")[0], 404)
             self.assertEqual(self.call("POST", f"/api/apps/vscode/{self.dead}/tokens", {"label": "x"})[0], 404)
+
+    DOWNLOADS = {"label": "Model Download", "description": "models for the job",
+                 "kinds": [{"id": "ollama", "label": "Ollama", "placeholder": "granite4.2:30b",
+                            "pattern": r"[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?"},
+                           {"id": "vllm", "label": "vLLM", "placeholder": "org/model",
+                            "pattern": r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*"}]}
+
+    def test_downloads(self):
+        manifest = dict(DEMO, apps={"demo": dict(DEMO["apps"]["demo"], downloads=self.DOWNLOADS)})
+        files = dict(DEMO_FILES, **{"tunnels/demo-tunnel/downloads.sh": "#!/bin/bash\n"})
+        status, out = self._post(make_zip(manifest, files), dry_run=False)
+        self.assertEqual(status, 201, out)
+        self.assertIn("app demo: Model Download (Ollama, vLLM)", out["summary"])
+        base = f"/api/apps/demo/{self.dead}"
+        state = self.call("GET", base)[1]
+        self.assertEqual([k["id"] for k in state["downloads"]["kinds"]], ["ollama", "vllm"])
+        self.assertNotIn("downloads", self.call("GET", f"/api/apps/vscode/{self.dead}")[1])
+        self.assertEqual(self.call("GET", base + "/downloads")[0], 409)                    # needs the login
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            host = agent_profiles.load(self.dead)["host"]
+            out = self.call("GET", base + "/downloads")[1]
+            self.assertEqual((out["items"], out["note"]), ([], "4.0 TB free"))
+            self.assertEqual(self.shell.calls[-1][-2:], ["--downloads", "list"])
+            self.assertIn(host, self.shell.calls[-1])
+            # a download is an operation with its log, followed by a check
+            status, op = self.call("POST", base + "/downloads", {"kind": "ollama", "name": "granite4.2:30b"})
+            self.assertEqual((status, op["kind"], op["title"], op["app"]), (202, "download", "download granite4.2:30b", "demo"))
+            self.assertEqual(self.shell.calls[-1][-5:], ["--check", "--downloads", "pull", "ollama", "granite4.2:30b"])
+            self.assertEqual(test_agent_console.TestTunnelInstall.wait_op(self, self.dead)["state"], "succeeded")
+            self.assertEqual(self.call("GET", base)[1]["install"]["state"], "missing")          # the check ran
+            items = self.call("GET", base + "/downloads")[1]["items"]
+            self.assertEqual(items, [{"kind": "ollama", "name": "granite4.2:30b", "size": 1000, "in_use": False,
+                                      "note": ""}])
+            self.assertEqual(self.call("POST", base + "/downloads",
+                                       {"kind": "vllm", "name": "ibm-granite/granite-4.2-30b"})[0], 202)
+            test_agent_console.TestTunnelInstall.wait_op(self, self.dead)
+            # names that don't fit the kind, or could reach outside it, are refused here
+            for bad in ({"kind": "ollama", "name": "Bad Name"}, {"kind": "vllm", "name": "no-org"},
+                        {"kind": "vllm", "name": "../x"}, {"kind": "ollama", "name": "a/../b"},
+                        {"kind": "ollama", "name": "x; rm -rf ~"}, {"kind": "hf", "name": "a/b"},
+                        {"kind": "ollama", "name": "-x"}, {"kind": "ollama", "name": 3}):
+                self.assertEqual(self.call("POST", base + "/downloads", bad)[0], 422, bad)
+            self.assertEqual(self.call("POST", base + "/downloads", {"name": "x"})[0], 400)
+            # remove: gone from the list; what is in use is refused, with the reason
+            out = self.call("POST", base + "/downloads/remove", {"kind": "ollama", "name": "granite4.2:30b"})[1]
+            self.assertEqual(out["removed"], {"kind": "ollama", "name": "granite4.2:30b"})
+            self.assertEqual([i["name"] for i in self.call("GET", base + "/downloads")[1]["items"]],
+                             ["ibm-granite/granite-4.2-30b"])
+            self.shell.downloads[0]["in_use"] = True
+            status, out = self.call("POST", base + "/downloads/remove", {"kind": "vllm", "name": "ibm-granite/granite-4.2-30b"})
+            self.assertEqual(status, 502)
+            self.assertIn("in use by a running job", out["error"])
+            # what downloads.sh lists is passed on field by field
+            self.shell.downloads = [{"kind": "ollama", "name": "x", "size": "big", "in_use": "yes", "secret": 1},
+                                    {"kind": "other", "name": "y"}, "junk"]
+            self.assertEqual(self.call("GET", base + "/downloads")[1]["items"],
+                             [{"kind": "ollama", "name": "x", "size": None, "in_use": False, "note": ""}])
+            self.shell.downloads_error = "setup_tunnel: demo-tunnel has no downloads.sh on this cluster"
+            status, out = self.call("GET", base + "/downloads")
+            self.assertEqual(status, 502)
+            self.assertIn("no downloads.sh", out["error"])
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.assertEqual(self.call("GET", f"/api/apps/vscode/{self.dead}/downloads")[0], 404)
+
+    def test_downloads_manifest_checks(self):
+        files = dict(DEMO_FILES, **{"tunnels/demo-tunnel/downloads.sh": "#!/bin/bash\n"})
+        def check(downloads, files=files):
+            return self._post(make_zip(dict(DEMO, apps={"demo": dict(DEMO["apps"]["demo"], downloads=downloads)}),
+                                       files), dry_run=True)
+        self.assertEqual(check(self.DOWNLOADS)[0], 200)
+        self.assertEqual(check({"kinds": [{"id": "model"}]})[0], 200)            # label and pattern have defaults
+        for bad, words in (({"kinds": []}, "1 to 8"), ({"kinds": [{"id": "Bad"}]}, "kind ids"),
+                           ({"kinds": [{"id": "a"}, {"id": "a"}]}, "kind ids"),
+                           ({"kinds": [{"id": "a", "pattern": "("}]}, "pattern"),
+                           ({"kinds": [{"id": "a", "url": "x"}]}, "each kind"), ({"kinds": [{"id": "a"}], "x": 1}, "downloads is")):
+            status, out = check(bad)
+            self.assertEqual(status, 422, bad)
+            self.assertIn(words, out["error"], bad)
+        status, out = check(self.DOWNLOADS, files=DEMO_FILES)
+        self.assertIn("downloads.sh", out["error"])
 
     def test_tokens_manifest_checks(self):
         files = dict(DEMO_FILES, **{"tunnels/demo-tunnel/tokens.sh": "#!/bin/bash\n"})
@@ -429,6 +548,82 @@ class TestClusterReceives(unittest.TestCase):
         out = run("--tokens", "list")
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("no tokens.sh", out.stderr)
+
+    def test_older_hpclib_in_bashrc(self):
+        """~/.bashrc pointing HPCLIB_DIR at another copy: it is still used (as before), with a warning if it's older."""
+        other = self.tmp / "scratch" / "hpclib"
+        shutil.copytree(HPCLIB, other)
+        hpclib_sh = other / "hpclib.sh"
+        hpclib_sh.write_text(re.sub(r'HPCLIB_VERSION="[^"]*"', 'HPCLIB_VERSION="0.1.0"', hpclib_sh.read_text()))
+        (self.tmp / "home" / ".bashrc").write_text(f"export HPCLIB_DIR={other}\n")
+        tunnel = self.tmp / "tunnels" / "demo-tunnel"
+        tunnel.mkdir(parents=True)
+        (tunnel / "sbatch_script.sh").write_text("true\n")
+        (tunnel / "tunnel_config.sh").write_text("")
+        (tunnel / "install.sh").write_text('#!/bin/bash\n# hpclib-install: --check\necho "installed: $HPCLIB_DIR"\n')
+        env = dict(self.env, HPCLIB_TUNNEL_PATH=str(self.tmp / "tunnels"))
+        env.pop("HPCLIB_DIR")
+        def check():
+            return subprocess.run(["bash", str(HPCLIB / "tunnels" / "setup_tunnel.sh"), "demo-tunnel", "--check"],
+                                  capture_output=True, text=True, env=env, timeout=60)
+        out = check()
+        self.assertIn(f"HPCLIB_TUNNEL_STATUS installed installed: {other}", out.stdout, out.stderr)   # used, as before
+        self.assertIn(f"WARNING: running hpclib 0.1.0 from {other}", out.stderr)
+        self.assertIn(f"older than", out.stderr)
+        # the same version elsewhere, or this copy through a link: nothing to say
+        hpclib_sh.write_text((HPCLIB / "hpclib.sh").read_text())
+        self.assertNotIn("WARNING", check().stderr)
+        link = self.tmp / "link"
+        link.symlink_to(HPCLIB)
+        (self.tmp / "home" / ".bashrc").write_text(f"export HPCLIB_DIR={link}\n")
+        self.assertNotIn("WARNING", check().stderr)
+
+    def test_downloads_option(self):
+        """setup_tunnel.sh --downloads: list and remove pass downloads.sh's JSON on; pull shows its progress."""
+        tunnel = self.tmp / "tunnels" / "demo-tunnel"
+        tunnel.mkdir(parents=True)
+        (tunnel / "sbatch_script.sh").write_text("true\n")
+        (tunnel / "tunnel_config.sh").write_text('TUNNEL_SETTINGS="DEMO_DIR"\n')
+        (tunnel / "install.sh").write_text("#!/bin/bash\n# hpclib-install: --check\necho installed: yes\n")
+        (tunnel / "downloads.sh").write_text(textwrap.dedent("""\
+            #!/bin/bash
+            printf '%s\\n' "$*" > "$DEMO_DIR/args"
+            case "$1:$2" in
+              --json:list) echo "noise"; echo '{"items": [{"kind": "ollama", "name": "m:1", "size": 5}]}' ;;
+              --json:remove) [ "$4" != busy ] || { echo "busy is in use by job 7" >&2; exit 1; }
+                             echo '{"removed": "'"$4"'"}' ;;
+              pull:*) echo "pulling $3: 50%"; [ "$3" != bad ] || exit 3; echo "pulling $3: done" ;;
+            esac
+            """))
+        env = dict(self.env, HPCLIB_TUNNEL_PATH=str(self.tmp / "tunnels") + ":" + str(HPCLIB / "tunnels"), DEMO_DIR=str(self.tmp))
+        def run(*args):
+            return subprocess.run(["bash", str(HPCLIB / "tunnels" / "setup_tunnel.sh"), "demo-tunnel", *args],
+                                  capture_output=True, text=True, env=env, timeout=60)
+        out = run("--downloads", "list")
+        self.assertEqual((out.returncode, out.stdout.strip()),
+                         (0, 'HPCLIB_DOWNLOADS {"items": [{"kind": "ollama", "name": "m:1", "size": 5}]}'), out.stderr)
+        out = run("--downloads", "remove", "ollama", "m:1")
+        self.assertEqual(out.stdout.strip(), 'HPCLIB_DOWNLOAD_REMOVED {"removed": "m:1"}')
+        self.assertEqual((self.tmp / "args").read_text().strip(), "--json remove ollama m:1")
+        out = run("--downloads", "remove", "ollama", "busy")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("setup_tunnel: downloads.sh remove failed: busy is in use by job 7", out.stderr)
+        # a pull: its progress as it comes, then the check asked for before it
+        out = run("--check", "--downloads", "pull", "ollama", "m:1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("pulling m:1: 50%\npulling m:1: done", out.stdout)
+        self.assertIn("HPCLIB_TUNNEL_STATUS installed installed: yes", out.stdout)
+        self.assertEqual((self.tmp / "args").read_text().strip(), "pull ollama m:1")
+        out = run("--check", "--downloads", "pull", "ollama", "bad")
+        self.assertEqual(out.returncode, 1)
+        self.assertNotIn("HPCLIB_TUNNEL_STATUS", out.stdout)
+        self.assertIn("downloading bad failed", out.stderr)
+        for args in (("--downloads", "nope"), ("--downloads",), ("--downloads", "pull", "ollama"),
+                     ("--downloads", "list", "x")):
+            self.assertEqual(run(*args).returncode, 2, args)
+        (tunnel / "downloads.sh").unlink()
+        out = run("--downloads", "list")
+        self.assertIn("no downloads.sh", out.stderr)
 
     def test_tunnel_and_settings_files(self):
         res = self.send("demo-tunnel", {"tunnel/sbatch_script.sh": "#!/bin/bash\n", "tunnel/tunnel_config.sh": "",

@@ -144,6 +144,30 @@ in the installed tunnel with the tunnel's settings in the environment and relays
 What a token allows is the app's business: it checks tokens itself, and the console only offers the manifest's
 scopes. The console keeps no token and logs none.
 
+### App downloads
+
+An app that needs large things on the cluster (OpenCode's models) can have the console download and remove them.
+Ship a `downloads.sh` in the tunnel and give the app a `downloads` section in the package manifest:
+
+```json
+"downloads": {"label": "Model Download", "description": "shown under the toolbar",
+              "kinds": [{"id": "ollama", "label": "Ollama", "placeholder": "granite4.2:30b",
+                         "pattern": "[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?"},
+                        {"id": "vllm", "label": "vLLM (Hugging Face)", "placeholder": "org/model",
+                         "pattern": "[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*"}]}
+```
+
+Each of the app's rows then has a toolbar: the kind, a name (which must match the kind's `pattern`, and be letters,
+digits and `. _ : / @ + -`, at most 200, with no `..`), **Download**, and **Downloaded…**, a list of what is there
+with sizes and **Remove**. The console runs `setup_tunnel.sh TUNNEL --downloads ACTION ...` over its login, on the
+login node, which runs `downloads.sh` in the installed tunnel with the tunnel's settings in the environment:
+
+| Call | Prints |
+| --- | --- |
+| `downloads.sh --json list` | `{"items": [{"kind", "name", "size" (bytes), "in_use", "note"}], "note"}` |
+| `downloads.sh pull KIND NAME` | progress, for people; exit 0 once it is there. The console runs it as an operation with its log, like Install, followed by a `--check` |
+| `downloads.sh --json remove KIND NAME` | `{"removed": NAME}`; refuses (exit 1, saying why on standard error) what is in use |
+
 ### clear_port.sh
 
 `start_tunnel.sh` runs `clear_port.sh PORT` before it checks the port, so a tunnel whose service hpclib can't
@@ -224,9 +248,12 @@ The page needs no change: it builds every app's Sessions page from `GET /api/app
 
 For an app that doesn't belong in hpclib (one group's server, a project's test instance), use a console package
 instead, described next. Package apps take a subset of these keys: `title`, `tunnel`, `description`, `open_path`,
-`health_path`, `token_regex` (a regular expression string with one group, the token), `settings`, `secrets`, and for an
+`health_path`, `token_regex` (a regular expression string with one group, the token), `password_regex` (the same for a
+password the app prints, shown with **Copy password** as for VS Code), `login_user` (with `password_regex`, the user
+name of the app's basic-auth login: Open then signs in with both, like Data transfer's GUI), `settings`, `secrets`, and for an
 app that one running job serves for everyone, `shared`, `instance_label` and `reinstall` (what Install is called once it is
-installed; PAI's is Update). An app with its own bearer tokens adds `tokens` (see App tokens).
+installed; PAI's is Update). An app with its own bearer tokens adds `tokens` (see App tokens), and one that
+downloads things to the cluster `downloads` (see App downloads).
 
 ## Console packages
 
@@ -269,8 +296,9 @@ our-lab/
 
 | Section | Meaning |
 | --- | --- |
-| `apps` | console apps: `title`, `tunnel` (one in the package or one of hpclib's), `description`, `open_path`, `health_path`, `token_regex`, `settings`, `secrets`; for a shared app (one job for everyone, see `SHARED_INSTANCE`): `shared`, `instance_label`, `reinstall` (`{label, title}`); `tokens` (`{scopes, default_scope, days, label, description}`, with `tokens.sh` in the tunnel: see App tokens) |
+| `apps` | console apps: `title`, `tunnel` (one in the package or one of hpclib's), `description`, `open_path`, `health_path`, `token_regex`, `password_regex`, `login_user`, `settings`, `secrets`; for a shared app (one job for everyone, see `SHARED_INSTANCE`): `shared`, `instance_label`, `reinstall` (`{label, title}`); `tokens` (`{scopes, default_scope, days, label, description}`, with `tokens.sh` in the tunnel: see App tokens); `downloads` (`{label, description, kinds}`, with `downloads.sh` in the tunnel: see App downloads) |
 | `tunnels` | tunnel folders in the zip, by name |
+| `clusters` | installable cluster configurations (hostname, resource defaults and SSH policy); see [Cluster presets](cluster-presets.md) |
 | `settings.TUNNEL.values` | default settings; a user's own values (per cluster) win, and the form shows the package's as placeholders |
 | `settings.TUNNEL.files` | files placed in `~/.local/tunnels/settings/TUNNEL.d/` on the cluster (e.g. extra rclone remotes, or a `NAME.gui.sh` for Data transfer's `SMB_GUI`) |
 | `secrets` | per app; each name must be in its tunnel's `TUNNEL_SECRETS` |
@@ -284,6 +312,29 @@ python3 hpclib/servers/console_packages.py build our-lab/       # writes our-lab
 A package can't replace hpclib's apps or tunnels or what another package provides. Its tunnel and settings files
 reach a cluster with the app's next Check, Install or Start (`tunnel_setup --push`). Raise `version` with each
 change; installing a newer version replaces the old one.
+
+### Running a program in the job sandbox
+
+A tunnel whose program should be held like a template job (an agent that runs commands, say) can run it in the
+sandbox the REST server's config gives template jobs. Its job writes the program's start as a short shell script and
+asks the REST server for the lines that run it there:
+
+```bash
+"$rest_python" "$HPCSERVERS_DIR/rest_server.py" --sandbox-script "$dir/service.sh" \
+  --sandbox-writable "$WORK_DIR" --sandbox-read-only "$TOOLS_DIR" --sandbox-network host > "$dir/launch.sh"
+bash "$dir/launch.sh"
+```
+
+- `--sandbox-writable` and `--sandbox-read-only` add to the config's own `writable` and `binds`; nothing of hpclib's
+  data (`~/.local/tunnels`, templates, tokens, the job database) may be bound, either way.
+- `--sandbox-network host` shares the node's network, loopback included, so the program can reach servers the job
+  runs beside it (podman `--network=host`; Apptainer always shares it).
+- It exits 3, saying why, when template jobs aren't sandboxed (no `sandbox` in the config, or method `none`), so
+  the tunnel can refuse to run unsandboxed.
+- The script is on the container's command line, which others on the node can read: keep secrets in files it reads.
+
+The `opencode` package (OpenCode with an open-weight model) does this, and starts a REST server of its own with a
+token for the job alone, for hpclib's MCP server inside the sandbox.
 
 ## Writing job templates
 

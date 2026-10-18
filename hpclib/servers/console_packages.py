@@ -1,5 +1,5 @@
 """
-Apps and settings for the agent console that aren't part of hpclib: installable packages.
+Apps, settings and cluster configurations for the agent console: installable packages.
 
 A package is a zip file with hpclib-package.json at its top level:
 
@@ -13,13 +13,19 @@ A package is a zip file with hpclib-package.json at its top level:
                 "description": "shown on its page",
                 "open_path": "/", "health_path": "/health",
                 "token_regex": null,         # optional: finds a login token in its log, for Open
+                "password_regex": null,      # optional: finds a password it prints there instead (Copy password)
+                "login_user": null,          # optional, with password_regex: the user name of its basic-auth
+                                             #   login; Open then signs in with both (user:password@ in the URL)
                 "shared": false,             # optional: one running instance serves everyone (see below)
                 "instance_label": "database",   # with shared: what the instance is called in the console
                 "reinstall": {"label": "Update", "title": "what it does"},   # optional: what Install does once installed
                 "settings": [{"name": "MY_DIR", "label": "Directory", "hint": "...", "choices": null}],
                 "secrets": [{"name": "MY_TOKEN", "label": "API token", "hint": "..."}],   # see below
                 "tokens": {"scopes": ["read", "write", "admin"], "default_scope": "write",
-                           "days": 90, "label": "API tokens"}}},   # optional: manage the app's own tokens (below)
+                           "days": 90, "label": "API tokens"},   # optional: manage the app's own tokens (below)
+                "downloads": {"label": "Model Download", "description": "...",   # optional: things to download
+                              "kinds": [{"id": "ollama", "label": "Ollama", "placeholder": "granite4.2:30b",
+                                         "pattern": "[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?"}]}}},   # (below)
    "tunnels": {"my-tunnel": "tunnels/my-tunnel"},      # directories in the zip: an hpclib tunnel each
    "settings": {                             # defaults and files for tunnels (this package's or hpclib's)
      "data-transfer": {"values": {"SMB_HOST": "files.example.edu", "SMB_DOMAIN": "EXAMPLE"},
@@ -48,8 +54,27 @@ write API). The tunnel ships tokens.sh, which the console runs on the cluster ov
 The secret of a new token is shown once (or goes straight to a file on the cluster) and is never kept by the
 console. What a token may do is the app's business: the console only offers the `scopes` the manifest lists.
 
+An app's `downloads` section puts a download toolbar under its rows, for apps that need large things on the cluster
+(OpenCode's models): pick a kind, type a name (which must match the kind's `pattern`), Download; and a list of
+what is there, with Remove. The tunnel ships downloads.sh, which the console runs on the cluster's login node over
+its login (setup_tunnel.sh --downloads):
+
+  --json list                  {"items": [{"kind", "name", "size" (bytes), "in_use" (true/false), "note"}],
+                                "note": "..."}: ONE line of JSON on its standard output
+  pull KIND NAME               downloads it, printing progress for people; exit 0 when it is there. The console runs
+                               this as an operation with its log, like Install (it can take hours)
+  --json remove KIND NAME      {"removed": NAME}; refuses (exit 1, saying why on standard error) what is in use
+
 A package with only `settings` is a settings package: e.g. a group's SMB server and its rclone remotes, which
 don't belong in hpclib itself.
+
+`clusters` maps preset IDs to {title, host, port, description, documentation_url,
+ssh_keys, defaults}. Defaults holds tunnel_args, rest_on, connection_hours, optional work_dir,
+app_settings and rest_config. The latter are native profile/setup defaults, filled with the
+user's username when a profile is added; installing a package does not connect to a cluster.
+ssh_keys is hpclib or site-managed. A preset supplies configuration, not a user's
+credentials: installing it only adds a choice to Clusters > Add cluster. Existing
+profiles remain independent when the package is replaced or removed.
 
 What happens to it:
   - the console keeps it in ~/.config/hpclib/console/packages/NAME/ (unpacked, with its zip's hash);
@@ -77,6 +102,7 @@ import stat
 import sys
 import tempfile
 import time
+import urllib.parse
 import zipfile
 
 __all__ = ["PackageError", "PackageStore", "build", "MANIFEST"]
@@ -94,11 +120,102 @@ MAX_ZIP = 64 << 20          # bytes, the zip itself
 MAX_UNPACKED = 256 << 20    # bytes, everything in it
 MAX_FILES = 5000
 MAX_SETTINGS_FILE = 1 << 20
-APP_KEYS = {"title", "tunnel", "description", "open_path", "health_path", "token_regex", "settings", "secrets",
+APP_KEYS = {"title", "tunnel", "description", "open_path", "health_path", "token_regex", "password_regex", "login_user",
+            "settings", "secrets", "downloads",
             "shared", "instance_label", "reinstall", "tokens"}
+LOGIN_USER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+DOWNLOAD_KEYS = {"label", "description", "kinds"}
+DOWNLOAD_KIND_KEYS = {"id", "label", "placeholder", "pattern"}
+DOWNLOAD_KIND_RE = re.compile(r"[a-z][a-z0-9_-]{0,19}")
+# whatever a kind's pattern allows, a name to download is at most this (it goes on a command line on the cluster)
+DOWNLOAD_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}")
 TOKEN_KEYS = {"label", "scopes", "default_scope", "days", "description"}
 SCOPE_RE = re.compile(r"[a-z][a-z0-9_-]{0,19}")
-TOP_KEYS = {"format", "name", "version", "description", "apps", "tunnels", "settings"}
+TOP_KEYS = {"format", "name", "version", "description", "apps", "tunnels", "settings", "clusters"}
+CLUSTER_KEYS = {"title", "host", "port", "description", "documentation_url", "defaults", "ssh_keys"}
+CLUSTER_HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}")
+CLUSTER_ARG_RE = re.compile(r"--(time|mem|partition|account|qos|cpus-per-task|constraint)=[A-Za-z0-9:._,+-]{1,64}")
+CLUSTER_DEFAULT_KEYS = {"tunnel_args", "rest_on", "connection_hours", "work_dir", "rest_config", "app_settings"}
+APP_SETTING_KEYS = {"tunnel_args", "conda_env", "modules", "project", "settings"}
+SECRET_FIELD_RE = re.compile(r"(?:^|_)(?:pass|password|passwd|pwd|passphrase|passcode|secret|secrets|token|tokens|"
+                             r"credential|credentials|api_key|access_key|private_key|authorization|auth_header|"
+                             r"cookie|cookies)(?:_|$)", re.I)
+URL_CREDENTIAL_RE = re.compile(r"[a-z][a-z0-9+.-]*://[^\s/]*:[^\s/]*@", re.I)
+QUERY_CREDENTIAL_RE = re.compile(r"[?&;](?:password|passwd|passphrase|secret|token|access_token|api_key)=[^&#\s]+", re.I)
+PRIVATE_KEY_RE = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----")
+AUTH_VALUE_RE = re.compile(r"^(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+\s*$|"
+                           r"(?:^|\s)Authorization:\s*(?:Bearer|Basic)\s+\S+", re.I)
+
+
+def check_public_defaults(value, path="cluster defaults", depth=0):
+    """Persistable defaults may contain configuration, never credential fields or key material."""
+    if depth > 32:
+        raise PackageError(f"{path}: defaults are nested too deeply")
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise PackageError(f"{path}: setting names must be strings")
+            name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key).replace("-", "_").replace(".", "_")
+            if SECRET_FIELD_RE.search(name):
+                raise PackageError(f"{path}.{key}: credentials cannot be stored in plaintext defaults")
+            check_public_defaults(item, f"{path}.{key}", depth + 1)
+    elif isinstance(value, list):
+        for item in value:
+            check_public_defaults(item, path, depth + 1)
+    elif isinstance(value, str) and (URL_CREDENTIAL_RE.search(value) or QUERY_CREDENTIAL_RE.search(value)
+                                   or PRIVATE_KEY_RE.search(value) or AUTH_VALUE_RE.search(value)):
+        raise PackageError(f"{path}: credentials or private keys cannot be stored in plaintext defaults")
+    elif isinstance(value, str) and value.lstrip().startswith(("{", "[", '"')):
+        try:
+            decoded = json.loads(value)
+        except RecursionError as e:
+            raise PackageError(f"{path}: defaults are nested too deeply") from e
+        except ValueError:
+            return
+        check_public_defaults(decoded, path, depth + 1)
+
+
+def check_cluster_config(config):
+    """Validate portable REST defaults using the REST server's own validators."""
+    try:
+        from . import rest_server
+    except ImportError:  # standalone package builder / console scripts
+        import rest_server
+    if not isinstance(config, dict):
+        raise PackageError("rest_config must be an object")
+    check_public_defaults(config, "rest_config")
+    try:
+        if len(json.dumps(config, allow_nan=False)) > 65536:
+            raise ValueError("rest_config is larger than 64 KiB")
+        normalized, _ = rest_server.updated_config({}, config)
+    except (ValueError, TypeError, KeyError) as e:
+        raise PackageError(f"invalid rest_config: {e}") from e
+    return json.loads(json.dumps(normalized))
+
+
+def _cluster_app_settings(apps):
+    if not isinstance(apps, dict):
+        raise PackageError("app_settings must map app IDs to their settings")
+    check_public_defaults(apps, "app_settings")
+    for app, settings in apps.items():
+        if not APP_ID_RE.fullmatch(app) or not isinstance(settings, dict) or set(settings) - APP_SETTING_KEYS:
+            raise PackageError("app_settings contains an invalid app ID or setting field")
+        for key, value in settings.items():
+            if key == "tunnel_args":
+                if not isinstance(value, list) or len(value) > 16 or not all(isinstance(v, str) and CLUSTER_ARG_RE.fullmatch(v) for v in value):
+                    raise PackageError("invalid app tunnel_args")
+            elif key == "modules":
+                if not isinstance(value, list) or not all(isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9_.+-][A-Za-z0-9_.+/-]{0,127}", v) for v in value):
+                    raise PackageError("invalid app modules")
+            elif key == "settings":
+                if not isinstance(value, dict) or not all(SETTING_NAME_RE.fullmatch(k) and isinstance(v, str) and VALUE_RE.fullmatch(v) for k, v in value.items()):
+                    raise PackageError("invalid app settings values")
+            elif key == "conda_env":
+                if value is not None and (not isinstance(value, str) or (value and not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value))):
+                    raise PackageError("invalid app conda_env")
+            elif not isinstance(value, str) or (value and (not value.startswith("/") or not VALUE_RE.fullmatch(value))):
+                raise PackageError("invalid app project")
+    return json.loads(json.dumps(apps))
 
 
 class PackageError(Exception):
@@ -182,7 +299,59 @@ def check_manifest(manifest, members, builtin_tunnels):
         raise PackageError("`version` must be a short version string such as 1.0.2")
     out = {"format": FORMAT, "name": name, "version": version,
            "description": _text(manifest.get("description"), "description", 2000, required=False) or "",
-           "apps": {}, "tunnels": {}, "settings": {}}
+           "apps": {}, "tunnels": {}, "settings": {}, "clusters": {}}
+
+    clusters = manifest.get("clusters") or {}
+    if not isinstance(clusters, dict):
+        raise PackageError("`clusters` maps preset IDs to cluster configuration objects")
+    for preset_id, spec in clusters.items():
+        if not APP_ID_RE.fullmatch(preset_id) or not isinstance(spec, dict) or set(spec) - CLUSTER_KEYS:
+            raise PackageError("invalid cluster preset ID or fields")
+        check_public_defaults(spec, f"cluster {preset_id}")
+        host = spec.get("host")
+        if not isinstance(host, str) or not CLUSTER_HOST_RE.fullmatch(host) or ".." in host:
+            raise PackageError(f"cluster {preset_id}: host must be a hostname without a username or SSH options")
+        port = spec.get("port", 22)
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise PackageError(f"cluster {preset_id}: port must be 1 to 65535")
+        url = spec.get("documentation_url") or ""
+        if not isinstance(url, str) or len(url) > 1024:
+            raise PackageError(f"cluster {preset_id}: invalid documentation URL")
+        try:
+            parsed = urllib.parse.urlsplit(url)
+        except ValueError as e:
+            raise PackageError(f"cluster {preset_id}: invalid documentation URL") from e
+        if url and (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or any(c in url for c in "\0\r\n")):
+            raise PackageError(f"cluster {preset_id}: documentation URL must be HTTPS without credentials")
+        ssh_keys = spec.get("ssh_keys", "hpclib")
+        if ssh_keys not in ("hpclib", "site-managed"):
+            raise PackageError(f"cluster {preset_id}: ssh_keys is hpclib or site-managed")
+        defaults = spec.get("defaults") or {}
+        if not isinstance(defaults, dict) or set(defaults) - CLUSTER_DEFAULT_KEYS:
+            raise PackageError(f"cluster {preset_id}: defaults use {sorted(CLUSTER_DEFAULT_KEYS)}")
+        args = defaults.get("tunnel_args", [])
+        if not isinstance(args, list) or len(args) > 16 or not all(isinstance(a, str) and CLUSTER_ARG_RE.fullmatch(a) for a in args):
+            raise PackageError(f"cluster {preset_id}: invalid tunnel_args")
+        hours = defaults.get("connection_hours", 12)
+        if isinstance(hours, bool) or not isinstance(hours, int) or not 1 <= hours <= 168:
+            raise PackageError(f"cluster {preset_id}: connection_hours must be 1 to 168")
+        rest_on = defaults.get("rest_on", "job")
+        if rest_on not in ("job", "login"):
+            raise PackageError(f"cluster {preset_id}: rest_on is job or login")
+        extra = {}
+        if "work_dir" in defaults:
+            work = defaults["work_dir"]
+            if not isinstance(work, str) or not work.startswith("/") or not VALUE_RE.fullmatch(work):
+                raise PackageError("work_dir must be an absolute path; {username} is filled when adding the cluster")
+            extra["work_dir"] = work
+        if "rest_config" in defaults:
+            extra["rest_config"] = check_cluster_config(defaults["rest_config"])
+        if "app_settings" in defaults:
+            extra["app_settings"] = _cluster_app_settings(defaults["app_settings"])
+        out["clusters"][preset_id] = {"title": _text(spec.get("title"), "cluster title", 80), "host": host,
+            "port": port, "description": _text(spec.get("description"), "cluster description", 2000, required=False) or "",
+            "documentation_url": url, "ssh_keys": ssh_keys,
+            "defaults": {"tunnel_args": list(args), "rest_on": rest_on, "connection_hours": hours, **extra}}
 
     tunnels = manifest.get("tunnels") or {}
     if not isinstance(tunnels, dict):
@@ -219,8 +388,11 @@ def check_manifest(manifest, members, builtin_tunnels):
         app = {"title": _text(spec.get("title"), f"apps.{app_id}.title", 60), "tunnel": tunnel,
                "description": _text(spec.get("description"), f"apps.{app_id}.description", 2000, required=False),
                "open_path": spec.get("open_path", "/"), "health_path": spec.get("health_path", "/"),
-               "token_regex": spec.get("token_regex"), "settings": [], "secrets": [],
-               "shared": spec.get("shared", False), "instance_label": None, "reinstall": None, "tokens": None}
+               "token_regex": spec.get("token_regex"), "password_regex": spec.get("password_regex"),
+               "login_user": spec.get("login_user"),
+               "settings": [], "secrets": [],
+               "shared": spec.get("shared", False), "instance_label": None, "reinstall": None, "tokens": None,
+               "downloads": None}
         if not isinstance(app["shared"], bool):
             raise PackageError(f"app {app_id}: shared is true or false")
         if spec.get("instance_label") is not None:
@@ -257,14 +429,25 @@ def check_manifest(manifest, members, builtin_tunnels):
         for key in ("open_path", "health_path"):
             if not isinstance(app[key], str) or not URL_PATH_RE.fullmatch(app[key]):
                 raise PackageError(f"app {app_id}: {key} must be a path such as /lab")
-        if app["token_regex"] is not None:
-            if not isinstance(app["token_regex"], str) or len(app["token_regex"]) > 200:
-                raise PackageError(f"app {app_id}: token_regex must be a regular expression")
+        for key, what in (("token_regex", "the token"), ("password_regex", "the password")):
+            if app[key] is None:
+                continue
+            if not isinstance(app[key], str) or len(app[key]) > 200:
+                raise PackageError(f"app {app_id}: {key} must be a regular expression")
             try:
-                if re.compile(app["token_regex"]).groups != 1:
-                    raise PackageError(f"app {app_id}: token_regex needs exactly one group, the token")
+                if re.compile(app[key], re.M).groups != 1:
+                    raise PackageError(f"app {app_id}: {key} needs exactly one group, {what}")
             except re.error as e:
-                raise PackageError(f"app {app_id}: token_regex: {e}")
+                raise PackageError(f"app {app_id}: {key}: {e}")
+        if spec.get("downloads") is not None:
+            app["downloads"] = _check_downloads(spec["downloads"], app_id)
+            if tunnel in out["tunnels"] and f"{out['tunnels'][tunnel]['dir']}/downloads.sh" not in members:
+                raise PackageError(f"app {app_id}: downloads needs {out['tunnels'][tunnel]['dir']}/downloads.sh in the tunnel")
+        if app["login_user"] is not None:
+            if not isinstance(app["login_user"], str) or not LOGIN_USER_RE.fullmatch(app["login_user"]):
+                raise PackageError(f"app {app_id}: login_user is a user name (letters, digits, . _ -)")
+            if app["password_regex"] is None:
+                raise PackageError(f"app {app_id}: login_user needs password_regex, which finds the password")
         fields = spec.get("settings") or []
         if not isinstance(fields, list):
             raise PackageError(f"app {app_id}: settings is a list of fields")
@@ -319,8 +502,8 @@ def check_manifest(manifest, members, builtin_tunnels):
             if len(members[path]) > MAX_SETTINGS_FILE:
                 raise PackageError(f"settings.{tunnel}.files: {path} is larger than 1 MB")
         out["settings"][tunnel] = {"values": dict(values), "files": dict(files)}
-    if not out["apps"] and not out["settings"] and not out["tunnels"]:
-        raise PackageError("the package adds nothing: give apps, tunnels or settings")
+    if not out["apps"] and not out["settings"] and not out["tunnels"] and not out["clusters"]:
+        raise PackageError("the package adds nothing: give apps, tunnels, settings or cluster presets")
     return out
 
 
@@ -355,6 +538,10 @@ class PackageStore:
         """Why it can't go in beside what's installed (another version of itself is replaced, not a conflict)."""
         problems = []
         others = [m for m, _ in self.installed() if m["name"] != manifest["name"]]
+        for preset in manifest.get("clusters", {}):
+            for m in others:
+                if preset in m.get("clusters", {}):
+                    problems.append(f"cluster preset {preset} is already in package {m['name']}")
         for app_id, app in manifest["apps"].items():
             if app_id in self.builtin_apps:
                 problems.append(f"app {app_id} is one of hpclib's own")
@@ -398,9 +585,30 @@ class PackageStore:
         """What installing `data` would do: the checked manifest, its hash and any problems."""
         raw, members = read_zip(data)
         manifest = check_manifest(raw, members, self.builtin_tunnels)
+        self.check_cluster_app_fields(manifest)
         current = {m["name"]: m for m, _ in self.installed()}.get(manifest["name"])
         return {"package": manifest, "sha256": hashlib.sha256(data).hexdigest(),
                 "replaces": current["version"] if current else None, "problems": self._conflicts(manifest)}
+
+    def check_cluster_app_fields(self, manifest):
+        """Fail closed: a preset may only fill declared non-secret settings of a known app."""
+        fields = {app: (set(names), set()) for app, (_, names) in self.builtin_apps.items()}
+        others = [m for m, _ in self.installed() if m["name"] != manifest["name"]]
+        for m in others + [manifest]:
+            for app, spec in m.get("apps", {}).items():
+                fields[app] = ({f["name"] for f in spec.get("settings", [])},
+                               {f["name"] for f in spec.get("secrets", [])})
+        for preset, spec in manifest.get("clusters", {}).items():
+            check_public_defaults(spec, f"cluster {preset}")
+            for app, config in spec.get("defaults", {}).get("app_settings", {}).items():
+                if app not in fields:
+                    raise PackageError(f"cluster {preset}: install app {app} first so its non-secret settings can be checked")
+                allowed, secrets = fields[app]
+                names = set(config.get("settings", {}))
+                if names & secrets:
+                    raise PackageError(f"cluster {preset}: app {app} secret fields cannot be stored in plaintext defaults")
+                if names - allowed:
+                    raise PackageError(f"cluster {preset}: app {app} defaults must use declared non-secret settings")
 
     def install(self, data):
         report = self.inspect(data)
@@ -441,6 +649,15 @@ class PackageStore:
     def apps(self):
         """app id -> (manifest, app spec, the package's directory)."""
         return {app_id: (m, app, d) for m, d in self.installed() for app_id, app in m["apps"].items()}
+
+    def cluster_presets(self):
+        """Installed configuration data; importing a package never creates a personal profile."""
+        out = {}
+        for manifest, _ in self.installed():
+            self.check_cluster_app_fields(manifest)
+            for key, spec in manifest.get("clusters", {}).items():
+                out[key] = dict(spec, id=key, package=manifest["name"], package_version=manifest["version"])
+        return out
 
     def tunnel_dir(self, tunnel):
         for m, d in self.installed():
@@ -495,11 +712,53 @@ class PackageStore:
             raise
         return final, (None if empty else digest.hexdigest())
 
+def _check_downloads(d, app_id):
+    """An app's `downloads` section, normalized."""
+    where = f"apps.{app_id}.downloads"
+    if not isinstance(d, dict) or set(d) - DOWNLOAD_KEYS:
+        raise PackageError(f"{where} is {{{', '.join(sorted(DOWNLOAD_KEYS))}}}")
+    kinds = d.get("kinds")
+    if not isinstance(kinds, list) or not 1 <= len(kinds) <= 8:
+        raise PackageError(f"{where}.kinds is a list of 1 to 8 kinds of download")
+    out = {"label": _text(d.get("label", "Downloads"), f"{where}.label", 40),
+           "description": _text(d.get("description", ""), f"{where}.description", 600, required=False) or "",
+           "kinds": []}
+    for k in kinds:
+        if not isinstance(k, dict) or set(k) - DOWNLOAD_KIND_KEYS:
+            raise PackageError(f"{where}: each kind is {{{', '.join(sorted(DOWNLOAD_KIND_KEYS))}}}")
+        kid = k.get("id")
+        if not isinstance(kid, str) or not DOWNLOAD_KIND_RE.fullmatch(kid) or kid in [x["id"] for x in out["kinds"]]:
+            raise PackageError(f"{where}: kind ids are distinct short names (lowercase letters, digits, _ -)")
+        pattern = k.get("pattern", DOWNLOAD_NAME_RE.pattern)
+        try:
+            if not isinstance(pattern, str) or len(pattern) > 200:
+                raise re.error("not a short string")
+            re.compile(pattern)
+        except re.error as e:
+            raise PackageError(f"{where}: kind {kid}: pattern must be a regular expression ({e})")
+        out["kinds"].append({"id": kid, "label": _text(k.get("label", kid), f"{where}.{kid}.label", 40),
+                             "placeholder": _text(k.get("placeholder", ""), f"{where}.{kid}.placeholder", 80,
+                                                  required=False) or "",
+                             "pattern": pattern})
+    return out
+
+
+def download_name_ok(kind, name):
+    """Whether NAME may be downloaded as KIND (a normalized kind from a `downloads` section)."""
+    return (isinstance(name, str) and DOWNLOAD_NAME_RE.fullmatch(name) is not None and ".." not in name.split("/")
+            and re.fullmatch(kind["pattern"], name) is not None)
+
+
 def summary(manifest):
     """One line per thing a package adds, for people."""
     lines = []
+    for preset, spec in manifest.get("clusters", {}).items():
+        lines.append(f"cluster preset {spec['title']} ({preset}): {spec['host']}:{spec['port']}, SSH keys {spec['ssh_keys']}")
     for app_id, app in manifest["apps"].items():
         lines.append(f"app {app['title']} ({app_id}), tunnel {app['tunnel']}")
+        if app.get("downloads"):
+            lines.append(f"app {app_id}: {app['downloads']['label']} ("
+                         f"{', '.join(k['label'] for k in app['downloads']['kinds'])})")
     for tunnel, t in manifest["tunnels"].items():
         lines.append(f"tunnel {tunnel}: {t['files']} files{', with install.sh' if t['install'] else ''}")
     for tunnel, s in manifest["settings"].items():

@@ -281,7 +281,42 @@ class TestSubmit(JobServerTestCase):
         self.assertTrue(out["accepted"])
         self.assertIn("to start at", out["slurm_message"])
         self.assertIn("--time=00:15:00", out["sbatch_args"])
+        self.assertIn("--ntasks=1", out["sbatch_args"])
         self.assertIn("export HPC_PARAM_MESSAGE=hi", out["script"])
+        self.assertEqual(self.llm.jobs()["jobs"], [])
+
+    def test_dry_run_rejects_scheduler_errors_even_with_zero_exit_status(self):
+        rejection = ("sbatch: error: (from job_submit) either --ntasks, or --ntasks-per-node, "
+                     "or --nodes should be provided.\nallocation failure: Unspecified error")
+        for stdout, stderr in (("", rejection),
+                               (rejection, "sbatch: Warning: site notice"),
+                               ("allocation failure: Unspecified error", "")):
+            with self.subTest(stdout=stdout, stderr=stderr):
+                result = subprocess.CompletedProcess(["sbatch"], 0, stdout, stderr)
+                with mock.patch.object(self.jobs.runner, "run", return_value=result):
+                    out = self.llm.submit_job("hello", dry_run=True)
+                self.assertFalse(out["accepted"])
+                self.assertEqual(out["returncode"], 0)
+                for text in (stdout, stderr):
+                    if text:
+                        self.assertIn(text, out["slurm_message"])
+        self.assertEqual(self.llm.jobs()["jobs"], [])
+
+    def test_dry_run_preserves_warnings_and_success_message(self):
+        result = subprocess.CompletedProcess(
+            ["sbatch"], 0, "Job 999 to start at 2026-10-01T12:00:00",
+            "sbatch: Warning: site notice")
+        with mock.patch.object(self.jobs.runner, "run", return_value=result):
+            out = self.llm.submit_job("hello", dry_run=True)
+        self.assertTrue(out["accepted"])
+        self.assertIn(result.stdout, out["slurm_message"])
+        self.assertIn(result.stderr, out["slurm_message"])
+
+    def test_dry_run_rejects_nonzero_exit_status(self):
+        with mock.patch.dict(os.environ, {"FAKE_SBATCH_FAIL": "1"}):
+            out = self.llm.submit_job("hello", dry_run=True)
+        self.assertFalse(out["accepted"])
+        self.assertEqual(out["returncode"], 1)
         self.assertEqual(self.llm.jobs()["jobs"], [])
 
     def test_submit_records_job_and_passes_resources(self):
@@ -290,6 +325,7 @@ class TestSubmit(JobServerTestCase):
         job = fake_job(self.slurm, out["job_id"])
         self.assertIn("--time=00:30:00", job["args"])
         self.assertIn("--mem=1G", job["args"])
+        self.assertIn("--ntasks=1", job["args"])
         self.assertIn("--comment=hpclib-rest:llm:hello", job["args"])
         self.assertIn(f"--chdir={self.llm_root}", job["args"])
         self.assertEqual(job["cwd"], str(self.llm_root))

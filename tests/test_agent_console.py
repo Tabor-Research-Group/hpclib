@@ -71,6 +71,8 @@ class FakeShell:
         self.tokens = []                                                         # the app's tokens, for --tokens
         self.tokens_error = None                                                 # what tunnel_setup --tokens says instead
         self.secret_seen = []                                                    # whatever it printed with a token
+        self.downloads = []                                                      # what --downloads list says is there
+        self.downloads_error = None                                              # what --downloads says instead
         self.smb_status = {"host": "files.example.edu", "user": "me", "auth": "auto", "kinit": "host",
                            "rclone_kerberos": True, "ticket": None, "credentials": False, "image": True}
 
@@ -112,6 +114,21 @@ class FakeShell:
                     log.write(f"HPCLIB_TOKEN_REVOKED {rest[1]}\n".encode())
                 else:
                     log.write(b"setup_tunnel: tokens.sh revoke failed\n")
+        if args[0] == "tunnel_setup" and "--downloads" in args:   # like setup_tunnel.sh --downloads over downloads.sh
+            rest = args[args.index("--downloads") + 1:]
+            if self.downloads_error:
+                log.write(self.downloads_error.encode() + b"\n")
+            elif rest[0] == "list":
+                log.write(b"HPCLIB_DOWNLOADS " + json.dumps({"items": self.downloads, "note": "4.0 TB free"}).encode() + b"\n")
+            elif rest[0] == "pull":
+                log.write(f"pulling {rest[2]}\n".encode())
+                self.downloads.append({"kind": rest[1], "name": rest[2], "size": 1000, "in_use": False})
+            elif rest[0] == "remove":
+                if any(d["name"] == rest[2] and d["in_use"] for d in self.downloads):
+                    log.write(b"setup_tunnel: downloads.sh remove failed: it is in use by a running job\n")
+                else:
+                    self.downloads = [d for d in self.downloads if d["name"] != rest[2]]
+                    log.write(b"HPCLIB_DOWNLOAD_REMOVED " + json.dumps({"removed": rest[2]}).encode() + b"\n")
         if args[0] == "smbshell" and "status" in args:      # like tunnels/data-transfer/smbshell.sh status --json
             log.write(("HPCLIB_SMB_STATUS " + json.dumps(self.smb_status) + "\n").encode())
         return subprocess.Popen(["sleep", "30" if args[0] in ("agent_tunnel", "launch_tunnel") else "0"], start_new_session=True)
@@ -518,15 +535,17 @@ FAKE_SSH_LOGIN = textwrap.dedent("""\
     if mode == "odd":
         ask("Favourite colour: ")
         sys.exit(255)
-    if mode == "duo":
+    if mode in ("duo", "tacc"):
         code, answer = ask("(me@" + host + ") Password: ")
         if code or answer != os.environ["FAKE_SSH_PASSWORD"]:
             ask("(me@" + host + ") Password: ")
             print("Permission denied (keyboard-interactive).", file=sys.stderr)
             sys.exit(255)
-        code, answer = ask("Duo two-factor login for me\\n\\nEnter a passcode or select one of the following "
-                           "options:\\n\\n 1. Duo Push to XXX-XXX-1234\\n\\nPasscode or option (1-1): ")
-        if code or answer != "1":
+        prompt = "(me@" + host + ") TACC Token Code: " if mode == "tacc" else (
+            "Duo two-factor login for me\\n\\nEnter a passcode or select one of the following "
+            "options:\\n\\n 1. Duo Push to XXX-XXX-1234\\n\\nPasscode or option (1-1): ")
+        code, answer = ask(prompt)
+        if code or answer != ("123456" if mode == "tacc" else "1"):
             sys.exit(255)
         time.sleep(float(os.environ.get("FAKE_PUSH_SECONDS", "0.6")))   # the phone
     open(master, "w").close()
@@ -535,6 +554,27 @@ FAKE_SSH_LOGIN = textwrap.dedent("""\
 
 
 class TestLogin(ConsoleTestCase):
+
+    def test_tacc_code_entry_is_one_time_and_never_in_status_or_logs(self):
+        with mock.patch.dict(os.environ, {"FAKE_SSH_MODE": "tacc"}):
+            out, _ = self.login({"password": "hunter2"}, until=("code_required", "failed"))
+            self.assertEqual(out["state"], "code_required", out)
+            route = f"/api/clusters/{self.dead}/login/answer"
+            self.assertEqual(self.call("POST", route, {"code": "123456", "challenge": out["challenge"]}, key=None)[0], 401)
+            self.assertEqual(self.call("POST", route, {"code": "123456", "challenge": "stale"})[0], 409)
+            self.assertEqual(self.call("POST", route, {"code": "bad", "challenge": out["challenge"]})[0], 422)
+            status, answer = self.call("POST", route, {"code": "123456", "challenge": out["challenge"]})
+            self.assertEqual(status, 202, answer)
+            self.assertNotIn("123456", json.dumps(answer))
+            self.assertEqual(self.call("POST", route, {"code": "123456", "challenge": out["challenge"]})[0], 409)
+            for _ in range(40):
+                done = self.call("GET", f"/api/clusters/{self.dead}/login")[1]
+                if done["state"] == "connected": break
+                time.sleep(0.1)
+            self.assertEqual(done["state"], "connected", done)
+            self.assertNotIn("123456", json.dumps(done))
+            for path in self.console.rglob("*.log"):
+                self.assertNotIn("123456", path.read_text())
 
     def setUp(self):
         super().setUp()

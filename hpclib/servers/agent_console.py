@@ -28,6 +28,11 @@ The front end depends only on the routes below; nothing here depends on it.
                                               the ssh connection pssh and agent_tunnel reuse
   POST /api/clusters/NAME/logout              close that connection
   POST /api/clusters                          {"host": "user@host", "port"?, "jump"?}: a profile for a new cluster
+  GET  /api/cluster-presets                   configuration choices from installed packages
+  POST /api/cluster-presets/ID               create a profile from a preset: username, work_dir,
+                                              account?, tunnel_args?, jump?; no remote action
+  POST /api/clusters/NAME/login/answer        {"code", "challenge"}: answer the current MFA code prompt;
+                                              codes are used once and never saved
   POST /api/clusters/NAME/install             install_hpclib over the login ({"force": true} reinstalls)
   POST /api/clusters/NAME/setup               setup_agents ({"work_dirs": [...], "binds": [...],
                                               "templates": "...", "rebuild": false})
@@ -54,6 +59,12 @@ The front end depends only on the routes below; nothing here depends on it.
                                               the token once ("token"), or, with save_to (an absolute path on the
                                               cluster), only that the file holds it: never kept or logged here
   DELETE /api/apps/APP/NAME/tokens/ID         revoke one
+  GET  /api/apps/APP/NAME/downloads           what a packaged app has downloaded to the cluster (its `downloads`
+                                              section: OpenCode's models), listed by the tunnel's downloads.sh:
+                                              {"items": [{"kind", "name", "size", "in_use", "note"}], "note"}
+  POST /api/apps/APP/NAME/downloads           {"kind", "name"}: download one, on the login node, as an operation with
+                                              its log (GET /api/clusters/NAME/operation), like Install
+  POST /api/apps/APP/NAME/downloads/remove    {"kind", "name"}: remove one (downloads.sh refuses what is in use)
   POST /api/apps/APP/NAME/check               is the tunnel installed? (its install.sh --check, on the cluster)
   GET  /api/apps/APP/NAME/instances           a shared app's running instances on the cluster, with owners
   POST /api/apps/APP/NAME/control/ID          one of the session's `controls`, e.g. stop_instance {"job": ...}:
@@ -140,6 +151,8 @@ TRANSFER_GUI_RE = re.compile(r"^HPCLIB_(TRANSFER|RCLONE)_GUI((?: [a-z]+=\S*)+)\s
 # port of its own. Optional parts:
 #   token_re      the app's access token in the job's log (streamed back over ssh), added to the URL to open
 #   password_re   a password it prints there instead, shown next to Open
+#   login_user    with password_re: the user name of a basic-auth login; Open signs in with both (user:password@ in
+#                 the URL, as for Data transfer's GUI), and the row shows the name in case the page asks again
 #   env_settings  JupyterLab's conda environment, modules and uv/pixi project fields
 #   settings      [(NAME, label, hint[, choices])]: the tunnel's TUNNEL_SETTINGS (tunnel_config.sh) the page
 #                 edits (with choices: a select of those values); they are saved on the cluster
@@ -259,15 +272,23 @@ def load_package_apps(store=None):
             spec["reinstall"] = dict(app["reinstall"])
         if app.get("token_regex"):
             spec["token_re"] = re.compile(app["token_regex"])
+        if app.get("password_regex"):   # shown beside Open, with Copy password (VS Code's password_re)
+            spec["password_re"] = re.compile(app["password_regex"], re.M)
+        if app.get("login_user"):
+            spec["login_user"] = app["login_user"]
         if app.get("secrets"):
             spec["secrets"] = [(f["name"], f["label"], f["hint"]) for f in app["secrets"]]
         if app.get("tokens"):
             spec["tokens"] = dict(app["tokens"])
+        if app.get("downloads"):
+            spec["downloads"] = dict(app["downloads"])
         APPS[app_id] = spec
     return store
 SECRETS_STATUS_RE = re.compile(r"^HPCLIB_TUNNEL_SECRETS((?: [A-Z_][A-Z0-9_]*:(?:set|unset))*)\s*$", re.M)
 SECRET_VALUE_RE = re.compile(r"[^\0\n\r]{1,4096}")
 TOKENS_LINE_RE = re.compile(r"^HPCLIB_TOKENS (\{.*\})\s*$", re.M)
+DOWNLOADS_LINE_RE = re.compile(r"^HPCLIB_DOWNLOADS (\{.*\})\s*$", re.M)
+DOWNLOAD_REMOVED_RE = re.compile(r"^HPCLIB_DOWNLOAD_REMOVED (\{.*\})\s*$", re.M)
 TOKEN_CREATED_RE = re.compile(r"^HPCLIB_TOKEN_CREATED (\{.*\})\s*$", re.M)
 TOKEN_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._@-]{0,63}")
 TOKEN_ID_RE = re.compile(r"[A-Za-z0-9]{1,32}")
@@ -297,8 +318,8 @@ def local_hpclib_version():
         return None
     return m.group(1) if m else None
 REST_ROUTE_RE = re.compile(r"[A-Za-z0-9_./-]{1,256}")
-PROFILE_KEYS = ("name", "host", "port", "process_port", "work_dirs", "binds", "local_roots", "token_name",
-                "mcp_name", "created", "updated")
+PROFILE_KEYS = ("name", "host", "port", "process_port", "work_dirs", "binds", "local_roots", "token_name", "preset",
+                "mcp_name", "created", "updated", "setup_config")
 
 
 class ConsoleError(Exception):
@@ -502,12 +523,13 @@ class Logins:
     ssh asks for the password and the second factor through SSH_ASKPASS
     (console_askpass.py), which relays each prompt here. For now the console
     answers a password prompt with the password given to `connect` and a Duo
-    prompt with "1" (a push to the phone); any other prompt ends the attempt
-    with its text, so it can be handled later. The password is kept in memory
-    only until ssh has used it.
+    prompt with "1" (a push to the phone). Numeric code prompts wait for the
+    authenticated login/answer endpoint. Other prompts end the attempt with
+    their text. Passwords and codes stay in memory only until ssh uses them.
     """
 
     PASSWORD_RE = re.compile(r"pass(word|phrase)", re.I)
+    CODE_RE = re.compile(r"(?:TACC token code|verification code|authentication code|security code|token code|one[- ]time(?: password| code)?)\s*:\s*$", re.I)
     PUSH_RE = re.compile(r"passcode|option|duo|two-factor|second factor", re.I)
     HOST_KEY_RE = re.compile(r"yes/no|fingerprint|authenticity", re.I)
     CONTROL_PATH = "~/.ssh/connections/%r@%h:%p"
@@ -577,24 +599,65 @@ class Logins:
             if self.HOST_KEY_RE.search(prompt):
                 return self._fail(attempt, "ssh doesn't know this host's key yet; connect once in a terminal "
                                            "(ssh " + attempt["host"] + ") to accept it, then try again", shown)
-            if self.PASSWORD_RE.search(prompt):
-                if attempt["password_used"]:
-                    return self._fail(attempt, "the password was not accepted", shown)
-                if not attempt["password"]:
-                    return self._fail(attempt, "the cluster asks for a password; enter it and connect again", shown)
-                answer, attempt["password"], attempt["password_used"] = attempt["password"], None, True
-                attempt.update(state="password_sent", message="password sent")
-                return {"answer": answer}
-            if self.PUSH_RE.search(prompt):
-                if attempt["push_sent"]:
-                    return self._fail(attempt, "the push was not approved", shown)
-                attempt.update(push_sent=True, state="push_sent",
-                               message="Duo push sent: approve it on your phone")
-                return {"answer": "1"}
-            return self._fail(attempt, "the cluster asked something the console doesn't answer yet", shown)
+            if self.CODE_RE.search(prompt):
+                event = threading.Event()
+                challenge = secrets.token_urlsafe(18)
+                attempt.update(state="code_required", message="Enter the code from your authenticator or SMS",
+                               prompt=shown, challenge=challenge, code_event=event, code_answer=None)
+            else:
+                event = None
+            if event is None:
+                return self._answer_standard_prompt(attempt, prompt, shown)
+        # The askpass process waits here; the HTTP login/answer request signals it.
+        event.wait(self.TIMEOUT)
+        with self.lock:
+            answer = attempt.pop("code_answer", None)
+            attempt.pop("code_event", None)
+            attempt.pop("challenge", None)
+            if answer is None or attempt["state"] == "failed":
+                return self._fail(attempt, "code entry expired or login was stopped", shown)
+            attempt.update(state="starting", message="Code sent; completing login", prompt=None)
+            return {"answer": answer}
+
+    def answer_code(self, profile, body):
+        if set(body) - {"code", "challenge"}:
+            raise ConsoleError(400, "code entry takes code and challenge")
+        code = body.get("code")
+        if not isinstance(code, str) or not re.fullmatch(r"[0-9]{6,12}", code):
+            raise ConsoleError(422, "enter the numeric MFA code")
+        with self.lock:
+            attempt = self.attempts.get(profile["name"])
+            if not attempt or attempt["state"] != "code_required" or body.get("challenge") != attempt.get("challenge"):
+                raise ConsoleError(409, "this code prompt is no longer waiting; refresh the login state")
+            attempt["code_answer"] = code
+            attempt["state"] = "starting"
+            attempt["message"] = "Code sent; completing login"
+            attempt["code_event"].set()
+        return self.status(profile, check=False)
+
+    def _answer_standard_prompt(self, attempt, prompt, shown):
+        """Called with the attempt lock held; password and Duo behavior is unchanged."""
+        if self.PASSWORD_RE.search(prompt):
+            if attempt["password_used"]:
+                return self._fail(attempt, "the password was not accepted", shown)
+            if not attempt["password"]:
+                return self._fail(attempt, "the cluster asks for a password; enter it and connect again", shown)
+            answer, attempt["password"], attempt["password_used"] = attempt["password"], None, True
+            attempt.update(state="password_sent", message="password sent")
+            return {"answer": answer}
+        if self.PUSH_RE.search(prompt):
+            if attempt["push_sent"]:
+                return self._fail(attempt, "the push was not approved", shown)
+            attempt.update(push_sent=True, state="push_sent",
+                           message="Duo push sent: approve it on your phone")
+            return {"answer": "1"}
+        return self._fail(attempt, "the cluster asked something the console doesn't answer yet", shown)
 
     def _fail(self, attempt, message, prompt=None):
         attempt.update(state="failed", message=message, password=None)
+        attempt["code_answer"] = None
+        if attempt.get("code_event"):
+            attempt["code_event"].set()
         if prompt:
             attempt["prompt"] = prompt
         return {"error": message}
@@ -633,8 +696,8 @@ class Logins:
         hours = profile.get("connection_hours") or self.DEFAULT_HOURS
         out = {"cluster": profile["name"], "connection_hours": hours}
         if attempt:
-            out.update({k: attempt.get(k) for k in ("state", "message", "started", "finished", "prompt")})
-        if attempt.get("state") in ("starting", "password_sent", "push_sent"):
+            out.update({k: attempt.get(k) for k in ("state", "message", "started", "finished", "prompt", "challenge")})
+        if attempt.get("state") in ("starting", "password_sent", "push_sent", "code_required"):
             return out
         if check:
             connected = self.alive(profile)
@@ -654,7 +717,7 @@ class Logins:
         name = profile["name"]
         with self.lock:
             current = self.attempts.get(name)
-            if current and current["state"] in ("starting", "password_sent", "push_sent"):
+            if current and current["state"] in ("starting", "password_sent", "push_sent", "code_required"):
                 raise ConsoleError(409, f"a login to {name} is already in progress")
         if self.alive(profile):
             with self.lock:
@@ -709,6 +772,9 @@ class Logins:
         with self.lock:
             self.by_nonce.pop(nonce, None)
             attempt["password"] = None
+            attempt["code_answer"] = None
+            if attempt.get("code_event"):
+                attempt["code_event"].set()
             attempt["finished"] = time.time()
             if attempt["state"] == "failed":
                 return
@@ -731,7 +797,9 @@ class Logins:
         except (OSError, subprocess.TimeoutExpired) as e:
             raise ConsoleError(502, f"could not run ssh: {e}")
         with self.lock:
-            self.attempts.pop(profile["name"], None)
+            attempt = self.attempts.pop(profile["name"], None)
+            if attempt:
+                self._fail(attempt, "login was stopped")
         return {"logged_out": res.returncode == 0, "detail": (res.stderr or res.stdout).strip()}
 
 
@@ -1029,6 +1097,8 @@ class Clusters:
         return self.run_operation(profile, "install", ["install_hpclib"] + (["--force"] if force else []) + login)
 
     def setup_ssh(self, profile, body):
+        if (profile.get("preset") or {}).get("ssh_keys") == "site-managed":
+            raise ConsoleError(409, "this cluster's SSH keys are managed by the site; hpclib key setup is disabled")
         if body:
             raise ConsoleError(422, "SSH setup takes no key paths or private-key contents")
         login = list(profile.get("login") or [])
@@ -1061,6 +1131,15 @@ class Clusters:
             raise ConsoleError(400, "rebuild must be true or false")
         if rebuild:
             args.append("--rebuild")
+        config = profile.get("setup_config")
+        if config is not None:
+            try:
+                config = console_packages.check_cluster_config(config)
+            except console_packages.PackageError as e:
+                raise ConsoleError(422, str(e)) from e
+            path = os.path.join(agent_profiles.profile_dir(profile["name"]), "setup-config.json")
+            write_private(path, json.dumps(config, indent=2) + "\n")
+            args += ["--config", path]
         return self.run_operation(profile, "setup", args + [profile["name"]])
 
     def add(self, body):
@@ -1087,6 +1166,66 @@ class Clusters:
             agent_profiles.cmd_init(name, host)
         agent_profiles.cmd_set(name, "login=", *[f"login+={a}" for a in login + [host]])
         return self.describe(agent_profiles.load(name), tunnel=False)
+
+    def preset_specs(self):
+        try:
+            return self.packages.cluster_presets()
+        except console_packages.PackageError as e:
+            raise ConsoleError(422, str(e)) from e
+
+    def add_preset(self, preset_id, body):
+        spec = self.preset_specs().get(preset_id)
+        if spec is None:
+            raise ConsoleError(404, "no installed cluster preset with this ID")
+        if set(body) - {"username", "work_dir", "account", "tunnel_args", "jump"}:
+            raise ConsoleError(400, "preset fields are username, work_dir, account, tunnel_args and jump")
+        username = body.get("username")
+        work = body.get("work_dir", spec["defaults"].get("work_dir"))
+        if not isinstance(username, str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}", username):
+            raise ConsoleError(422, "enter the cluster's username")
+        if isinstance(work, str):
+            work = work.replace("{username}", username)
+        if not isinstance(work, str) or not os.path.isabs(work) or len(work) > 1024 or any(c in work for c in "\0\r\n"):
+            raise ConsoleError(422, "work_dir must be one absolute path on the cluster")
+        args = body.get("tunnel_args", spec["defaults"]["tunnel_args"])
+        if not isinstance(args, list) or len(args) > 16 or not all(isinstance(a, str) and agent_profiles.TUNNEL_ARG_RE.fullmatch(a) for a in args):
+            raise ConsoleError(422, "invalid tunnel resource options")
+        args = list(args)
+        account = body.get("account") or ""
+        if not isinstance(account, str) or (account and not re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}", account)):
+            raise ConsoleError(422, "invalid allocation/account name")
+        if account:
+            args = [a for a in args if not a.startswith("--account=")] + ["--account=" + account]
+        def personalize(value):
+            if isinstance(value, str):
+                return value.replace("{username}", username)
+            if isinstance(value, list):
+                return [personalize(v) for v in value]
+            if isinstance(value, dict):
+                return {k: personalize(v) for k, v in value.items()}
+            return value
+        apps = personalize(spec["defaults"].get("app_settings", {}))
+        for app, settings in apps.items():
+            if app not in APPS:
+                raise ConsoleError(422, f"install app {app} first so its non-secret settings can be checked")
+            apps[app] = self.checked_app_settings(APPS[app], {}, settings)
+        config = spec["defaults"].get("rest_config")
+        if config is not None:
+            try:
+                config = console_packages.check_cluster_config(personalize(config))
+            except console_packages.PackageError as e:
+                raise ConsoleError(422, str(e)) from e
+        profile = self.add({"host": username + "@" + spec["host"], "port": spec["port"], "jump": body.get("jump")})
+        fresh = agent_profiles.load(profile["name"])
+        fresh.update(work_dirs=[work], tunnel_args=args, rest_on=spec["defaults"]["rest_on"],
+                     connection_hours=spec["defaults"]["connection_hours"],
+                     preset={k: spec[k] for k in ("id", "package", "package_version", "title", "description", "documentation_url", "ssh_keys")})
+        if apps:
+            fresh["apps"] = apps
+        if config is not None:
+            fresh["setup_config"] = config
+        agent_profiles.save(fresh)
+        return self.describe(fresh, tunnel=False)
 
     # -- tunnel apps (JupyterLab, ...) ----------------------------------------
 
@@ -1135,12 +1274,21 @@ class Clusters:
                 "installable": self.app_installable(app),
                 "applies": "the next time it starts; settings go to the cluster with the next Check, Install or Start"}
 
-    def save_app_settings(self, profile, app, body):
-        spec = self.app_spec(app)
+    @staticmethod
+    def checked_app_settings(spec, conf, body):
+        """Shared validation for app settings forms and personalized cluster defaults."""
+        try:
+            console_packages.check_public_defaults(body, "app settings")
+        except console_packages.PackageError as e:
+            raise ConsoleError(422, str(e)) from e
+        secret_names = {f[0] for f in spec.get("secrets", [])}
+        values = body.get("settings") or {}
+        if isinstance(values, dict) and set(values) & secret_names:
+            raise ConsoleError(422, "secret fields cannot be stored in plaintext app settings")
+        conf = json.loads(json.dumps(conf))
         unknown = set(body) - {"tunnel_args", "conda_env", "modules", "project", "settings"}
         if unknown:
             raise ConsoleError(400, f"unknown settings {sorted(unknown)}")
-        fresh, conf = self.app_config(profile, app, save=False)
         if "tunnel_args" in body:
             args = body["tunnel_args"]
             if not isinstance(args, list) or not all(isinstance(a, str) and agent_profiles.TUNNEL_ARG_RE.fullmatch(a)
@@ -1184,6 +1332,12 @@ class Clusters:
                     settings["SMB_ROOT"] = "/".join(parts[1:])
             conf["settings"] = settings
         conf["pushed"] = None              # the cluster's copy is out of date until the next Check, Install or Start
+        return conf
+
+    def save_app_settings(self, profile, app, body):
+        spec = self.app_spec(app)
+        fresh, conf = self.app_config(profile, app, save=False)
+        fresh["apps"][app] = self.checked_app_settings(spec, conf, body)
         agent_profiles.save(fresh)
         return self.app_settings(fresh, app)
 
@@ -1396,6 +1550,78 @@ class Clusters:
         if f"HPCLIB_TOKEN_REVOKED {ident}" not in text:
             raise self._tokens_failure(f"token {ident} wasn't revoked", text)
         return {"app": app, "cluster": profile["name"], "revoked": ident}
+
+    # -- what an app downloads to the cluster (a package's `downloads` section: OpenCode's models) ----------------
+
+    def _downloads_spec(self, app):
+        spec = self.app_spec(app)
+        if not spec.get("downloads"):
+            raise ConsoleError(404, f"{spec['title']} has nothing to download")
+        return spec
+
+    def _download_target(self, spec, body):
+        """(kind, name) from {"kind", "name"}, checked against the app's kinds."""
+        if not isinstance(body, dict) or set(body) != {"kind", "name"}:
+            raise ConsoleError(400, "send {\"kind\", \"name\"}")
+        kinds = {k["id"]: k for k in spec["downloads"]["kinds"]}
+        kind = kinds.get(body["kind"]) if isinstance(body["kind"], str) else None
+        if kind is None:
+            raise ConsoleError(422, f"kind: one of {sorted(kinds)}")
+        name = body["name"].strip() if isinstance(body["name"], str) else None
+        if not console_packages.download_name_ok(kind, name):
+            hint = f", e.g. {kind['placeholder']}" if kind["placeholder"] else ""
+            raise ConsoleError(422, f"name: not a {kind['label']} name{hint}")
+        return kind["id"], name
+
+    @staticmethod
+    def _download_record(rec, kinds):
+        if not isinstance(rec, dict) or rec.get("kind") not in kinds or not isinstance(rec.get("name"), str):
+            return None
+        size = rec.get("size")
+        return {"kind": rec["kind"], "name": rec["name"][:200],
+                "size": size if isinstance(size, int) and not isinstance(size, bool) and size >= 0 else None,
+                "in_use": rec.get("in_use") is True, "note": str(rec.get("note") or "")[:200]}
+
+    def app_downloads(self, profile, app):
+        """What the app has downloaded to the cluster, from its downloads.sh."""
+        spec = self._downloads_spec(app)
+        if not self.logins.alive(profile):
+            raise ConsoleError(409, f"log in to {profile['name']} first: the list comes over the console's ssh login")
+        text = self._run_setup(profile, self.setup_args(profile, app, "--downloads", "list"), 180)
+        found = DOWNLOADS_LINE_RE.findall(text)
+        if not found:
+            raise self._tokens_failure("couldn't list the downloads", text)
+        try:
+            listing = json.loads(found[-1])
+        except ValueError:
+            raise ConsoleError(502, "the tunnel's downloads.sh didn't print valid JSON")
+        kinds = {k["id"] for k in spec["downloads"]["kinds"]}
+        records = listing.get("items") if isinstance(listing, dict) else None
+        items = [r for r in map(lambda r: self._download_record(r, kinds), records if isinstance(records, list) else [])
+                 if r]
+        return {"app": app, "cluster": profile["name"], "items": items,
+                "note": str(listing.get("note") or "")[:400] if isinstance(listing, dict) else ""}
+
+    def app_download(self, profile, app, body):
+        """Download one on the cluster's login node: an operation with its log (it can take hours), then a Check."""
+        spec = self._downloads_spec(app)
+        kind, name = self._download_target(spec, body)
+        args = self.setup_args(profile, app, "--check", "--downloads", "pull", kind, name)
+        return self.run_operation(profile, "download", args, title=f"download {name}", app=app)
+
+    def app_download_remove(self, profile, app, body):
+        spec = self._downloads_spec(app)
+        kind, name = self._download_target(spec, body)
+        if not self.logins.alive(profile):
+            raise ConsoleError(409, f"log in to {profile['name']} first")
+        with self.lock:
+            op = self.ops.get(profile["name"])
+            if op and op["state"] == "running":
+                raise ConsoleError(409, f"{op['title']} is running on {profile['name']}; remove it when that is done")
+        text = self._run_setup(profile, self.setup_args(profile, app, "--downloads", "remove", kind, name), 300)
+        if not DOWNLOAD_REMOVED_RE.findall(text):
+            raise self._tokens_failure(f"{name} wasn't removed", text)
+        return {"app": app, "cluster": profile["name"], "removed": {"kind": kind, "name": name}}
 
     def _run_with_input(self, args, data, wait):
         """An hpclib shell function with `data` on its standard input; (exit code, output). Nothing is logged."""
@@ -1707,6 +1933,8 @@ class Clusters:
                "install": (conf.get("install") or {"state": "unchecked"}) if self.app_installable(app)
                           else {"state": "nothing"},
                "shared": bool(spec.get("shared")), "kind": spec.get("kind", "tunnel")}
+        if spec.get("downloads"):    # the row's download toolbar (a package's `downloads` section)
+            out["downloads"] = spec["downloads"]
         if spec.get("smb"):
             with self.lock:
                 control = self.control_procs.get((name, app))
@@ -1749,7 +1977,13 @@ class Clusters:
             return dict(out, state="up", token_known=True, **self.transfer_gui_url(port, spec, *found[-1]))
         extra = {}
         if spec.get("password_re") is not None:
-            extra["password"] = self._app_token(name, app, "password_re")
+            extra["password"] = password = self._app_token(name, app, "password_re")
+            if spec.get("login_user"):
+                # a basic-auth login: Open answers it (the browser keeps it for the page's own requests)
+                extra["username"] = spec["login_user"]
+                if password:
+                    q = urllib.parse.quote
+                    url = url.replace("http://", f"http://{q(spec['login_user'], safe='')}:{q(password, safe='')}@", 1)
         return dict(out, state="up", version=info.get("version"), url=url,
                     token_known=token is not None or "token_re" not in spec, **extra)
 
@@ -2112,6 +2346,10 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             return self.app_route(verb, parts[1], parts[2:])
         if parts == ["clusters"] and verb == "POST":
             return 201, dict(c.add(self.json_body()), ok=True)
+        if parts == ["cluster-presets"] and verb == "GET":
+            return 200, {"ok": True, "presets": list(c.preset_specs().values())}
+        if len(parts) == 2 and parts[0] == "cluster-presets" and verb == "POST":
+            return 201, dict(c.add_preset(parts[1], self.json_body()), ok=True)
         if parts == ["clusters"] and verb == "GET":
             profiles = agent_profiles.all_profiles()
             with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(profiles)))) as pool:
@@ -2140,6 +2378,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 return 200, dict(c.logins.status(profile), ok=True)
             if rest == ["login"] and verb == "POST":
                 return 202, dict(c.logins.connect(profile, self.json_body().get("password")), ok=True)
+            if rest == ["login", "answer"] and verb == "POST":
+                return 202, dict(c.logins.answer_code(profile, self.json_body()), ok=True)
             if rest == ["logout"] and verb == "POST":
                 return 200, dict(c.logins.disconnect(profile), ok=True)
             if rest == ["settings"] and verb == "GET":
@@ -2197,6 +2437,12 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             return 201, dict(c.create_token(profile, app, self.json_body()), ok=True)
         if len(action) == 2 and action[0] == "tokens" and verb == "DELETE":
             return 200, dict(c.revoke_token(profile, app, action[1]), ok=True)
+        if action == ["downloads"] and verb == "GET":
+            return 200, dict(c.app_downloads(profile, app), ok=True)
+        if action == ["downloads"] and verb == "POST":
+            return 202, dict(c.app_download(profile, app, self.json_body()), ok=True)
+        if action == ["downloads", "remove"] and verb == "POST":
+            return 200, dict(c.app_download_remove(profile, app, self.json_body()), ok=True)
         if action == ["secrets"] and verb == "PUT":
             return 200, dict(c.send_secrets(profile, app, self.json_body()), ok=True)
         if action == ["settings"] and verb == "PUT":
@@ -2204,6 +2450,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         raise ConsoleError(404, f"no route {verb} /api/apps/{app}/{'/'.join(rest)}")
 
     def proxy(self, verb, profile, route):
+        if (profile.get("preset") or {}).get("ssh_keys") == "site-managed" and route.startswith("admin/ssh/") and verb != "GET":
+            raise ConsoleError(409, "this cluster's SSH files are managed by the site; only read operations are available")
         if not REST_ROUTE_RE.fullmatch(route) or ".." in route.split("/"):
             raise ConsoleError(400, f"invalid cluster route {route!r}")
         query = {k: v for k, v in self.query.items() if k != "as"}

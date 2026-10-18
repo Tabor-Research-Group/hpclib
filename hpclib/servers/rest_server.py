@@ -102,6 +102,8 @@ Usage: rest_server.py [--host H] [--port P] [--allow DIR ...] [--config F]
        rest_server.py --list-proposals | --approve-template NAME [--replace] | --reject-template NAME
        rest_server.py --init-config [--config-base F] [--rebuild] [--no-sandbox] [--sandbox-bind DIR ...]
        rest_server.py --probe-sandbox
+       rest_server.py --sandbox-script SCRIPT [--sandbox-writable DIR ...] [--sandbox-read-only DIR ...]
+                      [--sandbox-network host]    (prints bash that runs SCRIPT in the template jobs' sandbox)
 """
 import sys
 
@@ -1515,6 +1517,19 @@ def parse_args(argv=None):
                             "on MODULEPATH are added automatically")
     setup.add_argument("--probe-sandbox", action="store_true",
                        help="print what this node supports for sandboxing, and test the configured sandbox")
+    service = parser.add_argument_group(
+        "sandboxed services (run in a tunnel's job; prints bash and exits)",
+        "--sandbox-script prints the bash that runs SCRIPT (a shell or Python script) in the sandbox the config "
+        "gives template jobs, for a tunnel that runs a program in it (the opencode package's agent, say). "
+        "Exits 3, printing why, when that sandbox is off or unavailable.")
+    service.add_argument("--sandbox-script", metavar="SCRIPT")
+    service.add_argument("--sandbox-writable", action="append", default=[], metavar="DIR",
+                         help="bound read-write (repeatable); never hpclib's own data")
+    service.add_argument("--sandbox-read-only", action="append", default=[], metavar="DIR",
+                         help="bound read-only, besides the config's binds (repeatable)")
+    service.add_argument("--sandbox-network", choices=("config", "host"), default="config",
+                         help="host: share the node's network, loopback included (podman --network=host; "
+                              "Apptainer always does)")
     return parser.parse_args(argv)
 
 def manage_tokens(opts, config):
@@ -1704,6 +1719,46 @@ def probe_sandbox(config):
         print("  (probed on this node; jobs run on compute nodes, where GET /sandbox reports again)")
     return test is None or test.get("passed", False)
 
+def sandbox_script(opts, config):
+    """
+    --sandbox-script: print the bash lines that run the script in the template jobs' sandbox; returns the exit
+    status (3: no sandbox to run it in). hpclib's own data (the tunnels' directory, templates, tokens, the job
+    database) is never made writable, and nothing may be bound over it.
+    """
+    try:
+        with open(os.path.expanduser(opts.sandbox_script)) as f:
+            text = f.read()
+    except OSError as e:
+        print(f"rest_server: cannot read {opts.sandbox_script}: {e}", file=sys.stderr)
+        return 2
+    shebang, _, body = text.partition("\n") if text.startswith("#!") else ("#!/bin/bash", "", text)
+    protected = [os.path.realpath(os.path.expanduser(p)) for p in
+                 (tunnels_data_dir(), config["templates_dir"], config["jobs_db"], config["tokens_file"],
+                  config["path"], config["proposals_dir"]) + ((config["audit_log"],) if config.get("audit_log") else ())]
+    binds = {"writable": [], "read-only": []}
+    for kind, given in (("writable", opts.sandbox_writable), ("read-only", opts.sandbox_read_only)):
+        for d in given:
+            real = os.path.realpath(os.path.expanduser(d))
+            clash = [p for p in protected if real == p or p.startswith(real + os.sep) or real.startswith(p + os.sep)]
+            if clash:
+                print(f"rest_server: {d} can't be bound ({kind}) in the sandbox: it holds or is inside hpclib's own "
+                      f"data ({clash[0]})", file=sys.stderr)
+                return 2
+            binds[kind].append(real)
+    sandbox = rest_sandbox.Sandbox(config.get("sandbox"), data_dir=rest_data_dir())
+    try:
+        lines, plan = sandbox.launch(shebang, body, binds["writable"], extra_ro=binds["read-only"],
+                                     network="host" if opts.sandbox_network == "host" else False)
+    except rest_sandbox.SandboxError as e:
+        print(f"rest_server: the job sandbox is unavailable: {e}", file=sys.stderr)
+        return 3
+    if lines is None:
+        print(f"rest_server: template jobs aren't sandboxed here ({plan.get('reason')}); add a `sandbox` to "
+              f"{config['path']} (setup_agents does)", file=sys.stderr)
+        return 3
+    print("\n".join(lines))
+    return 0
+
 def build_jobs(config, command_timeout, auto_approve=None):
     sandbox = rest_sandbox.Sandbox(config.get("sandbox"), data_dir=rest_data_dir())
     scheduler = rest_local.check_scheduler_section(config.get("scheduler"))
@@ -1745,6 +1800,8 @@ def main(argv=None, handler_class=HPCRESTHandler):
     config = load_config(opts.config)
     if opts.probe_sandbox:
         sys.exit(0 if probe_sandbox(config) else 1)
+    if opts.sandbox_script:
+        sys.exit(sandbox_script(opts, config))
     if manage_tokens(opts, config):
         return
 

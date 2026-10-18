@@ -1752,8 +1752,11 @@ class JobManager:
             res = self.runner.run(args + ["--test-only"], input=script, cwd=workdir)
             if tasks is not None and len(script) > 20000:
                 plan["script"] = script[:20000] + f"\n... ({len(script) - 20000} more bytes)"
-            return 200, dict(plan, dry_run=True, accepted=res.returncode == 0,
-                             slurm_message=(res.stderr or res.stdout).strip())
+            slurm_message = "\n".join(part.strip() for part in (res.stderr, res.stdout) if part.strip())
+            # Some Slurm/site plugins print a rejection but return zero for --test-only.
+            rejected = re.search(r"(?im)^\s*(?:sbatch:\s*error:|allocation failure:)", slurm_message)
+            return 200, dict(plan, dry_run=True, accepted=res.returncode == 0 and rejected is None,
+                             returncode=res.returncode, slurm_message=slurm_message)
 
         with self.submit_lock:
             if key is not None:

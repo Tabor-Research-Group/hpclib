@@ -96,9 +96,11 @@ import time
 __all__ = ["SandboxError", "Sandbox", "build_host_image", "probe", "child_env"]
 
 # Set by the Python launcher setup_agents writes when it loads a Python module:
-# the environment from before that, base64 of `env -0`. Commands and jobs the
-# server starts get it, so they don't inherit the server's Python modules.
+# the environment from before that, `env -0` on an inherited descriptor.
+# Commands and jobs the server starts get it, so they don't inherit the server's
+# Python modules. Older launchers supplied a base64 environment variable.
 BASE_ENV_VAR = "HPCLIB_BASE_ENV"
+BASE_ENV_FD_VAR = "HPCLIB_BASE_ENV_FD"
 SECRET_ENV_PREFIXES = ("HPC_REST_TOKEN",)
 
 
@@ -108,12 +110,32 @@ def _decode_base_env(text):
         raw = base64.b64decode(text.encode(), validate=False)
     except (ValueError, TypeError):
         return None
+    return _parse_base_env(raw)
+
+
+def _parse_base_env(raw):
     env = {}
     for item in raw.split(b"\0"):
         key, sep, value = item.partition(b"=")
         if sep and key:
             env[key.decode("utf-8", "surrogateescape")] = value.decode("utf-8", "surrogateescape")
     return env or None
+
+
+def _read_base_env_fd(text):
+    try:
+        fd = int(text)
+        chunks, offset = [], 0
+        while True:
+            # pread leaves the descriptor's offset alone, including for concurrent calls.
+            chunk = os.pread(fd, 65536, offset)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            offset += len(chunk)
+        return _parse_base_env(b"".join(chunks))
+    except (AttributeError, OSError, OverflowError, ValueError):
+        return None
 
 
 def child_env(env=None):
@@ -123,11 +145,13 @@ def child_env(env=None):
     minus anything secret.
     """
     if env is None:
+        saved_fd = os.environ.get(BASE_ENV_FD_VAR)
         saved = os.environ.get(BASE_ENV_VAR)
-        env = (_decode_base_env(saved) if saved else None) or os.environ
+        env = ((_read_base_env_fd(saved_fd) if saved_fd else None) or
+               (_decode_base_env(saved) if saved else None) or os.environ)
     env = dict(env)
     for key in list(env):
-        if key.startswith(SECRET_ENV_PREFIXES) or key == BASE_ENV_VAR:
+        if key.startswith(SECRET_ENV_PREFIXES) or key in (BASE_ENV_VAR, BASE_ENV_FD_VAR):
             del env[key]
     return env
 
@@ -438,7 +462,9 @@ class Sandbox:
         same shell that then execs the body: e.g. activating a Python
         environment, whose activation scripts must not run outside.
         `network`: give it the network whatever the config says (podman;
-        Apptainer always shares the host's), for environment syncs.
+        Apptainer always shares the host's), for environment syncs; "host"
+        shares the host's network as Apptainer does (podman --network=host),
+        for a service that talks to others on the node's loopback.
         """
         plan = self.plan(writable, extra_ro)
         if plan["method"] == "none":
@@ -448,7 +474,7 @@ class Sandbox:
             build_host_image(image, plan["read_only"] + plan["read_write"])
         if plan["method"] == "podman":
             if network:
-                plan["network"] = "default"
+                plan["network"] = "host" if network == "host" else "default"
             return self._podman_launch(plan, shebang, body, prelude), plan
         # --no-home: no writable stand-in for $HOME (allowed directories under it are still bound)
         args = [runtime, "-q", "exec", "--contain", "--no-home", "--pid", "--ipc"]
@@ -602,7 +628,8 @@ class Sandbox:
         info = self.podman_info(runtime)
         args = [runtime, "run", "--rm", "--pull=never", "--userns=keep-id", "--cap-drop=all",
                 "--security-opt=no-new-privileges", "--security-opt=label=disable", "--read-only",
-                "--pid=private", "--ipc=private"] + (["--network=none"] if plan.get("network", "none") == "none" else []) + [
+                "--pid=private", "--ipc=private"] + {"none": ["--network=none"], "host": ["--network=host"]}.get(
+                plan.get("network", "none"), []) + [
                 "--env-host", "--env", "TMPDIR=/tmp", "--label", "hpclib.sandbox=job"]
         if info.get("oci_runtime") == "crun":
             args += ["--group-add", "keep-groups"]   # your groups, for group-owned project directories

@@ -148,6 +148,7 @@ h4 { font-size: var(--font-size-caption); margin: var(--space-xl) 0 var(--space-
 .field small { font-size: var(--font-size-small); }
 .row { display: flex; flex-wrap: wrap; gap: var(--space-xs) 20px; }
 .row[hidden] { display: none; }
+.login-code[hidden] { display: none; }
 textarea {
   font: var(--font-size-code)/var(--line-height-code) var(--font-mono);
   width: 100%;
@@ -213,6 +214,11 @@ hpclib-toolbar-tool select { min-width: 16em; }
 hpclib-extra-controls { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-xs); margin-top: var(--space-sm);
                         padding-top: var(--space-sm); border-top: 1px dashed var(--line); }
 hpclib-control { display: block; }
+/* an app's downloads (OpenCode's Model Download): kind, name, Download, Downloaded… */
+.download-form { display: flex; flex-wrap: wrap; gap: var(--space-xs); align-items: center; }
+.download-form select { min-width: 8em; }
+.download-form input { min-width: 16em; flex: 1 1 18em; }
+table.downloads td.num { text-align: right; white-space: nowrap; }
 .control-hint { margin-top: 2px; }
 
 /* Add App or Settings (packages) */

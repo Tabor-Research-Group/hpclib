@@ -7,6 +7,8 @@ the command directly. TestRealSingularity runs real containers and is
 skipped where neither Singularity nor Apptainer is installed.
 """
 import getpass
+import base64
+import concurrent.futures
 import json
 import os
 import shutil
@@ -21,6 +23,46 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_rest_jobs import JobServerTestCase, fake_job  # noqa: E402
 import rest_sandbox  # noqa: E402
+
+
+class TestBaseEnvironment(unittest.TestCase):
+
+    def test_snapshot_descriptor_preserves_environment_and_strips_control_and_secrets(self):
+        with tempfile.TemporaryFile() as saved:
+            saved.write(b"PATH=/before/modules\0BASH_FUNC_module%%=() { echo module; }\0"
+                        b"HPC_REST_TOKEN=secret\0HPC_REST_TOKEN_FILE=/secret\0"
+                        b"HPCLIB_BASE_ENV_FD=99\0HPCLIB_BASE_ENV=old\0NON_UTF8=\xff\0")
+            saved.flush()
+            saved.seek(12)
+            with mock.patch.dict(os.environ, {"PATH": "/after/modules",
+                                             rest_sandbox.BASE_ENV_FD_VAR: str(saved.fileno())}, clear=True):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                    results = list(pool.map(lambda _: rest_sandbox.child_env(), range(8)))
+            expected = {"PATH": "/before/modules", "BASH_FUNC_module%%": "() { echo module; }",
+                        "NON_UTF8": "\udcff"}
+            self.assertEqual(results, [expected] * 8)
+            self.assertEqual(saved.tell(), 12)
+
+    def test_legacy_snapshot_remains_supported(self):
+        legacy = base64.b64encode(b"PATH=/legacy\0HPC_REST_TOKEN=secret\0").decode()
+        with mock.patch.dict(os.environ, {"PATH": "/module", rest_sandbox.BASE_ENV_VAR: legacy}, clear=True):
+            self.assertEqual(rest_sandbox.child_env(), {"PATH": "/legacy"})
+
+    def test_invalid_descriptor_falls_back_to_legacy_then_live_environment(self):
+        legacy = base64.b64encode(b"PATH=/legacy\0").decode()
+        for fd in ("not-a-number", "999999", "-1", "9" * 100):
+            with self.subTest(fd=fd), mock.patch.dict(os.environ, {
+                    "PATH": "/module", rest_sandbox.BASE_ENV_FD_VAR: fd,
+                    rest_sandbox.BASE_ENV_VAR: legacy, "HPC_REST_TOKEN": "secret"}, clear=True):
+                self.assertEqual(rest_sandbox.child_env(), {"PATH": "/legacy"})
+                os.environ[rest_sandbox.BASE_ENV_VAR] = "invalid"
+                self.assertEqual(rest_sandbox.child_env(), {"PATH": "/module"})
+
+    def test_explicit_environment_does_not_use_snapshot(self):
+        env = {"PATH": "/explicit", rest_sandbox.BASE_ENV_FD_VAR: "9",
+               rest_sandbox.BASE_ENV_VAR: "old", "HPC_REST_TOKEN": "secret"}
+        self.assertEqual(rest_sandbox.child_env(env), {"PATH": "/explicit"})
+        self.assertEqual(env[rest_sandbox.BASE_ENV_FD_VAR], "9")
 
 # Plays `singularity`: `exec --help` advertises --no-mount; `-q exec ...`
 # logs its arguments, then runs the command after the image directly.
@@ -484,6 +526,14 @@ class TestPodmanSandbox(SandboxServerTestCase):
         lines, plan = sandbox.launch("#!/bin/bash", "true", [str(self.llm_root)])
         self.assertIn("--network=none", "\n".join(lines))
 
+    def test_services_can_share_the_hosts_network(self):
+        # a service (the opencode package's agent) talks to its model server and REST server on the loopback
+        sandbox = self.use_podman({"method": "podman"})
+        lines, plan = sandbox.launch("#!/bin/bash", "true", [str(self.llm_root)], network="host")
+        self.assertEqual(plan["network"], "host")
+        self.assertIn("--network=host", "\n".join(lines))
+        self.assertNotIn("--network=none", "\n".join(lines))
+
     def test_limits(self):
         self.assertTrue(self.use_podman({"method": "podman"}).limits()["enforced"])
         v1 = {"host": {"cgroupVersion": "v1", "cgroupControllers": [], "ociRuntime": {"name": "runc"}}}
@@ -611,3 +661,67 @@ class TestRealPodman(unittest.TestCase):
         self.assertTrue((store / "storage.conf").is_file())
         self.addCleanup(subprocess.run, ["podman", "unshare", "rm", "-rf", str(store)], capture_output=True,
                         env=dict(os.environ, CONTAINERS_STORAGE_CONF=str(store / "storage.conf")))
+
+
+class TestSandboxScript(unittest.TestCase):
+    """rest_server.py --sandbox-script: a tunnel's service run in the template jobs' sandbox."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.data = self.tmp / "tunnels"
+        (self.data / "rest").mkdir(parents=True)
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        self.runtime = bin_dir / "singularity"
+        self.runtime.write_text(FAKE_RUNTIME)
+        self.runtime.chmod(0o755)
+        self.work = self.tmp / "work"
+        self.tools = self.tmp / "tools"
+        self.work.mkdir()
+        self.tools.mkdir()
+        self.script = self.tmp / "service.sh"
+        self.script.write_text('#!/bin/bash\necho "service in $PWD with $SERVICE_VALUE"\n')
+        self.log = self.tmp / "runtime.log"
+
+    def configure(self, sandbox):
+        (self.data / "rest" / "config.json").write_text(json.dumps({"sandbox": sandbox}))
+
+    def run_server(self, *args):
+        server = Path(rest_sandbox.__file__).resolve().parent / "rest_server.py"
+        env = dict(os.environ, HPCTUNNELS_DATA_DIR=str(self.data), FAKE_RUNTIME_LOG=str(self.log))
+        return subprocess.run([sys.executable, str(server), "--sandbox-script", str(self.script), *args],
+                              capture_output=True, text=True, env=env, timeout=60)
+
+    def test_prints_the_launch(self):
+        self.configure({"method": "singularity", "runtime": str(self.runtime), "binds": []})
+        res = self.run_server("--sandbox-writable", str(self.work), "--sandbox-read-only", str(self.tools),
+                              "--sandbox-network", "host")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn('echo "service in $PWD with $SERVICE_VALUE"', res.stdout)
+        run = subprocess.run(["bash", "-c", res.stdout], cwd=self.work, capture_output=True, text=True, timeout=60,
+                             env=dict(os.environ, FAKE_RUNTIME_LOG=str(self.log), SERVICE_VALUE="v",
+                                      TMPDIR=str(self.tmp)))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn(f"service in {self.work} with v", run.stdout)
+        args = json.loads(self.log.read_text().splitlines()[-1])
+        binds = [args[i + 1] for i, a in enumerate(args) if a == "--bind"]
+        self.assertIn(f"{self.work}:{self.work}", binds)
+        self.assertIn(f"{self.tools}:{self.tools}:ro", binds)
+
+    def test_refuses_without_a_sandbox(self):
+        self.configure({"method": "none"})
+        res = self.run_server("--sandbox-writable", str(self.work))
+        self.assertEqual(res.returncode, 3)
+        self.assertIn("aren't sandboxed", res.stderr)
+        self.assertEqual(res.stdout, "")
+        self.configure({"method": "singularity", "runtime": str(self.tmp / "missing")})
+        self.assertEqual(self.run_server().returncode, 3)
+
+    def test_hpclib_data_stays_out(self):
+        self.configure({"method": "singularity", "runtime": str(self.runtime)})
+        for flag, path in (("--sandbox-writable", self.data / "rest"), ("--sandbox-writable", self.tmp),
+                           ("--sandbox-read-only", self.data), ("--sandbox-read-only", self.data / "rest" / "x")):
+            res = self.run_server(flag, str(path))
+            self.assertEqual(res.returncode, 2, (flag, path, res.stderr))
+            self.assertIn("hpclib's own data", res.stderr)

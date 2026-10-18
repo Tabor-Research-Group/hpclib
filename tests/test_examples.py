@@ -552,6 +552,74 @@ class TestSetupAgents(unittest.TestCase):
                                 "me@login.example", expect=1)
         self.assertIn("is not Python 3.9 or newer", out)
 
+    def test_module_launcher_handles_a_large_exported_environment(self):
+        new = self.fake_modules()
+        self.setup_agents("--work-dir", str(self.work[0]), "--templates", "hello", "me@login.example")
+        temp = self.tmp / "launcher-tmp"
+        temp.mkdir()
+        env = dict(self.env, HOME=str(self.remote_home), PATH=self.env["TEST_REMOTE_PATH"], TMPDIR=str(temp))
+        env.update({f"BATCH_METADATA_{i}": "x" * 1200 for i in range(100)})
+        res = subprocess.run([str(self.rest / "python"), "-c", textwrap.dedent("""\
+            import json, os, stat, sys
+            sys.path.insert(0, sys.argv[1])
+            import rest_sandbox
+            fd = int(os.environ[rest_sandbox.BASE_ENV_FD_VAR])
+            info = os.fstat(fd)
+            child = rest_sandbox.child_env()
+            print(json.dumps({"server_path": os.environ["PATH"].split(os.pathsep)[0],
+                              "child_path": child["PATH"].split(os.pathsep)[0],
+                              "metadata": sum(len(v) for k, v in child.items() if k.startswith("BATCH_METADATA_")),
+                              "unlinked": info.st_nlink == 0, "mode": stat.S_IMODE(info.st_mode),
+                              "legacy": rest_sandbox.BASE_ENV_VAR in os.environ,
+                              "markers": [k for k in child if k in (rest_sandbox.BASE_ENV_VAR, rest_sandbox.BASE_ENV_FD_VAR)]}))
+            """), str(self.remote_home / "hpclib/servers")], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        result = json.loads(res.stdout)
+        self.assertEqual(result["server_path"], str(new))
+        self.assertEqual(result["child_path"], str(self.tmp / "old-python"))
+        self.assertEqual(result["metadata"], 120000)
+        self.assertTrue(result["unlinked"])
+        self.assertEqual(result["mode"], 0o600)
+        self.assertFalse(result["legacy"])
+        self.assertEqual(result["markers"], [])
+        self.assertEqual(list(temp.iterdir()), [])
+
+    def test_old_module_launcher_is_upgraded_without_rebuild(self):
+        self.fake_modules()
+        self.setup_agents("--work-dir", str(self.work[0]), "--templates", "hello", "me@login.example")
+        launcher = self.rest / "python"
+        source = launcher.read_text()
+        start = source.index("# Save the pre-module environment")
+        end = source.index("if ! type module", start)
+        legacy = ('if [ -z "${HPCLIB_BASE_ENV:-}" ]; then\n'
+                  '  HPCLIB_BASE_ENV=$(env -0 2> /dev/null | base64 | tr -d "\\n") && export HPCLIB_BASE_ENV\n'
+                  'fi\n')
+        launcher.write_text(source[:start] + legacy + source[end:])
+        before_python = json.loads((self.rest / "python.json").read_text())
+        before_token = self.token_file.read_bytes()
+        before_config = (self.rest / "config.json").read_bytes()
+        self.setup_agents("--no-install", "me@login.example")
+        self.assertIn("HPCLIB_BASE_ENV_FD", launcher.read_text())
+        self.assertNotIn("HPCLIB_BASE_ENV=$(env -0", launcher.read_text())
+        self.assertEqual(json.loads((self.rest / "python.json").read_text()), before_python)
+        self.assertEqual(self.token_file.read_bytes(), before_token)
+        self.assertEqual((self.rest / "config.json").read_bytes(), before_config)
+        self.assertIn("kept the existing", self.setup_agents("--no-install", "me@login.example"))
+
+    def test_module_launcher_keeps_an_existing_descriptor(self):
+        self.fake_modules()
+        self.setup_agents("--work-dir", str(self.work[0]), "--templates", "hello", "me@login.example")
+        owned = self.tmp / "owned-fd"
+        owned.write_text("preserved")
+        env = dict(self.env, HOME=str(self.remote_home), PATH=self.env["TEST_REMOTE_PATH"],
+                   HPCLIB_BASE_ENV_FD="999999")  # stale metadata must not prevent a fresh snapshot
+        res = subprocess.run(["bash", "-c", 'exec 9<"$1"; shift; exec "$@"', "test", str(owned),
+                              str(self.rest / "python"), "-c",
+                              'import os; print(os.environ["HPCLIB_BASE_ENV_FD"]); print(os.read(9, 20).decode())'],
+                             env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.splitlines(), ["8", "preserved"])
+
     def test_no_python_anywhere(self):
         self.fake_modules()
         self.env["BASH_FUNC_module%%"] = "() { return 1; }"

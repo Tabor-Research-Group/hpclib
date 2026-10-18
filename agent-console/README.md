@@ -67,6 +67,21 @@ information, array tasks, and bounded output previews; **Follow** refreshes ever
 **Requests** keeps the existing audit log view. This does not import jobs from the separate `job-queue`
 registry. See the [Activity guide](../docs/interface/agents.md#activity) for history limits and controls.
 
+## Packaged cluster configurations
+
+Packages can add configuration choices to **Agents → Clusters → Add cluster**. Install the
+package through **Add App or Settings**, choose its configuration, then enter your own cluster
+username, absolute work directory and allocation. Resource defaults are editable. Adding creates
+a local profile; log in and choose **Set up…** afterwards. Package installation, replacement and
+removal preserve existing profiles and credentials.
+
+Login supports passwords, Duo pushes and numeric MFA codes. **Enter code** reopens a pending
+code prompt. Codes are sent once for the current challenge and are not stored. For presets with
+site-managed SSH keys, **Set up SSH** and console SSH-file changes are disabled; public-key
+inspection and copying remain available.
+
+See the [cluster preset package format](../docs/cluster-presets.md).
+
 ## SSH keys
 
 **Agents → Clusters → Set up SSH** creates or reuses a compute identity in the shared
@@ -143,7 +158,7 @@ front end must arrange to serve its own `user.css` at the same URL on its own or
 | `<hpc-env-editor label>` | `NAME=value` lines, checked as you type against the server's own rules (`rules.environment` from `GET /admin/config`). |
 | `<hpc-cluster-row cluster local>` | an agent profile's row in the Clusters table, with a detail row for its log, setup form or install/setup output. |
 | `<hpc-app-session app app-title cluster>` | a tunnel app's session on one cluster (Open, Start, Stop, Log, Settings). |
-| `<hpclib-toolbar>` of `<hpclib-toolbar-tool label>` | tunnel-specific tools in a row under a session's row: text, selects, anything wider than a button. Hidden while empty. |
+| `<hpclib-toolbar>` of `<hpclib-toolbar-tool label>` | tunnel-specific tools in a row under a session's row: text, selects, anything wider than a button. Hidden while empty. An app with `downloads` (OpenCode's Model Download) gets a tool there: kind, name, **Download** (an operation with its log below the row, like Install) and **Downloaded…** (what is on the cluster, with sizes and **Remove**). |
 | `<hpclib-extra-controls>` of `<hpclib-control hint>` | tunnel-specific controls under a session's buttons, usually `<hpc-action-button>`s. Hidden while empty. |
 
 `confirmDialog(heading, text, ok)` asks a yes/no question in an `<hpc-dialog>`. A session's state from the

@@ -3,7 +3,7 @@
 # saves a tunnel's settings, and checks or installs what the tunnel needs with its install.sh.
 #
 #   setup_tunnel.sh TUNNEL [--receive] [--set NAME=VALUE]... [--save] [--install [--force]] [--check]
-#                   [--instances] [--stop-instance JOB] [--tokens ACTION [ARGS...]]
+#                   [--instances] [--stop-instance JOB] [--tokens ACTION [ARGS...]] [--downloads ACTION [ARGS...]]
 #
 #   --secrets         read secrets for the tunnel from standard input, one NAME=BASE64 a line (an empty value
 #                     removes one): each must be in the tunnel's TUNNEL_SECRETS (tunnel_config.sh). Each is kept
@@ -41,6 +41,13 @@
 #                       HPCLIB_TOKEN_REVOKED ID      (revoke)
 #                     It must be the last option. The token is on standard output only, never in a log or argument.
 #
+#   --downloads ACTION [ARGS...]
+#                     what the app downloads to the cluster (OpenCode's models), with the tunnel's downloads.sh:
+#                       list                         HPCLIB_DOWNLOADS {...}       (downloads.sh --json list)
+#                       pull KIND NAME               downloads.sh pull KIND NAME, its progress as it comes
+#                       remove KIND NAME             HPCLIB_DOWNLOAD_REMOVED {...} (downloads.sh --json remove ...)
+#                     It must be the last option; a --check given before it runs after a pull.
+#
 # An install.sh that can check says so on a line "# hpclib-install: --check" (and "--force" if it takes it);
 # one that doesn't is never run for a check, since it would install instead.
 
@@ -50,6 +57,19 @@ if [ -z "$HPCLIB_DIR" ]; then
   HPCLIB_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fi
 source "$HPCLIB_DIR/hpclib.sh" > /dev/null
+# Is a current hpclib loaded? ~/.bashrc may set HPCLIB_DIR to another copy, which is used as always; this only says
+# so when that copy is older than the one this script belongs to (its servers and tunnels may lack what this has).
+_hpclib_here="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." > /dev/null 2>&1 && pwd)"
+_hpclib_loaded="$(cd -P "$HPCLIB_DIR" > /dev/null 2>&1 && pwd)"
+if [ -n "$_hpclib_here" ] && [ "$_hpclib_loaded" != "$_hpclib_here" ] && [ -f "$_hpclib_here/hpclib.sh" ]; then
+  _hpclib_here_version=$(sed -n 's/^HPCLIB_VERSION="\(.*\)"/\1/p' "$_hpclib_here/hpclib.sh")
+  if [ "$(_hpclib_version_compare "${HPCLIB_VERSION:-0}" "$_hpclib_here_version" 2> /dev/null)" = -1 ]; then
+    echo "hpclib: WARNING: running hpclib ${HPCLIB_VERSION:-(unknown version)} from $HPCLIB_DIR (HPCLIB_DIR, set in" \
+      "~/.bashrc), which is older than $_hpclib_here_version in $_hpclib_here, where this started; update that" \
+      "copy, or point HPCLIB_DIR at $_hpclib_here" >&2
+  fi
+fi
+unset _hpclib_here _hpclib_loaded _hpclib_here_version
 HPCTUNNELS_DATA_DIR="${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}"
 
 usage='usage: setup_tunnel.sh TUNNEL [--set NAME=VALUE]... [--save] [--install [--force]] [--check]'
@@ -57,6 +77,7 @@ TUNNEL_NAME="$1"
 shift || true
 sets=() save=false install=false force=false check=false instances=false stop_job='' receive=false secrets=false
 tokens=false tokens_action='' tokens_args=()
+downloads=false downloads_action='' downloads_args=()
 source "$HPCLIB_DIR/tunnels/instances.sh"
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -72,6 +93,7 @@ while [ "$#" -gt 0 ]; do
     --stop-instance) stop_job="$2"; shift 2 ;;
     --stop-instance=*) stop_job="${1#--stop-instance=}"; shift ;;
     --tokens) tokens=true; tokens_action="${2:-}"; shift; [ "$#" -gt 0 ] && shift; tokens_args=("$@"); break ;;
+    --downloads) downloads=true; downloads_action="${2:-}"; shift; [ "$#" -gt 0 ] && shift; downloads_args=("$@"); break ;;
     *) echo "$usage" >&2; exit 2 ;;
   esac
 done
@@ -233,6 +255,47 @@ if [ "$tokens" = true ]; then
     revoke) printf 'HPCLIB_TOKEN_REVOKED %s\n' "${tokens_args[0]}" ;;
   esac
   exit 0
+fi
+
+# What the app downloads (its downloads.sh knows where and how): a list or a removal passes its JSON on; a pull
+# shows its progress as it comes, and is followed by --check if that was asked for
+if [ "$downloads" = true ]; then
+  case "$downloads_action" in
+    list) [ "${#downloads_args[@]}" = 0 ] ;;
+    pull|remove) [ "${#downloads_args[@]}" = 2 ] ;;
+    *) false ;;
+  esac || { echo "setup_tunnel: --downloads takes list, or pull or remove with a KIND and a NAME" >&2; exit 2; }
+  if [ ! -f "$TUNNEL_DIR/downloads.sh" ]; then
+    echo "setup_tunnel: $TUNNEL_NAME has no downloads.sh on this cluster (install or update the package with the app's Install)" >&2
+    exit 1
+  fi
+  if [ "$downloads_action" = pull ]; then
+    echo "downloading ${downloads_args[0]} ${downloads_args[1]} on $(hostname -s)"
+    (cd "$TUNNEL_DIR" && HPCLIB_TUNNEL_DIR="$TUNNEL_DIR" bash ./downloads.sh pull "${downloads_args[@]}") || {
+      echo "setup_tunnel: downloading ${downloads_args[1]} failed (above)" >&2
+      exit 1
+    }
+    [ "$check" = true ] || exit 0
+  else
+    downloads_err=$(mktemp "${TMPDIR:-/tmp}/hpclib-downloads.XXXXXX") || exit 1
+    trap 'rm -f "$downloads_err"' EXIT
+    downloads_out=$(cd "$TUNNEL_DIR" && HPCLIB_TUNNEL_DIR="$TUNNEL_DIR" \
+      bash ./downloads.sh --json "$downloads_action" "${downloads_args[@]}" 2> "$downloads_err") || {
+      reason=$(grep -v '^[[:space:]]*$' "$downloads_err" | tail -n 1 | tr -d '\r' | cut -c1-300)
+      echo "setup_tunnel: downloads.sh $downloads_action failed${reason:+: $reason}" >&2
+      exit 1
+    }
+    downloads_json=$(printf '%s\n' "$downloads_out" | grep '^{' | tail -n 1)
+    if [ -z "$downloads_json" ]; then
+      echo "setup_tunnel: downloads.sh $downloads_action printed no JSON" >&2
+      exit 1
+    fi
+    case "$downloads_action" in
+      list) printf 'HPCLIB_DOWNLOADS %s\n' "$downloads_json" ;;
+      remove) printf 'HPCLIB_DOWNLOAD_REMOVED %s\n' "$downloads_json" ;;
+    esac
+    exit 0
+  fi
 fi
 
 if [ "$check" = true ]; then

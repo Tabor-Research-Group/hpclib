@@ -678,8 +678,18 @@ function _hpclib_remote_python {
 
   mkdir -p "$data" || return 1
   if [ -z "$spec" ] && [ "$rebuild" != yes ] && [ -x "$launcher" ] && _hp_ok "$launcher"; then
-    printf 'python|%s|kept the existing %s\n' "$(_hp_version "$launcher")" "$launcher"
-    return 0
+    if grep -Fq '# Written by setup_agents (hpclib)' "$launcher" &&
+        grep -Fq 'HPCLIB_BASE_ENV=$(env -0' "$launcher"; then
+      # Upgrade our old environment-in-a-variable launcher without changing its Python modules.
+      spec=$("$launcher" -c 'import json, sys; print("modules:" + json.load(open(sys.argv[1]))["modules"])' \
+        "$data/python.json") || {
+        echo "setup_agents: could not read the existing Python modules; rerun with --python-module or --rebuild" >&2
+        return 1
+      }
+    else
+      printf 'python|%s|kept the existing %s\n' "$(_hp_version "$launcher")" "$launcher"
+      return 0
+    fi
   fi
 
   case "$spec" in
@@ -732,11 +742,35 @@ function _hpclib_remote_python {
     printf '# Written by setup_agents (hpclib): the Python (%s) that hpclib runs its servers with on this\n' "$version"
     printf '# cluster. Rerun setup_agents with --rebuild, --python-module or --remote-python to change it.\n'
     if [ "$kind" = modules ]; then
-      printf '# The environment from before these modules are loaded is saved for the server to give the\n'
-      printf "# jobs and commands it starts, so they don't inherit this Python's modules.\n"
-      printf 'if [ -z "${HPCLIB_BASE_ENV:-}" ]; then\n'
-      printf '  HPCLIB_BASE_ENV=$(env -0 2> /dev/null | base64 | tr -d "\\n") && export HPCLIB_BASE_ENV\n'
-      printf 'fi\n'
+      cat <<'HPCLIB_PYTHON_ENV'
+# Save the pre-module environment on an open descriptor, not in one oversized
+# environment entry. The private temporary file is unlinked before Python starts.
+# Keep a caller's existing snapshot, including the legacy base64 format.
+if [ -n "${HPCLIB_BASE_ENV_FD:-}" ] && ! { : <&"$HPCLIB_BASE_ENV_FD"; } 2> /dev/null; then
+  unset HPCLIB_BASE_ENV_FD
+fi
+if [ -z "${HPCLIB_BASE_ENV:-}" ] && [ -z "${HPCLIB_BASE_ENV_FD:-}" ]; then
+  _hpclib_env_file=$(umask 077; mktemp "${TMPDIR:-/tmp}/hpclib-base-env.XXXXXXXX") || exit 1
+  trap 'rm -f -- "$_hpclib_env_file"' EXIT
+  env -0 > "$_hpclib_env_file" || exit 1
+  _hpclib_env_fd=''
+  for _hpclib_env_candidate in 9 8 7 6 5 4 3; do
+    if ! { : <&"$_hpclib_env_candidate"; } 2> /dev/null; then
+      _hpclib_env_fd=$_hpclib_env_candidate
+      break
+    fi
+  done
+  if [ -z "$_hpclib_env_fd" ]; then
+    echo 'hpclib: no free descriptor for the Python environment snapshot' >&2
+    exit 1
+  fi
+  eval "exec $_hpclib_env_fd< \"\$_hpclib_env_file\"" || exit 1
+  rm -f -- "$_hpclib_env_file" || exit 1
+  trap - EXIT
+  export HPCLIB_BASE_ENV_FD=$_hpclib_env_fd
+  unset _hpclib_env_file _hpclib_env_fd _hpclib_env_candidate
+fi
+HPCLIB_PYTHON_ENV
       printf 'if ! type module > /dev/null 2>&1; then\n'
       printf '  for f in /etc/profile.d/lmod.sh /etc/profile.d/modules.sh /usr/share/lmod/lmod/init/bash /usr/share/Modules/init/bash; do\n'
       printf '    if [ -f "$f" ]; then . "$f" > /dev/null 2>&1; type module > /dev/null 2>&1 && break; fi\n'

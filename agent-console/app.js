@@ -137,16 +137,28 @@ function loginDialog(c, { onConnected = null, onClosed = render } = {}) {
   const password = el("input", { type: "password", autocomplete: "current-password", placeholder: "cluster password" });
   const status = el("p", { class: "muted" },
     `Logs in to ${c.host} once; the tunnel and other ssh commands reuse the login until it has been idle for ` +
-    `${c.connection_hours} h. After the password, a Duo push goes to your phone.`);
+    `${c.connection_hours || 12} h. Complete the site's second factor when prompted.`);
   const go = el("button", { class: "primary", type: "submit" }, "Log in");
   const close = el("button", { type: "button" }, "Close");
   const form = el("form", {}, status, password, el("div", { class: "actions" }, go, close));
+  const code = el("input", { type: "password", inputmode: "numeric", autocomplete: "one-time-code", "aria-label": "MFA code" });
+  let challenge = null;
+  const sendCode = action("Send code", async () => {
+    const value = code.value.trim(); code.value = "";
+    show(await api(cluster(c.name) + "/login/answer", { method: "POST", body: { code: value, challenge } }));
+  });
+  code.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); sendCode.run(); }
+  });
+  const codeArea = el("div", { class: "login-code", hidden: true }, field("Authenticator or SMS code", code), sendCode);
+  form.append(codeArea);
   const dialog = el("hpc-dialog", { heading: `Log in to ${c.name}`, transient: true }, form);
   let timer = null;
   let connected = false;
   const finish = () => dialog.close();
   dialog.addEventListener("close", async () => {   // Close, ×, Escape, or logged in
     clearInterval(timer);
+    code.value = password.value = "";
     if (connected && onConnected) {
       try { await onConnected(); } catch (err) { alertError(err); }
     }
@@ -156,19 +168,12 @@ function loginDialog(c, { onConnected = null, onClosed = render } = {}) {
   const show = (st) => {
     status.className = st.state === "failed" ? "error-box" : (st.state === "connected" ? "saved" : "muted");
     status.textContent = (st.message || LOGIN_LABEL[st.state] || st.state) + (st.prompt ? ` (asked: "${st.prompt}")` : "");
+    codeArea.hidden = st.state !== "code_required";
+    if (st.state === "code_required" && challenge !== st.challenge) { code.value = ""; code.focus(); }
+    challenge = st.challenge || null;
   };
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    go.disabled = password.disabled = true;
-    try {
-      const value = password.value;
-      password.value = "";                          // don't keep it in the page
-      show(await api(cluster(c.name) + "/login", { method: "POST", body: value ? { password: value } : {} }));
-    } catch (err) {
-      show({ state: "failed", message: err.message });
-      go.disabled = password.disabled = false;
-      return;
-    }
+  const poll = () => {
+    clearInterval(timer);
     timer = setInterval(async () => {
       let st;
       try { st = await api(cluster(c.name) + "/login"); } catch (err) { st = { state: "failed", message: err.message }; }
@@ -179,8 +184,26 @@ function loginDialog(c, { onConnected = null, onClosed = render } = {}) {
         else go.disabled = password.disabled = false;
       }
     }, 1000);
+  };
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!codeArea.hidden) { await sendCode.run(); return; }
+    go.disabled = password.disabled = true;
+    try {
+      const value = password.value;
+      password.value = "";                          // don't keep it in the page
+      show(await api(cluster(c.name) + "/login", { method: "POST", body: value ? { password: value } : {} }));
+    } catch (err) {
+      show({ state: "failed", message: err.message });
+      go.disabled = password.disabled = false;
+      return;
+    }
+    poll();
   });
   dialog.showModal();
+  api(cluster(c.name) + "/login").then((st) => {
+    if (dialog.open && LOGIN_BUSY.includes(st.state)) { go.disabled = password.disabled = true; show(st); poll(); }
+  }).catch(() => {});
 }
 
 function setupForm(c, row) {
@@ -224,6 +247,42 @@ function addClusterForm(onAdded) {
     el("div", { class: "row" }, field("Login", host), field("Port", port), field("Jump host", jump)),
     el("div", { class: "row" }, field("Work directory for agents", work, "absolute path on the cluster"),
       field("Extra read-only directories", binds, "space-separated")),
+    el("div", { class: "actions" }, add));
+}
+
+function presetClusterForm(spec, onAdded) {
+  const username = el("input", { "aria-label": "Cluster username", placeholder: "Your cluster username", size: 24 });
+  const work = el("input", { "aria-label": "Cluster work directory", placeholder: "Absolute path on the cluster", size: 40 });
+  const suggestedWork = () => (spec.defaults.work_dir || "").replaceAll("{username}", username.value.trim());
+  let workEdited = false;
+  work.addEventListener("input", () => { workEdited = true; });
+  username.addEventListener("input", () => { if (!workEdited) work.value = suggestedWork(); });
+  const account = el("input", { "aria-label": "Cluster allocation", placeholder: "Your allocation/account", size: 24 });
+  const given = Object.fromEntries(spec.defaults.tunnel_args.map((arg) => arg.replace(/^--/, "").split(/=(.*)/s).slice(0, 2)));
+  const controls = Object.fromEntries(["partition", "time", "mem", "cpus-per-task"].map((name) => [name,
+    el("input", { "aria-label": `Cluster ${name}`, value: given[name] || "", size: 14 })]));
+  const add = action("Add cluster", async () => {
+    const args = spec.defaults.tunnel_args.filter((arg) => !Object.keys(controls).some((name) => arg.startsWith(`--${name}=`)));
+    for (const [name, input] of Object.entries(controls)) if (input.value.trim()) args.push(`--${name}=${input.value.trim()}`);
+    const c = await api(`cluster-presets/${encodeURIComponent(spec.id)}`, { method: "POST", body: {
+      username: username.value.trim(), work_dir: work.value.trim(), account: account.value.trim(), tunnel_args: args } });
+    await onAdded(c);
+    return `Added ${c.name}.`;
+  }, { primary: true, result: true });
+  return el("section", { class: "card" }, el("h3", {}, spec.title),
+    spec.description ? el("p", {}, spec.description) : null,
+    el("p", { class: "muted" }, `Login: ${spec.host}:${spec.port} · configuration from ${spec.package}`),
+    spec.documentation_url ? el("p", {}, el("a", { href: spec.documentation_url, target: "_blank", rel: "noopener noreferrer" }, "Cluster user guide")) : null,
+    el("div", { class: "row" }, field("Username", username), field("Work directory for agents", work,
+      "Use a directory you own; enter the absolute path from the cluster's WORK or SCRATCH environment."),
+      field("Allocation", account, "For the agent tunnel's job; empty uses the site's account default.")),
+    el("div", { class: "row" }, Object.entries(controls).map(([name, input]) => field(
+      { partition: "Partition", time: "Time limit", mem: "Memory", "cpus-per-task": "CPUs" }[name], input))),
+    spec.ssh_keys === "site-managed" ? el("p", { class: "muted" }, "SSH keys are managed by this cluster's site. The console uses its existing keys and offers read-only SSH key management.") : null,
+    spec.defaults.rest_config ? el("p", { class: "muted" },
+      `Saved REST settings will be used during setup${spec.defaults.rest_config.limits?.max_concurrent_jobs != null ?
+        ` (maximum ${spec.defaults.rest_config.limits.max_concurrent_jobs} concurrent agent job slots)` : ""}. Reruns keep existing remote settings unless Rebuild is selected.`) : null,
+    el("p", { class: "muted" }, "After adding, log in and choose Set up… to install the agent service. Passwords and MFA codes are entered during login."),
     el("div", { class: "actions" }, add));
 }
 
@@ -317,12 +376,22 @@ function promptDialog(label, answerPath, prompt, { onCancel = null } = {}) {
 }
 
 async function clustersPage() {
-  const [{ clusters }, health] = await Promise.all([api("clusters"), api("health")]);
+  const [{ clusters }, health, presetList] = await Promise.all([api("clusters"), api("health"), api("cluster-presets")]);
+  const presets = presetList.presets || [];
   const local = health.hpclib_version;
   const addArea = el("div");
   const addBtn = el("button", { type: "button" }, "Add cluster");
   addBtn.addEventListener("click", () => {
-    addArea.replaceChildren(addArea.firstChild ? "" : addClusterForm(() => {}));
+    if (addArea.firstChild) { addArea.replaceChildren(); return; }
+    const choose = el("select", { "aria-label": "Cluster configuration" }, el("option", { value: "" }, "Custom cluster"),
+      presets.map((spec) => el("option", { value: spec.id }, spec.title)));
+    const form = el("div");
+    const draw = () => {
+      const preset = presets.find((spec) => spec.id === choose.value);
+      form.replaceChildren(preset ? presetClusterForm(preset, render) : addClusterForm(() => {}));
+    };
+    choose.addEventListener("change", draw); draw();
+    addArea.replaceChildren(field("Configuration", choose), form);
   });
   // each cluster's rows refresh themselves (components.js), so this page is drawn once
   const rows = clusters.map((c) => {
@@ -437,6 +506,12 @@ async function sshKeysPage() {
           action("Save host binding", () => mutate("hosts", "PUT", { host: host.value, key: identity.value,
             user: user.value, hostname: hostname.value, port: port.value ? Number(port.value) : null, revision: hosts.revision }),
             { disabled: !identity.options.length })));
+      if (pick.selected?.preset?.ssh_keys === "site-managed") {
+        body.prepend(el("p", { class: "muted" }, "This site's SSH files are managed by the cluster. You can inspect and copy public keys here; changes are disabled."));
+        for (const button of body.querySelectorAll("hpc-action-button")) {
+          if (button.getAttribute("label") !== "Copy public key") button.disabled = true;
+        }
+      }
       status.textContent = "";
     } catch (err) {
       if (current === generation) { status.textContent = err.message; body.replaceChildren(); }
@@ -1224,7 +1299,7 @@ async function packagesDialog() {
   const file = el("input", { type: "file", accept: ".zip,application/zip" });
   const dialog = el("hpc-dialog", { heading: "Add App or Settings", transient: true },
     el("p", { class: "muted" }, "A package is a zip file with an hpclib-package.json: apps for this console, the " +
-      "tunnels they run on your clusters, and settings (such as a group's SMB server). Its scripts run on your " +
+      "tunnels they run on your clusters, cluster configurations, and settings (such as a group's SMB server). Its scripts run on your " +
       "clusters as you, so install only packages you trust."),
     field("Package zip", file, "it is checked first; nothing is installed until you say so"),
     report, el("h4", {}, "Installed"), list);
@@ -1236,7 +1311,7 @@ async function packagesDialog() {
       el("ul", {}, p.summary.map((line) => el("li", { class: "muted" }, line))),
       action("Remove", async () => {
         if (!await confirmDialog(`Remove ${p.name}?`, `Its apps leave the console. What it sent to clusters stays ` +
-                                 `there; its settings files are cleared with each app's next Check.`, "Remove")) return;
+                                 `there; its settings files are cleared with each app's next Check. Added cluster profiles remain.`, "Remove")) return;
         await api(`packages/${encodeURIComponent(p.name)}`, { method: "DELETE" });
         location.reload();
       })))) : el("p", { class: "muted" }, "None yet."));

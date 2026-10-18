@@ -34,6 +34,19 @@ if [ "$HPCLIB_DIR" = "" ]; then
   unset _src _dir
 fi
 source "$HPCLIB_DIR/hpclib.sh"
+# Is a current hpclib loaded? ~/.bashrc may set HPCLIB_DIR to another copy, which is used as always; this only says
+# so when that copy is older than the one this script belongs to (its servers and tunnels may lack what this has).
+_hpclib_here="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." > /dev/null 2>&1 && pwd)"
+_hpclib_loaded="$(cd -P "$HPCLIB_DIR" > /dev/null 2>&1 && pwd)"
+if [ -n "$_hpclib_here" ] && [ "$_hpclib_loaded" != "$_hpclib_here" ] && [ -f "$_hpclib_here/hpclib.sh" ]; then
+  _hpclib_here_version=$(sed -n 's/^HPCLIB_VERSION="\(.*\)"/\1/p' "$_hpclib_here/hpclib.sh")
+  if [ "$(_hpclib_version_compare "${HPCLIB_VERSION:-0}" "$_hpclib_here_version" 2> /dev/null)" = -1 ]; then
+    echo "hpclib: WARNING: running hpclib ${HPCLIB_VERSION:-(unknown version)} from $HPCLIB_DIR (HPCLIB_DIR, set in" \
+      "~/.bashrc), which is older than $_hpclib_here_version in $_hpclib_here, where this started; update that" \
+      "copy, or point HPCLIB_DIR at $_hpclib_here" >&2
+  fi
+fi
+unset _hpclib_here _hpclib_loaded _hpclib_here_version
 source "$HPCLIB_DIR/tunnels/instances.sh"
 if [ "$HPCSERVERS_DIR" = "" ]; then
   HPCSERVERS_DIR="$HPCLIB_DIR/servers"

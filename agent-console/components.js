@@ -16,7 +16,8 @@
 //   <hpc-cluster-row cluster="…" local="0.2.24">           an agent profile's rows in a table: refreshes itself
 //   <hpc-app-session app="jupyter" app-title="…" cluster="…">   a tunnel app's session on one cluster, likewise
 //
-//   <hpclib-toolbar>                                      a row of tools under a cluster/tunnel row
+//   <hpclib-toolbar>                                      a row of tools under a cluster/tunnel row (an app with
+//                                                         `downloads`, like OpenCode, gets its Model Download here)
 //     <hpclib-toolbar-tool label="…">…text, a select…</hpclib-toolbar-tool>
 //   <hpclib-extra-controls>                               controls under a row's buttons, on the right
 //     <hpclib-control>…a button…</hpclib-control>
@@ -574,10 +575,10 @@ export function confirmDialog(heading, text, ok = "OK") {
 
 // ------------------------------------------------------------------ rows: <hpc-cluster-row>, <hpc-app-session>
 
-export const LOGIN_BUSY = ["starting", "password_sent", "push_sent"];
+export const LOGIN_BUSY = ["starting", "password_sent", "push_sent", "code_required"];
 export const LOGIN_LABEL = { connected: "logged in", none: "not logged in", expired: "login ended",
                              failed: "login failed", starting: "connecting", password_sent: "password sent",
-                             push_sent: "approve the push" };
+                             push_sent: "approve the push", code_required: "enter MFA code" };
 
 // Shared by both rows: a table row group (display: table-row-group) of the row itself and a detail row under it
 // for one panel (a log, a form, an operation). The row fetches its own state (src) every 3 s while something is
@@ -707,8 +708,8 @@ class TunnelRow extends HTMLElement {
   loginCells(lg, cluster) {
     const b = this.buttons.login;
     const connected = lg.state === "connected";
-    b.setAttribute("label", connected ? "Log out" : "Log in");
-    b.disabled = LOGIN_BUSY.includes(lg.state);
+    b.setAttribute("label", connected ? "Log out" : lg.state === "code_required" ? "Enter code" : "Log in");
+    b.disabled = LOGIN_BUSY.includes(lg.state) && lg.state !== "code_required";
     b.action = connected
       ? async () => { await fetcher(`clusters/${enc(cluster.name)}/logout`, { method: "POST" }); await this.refresh(); }
       : () => ask(this, "hpc-login", { cluster, then: () => this.refresh() });
@@ -786,8 +787,13 @@ export class HpcClusterRow extends TunnelRow {
       x.disabled = !loggedIn || running;
       x.title = loggedIn ? "" : "log in first";
     }
+    if (c.preset?.ssh_keys === "site-managed") {
+      b.ssh.disabled = true;
+      b.ssh.title = "SSH keys are managed by the cluster site";
+    }
     return [
-      [c.name, el("div", { class: "muted" }, c.mcp_name || "")],
+      [c.preset?.title || c.name, c.preset ? el("div", { class: "muted small" }, c.name) : null,
+       el("div", { class: "muted" }, c.mcp_name || "")],
       [el("hpc-state", { state: t.state || "down" }),
        t.state === "up" ? el("div", { class: "muted" }, `${t.hostname || ""}${t.slurm_job_id ? ` · job ${t.slurm_job_id}` : ""}`) : null,
        t.hpclib_version ? el("div", { class: behind ? "state starting" : "muted" },
@@ -801,6 +807,15 @@ export class HpcClusterRow extends TunnelRow {
       [el("div", { class: "actions" }, b.start, b.stop, b.log), el("div", { class: "actions second" }, b.install, b.setup, b.ssh)],
     ];
   }
+}
+
+/** 19.5 GB: a size in bytes for people (decimal units, as Ollama and Hugging Face give them). */
+export function formatBytes(n) {
+  if (typeof n !== "number") return "?";
+  const units = ["B", "kB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1000 && i < units.length - 1) { n /= 1000; i += 1; }
+  return `${i ? (n < 100 ? n.toFixed(1).replace(/\.0$/, "") : Math.round(n)) : n} ${units[i]}`;
 }
 
 const APP_STATE_LABEL = { up: "running", queued: "queued", starting: "starting", down: "stopped", error: "error" };
@@ -928,8 +943,92 @@ export class HpcAppSession extends TunnelRow {
       }
       return tool;
     });
-    this.toolbar.setTools(made);
+    const download = this.downloadTool(this._data);
+    this.toolbar.setTools(download ? [...made, download] : made);
     this.toolbarRow.hidden = this.toolbar.hidden;
+  }
+
+  // An app's `downloads` (OpenCode's models): kind, name and Download, which runs on the cluster's login node as an
+  // operation with its log, like Install; and what is there already, in a panel under the row, with Remove
+  downloadTool(s) {
+    const spec = s.downloads;
+    if (!spec) return null;
+    let t = this._download;
+    if (!t) {
+      t = this._download = { tool: el("hpclib-toolbar-tool", { class: "download-tool" }) };
+      t.kind = el("select", { "aria-label": "Kind" },
+        spec.kinds.map((k) => el("option", { value: k.id }, k.label)));
+      t.kind.hidden = spec.kinds.length < 2;
+      t.name = el("input", { size: 34, autocomplete: "off", spellcheck: "false", "aria-label": `${spec.label}: name` });
+      const placeholder = () => {
+        const k = spec.kinds.find((x) => x.id === t.kind.value) || spec.kinds[0];
+        t.name.placeholder = k.placeholder ? `e.g. ${k.placeholder}` : `${k.label} name`;
+      };
+      t.kind.addEventListener("change", placeholder);
+      placeholder();
+      t.go = action("Download", async () => {
+        const name = t.name.value.trim();
+        if (!name) throw new Error("type a name first");
+        await fetcher(this.base + "/downloads", { method: "POST", body: { kind: t.kind.value, name } });
+        t.name.value = "";
+        await this.refresh();
+        return `downloading ${name}: progress below`;
+      }, { result: true, primary: true });
+      t.name.addEventListener("keydown", (e) => { if (e.key === "Enter" && !t.go.disabled) { e.preventDefault(); t.go.run(); } });
+      t.list = action("Downloaded…", () => this.toggleDownloads());
+      t.tool.content = [el("div", { class: "download-form" }, t.kind, t.name, t.go, t.list),
+                        spec.description ? el("div", { class: "muted small" }, spec.description) : null];
+    }
+    t.tool.setAttribute("label", spec.label);
+    const loggedIn = (s.login || {}).state === "connected";
+    const busy = !!(s.operation && s.operation.state === "running");
+    t.go.disabled = !loggedIn || busy;
+    t.go.title = !loggedIn ? "log in first" : (busy ? "wait for what is running to finish" : "");
+    t.list.disabled = !loggedIn;
+    t.list.title = loggedIn ? "" : "log in first";
+    return t.tool;
+  }
+
+  toggleDownloads() {
+    if (this.detailKind === "downloads") return this.hideDetail();
+    return this.showDownloads();
+  }
+
+  async showDownloads() {
+    const spec = this._data.downloads;
+    const kinds = Object.fromEntries(spec.kinds.map((k) => [k.id, k.label]));
+    const body = el("div", { class: "muted" }, "Asking the cluster…");
+    const panel = el("hpc-panel", { heading: `${spec.label} on ${this.name}`, dismissible: true, class: "downloads-panel" },
+      body);
+    panel.append(action("Refresh", () => this.showDownloads(), { slot: "actions" }));
+    this.showDetail("downloads", panel);
+    let out;
+    try {
+      out = await fetcher(this.base + "/downloads");
+    } catch (err) {
+      body.replaceChildren(el("div", { class: "error-box small" }, err.message));
+      return;
+    }
+    const rows = out.items.map((item) => el("tr", {},
+      el("td", {}, kinds[item.kind] || item.kind),
+      el("td", {}, el("code", {}, item.name)),
+      el("td", { class: "num" }, formatBytes(item.size)),
+      el("td", {}, item.in_use ? el("hpc-state", { tone: "up", label: "in use" }) : null,
+         item.note ? el("div", { class: "muted small" }, item.note) : null),
+      el("td", {}, action("Remove", async () => {
+        if (!await confirmDialog(`Remove ${item.name}?`, `Deletes ${kinds[item.kind] || item.kind} ${item.name} ` +
+            `(${formatBytes(item.size)}) from ${this.name}. Download it again to use it.`, "Remove")) return null;
+        await fetcher(this.base + "/downloads/remove", { method: "POST", body: { kind: item.kind, name: item.name } });
+        await this.showDownloads();
+        return null;
+      }, { result: true }))));
+    body.className = "";
+    body.replaceChildren(
+      out.note ? el("p", { class: "muted" }, out.note) : null,
+      rows.length ? el("table", { class: "rows downloads" },
+        el("thead", {}, el("tr", {}, ["Kind", "Name", "Size", "", ""].map((h) => el("th", {}, h)))),
+        el("tbody", {}, rows))
+        : el("p", { class: "muted" }, "Nothing downloaded yet."));
   }
 
   drawControls(controls) {
