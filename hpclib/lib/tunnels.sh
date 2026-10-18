@@ -1524,23 +1524,60 @@ print(f"stopped what an earlier hpclib session left listening on port {port}", f
 PY
 }
 
+# Slurm accepts scancel before the allocation and its compute-node processes have finished stopping.
+# A free login-node forwarding port alone does not mean the server's compute-node port is free yet.
+function _hpclib_wait_job_end {
+  local job="$1" out elapsed=0 timeout="${HPCLIB_TUNNEL_STOP_WAIT:-20}"
+  case "$timeout" in ''|*[!0-9]*) echo 'HPCLIB_TUNNEL_STOP_WAIT must be a number of seconds' >&2; return 1 ;; esac
+  while true; do
+    if out=$(squeue -h -j "$job" -o %i 2>&1); then
+      [ -n "$out" ] || return 0
+    elif printf '%s' "$out" | grep -qi 'invalid job id'; then
+      return 0
+    else
+      echo "could not confirm that job $job has stopped: $out; keeping its tunnel record" >&2
+      return 1
+    fi
+    if [ "$elapsed" -ge "$timeout" ]; then
+      echo "job $job is still stopping after $timeout seconds; wait for it to finish and retry (keeping its tunnel record)" >&2
+      return 1
+    fi
+    sleep 1
+    elapsed=$((elapsed+1))
+  done
+}
+
 # _hpclib_clear_port PORT: stop whatever an earlier tunnel left on PORT on
 # this login node, then check the port is free. Only touches your own
 # processes, and only ones that look like hpclib tunnel pieces for PORT.
 function _hpclib_clear_port {
-  local port="$1" me file pid job other tries
+  local port="$1" me file pid job other tries out cancel_error
   me=$(id -un)
   file=$(_hpclib_port_file "$port")
   if [ -f "$file" ]; then
     read -r pid job < "$file"
+    if [ -n "$job" ]; then
+      if out=$(squeue -h -j "$job" -o %i 2>&1); then
+        if [ -n "$out" ]; then
+          echo "cancelling its job $job and waiting for it to stop" >&2
+          if ! cancel_error=$(scancel "$job" 2>&1); then
+            if ! printf '%s' "$cancel_error" | grep -qi 'invalid job id'; then
+              echo "could not cancel job $job: $cancel_error; keeping its tunnel record" >&2
+              return 1
+            fi
+          fi
+          _hpclib_wait_job_end "$job" || return 1
+        fi
+      elif ! printf '%s' "$out" | grep -qi 'invalid job id'; then
+        echo "could not check job $job: $out; keeping its tunnel record" >&2
+        return 1
+      fi
+    fi
+    # Keep the launcher (and its record) until Slurm confirms the owned job is gone.
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && ps -o args= -p "$pid" 2>/dev/null | grep -q start_tunnel; then
       echo "stopping the earlier tunnel on port $port (pid $pid)" >&2
       pkill -TERM -P "$pid" 2>/dev/null || true
       kill -TERM "$pid" 2>/dev/null || true
-    fi
-    if [ -n "$job" ] && [ -n "$(squeue -h -j "$job" -o %i 2>/dev/null)" ]; then
-      echo "cancelling its job $job" >&2
-      scancel "$job" 2>/dev/null || true
     fi
     rm -f "$file"
   fi
@@ -1592,9 +1629,12 @@ function stop_tunnel {
     echo "$usage" >&2
     return 2
   fi
-  script="$(declare -f _hpclib_sessions_root _hpclib_port_file _hpclib_port_free _hpclib_port_holders _hpclib_clear_port)
+  script="$(declare -f _hpclib_sessions_root _hpclib_port_file _hpclib_port_free _hpclib_port_holders _hpclib_wait_job_end _hpclib_clear_port)
 _hpclib_clear_port \"\$1\" && echo \"port \$1 is free on \$(hostname -s)\""
-  printf '%s\n' "$script" | HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$(printf '%q ' bash -s -- "$port")"
+  if ! printf '%s\n' "$script" | HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$(printf '%q ' bash -s -- "$port")"; then
+    echo "stop_tunnel: shutdown on the login node did not finish; see the message above and retry" >&2
+    return 1
+  fi
   # the forward this machine's ssh master holds for the tunnel
   HPCLIB_ECHO_COMMANDS= pssh -O cancel -L "127.0.0.1:$port:127.0.0.1:$port" "${login_args[@]}" 2>/dev/null || true
 }

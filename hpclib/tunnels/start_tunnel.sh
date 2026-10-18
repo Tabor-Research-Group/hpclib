@@ -308,7 +308,9 @@ function cleanup() {
   stop_git_server
   stop_shim
   pkill -TERM -P $$ 2>/dev/null   # e.g. the forward to the compute node
-  _hpclib_forget_port "$HOST_PORT" "$$"
+  # scancel is asynchronous. Keep the owned job id after this launcher exits, so the next Stop/Start can
+  # confirm it has finished before reusing the compute-node port. Clear_port removes the verified record.
+  if ! cancels_job || [ -z "$SESSION_ID" ]; then _hpclib_forget_port "$HOST_PORT" "$$"; fi
 }
 trap cleanup 0 1 2 3   # Ctrl+C locally now also cleans up the shim
 

@@ -335,6 +335,36 @@ def console_dir():
     return os.path.expanduser(os.environ.get("HPCLIB_CONSOLE_DIR") or "~/.config/hpclib/console")
 
 
+LOG_BLOCK_HEADER = re.compile(rb"(?m)^=== \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\r\n]* ===\r?$")
+TERMINAL_ESCAPE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def last_log_block(path, max_bytes=8 << 20):
+    """Read back to the newest console header, independently of the short display tail."""
+    try:
+        with open(path, "rb") as handle:
+            position = handle.seek(0, os.SEEK_END)
+            data = b""
+            while position:
+                start = max(0, position - (64 << 10))
+                handle.seek(start)
+                data = handle.read(position - start) + data
+                position = start
+                headers = [m for m in LOG_BLOCK_HEADER.finditer(data) if position == 0 or m.start() > 0]
+                if headers:
+                    data = data[headers[-1].start():]
+                    break
+                if len(data) > max_bytes:
+                    raise ConsoleError(413, "The last log block is too large to copy (over 8 MiB); open the log file instead.")
+    except FileNotFoundError:
+        return ""
+    if len(data) > max_bytes:
+        raise ConsoleError(413, "The last log block is too large to copy (over 8 MiB); open the log file instead.")
+    # PTYs add CRLF, colors and terminal-title sequences. Copy readable text, without terminal controls.
+    text = TERMINAL_ESCAPE.sub("", data.decode(errors="replace").replace("\r", ""))
+    return re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text)
+
+
 def open_with_default_application(path):
     """Use the OS file association; never choose or look for an editor ourselves."""
     if sys.platform == "win32":
@@ -1149,9 +1179,11 @@ class Clusters:
             if not out.get("more"):
                 time.sleep(self.INSTALL_POLL_SECONDS)
 
-    def operation(self, name, lines=200):
+    def operation(self, name, lines=200, latest=False):
         with self.lock:
             record = dict(self.ops.get(name) or {"state": "none"})
+        if latest:
+            return dict(record, copy_text=last_log_block(self.ops_log_path(name)))
         try:
             with open(self.ops_log_path(name), "rb") as f:
                 f.seek(0, os.SEEK_END)
@@ -2205,6 +2237,9 @@ class Clusters:
                 code = None
         finally:
             log.close()
+        if code != 0:
+            raise ConsoleError(502, f"stopping {APPS[app]['title']} did not finish (exit {code}); see its log and retry Stop",
+                               stop_exit=code)
         with self.lock:
             proc = self.app_procs.pop((name, app), None)
         if proc is not None and proc.poll() is None:
@@ -2215,8 +2250,10 @@ class Clusters:
                 pass
         return {"stopped": name, "app": app, "stop_exit": code}
 
-    def app_log(self, name, app, lines=200):
+    def app_log(self, name, app, lines=200, latest=False):
         self.app_spec(app)
+        if latest:
+            return {"copy_text": last_log_block(self.app_log_path(name, app))}
         try:
             with open(self.app_log_path(name, app), "rb") as f:
                 f.seek(0, os.SEEK_END)
@@ -2262,6 +2299,9 @@ class Clusters:
                 code = None
         finally:
             log.close()
+        if code != 0:
+            raise ConsoleError(502, f"stopping the agent tunnel did not finish (exit {code}); see its log and retry Stop",
+                               agent_stop_exit=code)
         with self.lock:
             proc = self.procs.pop(name, None)
         if proc is not None and proc.poll() is None:
@@ -2272,8 +2312,10 @@ class Clusters:
                 pass
         return {"stopped": name, "agent_stop_exit": code}
 
-    def tail_log(self, name, lines=200):
+    def tail_log(self, name, lines=200, latest=False):
         path = self.log_path(name)
+        if latest:
+            return {"cluster": name, "copy_text": last_log_block(path)}
         try:
             with open(path, "rb") as f:
                 f.seek(0, os.SEEK_END)
@@ -2501,7 +2543,7 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             if rest == ["ssh", "setup"] and verb == "POST":
                 return 202, dict(c.setup_ssh(profile, self.json_body()), ok=True)
             if rest == ["operation"] and verb == "GET":
-                return 200, dict(c.operation(profile["name"], self.int_arg("lines", 200, 1, 5000)), ok=True)
+                return 200, dict(c.operation(profile["name"], self.int_arg("lines", 200, 1, 5000), self.flag("latest")), ok=True)
             if rest == ["login"] and verb == "GET":
                 return 200, dict(c.logins.status(profile), ok=True)
             if rest == ["login"] and verb == "POST":
@@ -2526,7 +2568,7 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             if rest == ["tunnel", "stop"] and verb == "POST":
                 return 200, dict(c.stop_tunnel(profile), ok=True)
             if rest == ["tunnel", "log"] and verb == "GET":
-                return 200, dict(c.tail_log(profile["name"], self.int_arg("lines", 200, 1, 5000)), ok=True)
+                return 200, dict(c.tail_log(profile["name"], self.int_arg("lines", 200, 1, 5000), self.flag("latest")), ok=True)
             if rest[:1] == ["rest"] and len(rest) > 1:
                 return self.proxy(verb, profile, "/".join(rest[1:]))
         raise ConsoleError(404 if verb in ("GET", "POST", "PUT", "DELETE") else 405, f"no route {verb} {path}")
@@ -2548,7 +2590,7 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             proc = c.app_waiting(profile["name"], app)
             return 200, dict(c.answer_prompt(proc, self.json_body().get("answer")), ok=True)
         if action == ["log"] and verb == "GET":
-            return 200, dict(c.app_log(profile["name"], app, self.int_arg("lines", 200, 1, 5000)), ok=True)
+            return 200, dict(c.app_log(profile["name"], app, self.int_arg("lines", 200, 1, 5000), self.flag("latest")), ok=True)
         if action == ["check"] and verb == "POST":
             return 200, dict(install=c.app_check(profile, app), ok=True)
         if action == ["install"] and verb == "POST":

@@ -59,6 +59,19 @@ asks above 25 MB); a folder opens that folder. `cluster` may be the profile name
 name (`hpclib-grace`). The session key is kept for the console's address (localStorage), so links work in new
 tabs; after the console restarts, the page asks for the new key once.
 
+## Logs and tunnel shutdown
+
+Log panels have a **Copy last block** button. It fetches the newest command block, starting with its
+`=== YYYY-MM-DD HH:MM:SS command ===` header, and copies plain text through the current end of that
+log. This includes output beyond the short display tail and removes terminal colors and title codes.
+The button is available for agent tunnels, app tunnels and installation/setup operations. A block over
+8 MiB reports an error instead of copying an incomplete block.
+
+Stopping or restarting an owned tunnel waits for Slurm to finish stopping its recorded job before
+reusing the tunnel's port. If shutdown cannot be confirmed within 20 seconds, the console reports the
+failure and keeps the record: wait for the job to finish and retry **Stop**. The command-line wait can
+be adjusted with `HPCLIB_TUNNEL_STOP_WAIT` on the login node.
+
 ## Job activity
 
 **Agents → Activity → Jobs** tracks recent agent-API submissions and their finished outcomes.
@@ -149,7 +162,7 @@ front end must arrange to serve its own `user.css` at the same URL on its own or
 | Element | What it is |
 | --- | --- |
 | `<hpc-panel heading status tone dismissible>` | a bordered panel with a title, a status and an optional × in the corner; × hides it (or whatever a `dismiss` listener does instead). Buttons with `slot="actions"` sit in its header. |
-| `<hpc-log src field every empty>` | output that fetches itself from an `/api` path, refreshes every `every` seconds and keeps to the bottom unless you scroll up; it stops when removed. Fires `update` with each answer. |
+| `<hpc-log src field every empty>` | output that fetches itself from an `/api` path, refreshes every `every` seconds and keeps to the bottom unless you scroll up; it stops when removed. Copy last block fetches that path with `latest=1`. Fires `update` with each display refresh. |
 | `<hpc-dialog heading transient>` | a modal with a title and ×; Escape closes it; `transient` removes it once closed. |
 | `<hpc-state state label tone>` | an API state word (`up`, `queued`, `failed`, ...) in its colour. |
 | `<hpc-field label hint>` | a form control with its label and hint. |

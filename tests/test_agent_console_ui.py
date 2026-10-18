@@ -37,9 +37,18 @@ FIXTURE = """<!doctype html><html><head>
     const long = "x".repeat(10000);
     const lines = [long, ...Array.from({ length: 60 }, (_, n) => `line ${n}`)];
     const state = { cluster: "demo", host: "demo", port: 1234, state: "down", login: {state: "none"} };
-    configure({ api: async (path) => path.includes("/operation?")
-      ? { state: "succeeded", title: "Installation log", log: lines }
-      : path.includes("/log?") ? { lines } : state });
+    window.copyText = "=== 2026-10-18 10:08:54 agent_tunnel fixture@faster.example ===\\n" +
+      Array.from({ length: 1000 }, (_, n) => `full block line ${n}`).join("\\n");
+    window.copyRequests = [];
+    configure({ api: async (path) => {
+      if (path.includes("latest=1")) {
+        window.copyRequests.push(path);
+        if (window.copyError) throw new Error(window.copyError);
+        return { copy_text: window.copyText };
+      }
+      return path.includes("/operation?") ? { state: "succeeded", title: "Installation log", log: lines }
+        : path.includes("/log?") ? { lines } : state;
+    }});
     // Insert the custom row programmatically, as app.js does. HTML table parsing
     // would otherwise move an unknown element outside the table before upgrade.
     window.row = el("hpc-app-session", { app: "vscode", "app-title": "VS Code", cluster: "demo" });
@@ -90,6 +99,35 @@ class TestConsoleUI(unittest.TestCase):
     def load(self):
         self.page.goto(self.base + "/fixture.html")
         self.page.wait_for_function("window.ready === true")
+
+    def test_copy_last_block_fetches_complete_output_for_tunnel_and_operation_logs(self):
+        self.page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+        self.load()
+        expected = self.page.evaluate("window.copyText")
+        for kind in ("tunnel", "operation"):
+            with self.subTest(kind=kind):
+                self.page.evaluate("row.toggleLog()" if kind == "tunnel" else "row.showOperation('copy-test')")
+                self.page.get_by_role("button", name="Copy last block", exact=True).click()
+                self.page.wait_for_function("document.querySelector('hpc-log').textContent.includes('Copied.')")
+                self.assertEqual(self.page.evaluate("navigator.clipboard.readText()"), expected)
+        requests = self.page.evaluate("window.copyRequests")
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(all("latest=1" in path for path in requests))
+        self.assertIn("/log?", requests[0])
+        self.assertIn("/operation?", requests[1])
+        self.assertEqual(self.errors, [])
+
+    def test_copy_errors_remain_visible_without_replacing_the_clipboard(self):
+        self.page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+        self.load()
+        self.page.evaluate("navigator.clipboard.writeText('existing clipboard')")
+        self.page.evaluate("row.toggleLog()")
+        message = "The last log block is too large to copy (over 8 MiB); open the log file instead."
+        self.page.evaluate("message => { window.copyError = message; }", message)
+        self.page.get_by_role("button", name="Copy last block", exact=True).click()
+        self.page.get_by_text(message, exact=True).wait_for()
+        self.assertEqual(self.page.evaluate("navigator.clipboard.readText()"), "existing clipboard")
+        self.assertEqual(self.errors, [])
 
     def test_installation_modules_are_editable_without_a_python_environment(self):
         """Use the actual app settings form, including a package's optional registry credential fields."""
