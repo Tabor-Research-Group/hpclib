@@ -391,6 +391,27 @@ commands or paths. `GET /admin/tunnel-install?id=ID&offset=N` returns its state,
 it. Progress is appended to the console's existing installation log, without keeping one HTTP request open
 for an entire image pull. A failure on the REST node ends the operation; it is not delegated again.
 
+How the escalation stays safe (0.2.75):
+
+- **Only the owner can start it.** It needs the console's owner token. The REST server runs a fixed command,
+  `setup_tunnel.sh NAME --install [--force] --check`, on files and saved settings that already arrived over your
+  SSH login. Nothing in the request is a path, a command or a setting.
+- **The installer knows where it runs.** It sees `HPCLIB_INSTALL_VIA=rest`. There an exit 3 is reported as "can't
+  run on the REST server's node either"; it never asks to move again.
+- **Agents can't change what it runs.** Scoped tokens can't write to the installed tunnels, hpclib or your shell
+  startup files, and sandboxed jobs see them read-only (see [the MCP server](mcp-server.md#tokens-and-scopes)).
+- **One installation of a tunnel at a time.** `setup_tunnel.sh` holds a lock in `~/.local/tunnels/locks` while it
+  receives or installs a tunnel, so the login node and the REST node never replace each other's files. A second
+  run waits for the first.
+- **The console bounds what it accepts.** It waits between answers that bring nothing new and stops after 6 hours.
+  It copies at most 64 MB of output, rejects oversized answers, and logs the node name only if it is a plain
+  hostname.
+- **Old installations are forgotten.** The REST server keeps the last 20 installations and their logs.
+
+An installer should exit 3 only on purpose, after checking for the runtime and before changing anything, as PAI's
+does. Under `set -e`, a command that happens to fail with status 3 looks the same, so end such commands with
+`|| exit 1`. The console continues `HPCLIB_TOKENS_ELSEWHERE` only when `setup_tunnel.sh` also exited 3.
+
 ### Running a program in the job sandbox
 
 A tunnel whose program should be held like a template job (an agent that runs commands, say) can run it in the

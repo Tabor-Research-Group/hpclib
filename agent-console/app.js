@@ -10,7 +10,19 @@ import { configure, el, action, confirmDialog, LOGIN_BUSY, LOGIN_LABEL, HpcClust
 import { activityPage as buildActivity } from "./activity.js";
 
 const params = new URLSearchParams(location.search);
-const API = (params.get("api") || "").replace(/\/$/, "");
+// ?api= may only name a console on this machine (127.0.0.1 or localhost): the session key goes with every call, and a
+// link naming another address would hand it, and whatever is typed into the prompts that follow, to that host.
+function localApi(given) {
+  if (!given) return "";
+  try {
+    const u = new URL(given);
+    if (u.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(u.hostname) && u.pathname === "/" &&
+        !u.search && !u.hash && !u.username && !u.password) return u.origin;
+  } catch { /* not a URL */ }
+  console.warn(`ignoring ?api=${given}: only a console on this machine (http://127.0.0.1:PORT) can be used`);
+  return "";
+}
+const API = localApi((params.get("api") || "").replace(/\/$/, ""));
 const main = document.getElementById("main");
 const KEY_ITEM = "agent-console-key";
 let key = null;
@@ -971,7 +983,8 @@ async function settingsPage() {
 
 // sbatch options for the tunnel's job; empty: what its tunnel_config.sh asks for
 const APP_TUNNEL_FIELDS = [["time", "Time limit", "e.g. 12:00:00"], ["mem", "Memory", "e.g. 16gb"],
-                           ["cpus-per-task", "CPUs", "e.g. 4"], ["partition", "Partition", ""]];
+                           ["cpus-per-task", "CPUs", "e.g. 4"], ["partition", "Partition", ""],
+                           ["nodelist", "Node list (optional)", "empty: Slurm chooses; e.g. fc041 or fc[041-042]"]];
 
 // An app's own bearer tokens (a package's `tokens` section: PAI's write tokens). Listed, made and revoked on the
 // cluster by the app's tokens.sh over the console's login; a new token is shown once, or saved straight to a file on

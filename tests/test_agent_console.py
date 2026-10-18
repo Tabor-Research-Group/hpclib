@@ -97,6 +97,8 @@ class FakeShell:
             rest = args[args.index("--tokens") + 1:]
             if self.tokens_error:
                 log.write(self.tokens_error.encode() + b"\n")
+                if self.tokens_error.startswith("HPCLIB_TOKENS_ELSEWHERE"):   # setup_tunnel.sh exits 3 with it
+                    return subprocess.Popen(["bash", "-c", "exit 3"], start_new_session=True)
             elif rest[0] == "list":
                 log.write(b"banner\nHPCLIB_TOKENS " + json.dumps({"tokens": self.tokens}).encode() + b"\n")
             elif rest[0] == "create":
@@ -777,6 +779,20 @@ class FakeApp(http.server.BaseHTTPRequestHandler):
 
 class TestApps(ConsoleTestCase):
 
+    def test_optional_node_list_can_be_saved_and_cleared(self):
+        base = f"/api/apps/jupyter/{self.dead}/settings"
+        for node in ("fc041", "fc041,fc042", "fc[041-042]"):
+            with self.subTest(node=node):
+                args = ["--time=12:00:00", f"--nodelist={node}"]
+                status, out = self.call("PUT", base, {"tunnel_args": args})
+                self.assertEqual(status, 200, out)
+                self.assertEqual(self.call("GET", base)[1]["tunnel_args"], args)
+        for bad in ("--nodelist=", "--nodelist=fc041;id", "--nodelist=$(id)", "--nodelist=fc041 --wrap=x"):
+            self.assertEqual(self.call("PUT", base, {"tunnel_args": [bad]})[0], 422, bad)
+        status, out = self.call("PUT", base, {"tunnel_args": ["--time=12:00:00"]})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["tunnel_args"], ["--time=12:00:00"])
+
     def serve(self, port, waiting=False, answer=FakeApp.answer):
         handler = type("H", (FakeApp,), {"waiting": waiting, "answer": answer})
         server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
@@ -987,6 +1003,35 @@ class TestTunnelInstall(ConsoleTestCase):
                 self.assertIn("pull failed", "\n".join(out["log"]))
                 if code == 3:
                     self.assertIn("REST server's node either", "\n".join(out["log"]))
+
+    def test_rest_install_answers_are_bounded(self):
+        """A REST server that never progresses, or sends too much, can't spin the console or fill its log."""
+        self.shell.install_elsewhere = "no runtime"
+        started = (202, "application/json", json.dumps({"id": "c" * 32, "node": "bad\nnode"}).encode())
+        stuck = (200, "application/json", json.dumps({"state": "running", "output": "", "offset": 0,
+                                                       "more": True, "exit_code": None}).encode())
+        huge = (200, "application/json", json.dumps({"state": "running", "output": "x" * (2 << 20),
+                                                      "offset": 2 << 20, "more": True, "exit_code": None}).encode())
+        for answers, message in (([started] + [stuck] * 1000, "ran over"), ([started, huge], "invalid installation")):
+            calls = []
+            def rest(*a, **k):
+                calls.append(a)
+                return answers[min(len(calls) - 1, len(answers) - 1)]
+            with self.subTest(message=message), \
+                    mock.patch.object(self.clusters.logins, "alive", return_value=True), \
+                    mock.patch.object(self.clusters, "tunnel_state", return_value={"state": "up"}), \
+                    mock.patch.object(agent_console, "read_private", return_value="owner"), \
+                    mock.patch.object(self.clusters, "INSTALL_POLL_SECONDS", 0.05), \
+                    mock.patch.object(self.clusters, "INSTALL_DEADLINE", 0.5), \
+                    mock.patch.object(self.clusters, "call", side_effect=rest):
+                self.assertEqual(self.call("POST", f"/api/apps/pai/{self.dead}/install")[0], 202)
+                out = self.wait_op(self.dead)
+                self.assertEqual(out["state"], "failed", out)
+                log = "\n".join(out["log"])
+                self.assertIn(message, log)
+                self.assertLess(len(calls), 40)                        # waited between answers without progress
+                self.assertNotIn("bad\nnode", log)
+                self.assertIsNone(out.get("rest_node"))
 
     def test_settings_check_install_start(self):
         base = f"/api/apps/vscode/{self.dead}"

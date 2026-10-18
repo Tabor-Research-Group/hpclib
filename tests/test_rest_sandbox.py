@@ -12,6 +12,7 @@ import concurrent.futures
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_rest_jobs import JobServerTestCase, fake_job  # noqa: E402
 import rest_sandbox  # noqa: E402
+import rest_server  # noqa: E402
 
 
 class TestBaseEnvironment(unittest.TestCase):
@@ -205,6 +207,52 @@ class TestAccountFiles(unittest.TestCase):
         self.assertIn("group777:x:777:user777", res.stdout.splitlines())
 
 
+class TestProtectedPaths(unittest.TestCase):
+    """A bound directory that holds hpclib's data or what runs unsandboxed later: covered after the binds."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        h = self.home = self.tmp / "home"
+        (h / ".local/tunnels/rest/envs/e").mkdir(parents=True)
+        (h / ".local/tunnels/rest_token").write_text("OWNER\n")
+        (h / ".ssh").mkdir()
+        (h / "hpclib").mkdir()
+        (h / ".bashrc").write_text("")
+        (h / "proj").mkdir()
+        image = self.tmp / "image.sif"
+        image.write_text("")
+        self.sandbox = rest_sandbox.Sandbox({"method": "singularity", "image": str(image)}, data_dir=str(self.tmp / "data"),
+                                            which=lambda n: "/bin/true" if n == "singularity" else None)
+        self.sandbox.protect(hidden=[h / ".local/tunnels", h / ".ssh", self.tmp / "absent"],
+                             read_only=[h / "hpclib", h / ".bashrc"])
+
+    def test_bind_order(self):
+        h = str(self.home)
+        plan = self.sandbox.plan([h], extra_ro=[h + "/.local/tunnels/rest/envs/e"])
+        self.assertEqual(plan["hidden"], [h + "/.local/tunnels", h + "/.ssh"])
+        self.assertEqual(plan["protected"], [h + "/hpclib", h + "/.bashrc"])
+        args = self.sandbox._bind_args(plan, "--bind")[1::2]
+        empty_dir = str(self.tmp / "data/sandbox/mask/empty-dir")
+        self.assertEqual(args, [f"{h}:{h}", f"{empty_dir}:{h}/.local/tunnels:ro", f"{empty_dir}:{h}/.ssh:ro",
+                                f"{h}/hpclib:{h}/hpclib:ro", f"{h}/.bashrc:{h}/.bashrc:ro",
+                                f"{h}/.local/tunnels/rest/envs/e:{h}/.local/tunnels/rest/envs/e:ro"])
+        self.assertEqual(os.listdir(empty_dir), [])
+        self.assertEqual(stat.S_IMODE(os.stat(empty_dir).st_mode), 0o500)
+
+    def test_nothing_to_cover(self):
+        """A job bound to a project directory alone is planned as before."""
+        plan = self.sandbox.plan([str(self.home / "proj")])
+        self.assertNotIn("masks", plan)
+        self.assertEqual(self.sandbox._bind_args(plan, "-v"), ["-v", f"{self.home}/proj:{self.home}/proj"])
+
+    def test_read_only_bind_hides_secrets_too(self):
+        """Hidden paths are hidden under read-only binds as well; protected ones need no cover there."""
+        plan = self.sandbox.plan([], extra_ro=[str(self.home)])
+        self.assertEqual(plan["hidden"], [f"{self.home}/.local/tunnels", f"{self.home}/.ssh"])
+        self.assertEqual(plan["protected"], [])
+
+
 class SandboxServerTestCase(JobServerTestCase):
 
     def use_sandbox(self, config, runtime=True):
@@ -324,6 +372,22 @@ class TestRealSingularity(unittest.TestCase):
         script = "\n".join(["#!/bin/bash"] + lines) + "\n"
         return subprocess.run(["bash", "-c", script], cwd=self.allowed, capture_output=True, text=True,
                               timeout=120, env=dict(os.environ, HPC_PARAM_X="from the host"))
+
+    def test_protected_paths_inside_a_bound_directory(self):
+        """A job may write where it's bound, but not see hpclib's tokens or change what runs unsandboxed later."""
+        home = self.allowed / "home"
+        (home / ".local/tunnels").mkdir(parents=True)
+        (home / ".local/tunnels/rest_token").write_text("OWNER\n")
+        (home / "hpclib").mkdir()
+        (home / "hpclib/hpclib.sh").write_text("code\n")
+        (home / ".bashrc").write_text("rc\n")
+        self.sandbox.protect(hidden=[home / ".local/tunnels"], read_only=[home / "hpclib", home / ".bashrc"])
+        res = self.run_body(f"cat {home}/.local/tunnels/rest_token; echo x >> {home}/.bashrc; "
+                            f"echo x >> {home}/hpclib/hpclib.sh; echo ok > {home}/out && echo wrote")
+        self.assertNotIn("OWNER", res.stdout)
+        self.assertIn("wrote", res.stdout)
+        self.assertEqual(((home / ".bashrc").read_text(), (home / "hpclib/hpclib.sh").read_text()), ("rc\n", "code\n"))
+        self.assertEqual((home / ".local/tunnels/rest_token").read_text(), "OWNER\n")
 
     def test_host_environment_reaches_the_body(self):
         """Modules put programs and libraries on PATH and LD_LIBRARY_PATH, which the runtime would reset."""

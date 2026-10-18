@@ -105,11 +105,25 @@ while [ "$#" -gt 0 ]; do
     *) echo "$usage" >&2; exit 2 ;;
   esac
 done
-if [ "$receive" = true ]; then
+# One receive or installation of a tunnel at a time, also between the login node and the REST server's node (the
+# console's fallback), so neither replaces files under the other. Where the file system has no locks, as before.
+if [ "$receive" = true ] || [ "$install" = true ]; then
   if ! _hpclib_valid_tunnel_name "$TUNNEL_NAME"; then
     echo "setup_tunnel: invalid tunnel name '$TUNNEL_NAME'" >&2
     exit 2
   fi
+  if command -v flock > /dev/null 2>&1 && (umask 077 && mkdir -p "$HPCTUNNELS_DATA_DIR/locks") 2> /dev/null &&
+      exec 8>> "$HPCTUNNELS_DATA_DIR/locks/$TUNNEL_NAME.lock"; then
+    if ! lock_err=$(flock -n 8 2>&1); then
+      case "$lock_err" in
+        *"not supported"*|*"not implemented"*|*"No locks available"*|*"Bad file"*) ;;
+        *) echo "waiting for another installation of $TUNNEL_NAME to finish"
+           flock -w 1800 8 || { echo "setup_tunnel: another installation of $TUNNEL_NAME is still running" >&2; exit 1; } ;;
+      esac
+    fi
+  fi
+fi
+if [ "$receive" = true ]; then
   incoming=$(mktemp -d "${TMPDIR:-/tmp}/hpclib-receive.XXXXXX") || exit 1
   trap 'rm -rf "$incoming"' EXIT
   # plain files and directories only: no links, nothing outside the archive's own directory
@@ -118,6 +132,8 @@ if [ "$receive" = true ]; then
     echo "setup_tunnel: the files sent for $TUNNEL_NAME are not a plain tar archive" >&2
     exit 1
   fi
+  # what holds credentials (rclone remotes, say) is yours alone before it is moved anywhere
+  [ ! -d "$incoming/settings.d" ] || chmod -R go-rwx "$incoming/settings.d"
   if [ -d "$incoming/tunnel" ]; then
     if [ -d "$HPCLIB_DIR/tunnels/$TUNNEL_NAME" ]; then
       echo "setup_tunnel: $TUNNEL_NAME is one of hpclib's own tunnels; a package can't replace it" >&2
@@ -171,10 +187,13 @@ for kv in "${sets[@]}"; do
 done
 if [ "$save" = true ]; then
   mkdir -p "${settings_file%/*}"
+  # yours alone (a repository URL can hold a credential), and a temporary file of its own for each run
+  settings_tmp=$(umask 077 && mktemp "$settings_file.XXXXXX") || { echo "setup_tunnel: could not write $settings_file" >&2; exit 1; }
   {
     echo "# $TUNNEL_NAME tunnel settings, written by setup_tunnel.sh (the console's tunnel settings); start_tunnel.sh reads them"
     printf '%s\n' "${lines[@]}"
-  } > "$settings_file.tmp" && mv -f "$settings_file.tmp" "$settings_file"
+  } > "$settings_tmp" && mv -f "$settings_tmp" "$settings_file" ||
+    { rm -f "$settings_tmp"; echo "setup_tunnel: could not write $settings_file" >&2; exit 1; }
   echo "saved ${#lines[@]} setting(s) for $TUNNEL_NAME in $settings_file"
 fi
 if [ -f "$settings_file" ]; then
@@ -226,7 +245,12 @@ if [ "$install" = true ]; then
     echo "running $installer ${args[*]}"
     installer_status=0
     run_installer "${args[@]}" || installer_status=$?
-    if [ "$installer_status" = 3 ]; then
+    if [ "$installer_status" = 3 ] && [ "${HPCLIB_INSTALL_VIA:-}" = rest ]; then
+      # already where the REST server runs: not delegated again
+      echo "setup_tunnel: $TUNNEL_NAME's install.sh can't run on $(hostname -s) (the REST server's node) either" >&2
+      [ "$check" = true ] && status missing "its install.sh can't run on the login node or the REST server's node"
+      exit 3
+    elif [ "$installer_status" = 3 ]; then
       printf 'HPCLIB_INSTALL_ELSEWHERE %s\n' "install.sh cannot run on $(hostname -s); continue on the REST server's node"
       exit 3
     elif [ "$installer_status" != 0 ]; then
@@ -277,6 +301,8 @@ if [ "$secrets" = true ]; then
     fi
     mv -f "$secrets_dir/.$name.new" "$secrets_dir/$name"
   done
+  # set -a exported these: the last value read must not reach what runs next (install.sh, tokens.sh, containers)
+  unset line name value
   secrets_status
 fi
 
@@ -293,7 +319,10 @@ if [ "$tokens" = true ]; then
     tokens_status=$?
     # tokens.sh's own complaint (its standard error never holds a token), so the console can say why
     reason=$(grep -v '^[[:space:]]*$' "$tokens_err" | tail -n 1 | tr -d '\r' | cut -c1-300)
-    if [ "$tokens_status" = 3 ]; then     # not on this node: where the REST server runs, the console tries there
+    if [ "$tokens_status" = 3 ] && [ "${HPCLIB_INSTALL_VIA:-}" = rest ]; then
+      echo "setup_tunnel: tokens.sh can't run on $(hostname -s) (the REST server's node) either${reason:+: $reason}" >&2
+      exit 3
+    elif [ "$tokens_status" = 3 ]; then     # not on this node: where the REST server runs, the console tries there
       [ -n "$reason" ] || reason="tokens.sh cannot run on $(hostname -s)"
       printf 'HPCLIB_TOKENS_ELSEWHERE %s\n' "$reason"
       exit 3

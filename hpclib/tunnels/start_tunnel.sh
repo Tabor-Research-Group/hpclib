@@ -399,8 +399,9 @@ if [ "$SESSION_ID" = "" ]
       if [ "$CREATE_ENV_FILE" = "true" ]; then
         TUNNEL_ENV_FIlE="$SESSIONS_DIR/env-$SESSION_ID.sh"
         CURRENT_TUNNEL_ENV_FIlE="$SESSIONS_DIR/activate.sh"
-        declare -px > "$TUNNEL_ENV_FIlE"
-        cp "$TUNNEL_ENV_FIlE" "$CURRENT_TUNNEL_ENV_FIlE"
+        # everything exported (~/.bashrc's API keys too): yours alone
+        (umask 077 && declare -px > "$TUNNEL_ENV_FIlE" && cp "$TUNNEL_ENV_FIlE" "$CURRENT_TUNNEL_ENV_FIlE")
+        chmod 600 "$TUNNEL_ENV_FIlE" "$CURRENT_TUNNEL_ENV_FIlE" 2> /dev/null || true
       fi
 
       if [ "$start_bg" = "true" ];

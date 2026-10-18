@@ -1124,6 +1124,15 @@ class Clusters:
             return log.read().decode(errors="replace")
 
     INSTALL_POLL_SECONDS = 1
+    INSTALL_DEADLINE = 6 * 3600          # s: an installation through the REST API that takes longer is given up on
+    INSTALL_LOG_LIMIT = 64 << 20         # bytes of its output copied into the console's log
+    INSTALL_CHUNK_LIMIT = 1 << 20        # bytes in one answer (the REST server sends at most 64 KiB)
+    NODE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
+
+    @staticmethod
+    def _one_line(text, limit=300):
+        """Cluster-supplied text for one line of a log: no line breaks or control characters, bounded."""
+        return re.sub(r"[\x00-\x1f\x7f]+", " ", str(text))[:limit]
 
     def _install_via_rest(self, profile, record, reason, log):
         spec = self.app_spec(record["app"])
@@ -1147,26 +1156,39 @@ class Clusters:
                 raise ConsoleError(502, f"{needs}: update HPCLIB on the cluster to 0.2.71 or newer, "
                                         "then restart the agent tunnel")
             if status >= 400:
-                raise ConsoleError(502, f"{needs}: {out.get('error', f'HTTP {status}')}")
+                raise ConsoleError(502, f"{needs}: {self._one_line(out.get('error', f'HTTP {status}'))}")
             return out
 
+        reason = self._one_line(reason)
         log.write(f"Continuing {spec['title']} installation through the REST API: {reason}\n".encode())
         out = request("POST", {"tunnel": spec["tunnel"], "force": "--force" in record["command"]})
         ident = out.get("id")
         if not isinstance(ident, str) or not re.fullmatch(r"[a-f0-9]{32}", ident):
             raise ConsoleError(502, "the REST server returned no installation ID")
+        node = out.get("node") if isinstance(out.get("node"), str) and self.NODE_RE.fullmatch(out["node"]) else None
         with self.lock:
             record["rest_install_id"] = ident
-            record["rest_node"] = out.get("node")
-        log.write(f"Installation {ident} on {out.get('node', 'the REST node')}\n".encode())
-        offset = 0
+            record["rest_node"] = node
+        log.write(f"Installation {ident} on {node or 'the REST node'}\n".encode())
+        offset, copied, deadline = 0, 0, time.monotonic() + self.INSTALL_DEADLINE
         while True:
+            if time.monotonic() > deadline:
+                raise ConsoleError(504, f"the installation on the REST node ran over {self.INSTALL_DEADLINE // 3600} h;"
+                                        f" it may still be running there (installation {ident})")
             out = request("GET", query={"id": ident, "offset": offset})
             text, following = out.get("output"), out.get("offset")
             if (not isinstance(text, str) or isinstance(following, bool) or not isinstance(following, int) or
-                    following < offset or out.get("state") not in ("running", "succeeded", "failed")):
+                    following < offset or following - offset > self.INSTALL_CHUNK_LIMIT or
+                    len(text) > self.INSTALL_CHUNK_LIMIT or
+                    out.get("state") not in ("running", "succeeded", "failed")):
                 raise ConsoleError(502, "the REST server returned an invalid installation status")
-            log.write(text.encode())
+            if copied < self.INSTALL_LOG_LIMIT:
+                data = text.encode()[:self.INSTALL_LOG_LIMIT - copied]
+                log.write(data)
+                copied += len(data)
+                if copied >= self.INSTALL_LOG_LIMIT:
+                    log.write(b"\n(the rest of the installer's output is in its log on the REST node)\n")
+            progressed = following > offset
             offset = following
             if out.get("state") != "running" and not out.get("more"):
                 code = out.get("exit_code")
@@ -1176,7 +1198,7 @@ class Clusters:
                     raise ConsoleError(502, f"{spec['title']} cannot be installed on the REST server's node either; "
                                             "see the installer output above")
                 return code
-            if not out.get("more"):
+            if not (out.get("more") and progressed):    # only a server with more to send is asked again at once
                 time.sleep(self.INSTALL_POLL_SECONDS)
 
     def operation(self, name, lines=200, latest=False):
@@ -1404,7 +1426,7 @@ class Clusters:
             if not isinstance(args, list) or not all(isinstance(a, str) and agent_profiles.TUNNEL_ARG_RE.fullmatch(a)
                                                      for a in args):
                 raise ConsoleError(422, "tunnel_args must be sbatch options like --time=8:00:00 or --mem=16gb "
-                                        "(time, mem, partition, account, qos, cpus-per-task, constraint)")
+                                        "(time, mem, partition, account, qos, cpus-per-task, constraint, nodelist)")
             conf["tunnel_args"] = args
         if "conda_env" in body:
             env = body["conda_env"]
@@ -1590,8 +1612,9 @@ class Clusters:
         text = self._run_setup(profile, ["tunnel_setup"] + ssh_options(profile) +
                                [profile["host"], spec["tunnel"], "--tokens"] + args, wait)
         elsewhere = TOKENS_ELSEWHERE_RE.findall(text)
-        if elsewhere:
-            text = self._tokens_via_rest(profile, spec, args, elsewhere[-1].strip())
+        # setup_tunnel.sh prints the marker only as it exits 3; anything else (tokens.sh's own output) is no request
+        if elsewhere and text.rstrip().endswith("(exit 3)"):
+            text = self._tokens_via_rest(profile, spec, args, self._one_line(elsewhere[-1].strip()))
         return spec, text
 
     def _tokens_via_rest(self, profile, spec, args, reason):
@@ -1614,11 +1637,13 @@ class Clusters:
         if status == 404:
             raise ConsoleError(502, f"{needs}: update hpclib there (0.2.70 or newer), then restart the agent tunnel")
         if status >= 400:
-            raise ConsoleError(502, f"{needs}: {out.get('error', f'HTTP {status}')}")
+            raise ConsoleError(502, f"{needs}: {self._one_line(out.get('error', f'HTTP {status}'))}")
         text = str(out.get("stdout", "")) + "\n" + str(out.get("stderr", ""))
-        if TOKENS_ELSEWHERE_RE.search(text):
-            raise ConsoleError(502, f"{needs}, but it can't run on {out.get('node', 'that node')} either: "
-                                    f"{TOKENS_ELSEWHERE_RE.findall(text)[-1].strip()}")
+        if out.get("exit_code") == 3:
+            node = out.get("node") if isinstance(out.get("node"), str) and self.NODE_RE.fullmatch(out["node"]) else None
+            last = [l for l in str(out.get("stderr", "")).splitlines() if l.strip()]
+            raise ConsoleError(502, f"{needs}, but it can't run on {node or 'that node'} either"
+                                    + (f": {self._one_line(last[-1])}" if last else ""))
         return text
 
     @staticmethod
@@ -2620,10 +2645,11 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         raise ConsoleError(404, f"no route {verb} /api/apps/{app}/{'/'.join(rest)}")
 
     def proxy(self, verb, profile, route):
+        # empty and dot segments too: "admin//ssh/x" or "admin/./ssh/x" would pass a prefix check below
+        if not REST_ROUTE_RE.fullmatch(route) or any(part in ("", ".", "..") for part in route.rstrip("/").split("/")):
+            raise ConsoleError(400, f"invalid cluster route {route!r}")
         if (profile.get("preset") or {}).get("ssh_keys") == "site-managed" and route.startswith("admin/ssh/") and verb != "GET":
             raise ConsoleError(409, "this cluster's SSH files are managed by the site; only read operations are available")
-        if not REST_ROUTE_RE.fullmatch(route) or ".." in route.split("/"):
-            raise ConsoleError(400, f"invalid cluster route {route!r}")
         query = {k: v for k, v in self.query.items() if k != "as"}
         as_agent = self.query.get("as", [""])[-1] == "agent"
         if verb == "GET" and route in STREAMED_ROUTES:
@@ -2724,7 +2750,7 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         if not isinstance(args, list) or not all(isinstance(a, str) and agent_profiles.TUNNEL_ARG_RE.fullmatch(a)
                                                  for a in args):
             raise ConsoleError(422, "tunnel_args must be sbatch options like --time=12:00:00 or --mem=2gb "
-                                    "(time, mem, partition, account, qos, cpus-per-task, constraint)")
+                                    "(time, mem, partition, account, qos, cpus-per-task, constraint, nodelist)")
         hours = body.get("connection_hours", profile.get("connection_hours") or Logins.DEFAULT_HOURS)
         if isinstance(hours, bool) or not isinstance(hours, int) or not 1 <= hours <= 168:
             raise ConsoleError(422, "connection_hours must be a whole number of hours from 1 to 168")

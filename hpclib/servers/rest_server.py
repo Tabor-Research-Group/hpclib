@@ -119,6 +119,8 @@ if sys.version_info < (3, 7):  # http.server.ThreadingHTTPServer and subprocess.
 
 import abc
 import argparse
+import fcntl
+import functools
 import hashlib
 import hmac
 import http.server
@@ -239,6 +241,13 @@ class PathWhitelist:
         wl.base_dir = os.path.realpath(os.path.expanduser(base_dir))
         return wl
 
+    def with_deny(self, extra):
+        """The same whitelist, also refusing the `extra` paths (and everything under them)."""
+        wl = PathWhitelist.__new__(PathWhitelist)
+        wl.roots, wl.base_dir = self.roots, self.base_dir
+        wl.deny = tuple(sorted(set(self.deny) | {os.path.realpath(os.path.expanduser(d)) for d in extra if d}))
+        return wl
+
     def restrict(self, roots):
         """A narrower whitelist: only those `roots` that this one allows."""
         if roots is None:
@@ -264,6 +273,21 @@ class PathWhitelist:
         if not (self.contains(logical) and self.contains(real)):
             raise PermissionError(f"{path} is outside the allowed directories")
         return logical, real
+
+
+def _tokens_locked(method):
+    """Holds an exclusive lock beside the tokens file while `method` reads, changes and writes it (a revoke and a
+    concurrent --add-token can't undo each other)."""
+    @functools.wraps(method)
+    def locked(cls, tokens_file, *args, **kwargs):
+        os.makedirs(os.path.dirname(os.path.abspath(tokens_file)), mode=0o700, exist_ok=True)
+        fd = os.open(tokens_file + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            return method(cls, tokens_file, *args, **kwargs)
+        finally:
+            os.close(fd)
+    return locked
 
 
 class TokenIdentity:
@@ -404,6 +428,7 @@ class TokenAuth:
         return data.get("tokens", [])
 
     @classmethod
+    @_tokens_locked
     def add_token(cls, tokens_file, name, scopes, allow=None):
         if not cls.NAME_RE.fullmatch(name) or name == cls.OWNER:
             raise ValueError(f"invalid token name {name!r}")
@@ -423,6 +448,7 @@ class TokenAuth:
         return token
 
     @classmethod
+    @_tokens_locked
     def revoke_token(cls, tokens_file, name):
         entries = cls.read_tokens_file(tokens_file) if os.path.exists(tokens_file) else []
         kept = [e for e in entries if e.get("name") != name]
@@ -440,6 +466,7 @@ class TokenAuth:
         return None
 
     @classmethod
+    @_tokens_locked
     def revoke_token_hash(cls, tokens_file, digest):
         """Revoke the token whose sha256 is `digest`; returns its name."""
         entries = cls.read_tokens_file(tokens_file) if os.path.exists(tokens_file) else []
@@ -451,6 +478,7 @@ class TokenAuth:
         return names[0]
 
     @classmethod
+    @_tokens_locked
     def add_scopes_by_hash(cls, tokens_file, digest, scopes):
         """Add `scopes` to the token whose sha256 is `digest`; returns (name, scopes added)."""
         bad = [s for s in scopes if s not in cls.SCOPES]
@@ -514,6 +542,7 @@ class RESTServer(http.server.ThreadingHTTPServer):
         self.auth = auth
         self.config_path = config_path   # for GET/PUT /admin/config
         self.whitelist = whitelist
+        self.agent_whitelist = whitelist.with_deny(agent_protected_paths())
         self.command_timeout = command_timeout
         self.max_upload = max_upload
         self.disable_file_changes = disable_file_changes
@@ -544,6 +573,9 @@ class RESTHandler(http.server.BaseHTTPRequestHandler):
 
     server_version = "hpclib-rest/0.2"
     MAX_JSON_BODY = 1 << 20
+    AUDIT_PATH_MAX = 512
+    # a client that stops sending mid-request (or idles on a kept-alive connection) frees its thread after this
+    timeout = 120
     FILE_CHANGE_ROUTES = ()
     ROUTE_SCOPES = {}
     server: RESTServer
@@ -559,8 +591,14 @@ class RESTHandler(http.server.BaseHTTPRequestHandler):
 
     @property
     def whitelist(self) -> PathWhitelist:
-        """The server's whitelist, narrowed to the token's directories."""
-        return self.server.whitelist.restrict(self.identity.allow if self.identity else None)
+        """
+        The server's whitelist, narrowed to the token's directories. A token without `*` (an agent's) is also kept
+        out of what runs unsandboxed as you later (hpclib, installed tunnels, shell startup files, ~/.ssh): writing
+        there would turn a scoped token into your own powers the next time you install or start an app.
+        """
+        if self.identity is not None and self.identity.has_scope("*"):
+            return self.server.whitelist.restrict(self.identity.allow)
+        return self.server.agent_whitelist.restrict(self.identity.allow if self.identity else None)
 
     def handle_rest_request(self, verb):
         self.responded = False
@@ -597,9 +635,10 @@ class RESTHandler(http.server.BaseHTTPRequestHandler):
             self.send_error_json(403, {"error": str(e)})
         except FileNotFoundError as e:
             self.send_error_json(404, {"error": str(e)})
-        except Exception:
+        except Exception as e:
+            # the details go to the server's log only: an agent's token shouldn't learn paths and internals
             traceback.print_exc(limit=3)
-            self.send_error_json(500, {"error": traceback.format_exc(limit=1)})
+            self.send_error_json(500, {"error": f"internal error ({type(e).__name__}); see the REST server's log"})
         finally:
             self.write_audit(verb)
 
@@ -611,7 +650,7 @@ class RESTHandler(http.server.BaseHTTPRequestHandler):
             "client": self.client_address[0] if self.client_address else None,
             "token": self.identity.name if self.identity else None,
             "verb": verb,
-            "path": self.path,
+            "path": self.path if len(self.path) <= self.AUDIT_PATH_MAX else self.path[:self.AUDIT_PATH_MAX] + "...",
             "status": self.response_status,
         }
         if self.audit_detail:
@@ -858,13 +897,23 @@ class HPCRESTHandler(RESTHandler):
                 not all(isinstance(a, str) and len(a) <= 1024 and not re.search(r"[\0\n\r]", a) for a in args)):
             raise RESTError(422, "args: at most 16 one-line strings")
         script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tunnels", "setup_tunnel.sh")
+        env = dict(rest_sandbox.child_env(), HPCLIB_INSTALL_VIA="rest")
+        # its own session, so a timeout ends tokens.sh and the container it started too, not only bash
+        proc = subprocess.Popen(["bash", script, tunnel, "--tokens", action, *args], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                                start_new_session=True)
         try:
-            res = subprocess.run(["bash", script, tunnel, "--tokens", action, *args], capture_output=True, text=True,
-                                 timeout=180, stdin=subprocess.DEVNULL, env=rest_sandbox.child_env())
+            stdout, stderr = proc.communicate(timeout=180)
         except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.communicate()
+            self.audit_detail = {"tunnel": tunnel, "tokens": action, "exit_code": None}
             raise RESTError(504, f"setup_tunnel.sh {tunnel} --tokens {action} took over 180 s")
-        self.audit_detail = {"tunnel": tunnel, "tokens": action, "exit_code": res.returncode}
-        return 200, {"exit_code": res.returncode, "stdout": res.stdout[-65536:], "stderr": res.stderr[-8192:],
+        self.audit_detail = {"tunnel": tunnel, "tokens": action, "exit_code": proc.returncode}
+        return 200, {"exit_code": proc.returncode, "stdout": stdout[-65536:], "stderr": stderr[-8192:],
                      "node": socket.gethostname()}
 
     def do_admin_ssh(self):
@@ -1808,7 +1857,7 @@ def sandbox_script(opts, config):
                       f"data ({clash[0]})", file=sys.stderr)
                 return 2
             binds[kind].append(real)
-    sandbox = rest_sandbox.Sandbox(config.get("sandbox"), data_dir=rest_data_dir())
+    sandbox = protect_sandbox(rest_sandbox.Sandbox(config.get("sandbox"), data_dir=rest_data_dir()), config)
     try:
         lines, plan = sandbox.launch(shebang, body, binds["writable"], extra_ro=binds["read-only"],
                                      network="host" if opts.sandbox_network == "host" else False)
@@ -1847,12 +1896,49 @@ def build_jobs(config, command_timeout, auto_approve=None):
         job_env=env["jobs"],
     )
 
-def protected_paths(config, auth):
+def hpclib_code_dir():
+    """The hpclib this server belongs to (its servers/ and tunnels/ are here)."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def agent_protected_paths():
+    """
+    What runs, or is read, unsandboxed as you later, so that a scoped token (an agent's) must not change it, or
+    a template job see it writable: hpclib itself, the installed tunnels and the tunnel search path (an app's
+    install.sh, tokens.sh, sbatch_script.sh), shell startup files (setup_tunnel.sh and jobs source ~/.bashrc) and
+    ~/.ssh. Owner tokens are not limited by this.
+    """
+    home = os.path.expanduser("~")
+    paths = [hpclib_code_dir(), os.environ.get("HPCLIB_DIR"),
+             os.environ.get("HPCLIB_TUNNEL_INSTALL_LOCATION") or os.environ.get("USER_TUNNEL_DIR") or
+             os.path.join(home, ".local", "share", "hpclib", "tunnels"),
+             os.environ.get("HPCTUNNELS_DIR")]
+    paths += (os.environ.get("HPCLIB_TUNNEL_PATH") or "").split(":")
+    paths += [os.path.join(home, f) for f in (".bashrc", ".bash_profile", ".bash_login", ".profile", ".bash_logout",
+                                              ".ssh", ".config/hpclib")]
+    out = []
+    for p in paths:
+        if p and os.path.isabs(os.path.expanduser(p)):
+            real = os.path.realpath(os.path.expanduser(p))
+            if real != os.path.realpath(home) and real != "/" and real not in out:
+                out.append(real)
+    return out
+
+def protect_sandbox(sandbox, config, auth=None):
+    """
+    What a sandboxed job (template jobs, environment syncs, --sandbox-script) must not see or change even when a
+    directory holding it is bound: hpclib's data (tokens, the owner token, templates, the job database) and ~/.ssh
+    are hidden; what runs unsandboxed later (agent_protected_paths) is bound read-only.
+    """
+    hidden = protected_paths(config, auth) + [os.path.expanduser("~/.ssh")]
+    sandbox.protect(hidden=hidden, read_only=[p for p in agent_protected_paths() if p not in hidden])
+    return sandbox
+
+def protected_paths(config, auth=None):
     paths = [tunnels_data_dir(), config["templates_dir"], config["jobs_db"], config["tokens_file"],
              config["path"], config["proposals_dir"]]
     if config.get("audit_log"):
         paths.append(config["audit_log"])
-    if auth.source and not auth.source.startswith("$"):
+    if auth is not None and auth.source and not auth.source.startswith("$"):
         paths.append(auth.source)
     return [os.path.expanduser(p) for p in paths]
 
@@ -1881,6 +1967,7 @@ def main(argv=None, handler_class=HPCRESTHandler):
     if opts.auto_approve_templates not in (None, "new", "all"):
         raise SystemExit("--auto-approve-templates / $HPC_REST_AUTO_APPROVE_TEMPLATES must be new or all")
     jobs = build_jobs(config, opts.command_timeout, opts.auto_approve_templates)
+    protect_sandbox(jobs.sandbox, config, auth)
     audit = AuditLog(config["audit_log"]) if config.get("audit_log") else None
 
     if opts.host not in ("127.0.0.1", "localhost", "::1"):

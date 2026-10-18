@@ -134,7 +134,7 @@ class TestConsoleUI(unittest.TestCase):
         saved = []
         state = {"cluster": "demo", "host": "demo", "state": "down", "login": {"state": "none"},
                  "install": {"state": "unchecked"}}
-        conf = {"tunnel_args": [], "conda_env": None, "modules": [], "project": "", "python_env": False,
+        conf = {"tunnel_args": ["--time=12:00:00", "--nodelist=fc041"], "conda_env": None, "modules": [], "project": "", "python_env": False,
                 "job": True, "installable": True, "install_modules": ["WebProxy"], "settings": {}, "defaults": {},
                 "fields": [{"name": "PAI_GITHUB_USERNAME", "label": "GitHub username (optional)", "hint": "", "choices": None}],
                 "secrets": [{"name": "PAI_GITHUB_PAT", "label": "GitHub PAT (optional)", "hint": "", "set": False}],
@@ -165,16 +165,22 @@ class TestConsoleUI(unittest.TestCase):
         }))""")
         modules = self.page.locator('hpc-field[label="Installation modules"] input')
         self.assertEqual(modules.input_value(), "WebProxy")
+        nodes = self.page.locator('hpc-field[label="Job: Node list (optional)"] input')
+        self.assertEqual(nodes.input_value(), "fc041")
+        nodes.fill("fc[041-042]")
         self.assertEqual(self.page.get_by_label("GitHub PAT (optional)", exact=True).get_attribute("type"), "password")
         modules.fill("GCC/12.2.0 WebProxy")
         with self.page.expect_response(lambda response: response.request.method == "PUT" and response.url.endswith("/settings")):
             self.page.get_by_role("button", name="Save", exact=True).click()
         self.assertEqual(saved[-1]["install_modules"], ["GCC/12.2.0", "WebProxy"])
+        self.assertEqual(saved[-1]["tunnel_args"], ["--time=12:00:00", "--nodelist=fc[041-042]"])
         self.assertNotIn("PAI_GITHUB_PAT", saved[-1].get("settings", {}))
         modules.fill("")
+        nodes.fill("")
         with self.page.expect_response(lambda response: response.request.method == "PUT" and response.url.endswith("/settings")):
             self.page.get_by_role("button", name="Save", exact=True).click()
         self.assertEqual(saved[-1]["install_modules"], [])
+        self.assertEqual(saved[-1]["tunnel_args"], ["--time=12:00:00"])
         self.assertEqual(self.errors, [])
 
     def metrics(self):

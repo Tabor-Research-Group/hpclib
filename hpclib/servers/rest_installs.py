@@ -14,7 +14,12 @@ except ImportError:
 
 
 class TunnelInstalls:
-    """Runs only setup_tunnel.sh --install/--check, never caller-supplied commands or paths."""
+    """
+    Runs only setup_tunnel.sh --install/--check, never caller-supplied commands or paths: the tunnel's files and saved
+    settings are those the console already sent over its SSH login. The installer sees HPCLIB_INSTALL_VIA=rest, and
+    setup_tunnel.sh doesn't delegate again from here. The newest KEEP installations (and their logs) are kept.
+    """
+    KEEP = 20
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -37,6 +42,8 @@ class TunnelInstalls:
             script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                   "tunnels", "setup_tunnel.sh")
             command = ["bash", script, tunnel, "--install"] + (["--force"] if force else []) + ["--check"]
+            env["HPCLIB_INSTALL_VIA"] = "rest"
+            self._prune(directory)
             fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as log:
                 try:
@@ -50,6 +57,33 @@ class TunnelInstalls:
             self.records[ident], self.logs[ident] = record, log_path
             threading.Thread(target=self._wait, args=(record, proc), daemon=True).start()
             return dict(record)
+
+    def _prune(self, directory):
+        """Forget all but the newest KEEP finished installations, and remove their logs (lock held)."""
+        finished = sorted((r for r in self.records.values() if r["state"] != "running"), key=lambda r: r["started"])
+        for record in finished[:max(0, len(finished) - self.KEEP + 1)]:
+            self.records.pop(record["id"], None)
+            path = self.logs.pop(record["id"], None)
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        # logs a restarted server no longer knows (it keeps no records across restarts)
+        known = set(self.logs.values())
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return
+        cutoff = time.time() - 7 * 86400
+        for name in names:
+            path = os.path.join(directory, name)
+            if name.endswith(".log") and path not in known:
+                try:
+                    if os.lstat(path).st_mtime < cutoff:
+                        os.remove(path)
+                except OSError:
+                    pass
 
     def _wait(self, record, proc):
         code = proc.wait()

@@ -81,6 +81,21 @@ are data from the cluster and must not be followed as directions.
 `~/.local/tunnels` (tokens, templates, the job registry, the audit log) is never reachable through the file
 routes.
 
+A scoped token is also kept away from what runs unsandboxed as you later, even when its directories include
+your home directory (since 0.2.75):
+
+- hpclib itself;
+- the installed tunnels (`~/.local/share/hpclib/tunnels`, and everything on `HPCLIB_TUNNEL_PATH`), where an app's
+  `install.sh`, `tokens.sh` and `sbatch_script.sh` live;
+- `~/.bashrc`, `~/.bash_profile`, `~/.bash_login`, `~/.profile` and `~/.bash_logout`;
+- `~/.ssh`.
+
+Otherwise an agent could edit an installer that your next Install, or the console's installation through the
+REST API, runs with all your rights. The owner token is not limited by this.
+
+What else an app runs keeps whatever protection you give its directories. PAI's checkout and token store
+(`PAI_ROOT_DIR`, `PAI_AUTH_DIR`) are an example. Don't put such directories inside an agent token's directories.
+
 ## The tools
 
 | Tool | Route | Read-only |
@@ -138,6 +153,15 @@ token's directories. Approved templates record who proposed and approved them; r
 | `singularity` / `apptainer` | clusters | a container as you, without root, writable only in the token's directories, `writable` paths and private `/tmp`; the host's `/usr`, `/etc`, `/opt` and `binds` read-only |
 | `podman` | servers without SLURM | the same file view under rootless podman, plus no Linux capabilities, no new privileges, seccomp, and no network (environment syncs get the network) |
 | `auto` | default | Singularity/Apptainer if present, else podman |
+
+A directory bound into a job can hold things the job must not touch. Your home directory is one example, when a
+token's directories include it. Such paths are covered after the binds:
+
+- `~/.local/tunnels` (the owner token, `tokens.json`, templates, the job registry) and `~/.ssh` are hidden under
+  an empty, read-only directory;
+- hpclib, the installed tunnels and the shell startup files are bound read-only over themselves.
+
+A job's Python environment under `~/.local/tunnels` is bound again on top of that.
 
 The default image is a **host image**: an empty directory whose system directories are bound from the host, so
 host programs and modules work unchanged and nothing has to be built. The job writes `passwd` and `group` files

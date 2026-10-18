@@ -696,10 +696,10 @@ class PackageStore:
             with open(os.path.join(staging, "package.json"), "w") as f:
                 json.dump(manifest, f, indent=1)
             target = self._dir(manifest["name"])
-            old = target + ".old"
-            shutil.rmtree(old, ignore_errors=True)
+            # a hidden name of its own (NAME_RE can't start with "."), never another package's directory ("foo.old")
+            old = tempfile.mkdtemp(prefix=".replaced-", dir=self.root)
             if os.path.exists(target):
-                os.replace(target, old)
+                os.replace(target, os.path.join(old, "package"))
             os.replace(staging, target)
             shutil.rmtree(old, ignore_errors=True)
         except BaseException:

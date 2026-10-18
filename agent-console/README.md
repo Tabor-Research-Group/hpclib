@@ -61,6 +61,11 @@ tabs; after the console restarts, the page asks for the new key once.
 
 ## Logs and tunnel shutdown
 
+An app's **Settings → Job: Node list (optional)** can request a particular node or Slurm host list.
+Leave it blank to use the tunnel's defaults; PAI 0.2.6 has no node restriction, so Slurm chooses.
+Clearing the field removes its `--nodelist` argument from subsequent submissions. A shared app still
+attaches to an existing database job, whose node does not change until that database job is replaced.
+
 Log panels have a **Copy last block** button. It fetches the newest command block, starting with its
 `=== YYYY-MM-DD HH:MM:SS command ===` header, and copies plain text through the current end of that
 log. This includes output beyond the short display tail and removes terminal colors and title codes.

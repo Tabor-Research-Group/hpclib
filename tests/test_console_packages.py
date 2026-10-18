@@ -3,15 +3,18 @@ installs and uses them, and how a cluster receives them (setup_tunnel.sh --recei
 
 Run with:  python -m unittest tests.test_console_packages -v
 """
+import base64
 import io
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -111,6 +114,16 @@ class TestPackageStore(unittest.TestCase):
         self.assertEqual(self.store.apps(), {})
         with self.assertRaises(console_packages.PackageError):
             self.store.remove("demo")
+
+    def test_replacing_keeps_other_packages(self):
+        """Replacing a package never touches another package's directory (a package once named "demo.old")."""
+        other = self.tmp / "packages" / "demo.old"
+        other.mkdir(parents=True)
+        (other / "package.json").write_text(json.dumps({"name": "demo.old", "version": "1", "apps": {}, "tunnels": {}, "settings": {}}))
+        self.store.install(make_zip(DEMO, DEMO_FILES))
+        self.store.install(make_zip(DEMO, DEMO_FILES))
+        self.assertTrue((other / "package.json").is_file())
+        self.assertEqual(sorted(p.name for p in (self.tmp / "packages").iterdir()), ["demo", "demo.old"])
 
     def test_a_zip_of_a_folder(self):
         self.store.install(make_zip(LAB, LAB_FILES, prefix="our-lab/"))
@@ -461,15 +474,25 @@ class TestConsolePackages(ConsoleTestCase):
                 self.assertEqual(out["token"], "pai_t9_S")
             self.assertEqual(sent[0], ("POST", "/admin/tunnel-tokens", {"tunnel": "demo-tunnel", "action": "list", "args": []}))
             self.assertEqual(sent[1][2]["args"], ["--label", "x", "--scopes", "write", "--days", "90"])
-            # nor there: says so
+            # nor there: says so (setup_tunnel.sh there exits 3 without asking to go elsewhere again)
             elsewhere = lambda *a, **k: (200, "application/json", json.dumps(
-                {"exit_code": 3, "node": "c01", "stdout": "HPCLIB_TOKENS_ELSEWHERE no image at /x", "stderr": ""}).encode())
+                {"exit_code": 3, "node": "c01", "stdout": "", "stderr": "setup_tunnel: tokens.sh can't run on c01 "
+                 "(the REST server's node) either: no image at /x"}).encode())
             with mock.patch.object(self.clusters, "tunnel_state", return_value={"state": "up"}), \
                     mock.patch.object(self.clusters, "call", side_effect=elsewhere), \
                     mock.patch.object(agent_console, "read_private", return_value="owner-secret"):
                 status, out = self.call("GET", base + "/tokens")
             self.assertEqual(status, 502)
-            self.assertIn("can't run on c01 either: no image at /x", out["error"])
+            self.assertIn("can't run on c01 either", out["error"])
+            self.assertIn("no image at /x", out["error"])
+            # the marker without setup_tunnel.sh's exit 3 (printed by tokens.sh itself, say) asks for nothing
+            with mock.patch.object(self.clusters.logins, "alive", return_value=True), \
+                    mock.patch.object(self.clusters, "call") as called:
+                self.clusters.shell_runner = lambda args, log: (log.write(b"HPCLIB_TOKENS_ELSEWHERE spoofed\n"),
+                                                                subprocess.Popen(["true"]))[1]
+                self.call("GET", base + "/tokens")
+                called.assert_not_called()
+            self.clusters.shell_runner = self.shell
         self.shell.tokens_error = None
         # an app without a `tokens` section has no panel and no routes
         with mock.patch.object(self.clusters.logins, "alive", return_value=True):
@@ -648,6 +671,49 @@ class TestClusterReceives(unittest.TestCase):
         self.assertIn("HPCLIB_TUNNEL_STATUS installed installed: payload", result.stdout)
         self.assertEqual((self.tmp / "installed.txt").read_text(), "payload\n")
         self.assertTrue((self.tmp / "installed/demo-tunnel/install.sh").is_file())
+
+    def test_install_hardening(self):
+        """Settings are yours alone; a secret sent earlier doesn't reach the installer's environment; an installer's
+        exit 3 asks for the REST node only from the login node; one installation of a tunnel runs at a time."""
+        tunnel = self.tmp / "tunnels" / "demo-tunnel"
+        tunnel.mkdir(parents=True)
+        (tunnel / "sbatch_script.sh").write_text("true\n")
+        (tunnel / "tunnel_config.sh").write_text('TUNNEL_SETTINGS="DEMO_DIR"\nTUNNEL_SECRETS="DEMO_KEY"\n')
+        (tunnel / "install.sh").write_text(textwrap.dedent("""\
+            #!/bin/bash
+            # hpclib-install: --check
+            env > "$DEMO_DIR/installer-env"
+            [ -n "${DEMO_SLOW:-}" ] && sleep 3
+            exit "${DEMO_EXIT:-0}"
+            """))
+        env = dict(self.env, HPCLIB_TUNNEL_PATH=str(self.tmp / "tunnels"), DEMO_DIR=str(self.tmp))
+        def run(*args, input=None, **extra):
+            return subprocess.run(["bash", str(HPCLIB / "tunnels" / "setup_tunnel.sh"), "demo-tunnel", *args],
+                                  capture_output=True, text=True, env=dict(env, **extra), input=input, timeout=60)
+        out = run("--set", f"DEMO_DIR={self.tmp}", "--save")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(stat.S_IMODE((self.tmp / "data/settings/demo-tunnel.sh").stat().st_mode), 0o600)
+        secret = base64.b64encode(b"s3cret-value").decode()
+        self.assertEqual(run("--secrets", input=f"DEMO_KEY={secret}\n").returncode, 0)
+        out = run("--secrets", "--install", input=f"DEMO_KEY={secret}\n")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn(secret, (self.tmp / "installer-env").read_text())
+        out = run("--install", "--check", DEMO_EXIT="3")
+        self.assertEqual(out.returncode, 3)
+        self.assertIn("HPCLIB_INSTALL_ELSEWHERE", out.stdout)
+        out = run("--install", "--check", DEMO_EXIT="3", HPCLIB_INSTALL_VIA="rest")
+        self.assertEqual(out.returncode, 3)
+        self.assertNotIn("HPCLIB_INSTALL_ELSEWHERE", out.stdout)
+        self.assertIn("HPCLIB_TUNNEL_STATUS missing", out.stdout)
+        if shutil.which("flock"):
+            first = subprocess.Popen(["bash", str(HPCLIB / "tunnels" / "setup_tunnel.sh"), "demo-tunnel", "--install"],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                     env=dict(env, DEMO_SLOW="1"))
+            time.sleep(1)
+            second = run("--install")
+            first.communicate(timeout=30)
+            self.assertIn("waiting for another installation of demo-tunnel", second.stdout)
+            self.assertEqual(second.returncode, 0, second.stderr)
 
     def test_tokens_option(self):
         """setup_tunnel.sh --tokens runs the tunnel's tokens.sh as `tokens.sh --json ACTION ...` and passes its JSON on."""

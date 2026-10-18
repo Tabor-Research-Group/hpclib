@@ -39,7 +39,7 @@ LIST_KEYS = ("login", "work_dirs", "binds", "local_roots", "tunnel_args")
 #                           the login node, for sites that would rather it didn't hold a share of a compute node)
 APPROVE_MODES = ("all", "new", "review")
 REST_ON = ("job", "login")
-TUNNEL_ARG_RE = re.compile(r"--(time|mem|partition|account|qos|cpus-per-task|constraint)=[A-Za-z0-9:._,+-]{1,64}")
+TUNNEL_ARG_RE = re.compile(r"--(?:(time|mem|partition|account|qos|cpus-per-task|constraint)=[A-Za-z0-9:._,+-]{1,64}|nodelist=[A-Za-z0-9._,+\[\]-]{1,256})")
 
 
 def root():

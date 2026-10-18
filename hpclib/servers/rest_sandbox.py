@@ -292,6 +292,7 @@ class Sandbox:
             raise ValueError("sandbox `allow_unsandboxed` must be true or false")
         self.data_dir = data_dir
         self.which = which
+        self.hidden, self.read_only_paths = (), ()
         self._help_cache = {}
         self._podman_cache = {}
         self._lock = threading.Lock()
@@ -378,11 +379,60 @@ class Sandbox:
                 self._help_cache[runtime] = out
             return flag in self._help_cache[runtime]
 
+    def protect(self, hidden=(), read_only=()):
+        """
+        Paths a job must not see (`hidden`: hpclib's tokens and data, ~/.ssh) or change (`read_only`: what runs
+        unsandboxed later, such as hpclib and the installed tunnels) even when a directory that holds them is bound.
+        They are covered after the binds: an empty, read-only directory or file over a hidden one, and a read-only
+        bind of a protected one over itself.
+        """
+        self.hidden = tuple(os.path.realpath(os.path.expanduser(p)) for p in hidden if p)
+        self.read_only_paths = tuple(os.path.realpath(os.path.expanduser(p)) for p in read_only if p)
+        return self
+
+    @staticmethod
+    def _within(path, parents):
+        return any(path != d and path.startswith(d.rstrip("/") + "/") for d in parents)
+
+    def mask_sources(self):
+        """An empty directory and an empty file, both read-only, bound over hidden paths."""
+        base = os.path.join(self.data_dir or os.path.join(tempfile.gettempdir(), f"hpclib-{os.getuid()}"),
+                            "sandbox", "mask")
+        os.makedirs(base, mode=0o700, exist_ok=True)
+        empty_dir, empty_file = os.path.join(base, "empty-dir"), os.path.join(base, "empty-file")
+        os.makedirs(empty_dir, exist_ok=True)
+        if os.listdir(empty_dir):
+            raise SandboxError(f"{empty_dir}, bound over hidden paths, must be empty")
+        if not os.path.isfile(empty_file) or os.path.getsize(empty_file):
+            with open(empty_file, "w"):
+                pass
+        os.chmod(empty_dir, 0o500)
+        os.chmod(empty_file, 0o400)
+        return empty_dir, empty_file
+
+    def _protection(self, ro, rw):
+        """
+        (masks, protected, rebind): hidden paths inside a bind (with what covers each), protected paths inside a
+        writable bind, and the binds inside a hidden path (bound again after the masks, e.g. a Python environment's
+        under hpclib's data directory).
+        """
+        binds = ro + rw
+        hidden = [h for h in self.hidden if os.path.lexists(h) and self._within(h, binds)]
+        masks = []
+        if hidden:
+            empty_dir, empty_file = self.mask_sources()
+            masks = [(empty_dir if os.path.isdir(h) else empty_file, h) for h in hidden]
+        protected = [p for p in self.read_only_paths if os.path.exists(p) and self._within(p, rw)
+                     and not (p in hidden or self._within(p, hidden))]
+        rebind = [(d, "ro" if d in ro else "rw") for d in binds if self._within(d, hidden)]
+        return masks, protected, rebind
+
     def plan(self, writable, extra_ro=()):
         """
         What a job would see: the method and the read-only and read-write
         binds. `extra_ro` adds read-only binds for this job (e.g. a Python
-        environment's interpreter).
+        environment's interpreter). `hidden` and `protected` (see protect)
+        are covered after them, and `rebind` binds again over those.
         """
         method, detail = self.resolve()
         if method == "none":
@@ -400,6 +450,9 @@ class Sandbox:
             (rw if os.path.exists(d) else missing).append(d)
         plan = {"method": method, "runtime": detail, "image": self.image or self.host_image_for(method),
                 "host_image": self.image is None, "read_only": ro, "read_write": rw}
+        masks, protected, rebind = self._protection(ro, rw)
+        if masks or protected:
+            plan.update(hidden=[h for _, h in masks], protected=protected, masks=masks, rebind=rebind)
         if method == "podman":
             plan["network"] = self.network
         if missing:
@@ -471,7 +524,8 @@ class Sandbox:
             return None, plan
         runtime, image = plan["runtime"], plan["image"]
         if plan["host_image"]:
-            build_host_image(image, plan["read_only"] + plan["read_write"])
+            build_host_image(image, plan["read_only"] + plan["read_write"] + plan.get("hidden", []) +
+                             plan.get("protected", []))
         if plan["method"] == "podman":
             if network:
                 plan["network"] = "host" if network == "host" else "default"
@@ -480,10 +534,7 @@ class Sandbox:
         args = [runtime, "-q", "exec", "--contain", "--no-home", "--pid", "--ipc"]
         if self.supports(runtime, "--no-mount"):
             args += ["--no-mount", "bind-paths"]   # site-wide binds would add paths behind our back
-        for path in plan["read_only"]:
-            args += ["--bind", f"{path}:{path}:ro"]
-        for path in plan["read_write"]:
-            args += ["--bind", f"{path}:{path}"]
+        args += self._bind_args(plan, "--bind")
         args += self.flags
         quoted = " ".join(shlex.quote(a) for a in args)
         own_account = plan["host_image"] and "/etc" in plan["read_only"]
@@ -620,9 +671,32 @@ class Sandbox:
                         f"(systemd's Delegate= for user@.service; ask the admin)")
         return dict(have, enforced=True, reason="cgroups v2 with the cpu and memory controllers delegated")
 
+    @staticmethod
+    def _bind_args(plan, flag):
+        """
+        The binds in order: what the job may use, then the masks over hidden paths, read-only binds over protected
+        ones, and the binds inside hidden paths again. Later binds cover earlier ones.
+        """
+        rebind = {d for d, _ in plan.get("rebind", [])}
+        args = []
+        for path in plan["read_only"]:
+            if path not in rebind:
+                args += [flag, f"{path}:{path}:ro"]
+        for path in plan["read_write"]:
+            if path not in rebind:
+                args += [flag, f"{path}:{path}"]
+        for source, path in plan.get("masks", []):
+            args += [flag, f"{source}:{path}:ro"]
+        for path in plan.get("protected", []):
+            args += [flag, f"{path}:{path}:ro"]
+        for path, mode in plan.get("rebind", []):
+            args += [flag, f"{path}:{path}" + (":ro" if mode == "ro" else "")]
+        return args
+
     def _podman_launch(self, plan, shebang, body, prelude):
         runtime, image = plan["runtime"], plan["image"]
-        for path in plan["read_only"] + plan["read_write"]:
+        for path in plan["read_only"] + plan["read_write"] + plan.get("hidden", []) + plan.get("protected", []) + [
+                source for source, _ in plan.get("masks", [])]:
             if ":" in path or "," in path:
                 raise SandboxError(f"podman can't bind {path!r} (it contains ':' or ',')")
         info = self.podman_info(runtime)
@@ -637,10 +711,7 @@ class Sandbox:
         if any(os.path.exists(p) for p in PODMAN_INITS):
             # a small init as PID 1, which passes scancel's TERM on: the job's shell as PID 1 would ignore it
             args.append("--init")
-        for path in plan["read_only"]:
-            args += ["-v", f"{path}:{path}:ro"]
-        for path in plan["read_write"]:
-            args += ["-v", f"{path}:{path}"]
+        args += self._bind_args(plan, "-v")
         args += self.flags
         quoted = " ".join(shlex.quote(a) for a in args)
         own_account = plan["host_image"] and "/etc" in plan["read_only"]

@@ -375,8 +375,25 @@ echo done
         started = self.request("POST", "/admin/tunnel-install", json_body={"tunnel": "demo"})[1]
         finished, output = self.wait_install(started["id"])
         self.assertEqual((finished["state"], finished["exit_code"]), ("failed", 3))
-        self.assertIn("HPCLIB_INSTALL_ELSEWHERE", output)
+        # already on the REST node: never delegated again, and says why
+        self.assertNotIn("HPCLIB_INSTALL_ELSEWHERE", output)
+        self.assertIn("(the REST server's node) either", output)
+        self.assertIn("HPCLIB_TUNNEL_STATUS missing", output)
         self.assertNotIn("HPCLIB_TUNNEL_STATUS installed", output)
+
+    def test_old_installations_forgotten(self):
+        """Only the newest KEEP finished installations, and their logs, are kept; the installer knows it's here."""
+        self.installer.write_text('#!/bin/bash\necho "via=$HPCLIB_INSTALL_VIA"\n')
+        with mock.patch.object(self.server.tunnel_installs, "KEEP", 3):
+            ids = []
+            for _ in range(5):
+                ident = self.request("POST", "/admin/tunnel-install", json_body={"tunnel": "demo"})[1]["id"]
+                finished, output = self.wait_install(ident)
+                ids.append(ident)
+            self.assertIn("via=rest", output)
+        self.assertEqual(self.request("GET", "/admin/tunnel-install", query={"id": ids[0]})[0], 404)
+        self.assertEqual(self.request("GET", "/admin/tunnel-install", query={"id": ids[-1]})[0], 200)
+        self.assertEqual(len(list((self.tmp / "data/installs").glob("*.log"))), 3)
 
     def test_validation_and_owner_only(self):
         for body in ({"tunnel": "../bad"}, {"tunnel": "demo;echo"}, {"tunnel": "demo", "force": 1}):
@@ -392,6 +409,56 @@ echo done
         self.assertEqual(self.request("GET", "/admin/tunnel-install", query={"id": "../bad"})[0], 422)
         self.assertEqual(self.request("GET", "/admin/tunnel-install", query={"id": "a" * 32})[0], 404)
         self.assertEqual(self.request("GET", "/admin/tunnel-install", query={"id": "a" * 32, "offset": -1})[0], 400)
+
+
+class TestAgentProtectedPaths(RESTServerTestCase):
+    """
+    A scoped token (an agent's) allowed a whole home directory still can't change what runs unsandboxed as you
+    later: installed tunnels (an app's install.sh or tokens.sh, which Install and the REST fallback run), shell
+    startup files, ~/.ssh or hpclib. The owner token can.
+    """
+    allow_dirs = False
+
+    def setUp(self):
+        tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        self.home = tmp / "home"
+        (self.home / ".local/share/hpclib/tunnels/pai").mkdir(parents=True)
+        (self.home / ".ssh").mkdir()
+        env = mock.patch.dict(os.environ, {"HOME": str(self.home)})
+        env.start()
+        self.addCleanup(env.stop)
+        for var in ("HPCLIB_TUNNEL_INSTALL_LOCATION", "USER_TUNNEL_DIR", "HPCLIB_TUNNEL_PATH", "HPCLIB_DIR"):
+            os.environ.pop(var, None)
+        super().setUp()
+        tokens = self.tmp / "tokens.json"
+        self.agent = TokenAuth.add_token(str(tokens), "agent", ["read", "files:write"], [str(self.home)])
+        self.server.auth.tokens_file = str(tokens)
+
+    def put(self, path, token):
+        return self.request("PUT", "/files/content", query={"path": str(path), "overwrite": 1, "parents": 1},
+                            data=b"echo planted\n", token=token)[0]
+
+    def test_agent_kept_out(self):
+        for path in (self.home / ".local/share/hpclib/tunnels/pai/install.sh", self.home / ".bashrc",
+                     self.home / ".profile", self.home / ".ssh/authorized_keys",
+                     Path(rest_server.hpclib_code_dir()) / "planted.sh"):
+            with self.subTest(path=path):
+                self.assertEqual(self.put(path, self.agent), 403)
+                self.assertFalse(path.exists())
+        self.assertEqual(self.put(self.home / "project/run.sh", self.agent), 201)
+        # reading is refused too: these are the token's, not the agent's
+        self.assertEqual(self.request("GET", "/files", query={"path": str(self.home / ".ssh")}, token=self.agent)[0], 403)
+
+    def test_owner_unchanged(self):
+        self.assertEqual(self.put(self.home / ".bashrc", TOKEN), 201)
+        self.assertEqual(self.put(self.home / ".local/share/hpclib/tunnels/pai/install.sh", TOKEN), 201)
+
+    def test_errors_hide_internals(self):
+        with mock.patch.object(HPCRESTHandler, "do_health", side_effect=RuntimeError("/secret/path")):
+            status, out = self.request("GET", "/health", token=self.agent)
+        self.assertEqual(status, 500)
+        self.assertNotIn("/secret/path", out["error"])
 
 
 class TestFileChangesDisabled(RESTServerTestCase):
