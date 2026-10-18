@@ -1043,7 +1043,8 @@ function tokensSection(app, s, tk) {
     el("h4", {}, tk.label),
     tk.description ? el("p", { class: "muted" }, tk.description) : null,
     el("p", { class: "muted" }, `Run on ${s.cluster} over your login (it must be logged in, and the app installed or ` +
-      "updated there first, so its tokens.sh is on the cluster)."),
+      "updated there first, so its tokens.sh is on the cluster). Where the login node can't (no Singularity there, " +
+      "only on compute nodes), they run where the cluster's REST server does: then the agent tunnel must be up too."),
     listing,
     el("div", { class: "row" },
       field("Label", label, "what uses it"),

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -254,6 +255,145 @@ class TestUnrestricted(RESTServerTestCase):
         self.assertIsNone(body["allowed_dirs"])
 
 
+class TestTunnelTokens(RESTServerTestCase):
+    """POST /admin/tunnel-tokens: an app's tokens.sh run on the REST server's node (owner only)."""
+
+    def setUp(self):
+        super().setUp()
+        tunnel = self.tmp / "tunnels" / "demo"
+        tunnel.mkdir(parents=True)
+        (tunnel / "sbatch_script.sh").write_text("true\n")
+        (tunnel / "tunnel_config.sh").write_text("")
+        (tunnel / "tokens.sh").write_text('#!/bin/bash\necho "noise"\necho \'{"tokens": [], "args": "\'"$*"\'"}\'\n')
+        home = self.tmp / "home"
+        home.mkdir()
+        (home / ".bashrc").write_text("")
+        env = mock.patch.dict(os.environ, {"HOME": str(home), "HPCLIB_TUNNEL_PATH": str(self.tmp / "tunnels"),
+                                           "HPCTUNNELS_DATA_DIR": str(self.tmp / "data")})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("HPCLIB_DIR", None)
+
+    def test_runs_tokens_here(self):
+        status, out = self.request("POST", "/admin/tunnel-tokens", json_body={"tunnel": "demo", "action": "list"})
+        self.assertEqual((status, out["exit_code"]), (200, 0), out)
+        self.assertIn('HPCLIB_TOKENS {"tokens": [], "args": "--json list"}', out["stdout"])
+        status, out = self.request("POST", "/admin/tunnel-tokens", json_body={
+            "tunnel": "demo", "action": "create", "args": ["--label", "a b", "--scopes", "write"]})
+        self.assertEqual((status, out["exit_code"]), (200, 0))
+        self.assertIn('HPCLIB_TOKEN_CREATED {"tokens": [], "args": "--json create --label a b --scopes write"}', out["stdout"])
+        for bad in ({"tunnel": "../x", "action": "list"}, {"tunnel": "demo", "action": "rm"},
+                    {"tunnel": "demo", "action": "list", "args": ["a\nb"]},
+                    {"tunnel": "demo", "action": "list", "args": "x"}):
+            self.assertEqual(self.request("POST", "/admin/tunnel-tokens", json_body=bad)[0], 422, bad)
+        self.assertEqual(self.request("POST", "/admin/tunnel-tokens", json_body={"tunnel": "demo", "x": 1})[0], 400)
+        self.assertEqual(self.request("POST", "/admin/tunnel-tokens", json_body={"tunnel": "demo", "action": "list"},
+                                      token=None)[0], 401)
+
+
+class TestTunnelInstallRest(RESTServerTestCase):
+    """Owner-only background installation on the REST node, including progress and retry attachment."""
+
+    def setUp(self):
+        super().setUp()
+        tunnel = self.tmp / "tunnels" / "demo"
+        tunnel.mkdir(parents=True)
+        (tunnel / "sbatch_script.sh").write_text("true\n")
+        (tunnel / "tunnel_config.sh").write_text("")
+        self.installer = tunnel / "install.sh"
+        self.installer.write_text('''#!/bin/bash
+# hpclib-install: --check --force
+if [ "$1" = --check ]; then echo 'installed: demo'; exit 0; fi
+echo "starting installer $*"
+echo "secret=${HPC_REST_TOKEN_SHOULD_NOT_LEAK:-absent}"
+while [ ! -f "$TEST_INSTALL_DIR/release" ]; do sleep 0.02; done
+echo done
+''')
+        home = self.tmp / "home"
+        home.mkdir()
+        (home / ".bashrc").write_text("")
+        env = mock.patch.dict(os.environ, {"HOME": str(home), "HPCLIB_TUNNEL_PATH": str(self.tmp / "tunnels"),
+            "HPCTUNNELS_DATA_DIR": str(self.tmp / "data"), "TEST_INSTALL_DIR": str(self.tmp),
+            "HPC_REST_TOKEN_SHOULD_NOT_LEAK": "secret"})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("HPCLIB_DIR", None)
+
+    def tearDown(self):
+        (self.tmp / "release").touch()
+        for _ in range(100):
+            if all(r["state"] != "running" for r in self.server.tunnel_installs.records.values()):
+                break
+            time.sleep(0.02)
+        super().tearDown()
+
+    def wait_install(self, ident, offset=0):
+        text = ""
+        for _ in range(100):
+            status, out = self.request("GET", "/admin/tunnel-install", query={"id": ident, "offset": offset})
+            self.assertEqual(status, 200, out)
+            text += out["output"]
+            offset = out["offset"]
+            if out["state"] != "running" and not out["more"]:
+                return out, text
+            time.sleep(0.02)
+        self.fail("installation did not finish")
+
+    def test_background_progress_and_retry(self):
+        status, started = self.request("POST", "/admin/tunnel-install", json_body={"tunnel": "demo", "force": True})
+        self.assertEqual((status, started["state"]), (202, "running"), started)
+        ident = started["id"]
+        for _ in range(100):
+            status, progress = self.request("GET", "/admin/tunnel-install", query={"id": ident})
+            if "starting installer" in progress["output"]:
+                break
+            time.sleep(0.02)
+        self.assertEqual(progress["state"], "running")
+        self.assertIn("starting installer --force", progress["output"])
+        self.assertIn("secret=absent", progress["output"])
+        retry = self.request("POST", "/admin/tunnel-install", json_body={"tunnel": "demo", "force": True})[1]
+        self.assertEqual(retry["id"], ident)
+        self.assertTrue(retry["already_running"])
+        self.assertEqual(self.request("POST", "/admin/tunnel-install", json_body={"tunnel": "demo"})[0], 409)
+        (self.tmp / "release").touch()
+        finished, rest = self.wait_install(ident, progress["offset"])
+        self.assertEqual((finished["state"], finished["exit_code"]), ("succeeded", 0))
+        self.assertNotIn("starting installer", rest)
+        self.assertIn("HPCLIB_TUNNEL_STATUS installed installed: demo", rest)
+        self.assertEqual((self.tmp / "data/installs" / (ident + ".log")).stat().st_mode & 0o777, 0o600)
+
+    def test_failure_and_chunked_output(self):
+        self.installer.write_text("#!/bin/bash\nhead -c 70000 /dev/zero | tr '\\000' x\necho\nexit 1\n")
+        started = self.request("POST", "/admin/tunnel-install", json_body={"tunnel": "demo"})[1]
+        finished, output = self.wait_install(started["id"])
+        self.assertEqual((finished["state"], finished["exit_code"]), ("failed", 1))
+        self.assertGreater(len(output), 70000)
+        self.assertIn("HPCLIB_TUNNEL_STATUS missing its install.sh failed", output)
+
+    def test_runtime_unavailable_here(self):
+        self.installer.write_text("#!/bin/bash\necho no-runtime >&2\nexit 3\n")
+        started = self.request("POST", "/admin/tunnel-install", json_body={"tunnel": "demo"})[1]
+        finished, output = self.wait_install(started["id"])
+        self.assertEqual((finished["state"], finished["exit_code"]), ("failed", 3))
+        self.assertIn("HPCLIB_INSTALL_ELSEWHERE", output)
+        self.assertNotIn("HPCLIB_TUNNEL_STATUS installed", output)
+
+    def test_validation_and_owner_only(self):
+        for body in ({"tunnel": "../bad"}, {"tunnel": "demo;echo"}, {"tunnel": "demo", "force": 1}):
+            self.assertEqual(self.request("POST", "/admin/tunnel-install", json_body=body)[0], 422)
+        self.assertEqual(self.request("POST", "/admin/tunnel-install", json_body={"tunnel": "demo", "args": []})[0], 400)
+        for verb in ("POST", "GET"):
+            self.assertEqual(self.request(verb, "/admin/tunnel-install", token=None)[0], 401)
+        tokens = self.tmp / "tokens.json"
+        reader = TokenAuth.add_token(str(tokens), "reader", ["read"], [str(self.root)])
+        self.server.auth.tokens_file = str(tokens)
+        self.assertEqual(self.request("POST", "/admin/tunnel-install", json_body={"tunnel": "demo"}, token=reader)[0], 403)
+        self.assertEqual(self.request("GET", "/admin/tunnel-install", query={"id": "a" * 32}, token=reader)[0], 403)
+        self.assertEqual(self.request("GET", "/admin/tunnel-install", query={"id": "../bad"})[0], 422)
+        self.assertEqual(self.request("GET", "/admin/tunnel-install", query={"id": "a" * 32})[0], 404)
+        self.assertEqual(self.request("GET", "/admin/tunnel-install", query={"id": "a" * 32, "offset": -1})[0], 400)
+
+
 class TestFileChangesDisabled(RESTServerTestCase):
     disable_file_changes = True
 
@@ -269,6 +409,8 @@ class TestFileChangesDisabled(RESTServerTestCase):
         self.assertEqual(self.request("POST", "/files/mkdir", query={"path": "d"})[0], 403)
         self.assertEqual(self.request("DELETE", "/files", query={"path": "keep.txt"})[0], 403)
         self.assertEqual(self.request("DELETE", "/files", query={"path": "empty"})[0], 403)
+        self.assertEqual(self.request("POST", "/admin/tunnel-tokens", json_body={"tunnel": "x", "action": "list"})[0], 403)
+        self.assertEqual(self.request("POST", "/admin/tunnel-install", json_body={"tunnel": "x"})[0], 403)
         self.assertEqual(sorted(os.listdir(self.root)), before)
         self.assertEqual((self.root / "keep.txt").read_text(), "keep")
 

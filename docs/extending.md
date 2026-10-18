@@ -144,6 +144,11 @@ in the installed tunnel with the tunnel's settings in the environment and relays
 What a token allows is the app's business: it checks tokens itself, and the console only offers the manifest's
 scopes. The console keeps no token and logs none.
 
+A `tokens.sh` that can't work on the login node (PAI's runs the app's image, and some clusters have Singularity
+only on compute nodes) exits 3, with the reason on standard error. `setup_tunnel.sh` passes that on as
+`HPCLIB_TOKENS_ELSEWHERE REASON`, and the console runs the same call on the node of the cluster's REST server
+instead (`POST /admin/tunnel-tokens`, owner token only), through the agent tunnel, which must then be up.
+
 ### App downloads
 
 An app that needs large things on the cluster (OpenCode's models) can have the console download and remove them.
@@ -302,6 +307,7 @@ our-lab/
 | `settings.TUNNEL.values` | default settings; a user's own values (per cluster) win, and the form shows the package's as placeholders |
 | `settings.TUNNEL.files` | files placed in `~/.local/tunnels/settings/TUNNEL.d/` on the cluster (e.g. extra rclone remotes, or a `NAME.gui.sh` for Data transfer's `SMB_GUI`) |
 | `secrets` | per app; each name must be in its tunnel's `TUNNEL_SECRETS` |
+| `apps.APP.install_files` | installation files copied from the zip into that app's packaged tunnel before Check, Install or Start; see below |
 
 Build and check it, then install it from **Add App or Settings**:
 
@@ -312,6 +318,52 @@ python3 hpclib/servers/console_packages.py build our-lab/       # writes our-lab
 A package can't replace hpclib's apps or tunnels or what another package provides. Its tunnel and settings files
 reach a cluster with the app's next Check, Install or Start (`tunnel_setup --push`). Raise `version` with each
 change; installing a newer version replaces the old one.
+
+### Installation files
+
+Every file inside a packaged tunnel, including its `install.sh`, already travels through the console's SSH
+connection. If an app's installer or payload is elsewhere in the package, declare it in `apps.APP.install_files`:
+
+```json
+"install_files": {
+  "install.sh": "install/install.sh",
+  "helpers/setup.py": "install/setup.py",
+  "requirements.txt": "requirements.txt"
+}
+```
+
+Keys are destination paths relative to the tunnel directory; values are file paths relative to the package
+root. A list such as `["install.sh", "requirements.txt"]` uses each path as both source and destination.
+All sources must be plain files included in the zip. Paths cannot escape the tunnel or conflict with its files
+or with another app's declarations for the same tunnel. A declaration needs a tunnel owned by the package;
+packages cannot replace hpclib's built-in tunnel files.
+The package root's `package.json` is reserved for installed metadata; place a payload with that name in a
+subdirectory (for example, `install/package.json`) and map it to the desired destination.
+
+HPCLIB stages these files with the tunnel and sends them in its existing `tunnel_setup --push` archive over the
+console's SSH login. The cluster receives them before running `install.sh` or its `--check`. Installers run with
+the tunnel directory as their working directory, so they can open the declared files using relative paths.
+Changing a payload changes the staged content hash; replacing the package replaces the received tunnel tree
+on its next push. Existing packages without `install_files` keep their current behavior.
+
+### Installers that need a different node
+
+An `install.sh` can exit 3 to say that it cannot run on the current node, for example because images need
+Singularity and the login node has none. It should check that before cloning, updating or pulling images.
+`setup_tunnel.sh` preserves this as exit 3 and `HPCLIB_INSTALL_ELSEWHERE`. Other failures remain failures.
+
+In HPCLIB 0.2.71 the console responds by asking the cluster's REST server to install the same tunnel, with
+the same saved settings and force flag. The package and settings have already arrived over SSH; the REST
+node needs to see those files and the install directory. It also needs access to the app's download sources
+(including SSH Git credentials for private repositories). The agent tunnel must be up with its REST job
+running, and the console must have its owner token, as for the token-management fallback.
+
+The owner-only `POST /admin/tunnel-install` accepts `{"tunnel": "NAME", "force": false}` and returns 202 with
+an installation `id`. It starts only `setup_tunnel.sh NAME --install [--force] --check`; callers cannot supply
+commands or paths. `GET /admin/tunnel-install?id=ID&offset=N` returns its state, exit code and next log chunk
+(`output`, next byte `offset`, `more`). Repeating a start while the same installation is running attaches to
+it. Progress is appended to the console's existing installation log, without keeping one HTTP request open
+for an entire image pull. A failure on the REST node ends the operation; it is not delegated again.
 
 ### Running a program in the job sandbox
 

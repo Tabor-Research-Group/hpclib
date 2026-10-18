@@ -84,6 +84,11 @@ Endpoints (all responses are JSON unless noted)    scope
   POST   /slurm/{sbatch,squeue,sacct,scontrol,scancel}
            body: {"args": [...], "cwd": "...", "input": "..."}   slurm
   GET    /slurm/{squeue,sacct}?arg=...&arg=...&cwd=...          slurm
+  POST   /admin/tunnel-tokens {"tunnel", "action": list|create|revoke, "args"}   owner
+  POST   /admin/tunnel-install {"tunnel", "force"?}   owner; background install on this node (202 + id)
+  GET    /admin/tunnel-install?id=ID&offset=N          owner; status and the next log chunk
+           an app's tokens.sh on this node (setup_tunnel.sh TUNNEL --tokens ...), for clusters whose
+           login nodes can't run it; the answer holds its output, which may hold a new token
   GET    /files?path=P                       list a directory / stat a file   read
   GET    /files/content?path=P               download (raw bytes)             read
   GET    /files/read?path=P[&offset=N][&length=N]   bounded text read         read
@@ -133,13 +138,14 @@ import traceback
 import urllib.parse
 
 try:
-    from . import rest_envs, rest_jobs, rest_local, rest_sandbox, ssh_keys
+    from . import rest_envs, rest_jobs, rest_local, rest_sandbox, ssh_keys, rest_installs
 except ImportError:  # run as a script from the servers directory
     import rest_envs
     import rest_jobs
     import rest_local
     import rest_sandbox
     import ssh_keys
+    import rest_installs
 RESTError = rest_jobs.RESTError  # re-exported
 
 __all__ = [
@@ -514,6 +520,7 @@ class RESTServer(http.server.ThreadingHTTPServer):
         self.jobs = jobs
         self.audit = audit
         self.ssh_keys = ssh_keys.SSHKeyStore()
+        self.tunnel_installs = rest_installs.TunnelInstalls()
         self.sandbox_prober = None
         if jobs is not None:
             probe_dir = os.path.join(jobs.sandbox.data_dir or tempfile.gettempdir(), "sandbox", "probe")
@@ -712,6 +719,8 @@ class HPCRESTHandler(RESTHandler):
         ("PUT", "/admin/ssh/hosts"),
         ("DELETE", "/admin/ssh/hosts"),
         ("POST", "/envs/sync"),
+        ("POST", "/admin/tunnel-tokens"),
+        ("POST", "/admin/tunnel-install"),
         ("PUT", "/files/content"),
         ("POST", "/files/mkdir"),
         ("DELETE", "/files"),
@@ -785,6 +794,9 @@ class HPCRESTHandler(RESTHandler):
             ("POST", "/admin/tokens/revoke"): self.do_admin_revoke_token,
             ("GET", "/admin/config"): self.do_admin_config,
             ("PUT", "/admin/config"): self.do_admin_update_config,
+            ("POST", "/admin/tunnel-tokens"): self.do_admin_tunnel_tokens,
+            ("POST", "/admin/tunnel-install"): self.do_admin_tunnel_install,
+            ("GET", "/admin/tunnel-install"): self.do_admin_tunnel_install_status,
             ("POST", "/admin/ssh/setup"): self.do_admin_ssh,
             ("GET", "/admin/ssh/keys"): self.do_admin_ssh,
             ("POST", "/admin/ssh/keys"): self.do_admin_ssh,
@@ -803,6 +815,57 @@ class HPCRESTHandler(RESTHandler):
             if cmd in self.READ_ONLY_COMMANDS:
                 routes[("GET", f"/slurm/{cmd}")] = self._slurm_route(cmd)
         return routes
+
+    TUNNEL_TOKEN_ACTIONS = ("list", "create", "revoke")
+
+    def do_admin_tunnel_install(self):
+        """Owner only: continue an installation on this node, without a long HTTP request."""
+        body = self.read_json()
+        if not isinstance(body, dict) or set(body) - {"tunnel", "force"}:
+            raise RESTError(400, 'send {"tunnel", "force": false}')
+        tunnel, force = body.get("tunnel"), body.get("force", False)
+        if not isinstance(tunnel, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", tunnel):
+            raise RESTError(422, "tunnel: a tunnel name")
+        if not isinstance(force, bool):
+            raise RESTError(422, "force: true or false")
+        out = self.server.tunnel_installs.start(tunnel, force)
+        self.audit_detail = {"tunnel": tunnel, "install": out["id"], "force": force}
+        return 202, out
+
+    def do_admin_tunnel_install_status(self):
+        ident = self.query_value("id", required=True)
+        if not re.fullmatch(r"[a-f0-9]{32}", ident):
+            raise RESTError(422, "id: the installation ID returned by POST /admin/tunnel-install")
+        offset = self.query_int("offset", 0, minimum=0)
+        return 200, self.server.tunnel_installs.status(ident, offset)
+
+    def do_admin_tunnel_tokens(self):
+        """
+        Owner only: a packaged app's own tokens (setup_tunnel.sh TUNNEL --tokens ACTION ARGS...), run on this node.
+        For clusters whose login nodes can't run the app's tokens.sh (PAI's needs Singularity, which some clusters
+        have only on compute nodes): the console asks here when the login node said HPCLIB_TOKENS_ELSEWHERE. The
+        answer holds setup_tunnel.sh's output, which may hold a new token; the audit log gets only the action.
+        """
+        body = self.read_json()
+        if not isinstance(body, dict) or set(body) - {"tunnel", "action", "args"}:
+            raise RESTError(400, 'send {"tunnel", "action", "args": [...]}')
+        tunnel, action, args = body.get("tunnel"), body.get("action"), body.get("args") or []
+        if not isinstance(tunnel, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", tunnel):
+            raise RESTError(422, "tunnel: a tunnel name")
+        if action not in self.TUNNEL_TOKEN_ACTIONS:
+            raise RESTError(422, f"action: one of {list(self.TUNNEL_TOKEN_ACTIONS)}")
+        if (not isinstance(args, list) or len(args) > 16 or
+                not all(isinstance(a, str) and len(a) <= 1024 and not re.search(r"[\0\n\r]", a) for a in args)):
+            raise RESTError(422, "args: at most 16 one-line strings")
+        script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tunnels", "setup_tunnel.sh")
+        try:
+            res = subprocess.run(["bash", script, tunnel, "--tokens", action, *args], capture_output=True, text=True,
+                                 timeout=180, stdin=subprocess.DEVNULL, env=rest_sandbox.child_env())
+        except subprocess.TimeoutExpired:
+            raise RESTError(504, f"setup_tunnel.sh {tunnel} --tokens {action} took over 180 s")
+        self.audit_detail = {"tunnel": tunnel, "tokens": action, "exit_code": res.returncode}
+        return 200, {"exit_code": res.returncode, "stdout": res.stdout[-65536:], "stderr": res.stderr[-8192:],
+                     "node": socket.gethostname()}
 
     def do_admin_ssh(self):
         """Owner-only targeted SSH operations; private key bytes never leave the store."""

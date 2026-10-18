@@ -21,6 +21,8 @@
 #                     tunnel's settings file, $HPCTUNNELS_DATA_DIR/settings/TUNNEL.sh, which start_tunnel.sh
 #                     reads (so the job and install.sh see the same paths); without it they apply to this run.
 #   --install         run the tunnel's install.sh (--force: its --force, e.g. pull an image again)
+#                     exit 3 means it cannot run on this node: HPCLIB_INSTALL_ELSEWHERE asks the console to
+#                     continue on the REST node through POST /admin/tunnel-install (owner only).
 #   --check           report whether it is installed, on a last line
 #                       HPCLIB_TUNNEL_STATUS installed|missing|unknown|nothing MESSAGE
 #                     (unknown: its install.sh can't check; nothing: it has nothing to install)
@@ -40,6 +42,9 @@
 #                       HPCLIB_TOKEN_CREATED {...}   (create: the token itself, or the file it went to)
 #                       HPCLIB_TOKEN_REVOKED ID      (revoke)
 #                     It must be the last option. The token is on standard output only, never in a log or argument.
+#                     A tokens.sh that can't work on this node (no Singularity or Apptainer on a login node, say)
+#                     exits 3, which is passed on as HPCLIB_TOKENS_ELSEWHERE REASON and exit 3: the console then runs
+#                     it on the REST server's node instead (POST /admin/tunnel-tokens), through the agent tunnel.
 #
 #   --downloads ACTION [ARGS...]
 #                     what the app downloads to the cluster (OpenCode's models), with the tunnel's downloads.sh:
@@ -178,7 +183,12 @@ if [ "$install" = true ]; then
       if can --force; then args+=(--force); else echo "($TUNNEL_NAME's install.sh has no --force; running it as is)"; fi
     fi
     echo "running $installer ${args[*]}"
-    if ! (cd "$TUNNEL_DIR" && HPCLIB_TUNNEL_DIR="$TUNNEL_DIR" bash ./install.sh "${args[@]}"); then
+    installer_status=0
+    (cd "$TUNNEL_DIR" && HPCLIB_TUNNEL_DIR="$TUNNEL_DIR" bash ./install.sh "${args[@]}") || installer_status=$?
+    if [ "$installer_status" = 3 ]; then
+      printf 'HPCLIB_INSTALL_ELSEWHERE %s\n' "install.sh cannot run on $(hostname -s); continue on the REST server's node"
+      exit 3
+    elif [ "$installer_status" != 0 ]; then
       echo "setup_tunnel: $TUNNEL_NAME's install.sh failed" >&2
       [ "$check" = true ] && status missing "its install.sh failed"
       exit 1
@@ -239,8 +249,14 @@ if [ "$tokens" = true ]; then
   tokens_err=$(mktemp "${TMPDIR:-/tmp}/hpclib-tokens.XXXXXX") || exit 1
   trap 'rm -f "$tokens_err"' EXIT
   tokens_out=$(cd "$TUNNEL_DIR" && HPCLIB_TUNNEL_DIR="$TUNNEL_DIR" bash ./tokens.sh --json "$tokens_action" "${tokens_args[@]}" 2> "$tokens_err") || {
+    tokens_status=$?
     # tokens.sh's own complaint (its standard error never holds a token), so the console can say why
     reason=$(grep -v '^[[:space:]]*$' "$tokens_err" | tail -n 1 | tr -d '\r' | cut -c1-300)
+    if [ "$tokens_status" = 3 ]; then     # not on this node: where the REST server runs, the console tries there
+      [ -n "$reason" ] || reason="tokens.sh cannot run on $(hostname -s)"
+      printf 'HPCLIB_TOKENS_ELSEWHERE %s\n' "$reason"
+      exit 3
+    fi
     echo "setup_tunnel: tokens.sh $tokens_action failed${reason:+: $reason}" >&2
     exit 1
   }

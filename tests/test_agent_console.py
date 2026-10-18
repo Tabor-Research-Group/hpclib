@@ -68,6 +68,7 @@ class FakeShell:
         self.calls = []
         self.setup_status = "missing not installed: no image at /x/vscode.sif"   # what tunnel_setup --check says
         self.stop_answer = None                                                  # what --stop-instance says
+        self.install_elsewhere = None
         self.tokens = []                                                         # the app's tokens, for --tokens
         self.tokens_error = None                                                 # what tunnel_setup --tokens says instead
         self.secret_seen = []                                                    # whatever it printed with a token
@@ -82,6 +83,9 @@ class FakeShell:
         if args[0] == "tunnel_setup":   # like tunnels/setup_tunnel.sh
             if "--save" in args:
                 log.write(f"saved {args.count('--set')} setting(s) for the tunnel\n".encode())
+            if "--install" in args and self.install_elsewhere:
+                log.write(f"HPCLIB_INSTALL_ELSEWHERE {self.install_elsewhere}\n".encode())
+                return subprocess.Popen(["bash", "-c", "exit 3"], start_new_session=True)
             if "--check" in args:
                 log.write(f"HPCLIB_TUNNEL_STATUS {self.setup_status}\n".encode())
             if "--instances" in args:
@@ -895,6 +899,75 @@ class TestTunnelInstall(ConsoleTestCase):
                 return out
             time.sleep(0.1)
         return out
+
+    def test_install_continues_over_rest_with_logs_and_force(self):
+        self.shell.install_elsewhere = "no Singularity on login"
+        sent = []
+        ident = "a" * 32
+        chunks = ["pulling image: 50%\n", "HPCLIB_TUNNEL_STATUS installed installed: remote image\n"]
+        offset = 0
+
+        def rest(profile, verb, route, query=None, body=None, **kwargs):
+            nonlocal offset
+            sent.append((verb, route, query, json.loads(body) if body else None))
+            if verb == "POST":
+                out = {"id": ident, "node": "compute01", "state": "running"}
+            else:
+                self.assertEqual(query, {"id": ident, "offset": offset})
+                text = chunks.pop(0)
+                offset += len(text.encode())
+                out = {"state": "running" if chunks else "succeeded", "output": text,
+                       "offset": offset, "more": False, "exit_code": None if chunks else 0}
+            return 202 if verb == "POST" else 200, "application/json", json.dumps(out).encode()
+
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True), \
+                mock.patch.object(self.clusters, "tunnel_state", return_value={"state": "up"}), \
+                mock.patch.object(self.clusters, "call", side_effect=rest), \
+                mock.patch.object(self.clusters, "INSTALL_POLL_SECONDS", 0.001), \
+                mock.patch.object(agent_console, "read_private", return_value="owner-secret"):
+            status, out = self.call("POST", f"/api/apps/pai/{self.dead}/install", {"force": True})
+            self.assertEqual(status, 202, out)
+            result = self.wait_op(self.dead)
+        self.assertEqual((result["state"], result["exit_code"]), ("succeeded", 0), result)
+        self.assertEqual(result["rest_install_id"], ident)
+        self.assertEqual(sent[0], ("POST", "/admin/tunnel-install", None, {"tunnel": "pai", "force": True}))
+        self.assertIn("pulling image: 50%", "\n".join(result["log"]))
+        self.assertEqual(agent_profiles.load(self.dead)["apps"]["pai"]["install"]["state"], "installed")
+
+    def test_install_rest_prerequisites_and_failures(self):
+        self.shell.install_elsewhere = "no runtime on login"
+        cases = [("down", "owner", None, "start the agent tunnel"),
+                 ("up", None, None, "owner token"),
+                 ("up", "owner", (404, "application/json", b'{"error":"unknown route"}'), "0.2.71"),
+                 ("up", "owner", (200, "text/html", b'<html>queued</html>'), "queued or starting")]
+        for state, owner, response, message in cases:
+            with self.subTest(message=message), \
+                    mock.patch.object(self.clusters.logins, "alive", return_value=True), \
+                    mock.patch.object(self.clusters, "tunnel_state", return_value={"state": state}), \
+                    mock.patch.object(agent_console, "read_private", return_value=owner), \
+                    mock.patch.object(self.clusters, "call", return_value=response):
+                self.assertEqual(self.call("POST", f"/api/apps/pai/{self.dead}/install")[0], 202)
+                out = self.wait_op(self.dead)
+                self.assertEqual(out["state"], "failed", out)
+                self.assertIn(message, "\n".join(out["log"]))
+
+    def test_remote_installer_failure_is_not_success(self):
+        self.shell.install_elsewhere = "no runtime"
+        for code in (1, 3):
+            with self.subTest(code=code), \
+                    mock.patch.object(self.clusters.logins, "alive", return_value=True), \
+                    mock.patch.object(self.clusters, "tunnel_state", return_value={"state": "up"}), \
+                    mock.patch.object(agent_console, "read_private", return_value="owner"), \
+                    mock.patch.object(self.clusters, "call", side_effect=[
+                        (202, "application/json", json.dumps({"id": "b" * 32}).encode()),
+                        (200, "application/json", json.dumps({"state": "failed", "output": "pull failed\n",
+                            "offset": 12, "more": False, "exit_code": code}).encode())]):
+                self.assertEqual(self.call("POST", f"/api/apps/pai/{self.dead}/install")[0], 202)
+                out = self.wait_op(self.dead)
+                self.assertEqual(out["state"], "failed", out)
+                self.assertIn("pull failed", "\n".join(out["log"]))
+                if code == 3:
+                    self.assertIn("REST server's node either", "\n".join(out["log"]))
 
     def test_settings_check_install_start(self):
         base = f"/api/apps/vscode/{self.dead}"

@@ -287,6 +287,8 @@ def load_package_apps(store=None):
 SECRETS_STATUS_RE = re.compile(r"^HPCLIB_TUNNEL_SECRETS((?: [A-Z_][A-Z0-9_]*:(?:set|unset))*)\s*$", re.M)
 SECRET_VALUE_RE = re.compile(r"[^\0\n\r]{1,4096}")
 TOKENS_LINE_RE = re.compile(r"^HPCLIB_TOKENS (\{.*\})\s*$", re.M)
+TOKENS_ELSEWHERE_RE = re.compile(r"^HPCLIB_TOKENS_ELSEWHERE (.*)$", re.M)
+INSTALL_ELSEWHERE_RE = re.compile(r"^HPCLIB_INSTALL_ELSEWHERE (.*)$", re.M)
 DOWNLOADS_LINE_RE = re.compile(r"^HPCLIB_DOWNLOADS (\{.*\})\s*$", re.M)
 DOWNLOAD_REMOVED_RE = re.compile(r"^HPCLIB_DOWNLOAD_REMOVED (\{.*\})\s*$", re.M)
 TOKEN_CREATED_RE = re.compile(r"^HPCLIB_TOKEN_CREATED (\{.*\})\s*$", re.M)
@@ -1051,13 +1053,14 @@ class Clusters:
             raise ConsoleError(409, f"log in to {name} first: {kind} runs over the console's ssh login, which "
                                     f"can't answer a password or 2FA prompt by itself")
         log = self._open_log(name, " ".join(args), self.ops_log_path(name))
+        log_offset = log.tell()
         try:
             proc = self.shell_runner(args, log)
         finally:
             log.close()
         record = {"kind": kind, "title": title or {"install": "install_hpclib", "setup": "setup_agents"}.get(kind, kind),
                   "app": app, "command": args, "state": "running", "started": time.time(), "finished": None,
-                  "exit_code": None, "pid": proc.pid}
+                  "exit_code": None, "pid": proc.pid, "log_offset": log_offset}
         with self.lock:
             self.ops[name] = record
         threading.Thread(target=self._wait_operation, args=(record, proc, profile), daemon=True).start()
@@ -1065,14 +1068,86 @@ class Clusters:
 
     def _wait_operation(self, record, proc, profile=None):
         code = proc.wait()
+        if record["kind"] == "tunnel_install" and profile is not None and code == 3:
+            elsewhere = INSTALL_ELSEWHERE_RE.findall(self._operation_text(profile, record))
+            if elsewhere:
+                with open(self.ops_log_path(profile["name"]), "ab", buffering=0) as log:
+                    try:
+                        code = self._install_via_rest(profile, record, elsewhere[-1], log)
+                    except Exception as e:
+                        log.write(f"setup_tunnel: {e}\nHPCLIB_TUNNEL_STATUS missing installation could not continue: {e}\n".encode())
+                        code = 1
         if record.get("app") and profile is not None:
             # what the install found, from the end of its log
             try:
-                self._record_setup(profile, record["app"], "\n".join(self.operation(profile["name"], 400)["log"]))
+                self._record_setup(profile, record["app"], self._operation_text(profile, record))
             except Exception:    # the log or the profile is gone: the next Check says
                 pass
         with self.lock:
             record.update(state="succeeded" if code == 0 else "failed", exit_code=code, finished=time.time())
+
+    def _operation_text(self, profile, record):
+        """Only this operation's output, so a prior installation cannot supply its status or fallback marker."""
+        with open(self.ops_log_path(profile["name"]), "rb") as log:
+            log.seek(0, os.SEEK_END)
+            log.seek(max(record.get("log_offset", 0), log.tell() - (256 << 10)))
+            return log.read().decode(errors="replace")
+
+    INSTALL_POLL_SECONDS = 1
+
+    def _install_via_rest(self, profile, record, reason, log):
+        spec = self.app_spec(record["app"])
+        needs = f"{spec['title']}'s installation needs the REST server's node ({reason})"
+        if self.tunnel_state(profile)["state"] != "up":
+            raise ConsoleError(409, f"{needs}: start the agent tunnel first (Agents → Clusters → Start)")
+        if not read_private(profile.get("owner_token_file") or ""):
+            raise ConsoleError(409, f"{needs}: this console needs its owner token; rerun setup_agents")
+
+        def request(verb, body=None, query=None):
+            status, ctype, content = self.call(profile, verb, "/admin/tunnel-install", query=query,
+                body=json.dumps(body).encode() if body is not None else None,
+                headers={"Content-Type": "application/json"} if body is not None else None, timeout=30)
+            try:
+                out = json.loads(content)
+            except ValueError:
+                out = None
+            if "text/html" in ctype or not isinstance(out, dict):
+                raise ConsoleError(503, f"{needs}: the REST server job is still queued or starting")
+            if status == 404 and verb == "POST":
+                raise ConsoleError(502, f"{needs}: update HPCLIB on the cluster to 0.2.71 or newer, "
+                                        "then restart the agent tunnel")
+            if status >= 400:
+                raise ConsoleError(502, f"{needs}: {out.get('error', f'HTTP {status}')}")
+            return out
+
+        log.write(f"Continuing {spec['title']} installation through the REST API: {reason}\n".encode())
+        out = request("POST", {"tunnel": spec["tunnel"], "force": "--force" in record["command"]})
+        ident = out.get("id")
+        if not isinstance(ident, str) or not re.fullmatch(r"[a-f0-9]{32}", ident):
+            raise ConsoleError(502, "the REST server returned no installation ID")
+        with self.lock:
+            record["rest_install_id"] = ident
+            record["rest_node"] = out.get("node")
+        log.write(f"Installation {ident} on {out.get('node', 'the REST node')}\n".encode())
+        offset = 0
+        while True:
+            out = request("GET", query={"id": ident, "offset": offset})
+            text, following = out.get("output"), out.get("offset")
+            if (not isinstance(text, str) or isinstance(following, bool) or not isinstance(following, int) or
+                    following < offset or out.get("state") not in ("running", "succeeded", "failed")):
+                raise ConsoleError(502, "the REST server returned an invalid installation status")
+            log.write(text.encode())
+            offset = following
+            if out.get("state") != "running" and not out.get("more"):
+                code = out.get("exit_code")
+                if isinstance(code, bool) or not isinstance(code, int):
+                    raise ConsoleError(502, "the REST server returned no installer exit code")
+                if code == 3:
+                    raise ConsoleError(502, f"{spec['title']} cannot be installed on the REST server's node either; "
+                                            "see the installer output above")
+                return code
+            if not out.get("more"):
+                time.sleep(self.INSTALL_POLL_SECONDS)
 
     def operation(self, name, lines=200):
         with self.lock:
@@ -1346,6 +1421,8 @@ class Clusters:
     def app_installable(self, app):
         """Whether the app's tunnel has an install.sh (in this machine's hpclib, or the package it came from)."""
         tunnel = APPS[app]["tunnel"]
+        if "install.sh" in self.packages.install_files(tunnel):
+            return True
         directory = self.packages.tunnel_dir(tunnel) or os.path.join(HPCLIB_DIR, "tunnels", tunnel)
         return os.path.isfile(os.path.join(directory, "install.sh"))
 
@@ -1454,12 +1531,47 @@ class Clusters:
     # -- an app's own bearer tokens (a package's `tokens` section; see console_packages) --------
 
     def _tokens_run(self, profile, app, args, wait=120):
+        """
+        The app's tokens.sh on the cluster's login node, over the console's login; where it can't run there
+        (HPCLIB_TOKENS_ELSEWHERE: no Singularity on the login node, say), on the REST server's node through the agent
+        tunnel instead (POST /admin/tunnel-tokens, owner only), which must then be up.
+        """
         spec = self.app_spec(app)
         if not spec.get("tokens"):
             raise ConsoleError(404, f"{spec['title']} has no tokens to manage")
         text = self._run_setup(profile, ["tunnel_setup"] + ssh_options(profile) +
                                [profile["host"], spec["tunnel"], "--tokens"] + args, wait)
+        elsewhere = TOKENS_ELSEWHERE_RE.findall(text)
+        if elsewhere:
+            text = self._tokens_via_rest(profile, spec, args, elsewhere[-1].strip())
         return spec, text
+
+    def _tokens_via_rest(self, profile, spec, args, reason):
+        needs = (f"{spec['title']}'s tokens can't be managed on {profile['name']}'s login node ({reason}), so they "
+                 f"are managed where its REST server runs, through the agent tunnel")
+        if self.tunnel_state(profile)["state"] != "up":
+            raise ConsoleError(409, f"{needs}: start the agent tunnel first (Agents → Clusters → Start)")
+        if not read_private(profile.get("owner_token_file") or ""):
+            raise ConsoleError(409, f"{needs}, with the owner token, which this console doesn't have for it: rerun "
+                                    f"setup_agents")
+        status, ctype, content = self.call(profile, "POST", "/admin/tunnel-tokens", body=json.dumps(
+            {"tunnel": spec["tunnel"], "action": args[0], "args": args[1:]}).encode(),
+            headers={"Content-Type": "application/json"}, timeout=240)
+        try:
+            out = json.loads(content)
+        except ValueError:
+            out = None
+        if "text/html" in ctype or not isinstance(out, dict):
+            raise ConsoleError(503, f"{needs}: its REST server job is still queued or starting")
+        if status == 404:
+            raise ConsoleError(502, f"{needs}: update hpclib there (0.2.70 or newer), then restart the agent tunnel")
+        if status >= 400:
+            raise ConsoleError(502, f"{needs}: {out.get('error', f'HTTP {status}')}")
+        text = str(out.get("stdout", "")) + "\n" + str(out.get("stderr", ""))
+        if TOKENS_ELSEWHERE_RE.search(text):
+            raise ConsoleError(502, f"{needs}, but it can't run on {out.get('node', 'that node')} either: "
+                                    f"{TOKENS_ELSEWHERE_RE.findall(text)[-1].strip()}")
+        return text
 
     @staticmethod
     def _tokens_failure(what, text, quote=True):

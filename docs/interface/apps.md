@@ -29,6 +29,11 @@ automatically once you are logged in.
 | **Check** | check again (runs the tunnel's `install.sh --check` on the cluster) |
 | **Install** / **Reinstall** | install what the app needs; its output appears under the row. Some apps call this **Update** once installed |
 
+When an installer reports that it cannot run on the login node (PAI needs Singularity or Apptainer to pull
+images), the console continues it through the cluster's REST API. Start the agent tunnel first; its REST job
+must be running. Install and Update retain their progress log and final status. This requires HPCLIB 0.2.71
+on your machine and the cluster; after updating the cluster, restart its agent tunnel.
+
 Each app on each cluster gets ports of its own, chosen once and kept, so apps never collide with each other,
 with the agents' tunnel or with other users. Starting an app on a port an earlier session left behind clears
 that port first; see [Ending tunnels](../architecture.md#ending-tunnels-and-stale-ports).

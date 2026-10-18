@@ -19,6 +19,7 @@ A package is a zip file with hpclib-package.json at its top level:
                 "shared": false,             # optional: one running instance serves everyone (see below)
                 "instance_label": "database",   # with shared: what the instance is called in the console
                 "reinstall": {"label": "Update", "title": "what it does"},   # optional: what Install does once installed
+                "install_files": {"install.sh": "install/install.sh", "helpers/setup.py": "install/setup.py"},
                 "settings": [{"name": "MY_DIR", "label": "Directory", "hint": "...", "choices": null}],
                 "secrets": [{"name": "MY_TOKEN", "label": "API token", "hint": "..."}],   # see below
                 "tokens": {"scopes": ["read", "write", "admin"], "default_scope": "write",
@@ -88,6 +89,12 @@ What happens to it:
 A package's tunnel scripts run on your clusters as you: install only packages you trust. The console checks
 the zip's structure (no links, no paths outside it, sizes) and the manifest, not what the scripts do.
 
+An app's `install_files` maps paths relative to its packaged tunnel to source files in the zip. A list is
+shorthand for identical source and destination paths (e.g. ["install.sh", "requirements.txt"]). These files
+join the tunnel in the existing SSH push before Check, Install or Start. An install.sh already inside the
+tunnel is always sent, even without this field. Declarations cannot replace built-in tunnels or conflict
+with another file in the same tunnel. Installers run from the received tunnel directory, beside their files.
+
 Build one with:  python3 console_packages.py build DIR [OUT.zip]   (DIR holds hpclib-package.json)
 
 Standard library only.
@@ -121,7 +128,7 @@ MAX_UNPACKED = 256 << 20    # bytes, everything in it
 MAX_FILES = 5000
 MAX_SETTINGS_FILE = 1 << 20
 APP_KEYS = {"title", "tunnel", "description", "open_path", "health_path", "token_regex", "password_regex", "login_user",
-            "settings", "secrets", "downloads",
+            "settings", "secrets", "downloads", "install_files",
             "shared", "instance_label", "reinstall", "tokens"}
 LOGIN_USER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 DOWNLOAD_KEYS = {"label", "description", "kinds"}
@@ -282,6 +289,29 @@ def read_zip(data):
     return manifest, members
 
 
+def _check_install_files(value, app_id, members):
+    """Destination paths in the tunnel -> package-relative source paths, all plain zip members."""
+    where = f"apps.{app_id}.install_files"
+    if value is None:
+        return {}
+    if isinstance(value, list):
+        if not all(isinstance(p, str) for p in value) or len(set(value)) != len(value):
+            raise PackageError(f"{where} must list distinct file paths")
+        value = {p: p for p in value}
+    if not isinstance(value, dict):
+        raise PackageError(f"{where} must map tunnel-relative destinations to files in the zip, or list file paths")
+    for dest, source in value.items():
+        if (not isinstance(dest, str) or not dest or len(dest) > 512 or
+                any(ord(c) < 32 for c in dest) or _member_path(dest) is None):
+            raise PackageError(f"{where}: invalid destination {dest!r}")
+        if not isinstance(source, str) or source not in members:
+            raise PackageError(f"{where}: {source!r} is not a file in the zip")
+        if source == "package.json":
+            raise PackageError(f"{where}: root package.json is reserved for installed metadata; "
+                               "put the source file in a subdirectory")
+    return dict(value)
+
+
 def check_manifest(manifest, members, builtin_tunnels):
     """The manifest, normalized; raises PackageError. `builtin_tunnels`: hpclib's own tunnel names."""
     if not isinstance(manifest, dict):
@@ -385,6 +415,10 @@ def check_manifest(manifest, members, builtin_tunnels):
         tunnel = spec.get("tunnel")
         if tunnel not in out["tunnels"] and tunnel not in builtin_tunnels:
             raise PackageError(f"app {app_id}: tunnel {tunnel!r} is neither in this package nor one of hpclib's")
+        install_files = _check_install_files(spec.get("install_files"), app_id, members)
+        if install_files and tunnel not in out["tunnels"]:
+            raise PackageError(f"app {app_id}: install_files needs a tunnel owned by this package; "
+                               "a package can't replace hpclib's own tunnel files")
         app = {"title": _text(spec.get("title"), f"apps.{app_id}.title", 60), "tunnel": tunnel,
                "description": _text(spec.get("description"), f"apps.{app_id}.description", 2000, required=False),
                "open_path": spec.get("open_path", "/"), "health_path": spec.get("health_path", "/"),
@@ -392,7 +426,7 @@ def check_manifest(manifest, members, builtin_tunnels):
                "login_user": spec.get("login_user"),
                "settings": [], "secrets": [],
                "shared": spec.get("shared", False), "instance_label": None, "reinstall": None, "tokens": None,
-               "downloads": None}
+               "downloads": None, "install_files": install_files}
         if not isinstance(app["shared"], bool):
             raise PackageError(f"app {app_id}: shared is true or false")
         if spec.get("instance_label") is not None:
@@ -476,6 +510,23 @@ def check_manifest(manifest, members, builtin_tunnels):
             app["secrets"].append({"name": f["name"], "label": _text(f.get("label"), "label", 80),
                                    "hint": _text(f.get("hint", ""), "hint", 400, required=False) or ""})
         out["apps"][app_id] = app
+
+    # All apps sharing a tunnel must agree on its files. Refuse file/directory collisions before staging.
+    for tunnel, entry in out["tunnels"].items():
+        prefix = entry["dir"] + "/"
+        destinations = {p[len(prefix):]: p for p in members if p.startswith(prefix)}
+        for app in out["apps"].values():
+            if app["tunnel"] != tunnel:
+                continue
+            for dest, source in app["install_files"].items():
+                if dest in destinations and destinations[dest] != source:
+                    raise PackageError(f"install_files for {tunnel}: conflicting destination {dest!r}")
+                destinations[dest] = source
+        for dest in destinations:
+            parts = dest.split("/")
+            if any("/".join(parts[:i]) in destinations for i in range(1, len(parts))):
+                raise PackageError(f"install_files for {tunnel}: file/directory conflict at {dest!r}")
+        entry["install"] = "install.sh" in destinations
 
     settings = manifest.get("settings") or {}
     if not isinstance(settings, dict):
@@ -675,10 +726,17 @@ class PackageStore:
         return {fname: os.path.join(d, *path.split("/")) for m, d in self.installed()
                 for fname, path in ((m["settings"].get(tunnel) or {}).get("files") or {}).items()}
 
+    def install_files(self, tunnel):
+        """Declared installer files, including payloads outside the package's tunnel directory."""
+        return {dest: os.path.join(directory, *source.split("/"))
+                for manifest, directory in self.installed() for app in manifest["apps"].values()
+                if app["tunnel"] == tunnel for dest, source in app.get("install_files", {}).items()}
+
     def stage(self, tunnel, root):
         """
         The directory tunnel_setup --push sends for `tunnel`: tunnel/ (a packaged tunnel) and settings.d/ (the
-        packages' files for it), under `root` and named by its content's hash, so it never changes once made;
+        packages' files for it). Declared install_files join tunnel/, including an external install.sh.
+        Under `root` and named by its content's hash, so it never changes once made;
         returns (path, hash). With nothing from the packages, an empty settings.d/ (which clears what an earlier
         push left on a cluster) and hash None.
         """
@@ -689,6 +747,10 @@ class PackageStore:
             os.makedirs(os.path.join(tmp, "settings.d"))
             if source is not None:
                 shutil.copytree(source, os.path.join(tmp, "tunnel"))
+            for dest, path in self.install_files(tunnel).items():
+                target = os.path.join(tmp, "tunnel", *dest.split("/"))
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                shutil.copy2(path, target)
             for fname, path in files.items():
                 shutil.copyfile(path, os.path.join(tmp, "settings.d", fname))
             digest = hashlib.sha256()
@@ -756,6 +818,8 @@ def summary(manifest):
         lines.append(f"cluster preset {spec['title']} ({preset}): {spec['host']}:{spec['port']}, SSH keys {spec['ssh_keys']}")
     for app_id, app in manifest["apps"].items():
         lines.append(f"app {app['title']} ({app_id}), tunnel {app['tunnel']}")
+        for dest in app.get("install_files", {}):
+            lines.append(f"app {app_id}: install file {dest}")
         if app.get("downloads"):
             lines.append(f"app {app_id}: {app['downloads']['label']} ("
                          f"{', '.join(k['label'] for k in app['downloads']['kinds'])})")

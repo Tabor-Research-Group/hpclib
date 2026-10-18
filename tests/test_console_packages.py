@@ -48,6 +48,19 @@ DEMO_FILES = {"tunnels/demo-tunnel/sbatch_script.sh": "#!/bin/bash\necho demo\n"
 LAB_FILES = {"settings/rclone.conf": "[ours]\ntype = alias\nremote = smb:research/our_group\n"}
 
 
+def external_installer_package():
+    """A tunnel whose installer and payload live elsewhere in the zip."""
+    manifest = dict(DEMO, apps={"demo": dict(DEMO["apps"]["demo"], install_files={
+        "install.sh": "install/install.sh", "helpers/value.txt": "install/value.txt"})})
+    files = {k: v for k, v in DEMO_FILES.items() if not k.endswith("/install.sh")}
+    files.update({"install/install.sh": '#!/bin/bash\n# hpclib-install: --check\n'
+                  'set -e\n[ "$(cat helpers/value.txt)" = payload ]\n'
+                  '[ "$1" = --check ] || cp helpers/value.txt "$DEMO_DIR/installed.txt"\n'
+                  '[ -f "$DEMO_DIR/installed.txt" ]\necho installed: payload\n',
+                  "install/value.txt": "payload\n"})
+    return manifest, files
+
+
 def make_zip(manifest, files=(), links=(), prefix=""):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
@@ -102,6 +115,57 @@ class TestPackageStore(unittest.TestCase):
     def test_a_zip_of_a_folder(self):
         self.store.install(make_zip(LAB, LAB_FILES, prefix="our-lab/"))
         self.assertEqual([m["name"] for m, _ in self.store.installed()], ["our-lab"])
+
+    def test_install_files_stage_and_replace(self):
+        manifest, files = external_installer_package()
+        report = self.store.install(make_zip(manifest, files))
+        self.assertTrue(report["package"]["tunnels"]["demo-tunnel"]["install"])
+        root = str(self.tmp / "staging")
+        stage, digest = self.store.stage("demo-tunnel", root)
+        self.assertEqual((Path(stage) / "tunnel/helpers/value.txt").read_text(), "payload\n")
+        self.assertTrue(os.access(Path(stage) / "tunnel/install.sh", os.X_OK))
+        self.assertEqual(self.store.stage("demo-tunnel", root), (stage, digest))
+        self.store.install(make_zip(dict(manifest, version="1.1"), dict(files, **{"install/value.txt": "new\n"})))
+        changed, new_digest = self.store.stage("demo-tunnel", root)
+        self.assertNotEqual(new_digest, digest)
+        self.assertEqual((Path(changed) / "tunnel/helpers/value.txt").read_text(), "new\n")
+        self.assertEqual((Path(stage) / "tunnel/helpers/value.txt").read_text(), "payload\n")
+        # Removing a declaration removes its staged payload; legacy install.sh still goes along.
+        self.store.install(make_zip(dict(DEMO, version="1.2"), DEMO_FILES))
+        changed, _ = self.store.stage("demo-tunnel", root)
+        self.assertFalse((Path(changed) / "tunnel/helpers").exists())
+        self.assertTrue((Path(changed) / "tunnel/install.sh").is_file())
+
+    def test_install_files_list(self):
+        manifest, files = external_installer_package()
+        manifest["apps"]["demo"]["install_files"] = ["install.sh", "helpers/value.txt"]
+        files["install.sh"] = files.pop("install/install.sh")
+        files["helpers/value.txt"] = files.pop("install/value.txt")
+        self.store.install(make_zip(manifest, files))
+        stage, _ = self.store.stage("demo-tunnel", str(self.tmp / "staging"))
+        self.assertEqual((Path(stage) / "tunnel/helpers/value.txt").read_text(), "payload\n")
+
+    def test_install_files_refused(self):
+        manifest, files = external_installer_package()
+        files["package.json"] = "{}\n"
+        for declaration in ("install.sh", [1], ["install/install.sh"] * 2, {"x": "missing"},
+                            {"package.json": "package.json"},
+                            {"../escape": "install/value.txt"}, {"/abs": "install/value.txt"},
+                            {"a/../escape": "install/value.txt"}, {"a\\b": "install/value.txt"},
+                            {"a/": "install/value.txt"}, {"a\n": "install/value.txt"},
+                            {"helpers": "install/value.txt", "helpers/x": "install/value.txt"},
+                            {"sbatch_script.sh/x": "install/value.txt"},
+                            {"sbatch_script.sh": "install/value.txt"}):
+            with self.subTest(declaration=declaration):
+                app = dict(manifest["apps"]["demo"], install_files=declaration)
+                with self.assertRaises(console_packages.PackageError):
+                    self.store.inspect(make_zip(dict(manifest, apps={"demo": app}), files))
+        app = dict(manifest["apps"]["demo"], tunnel="vscode")
+        with self.assertRaisesRegex(console_packages.PackageError, "owned by this package"):
+            self.store.inspect(make_zip(dict(manifest, apps={"demo": app}), files))
+        app = dict(manifest["apps"]["demo"], install_files={"helpers/value.txt": "install/install.sh"})
+        with self.assertRaisesRegex(console_packages.PackageError, "conflicting destination"):
+            self.store.inspect(make_zip(dict(manifest, apps=dict(manifest["apps"], other=app)), files))
 
     def test_refused(self):
         bad = [
@@ -217,6 +281,19 @@ class TestConsolePackages(ConsoleTestCase):
         self.assertEqual((status, out["apps"]), (200, ["demo"]), out)
         self.assertNotIn("demo", [a["id"] for a in self.call("GET", "/api/apps")[1]["apps"]])
         self.assertEqual(self.call("DELETE", "/api/packages/demo")[0], 404)
+
+    def test_declared_installer_is_installable_and_pushed(self):
+        manifest, files = external_installer_package()
+        self.assertEqual(self._post(make_zip(manifest, files), dry_run=False)[0], 201)
+        base = f"/api/apps/demo/{self.dead}"
+        self.assertTrue(self.call("GET", base + "/settings")[1]["installable"])
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.assertEqual(self.call("POST", base + "/install")[0], 202)
+        call = self.shell.calls[-1]
+        self.assertIn("--install", call)
+        pushed = Path(call[call.index("--push") + 1])
+        self.assertTrue((pushed / "tunnel/install.sh").is_file())
+        self.assertEqual((pushed / "tunnel/helpers/value.txt").read_text(), "payload\n")
 
     def test_password_regex(self):
         """an app that prints a password (OpenCode's basic-auth login) gets VS Code's Copy password"""
@@ -349,6 +426,40 @@ class TestConsolePackages(ConsoleTestCase):
             status, out = self.call("POST", base + "/tokens", {"label": "x"})
             self.assertEqual(status, 502)
             self.assertNotIn("LEAKED", out["error"])
+        # a login node that can't run tokens.sh: on the REST server's node, through the agent tunnel, with the owner token
+        self.shell.tokens_error = "HPCLIB_TOKENS_ELSEWHERE neither singularity nor apptainer is on PATH"
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            with mock.patch.object(self.clusters, "tunnel_state", return_value={"state": "down"}):
+                status, out = self.call("GET", base + "/tokens")
+            self.assertEqual(status, 409)
+            self.assertIn("login node (neither singularity nor apptainer is on PATH)", out["error"])
+            self.assertIn("start the agent tunnel", out["error"])
+            sent = []
+            def rest(profile, verb, route, query=None, body=None, headers=None, as_agent=False, timeout=None):
+                sent.append((verb, route, json.loads(body)))
+                if json.loads(body)["action"] == "create":
+                    return 200, "application/json", json.dumps({"exit_code": 0, "node": "c01", "stderr": "", "stdout":
+                        'HPCLIB_TOKEN_CREATED {"id": "t9", "label": "x", "scopes": ["write"], "token": "pai_t9_S"}'}).encode()
+                return 200, "application/json", json.dumps({"exit_code": 0, "node": "c01", "stderr": "",
+                                                            "stdout": 'HPCLIB_TOKENS {"tokens": []}'}).encode()
+            with mock.patch.object(self.clusters, "tunnel_state", return_value={"state": "up"}), \
+                    mock.patch.object(self.clusters, "call", side_effect=rest), \
+                    mock.patch.object(agent_console, "read_private", return_value="owner-secret"):
+                self.assertEqual(self.call("GET", base + "/tokens")[1]["tokens"], [])
+                out = self.call("POST", base + "/tokens", {"label": "x", "scopes": ["write"]})[1]
+                self.assertEqual(out["token"], "pai_t9_S")
+            self.assertEqual(sent[0], ("POST", "/admin/tunnel-tokens", {"tunnel": "demo-tunnel", "action": "list", "args": []}))
+            self.assertEqual(sent[1][2]["args"], ["--label", "x", "--scopes", "write", "--days", "90"])
+            # nor there: says so
+            elsewhere = lambda *a, **k: (200, "application/json", json.dumps(
+                {"exit_code": 3, "node": "c01", "stdout": "HPCLIB_TOKENS_ELSEWHERE no image at /x", "stderr": ""}).encode())
+            with mock.patch.object(self.clusters, "tunnel_state", return_value={"state": "up"}), \
+                    mock.patch.object(self.clusters, "call", side_effect=elsewhere), \
+                    mock.patch.object(agent_console, "read_private", return_value="owner-secret"):
+                status, out = self.call("GET", base + "/tokens")
+            self.assertEqual(status, 502)
+            self.assertIn("can't run on c01 either: no image at /x", out["error"])
+        self.shell.tokens_error = None
         # an app without a `tokens` section has no panel and no routes
         with mock.patch.object(self.clusters.logins, "alive", return_value=True):
             self.assertEqual(self.call("GET", f"/api/apps/vscode/{self.dead}/tokens")[0], 404)
@@ -508,6 +619,25 @@ class TestClusterReceives(unittest.TestCase):
         return subprocess.run(["bash", str(HPCLIB / "tunnels" / "setup_tunnel.sh"), tunnel, "--receive", *args],
                               input=tar, capture_output=True, env=self.env, timeout=120)
 
+    def test_declared_files_through_ssh_push(self):
+        """Exercise the real tar/SSH pipeline and receiver, replacing only the remote SSH transport."""
+        manifest, files = external_installer_package()
+        store = console_packages.PackageStore(str(self.tmp / "packages"), {}, set())
+        store.install(make_zip(manifest, files))
+        stage, _ = store.stage("demo-tunnel", str(self.tmp / "staging"))
+        script = '''
+            source "$HPCLIB_DIR/hpclib.sh" >/dev/null
+            pssh() { [ "$1" = test-host ] || return 9; bash -c "$2"; }
+            tunnel_setup test-host demo-tunnel --push "$1" --set "DEMO_DIR=$2" --save --install --check
+        '''
+        env = dict(self.env, HPCLIB_REMOTE_INSTALL_LOCATION=str(HPCLIB))
+        result = subprocess.run(["bash", "-c", script, "test", stage, str(self.tmp)],
+                                env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("HPCLIB_TUNNEL_STATUS installed installed: payload", result.stdout)
+        self.assertEqual((self.tmp / "installed.txt").read_text(), "payload\n")
+        self.assertTrue((self.tmp / "installed/demo-tunnel/install.sh").is_file())
+
     def test_tokens_option(self):
         """setup_tunnel.sh --tokens runs the tunnel's tokens.sh as `tokens.sh --json ACTION ...` and passes its JSON on."""
         tunnel = self.tmp / "tunnels" / "demo-tunnel"
@@ -544,6 +674,11 @@ class TestClusterReceives(unittest.TestCase):
         # a failure says why, in tokens.sh's own words
         self.assertIn("setup_tunnel: tokens.sh list failed: the directory of /x/y does not exist", run("--tokens", "list", DEMO_FAIL="1").stderr)
         self.assertEqual(run("--tokens", "list", DEMO_FAIL="1").returncode, 1)
+        # a tokens.sh that can't work on this node (exit 3): passed on, for the console to try the REST server's node
+        (tunnel / "tokens.sh").write_text('#!/bin/bash\necho "neither singularity nor apptainer is on PATH" >&2\nexit 3\n')
+        out = run("--tokens", "list")
+        self.assertEqual((out.returncode, out.stdout.strip()),
+                         (3, "HPCLIB_TOKENS_ELSEWHERE neither singularity nor apptainer is on PATH"))
         (tunnel / "tokens.sh").unlink()
         out = run("--tokens", "list")
         self.assertNotEqual(out.returncode, 0)
