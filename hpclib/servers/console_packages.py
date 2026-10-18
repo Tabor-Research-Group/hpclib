@@ -20,6 +20,7 @@ A package is a zip file with hpclib-package.json at its top level:
                 "instance_label": "database",   # with shared: what the instance is called in the console
                 "reinstall": {"label": "Update", "title": "what it does"},   # optional: what Install does once installed
                 "install_files": {"install.sh": "install/install.sh", "helpers/setup.py": "install/setup.py"},
+                "install_modules": ["WebProxy"],   # defaults; users may replace or clear these in Settings
                 "settings": [{"name": "MY_DIR", "label": "Directory", "hint": "...", "choices": null}],
                 "secrets": [{"name": "MY_TOKEN", "label": "API token", "hint": "..."}],   # see below
                 "tokens": {"scopes": ["read", "write", "admin"], "default_scope": "write",
@@ -39,8 +40,9 @@ ends it. `reinstall` renames what Install does once the app is installed (for PA
 
 An app's `secrets` (tokens, OAuth client secrets) are typed into its settings panel and sent to a cluster over
 ssh on standard input (setup_tunnel.sh --secrets), never kept by the console, logged or put on a command line.
-The cluster keeps each in ~/.local/tunnels/secrets/TUNNEL/NAME (mode 600), out of the agents' reach; the
-tunnel's scripts read them there. The tunnel must list them in TUNNEL_SECRETS (its tunnel_config.sh).
+The cluster keeps each in ~/.local/tunnels/secrets/TUNNEL/NAME (mode 600); the tunnel's scripts read them there.
+Other processes with file access as the same Unix account can also read them. The tunnel must list them in
+TUNNEL_SECRETS (its tunnel_config.sh).
 
 An app's `tokens` section puts a Tokens panel in its settings, for apps that keep their own bearer tokens (PAI's
 write API). The tunnel ships tokens.sh, which the console runs on the cluster over its login (setup_tunnel.sh
@@ -128,7 +130,7 @@ MAX_UNPACKED = 256 << 20    # bytes, everything in it
 MAX_FILES = 5000
 MAX_SETTINGS_FILE = 1 << 20
 APP_KEYS = {"title", "tunnel", "description", "open_path", "health_path", "token_regex", "password_regex", "login_user",
-            "settings", "secrets", "downloads", "install_files",
+            "settings", "secrets", "downloads", "install_files", "install_modules",
             "shared", "instance_label", "reinstall", "tokens"}
 LOGIN_USER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 DOWNLOAD_KEYS = {"label", "description", "kinds"}
@@ -143,7 +145,8 @@ CLUSTER_KEYS = {"title", "host", "port", "description", "documentation_url", "de
 CLUSTER_HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}")
 CLUSTER_ARG_RE = re.compile(r"--(time|mem|partition|account|qos|cpus-per-task|constraint)=[A-Za-z0-9:._,+-]{1,64}")
 CLUSTER_DEFAULT_KEYS = {"tunnel_args", "rest_on", "connection_hours", "work_dir", "rest_config", "app_settings"}
-APP_SETTING_KEYS = {"tunnel_args", "conda_env", "modules", "project", "settings"}
+APP_SETTING_KEYS = {"tunnel_args", "conda_env", "modules", "install_modules", "project", "settings"}
+INSTALL_MODULE_RE = re.compile(r"[A-Za-z0-9_.+][A-Za-z0-9_.+/-]{0,127}")
 SECRET_FIELD_RE = re.compile(r"(?:^|_)(?:pass|password|passwd|pwd|passphrase|passcode|secret|secrets|token|tokens|"
                              r"credential|credentials|api_key|access_key|private_key|authorization|auth_header|"
                              r"cookie|cookies)(?:_|$)", re.I)
@@ -200,6 +203,17 @@ def check_cluster_config(config):
     return json.loads(json.dumps(normalized))
 
 
+def check_install_modules(value, *, allow_default=False):
+    """An ordered module list, serialized with colons for setup_tunnel.sh; None restores app defaults."""
+    if value is None and allow_default:
+        return None
+    if (not isinstance(value, list) or len(value) > 32 or
+            not all(isinstance(m, str) and INSTALL_MODULE_RE.fullmatch(m) for m in value) or
+            len(":".join(value)) > 1024):
+        raise PackageError("install_modules must be up to 32 module names, at most 1024 characters together")
+    return list(value)
+
+
 def _cluster_app_settings(apps):
     if not isinstance(apps, dict):
         raise PackageError("app_settings must map app IDs to their settings")
@@ -211,6 +225,8 @@ def _cluster_app_settings(apps):
             if key == "tunnel_args":
                 if not isinstance(value, list) or len(value) > 16 or not all(isinstance(v, str) and CLUSTER_ARG_RE.fullmatch(v) for v in value):
                     raise PackageError("invalid app tunnel_args")
+            elif key == "install_modules":
+                check_install_modules(value, allow_default=True)
             elif key == "modules":
                 if not isinstance(value, list) or not all(isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9_.+-][A-Za-z0-9_.+/-]{0,127}", v) for v in value):
                     raise PackageError("invalid app modules")
@@ -426,7 +442,8 @@ def check_manifest(manifest, members, builtin_tunnels):
                "login_user": spec.get("login_user"),
                "settings": [], "secrets": [],
                "shared": spec.get("shared", False), "instance_label": None, "reinstall": None, "tokens": None,
-               "downloads": None, "install_files": install_files}
+               "downloads": None, "install_files": install_files,
+               "install_modules": check_install_modules(spec.get("install_modules", []))}
         if not isinstance(app["shared"], bool):
             raise PackageError(f"app {app_id}: shared is true or false")
         if spec.get("instance_label") is not None:

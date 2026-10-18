@@ -82,7 +82,8 @@ export MYAPP_DATA="${MYAPP_DATA:-/scratch/user/$(whoami)/myapp-data}"
 
 `tunnel_setup HOST my-tunnel --set MYAPP_IMAGE=... --save` writes `~/.local/tunnels/settings/my-tunnel.sh`,
 which `start_tunnel.sh` sources before the job starts and `setup_tunnel.sh` before `install.sh` runs, so both see
-the same values. Only names listed in `TUNNEL_SETTINGS` are accepted.
+the same values. Only names listed in `TUNNEL_SETTINGS` are accepted, plus the common
+`HPCLIB_INSTALL_MODULES` installation setting described below.
 
 ### install.sh
 
@@ -115,12 +116,36 @@ echo "installed: $MYAPP_IMAGE"
 An `install.sh` without the `hpclib-install:` line is never run for a check; the console then reports the status
 as unknown.
 
+#### Modules before installation
+
+Every installable app has an **Installation modules** field in Settings, independent of the job's modules.
+Modules load in order before `install.sh`, including `--check` and `--force`, on both the login node and the
+REST node. For example, `WebProxy` enables image downloads on HPRC compute nodes. A package can suggest defaults
+with `apps.APP.install_modules: ["WebProxy"]`; a user can replace the list or clear it to load none.
+The app settings API accepts `install_modules` as a list, `[]` to disable preloading, or `null` for package defaults.
+Cluster presets may supply the same field in `defaults.app_settings.APP`.
+
+The command-line equivalent is:
+
+```bash
+tunnel_setup HOST my-tunnel --set HPCLIB_INSTALL_MODULES=GCC/12.2.0:WebProxy --save --install --check
+```
+
+This common setting needs no entry in `TUNNEL_SETTINGS`. A tunnel may also provide a command-line default in
+`tunnel_config.sh`, using `HPCLIB_INSTALL_MODULES="${HPCLIB_INSTALL_MODULES-WebProxy}"` so an explicit empty value
+disables it. Modules are ordinary names, not shell commands (up to 32 names and 1024 characters in total).
+If a module cannot load on the login node, Install defers to the REST node with exit 3, like an installer that
+cannot run there. A failure on the REST node remains a failed installation. A standalone Check reports unknown
+when its modules cannot load. Module environments are local to the installer; they do not change the REST
+server or other jobs. Starting the database job still uses its own module configuration.
+
 ### Secrets
 
 For values that must not appear in settings files or command lines (an OAuth client secret, an API key), list
 their names in `TUNNEL_SECRETS`. The console's settings panel then shows password fields for them and sends the
 values over ssh on standard input to `setup_tunnel.sh --secrets`, which stores each in
-`~/.local/tunnels/secrets/TUNNEL/NAME` (mode 600, out of the agents' reach). The job reads them from there:
+`~/.local/tunnels/secrets/TUNNEL/NAME` (mode 600). This excludes other Unix accounts; a process with file access
+as the same account can still read them. The installer or job reads them from there:
 
 ```bash
 token=$(cat "${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/secrets/my-tunnel/MYAPP_TOKEN" 2>/dev/null)
@@ -308,6 +333,7 @@ our-lab/
 | `settings.TUNNEL.files` | files placed in `~/.local/tunnels/settings/TUNNEL.d/` on the cluster (e.g. extra rclone remotes, or a `NAME.gui.sh` for Data transfer's `SMB_GUI`) |
 | `secrets` | per app; each name must be in its tunnel's `TUNNEL_SECRETS` |
 | `apps.APP.install_files` | installation files copied from the zip into that app's packaged tunnel before Check, Install or Start; see below |
+| `apps.APP.install_modules` | default ordered list of modules loaded before the installer; users can replace or clear it in app Settings |
 
 Build and check it, then install it from **Add App or Settings**:
 

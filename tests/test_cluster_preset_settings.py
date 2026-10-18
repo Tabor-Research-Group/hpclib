@@ -19,7 +19,7 @@ import rest_server
 PORTABLE = {"format": 1, "name": "entropy-cluster", "version": "1.0.0", "clusters": {"entropy": {
     "title": "Entropy", "host": "entropy.chem.tamu.edu", "defaults": {
         "work_dir": "/scratch/user/{username}/llm",
-        "app_settings": {"jupyter": {"conda_env": "default", "modules": [], "project": ""},
+        "app_settings": {"jupyter": {"conda_env": "default", "modules": [], "install_modules": ["WebProxy"], "project": ""},
                          "transfer": {"settings": {"SMB_USER": "{username}", "SMB_DOMAIN": "AUTH"}}},
         "rest_config": {"limits": {"max_concurrent_jobs": 8, "max_time": "1-00:00:00", "max_mem": "64G"},
                         "sandbox": {"method": "auto", "binds": ["/software"]},
@@ -45,7 +45,8 @@ class TestPortablePresetValidation(unittest.TestCase):
                 manifest["clusters"]["entropy"]["defaults"]["rest_config"] = config
                 with self.assertRaises(console_packages.PackageError):
                     self.store().inspect(packages_tests.make_zip(manifest))
-        for settings in ({"token": "secret"}, {"port": 20735}, {"tunnel_args": ["--wrap=evil"]}):
+        for settings in ({"token": "secret"}, {"port": 20735}, {"tunnel_args": ["--wrap=evil"]},
+                         {"install_modules": ["WebProxy; echo wrong"]}):
             manifest = copy.deepcopy(PORTABLE)
             manifest["clusters"]["entropy"]["defaults"]["app_settings"] = {"jupyter": settings}
             with self.assertRaises(console_packages.PackageError):
@@ -69,6 +70,8 @@ class TestPortablePresetSetup(ConsoleTestCase):
         self.assertEqual(self.call("GET", f"/api/clusters/{name}")[1]["setup_config"]["limits"]["max_concurrent_jobs"], 8)
         jupyter = self.call("GET", f"/api/apps/jupyter/{name}/settings")[1]
         self.assertEqual(jupyter["conda_env"], "default")
+        self.assertEqual(jupyter["install_modules"], ["WebProxy"])
+        self.assertIn("HPCLIB_INSTALL_MODULES=WebProxy", self.clusters.setup_args(profile, "jupyter", "--install"))
         self.assertNotEqual(jupyter["port"], profile["port"])
         self.clusters.package_remove("entropy-cluster")
         self.assertEqual(agent_profiles.load(name)["setup_config"]["limits"]["max_concurrent_jobs"], 8)

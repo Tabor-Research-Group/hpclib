@@ -1065,6 +1065,8 @@ async function appSettingsForm(app, s, row) {
   const conda = el("input", { value: conf.conda_env === null ? "" : (conf.conda_env === "" ? "none" : conf.conda_env),
                               placeholder: "default", size: 16 });
   const modules = el("input", { value: conf.modules.join(" "), placeholder: "e.g. JupyterLab/4.2.0", size: 32 });
+  const installModules = el("input", { value: (conf.install_modules || []).join(" "),
+    placeholder: "e.g. WebProxy", size: 40 });
   const project = el("input", { value: conf.project, placeholder: "/scratch/user/me/llm/my-project", size: 40 });
   // empty: a package's value if one gives it (shown, with the package), else the tunnel's own default
   const defaults = conf.defaults || {};
@@ -1078,6 +1080,7 @@ async function appSettingsForm(app, s, row) {
     const tunnel_args = APP_TUNNEL_FIELDS.filter(([k]) => inputs[k].value.trim())
       .map(([k]) => `--${k}=${inputs[k].value.trim()}`).concat(other);
     const body = { tunnel_args };
+    if (conf.installable) body.install_modules = words(installModules.value);
     if (conf.python_env) {
       const c = conda.value.trim();
       Object.assign(body, { conda_env: c === "" ? null : (c === "none" ? "" : c), modules: words(modules.value),
@@ -1104,7 +1107,7 @@ async function appSettingsForm(app, s, row) {
       secretInputs[f.name].value = "";
       secretInputs[f.name].placeholder = f.set ? "set on the cluster; type to replace" : "not set";
     }
-    return "Sent. The app uses them from its next Start.";
+    return "Sent. The app can use them on its next Install or Start.";
   });
   const clearSecrets = action("Remove them", async () => {
     if (!await confirmDialog("Remove the secrets?", `They are deleted on ${s.cluster}; the app runs without them ` +
@@ -1124,6 +1127,8 @@ async function appSettingsForm(app, s, row) {
         field("Conda environment", conda, "empty: the tunnel's default; none: no conda"),
         field("Modules", modules, "loaded in the job, space-separated"),
         field("uv or pixi project", project, "its .venv or .pixi/envs/default; Install puts jupyterlab there"))] : null,
+    conf.installable ? field("Installation modules", installModules,
+      "loaded in order before Install, Update and Check, including on the REST node; space-separated; empty: none") : null,
     conf.fields.length ? [
       el("p", { class: "muted" }, "On the cluster (empty: an installed package's value, else the tunnel's default). " +
         (conf.job === false ? "Install and Start both use these." : "Install and the job both use these.")),
@@ -1131,8 +1136,8 @@ async function appSettingsForm(app, s, row) {
     el("div", { class: "actions" }, save),
     secrets.length ? el("section", { class: "secrets" },
       el("h4", {}, "Secrets"),
-      el("p", { class: "muted" }, `Sent to ${s.cluster} over your login and kept there in a file only you can ` +
-        "read (out of the agents' reach); this machine keeps only whether each is set. Needs the login."),
+      el("p", { class: "muted" }, `Sent to ${s.cluster} over your login and kept there in a file readable by your ` +
+        "cluster account; this machine keeps only whether each is set. Needs the login."),
       el("div", { class: "row" }, secrets.map((f) => field(f.label, secretInputs[f.name], f.hint))),
       el("div", { class: "actions" }, sendSecrets, clearSecrets)) : null,
     conf.tokens ? tokensSection(app, s, conf.tokens) : null));

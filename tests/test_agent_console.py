@@ -901,6 +901,8 @@ class TestTunnelInstall(ConsoleTestCase):
         return out
 
     def test_install_continues_over_rest_with_logs_and_force(self):
+        self.clusters.save_app_settings(agent_profiles.load(self.dead), "pai",
+                                        {"install_modules": ["GCC/12.2.0", "WebProxy"]})
         self.shell.install_elsewhere = "no Singularity on login"
         sent = []
         ident = "a" * 32
@@ -931,8 +933,25 @@ class TestTunnelInstall(ConsoleTestCase):
         self.assertEqual((result["state"], result["exit_code"]), ("succeeded", 0), result)
         self.assertEqual(result["rest_install_id"], ident)
         self.assertEqual(sent[0], ("POST", "/admin/tunnel-install", None, {"tunnel": "pai", "force": True}))
+        setup = [call for call in self.shell.calls if call[0] == "tunnel_setup"][-1]
+        self.assertIn("HPCLIB_INSTALL_MODULES=GCC/12.2.0:WebProxy", setup)
         self.assertIn("pulling image: 50%", "\n".join(result["log"]))
         self.assertEqual(agent_profiles.load(self.dead)["apps"]["pai"]["install"]["state"], "installed")
+
+    def test_install_module_defaults_overrides_and_validation(self):
+        spec = agent_console.APPS["pai"]
+        with mock.patch.dict(spec, {"install_modules": ["WebProxy"]}):
+            profile = agent_profiles.load(self.dead)
+            self.assertEqual(self.clusters.app_settings(profile, "pai")["install_modules"], ["WebProxy"])
+            for modules in (["GCC/12.2.0", "WebProxy"], [], None):
+                out = self.clusters.save_app_settings(profile, "pai", {"install_modules": modules})
+                expected = ["WebProxy"] if modules is None else modules
+                self.assertEqual(out["install_modules"], expected)
+                self.assertIn("HPCLIB_INSTALL_MODULES=" + ":".join(expected),
+                              self.clusters.setup_args(profile, "pai", "--install"))
+            for value in ("WebProxy", ["a;b"], ["--force"], [1], ["x"] * 33):
+                with self.subTest(value=value), self.assertRaises(agent_console.ConsoleError):
+                    self.clusters.save_app_settings(profile, "pai", {"install_modules": value})
 
     def test_install_rest_prerequisites_and_failures(self):
         self.shell.install_elsewhere = "no runtime on login"
@@ -996,6 +1015,7 @@ class TestTunnelInstall(ConsoleTestCase):
             status, out = self.call("POST", base + "/check")
             self.assertEqual((status, out["install"]["state"]), (200, "missing"), out)
             self.assertEqual(self.shell.calls[-1], ["tunnel_setup", host, "vscode", "--set",
+                                                    "HPCLIB_INSTALL_MODULES=", "--set",
                                                     "VSCODE_CONTAINER=/x/vscode.sif", "--save", "--check"])
             status, out = self.call("POST", base + "/start")
             self.assertEqual(status, 409)

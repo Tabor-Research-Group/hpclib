@@ -91,6 +91,54 @@ class TestConsoleUI(unittest.TestCase):
         self.page.goto(self.base + "/fixture.html")
         self.page.wait_for_function("window.ready === true")
 
+    def test_installation_modules_are_editable_without_a_python_environment(self):
+        """Use the actual app settings form, including a package's optional registry credential fields."""
+        saved = []
+        state = {"cluster": "demo", "host": "demo", "state": "down", "login": {"state": "none"},
+                 "install": {"state": "unchecked"}}
+        conf = {"tunnel_args": [], "conda_env": None, "modules": [], "project": "", "python_env": False,
+                "job": True, "installable": True, "install_modules": ["WebProxy"], "settings": {}, "defaults": {},
+                "fields": [{"name": "PAI_GITHUB_USERNAME", "label": "GitHub username (optional)", "hint": "", "choices": None}],
+                "secrets": [{"name": "PAI_GITHUB_PAT", "label": "GitHub PAT (optional)", "hint": "", "set": False}],
+                "tokens": None}
+
+        def respond(route):
+            path = route.request.url.split("/api/", 1)[1].split("?", 1)[0]
+            if path.endswith("/settings"):
+                if route.request.method == "PUT":
+                    saved.append(route.request.post_data_json)
+                out = conf
+            elif path == "apps":
+                out = {"apps": [{"id": "pai", "title": "PAI"}]}
+            elif path == "apps/pai":
+                out = {"title": "PAI", "sessions": [state]}
+            elif path == "apps/pai/demo":
+                out = state
+            else:
+                out = {"prompts": [], "proposals": [], "clusters": []}
+            route.fulfill(body=json.dumps(out), content_type="application/json")
+
+        self.page.route("**/api/**", respond)
+        self.page.add_init_script("localStorage.setItem('agent-console-key', 'fixture-key')")
+        self.page.goto(self.base + "/index.html#/pai/sessions")
+        self.page.locator("hpc-app-session").wait_for()
+        self.page.evaluate("""() => document.dispatchEvent(new CustomEvent('hpc-app-settings', {
+          detail: {app: 'pai', session: {cluster: 'demo'}, row: document.querySelector('hpc-app-session')}
+        }))""")
+        modules = self.page.locator('hpc-field[label="Installation modules"] input')
+        self.assertEqual(modules.input_value(), "WebProxy")
+        self.assertEqual(self.page.get_by_label("GitHub PAT (optional)", exact=True).get_attribute("type"), "password")
+        modules.fill("GCC/12.2.0 WebProxy")
+        with self.page.expect_response(lambda response: response.request.method == "PUT" and response.url.endswith("/settings")):
+            self.page.get_by_role("button", name="Save", exact=True).click()
+        self.assertEqual(saved[-1]["install_modules"], ["GCC/12.2.0", "WebProxy"])
+        self.assertNotIn("PAI_GITHUB_PAT", saved[-1].get("settings", {}))
+        modules.fill("")
+        with self.page.expect_response(lambda response: response.request.method == "PUT" and response.url.endswith("/settings")):
+            self.page.get_by_role("button", name="Save", exact=True).click()
+        self.assertEqual(saved[-1]["install_modules"], [])
+        self.assertEqual(self.errors, [])
+
     def metrics(self):
         self.page.wait_for_function("document.querySelector('pre.log')?.textContent.startsWith('xxxx')")
         return self.page.evaluate("""() => {

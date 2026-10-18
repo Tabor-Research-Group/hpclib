@@ -39,7 +39,7 @@ when adding a profile. The suggested work directory follows username changes unt
 user edits it. The API also accepts the suggested directory when `work_dir` is omitted.
 
 `defaults.app_settings` maps app IDs to the same fields as the app settings API:
-`tunnel_args`, `conda_env`, `modules`, `project`, and `settings`. These are copied into the
+`tunnel_args`, `conda_env`, `modules`, `install_modules`, `project`, and `settings`. These are copied into the
 new profile, without ports, installation status, tokens or cached authentication state.
 An app package must be installed before importing preset defaults for that app, so the
 console can verify its declared non-secret fields. Unknown apps and undeclared or secret

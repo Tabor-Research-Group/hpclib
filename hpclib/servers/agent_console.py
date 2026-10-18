@@ -46,7 +46,7 @@ The front end depends only on the routes below; nothing here depends on it.
                                               queued, up), the job's queue status, and the URL to open
   POST /api/apps/APP/NAME/start|stop          launch_tunnel / stop_tunnel for it, over the login
   GET  /api/apps/APP/NAME/log                 its tunnel's output
-  GET  /api/apps/APP/NAME/settings, PUT ...   {"tunnel_args": [...], "conda_env": ..., "modules": [...],
+  GET  /api/apps/APP/NAME/settings, PUT ...   {"tunnel_args": [...], "install_modules": [...], "conda_env": ..., "modules": [...],
                                               "project": "/path/to/uv-or-pixi-project",
                                               "settings": {"VSCODE_CONTAINER": "/path/...", ...}}: the tunnel's
                                               settings, saved on the cluster with the next check/install/start
@@ -260,7 +260,7 @@ def load_package_apps(store=None):
     for app_id, (manifest, app, _) in store.apps().items():
         spec = {"title": app["title"], "tunnel": app["tunnel"], "open_path": app["open_path"],
                 "health_path": app["health_path"], "package": manifest["name"],
-                "package_version": manifest["version"],
+                "package_version": manifest["version"], "install_modules": app.get("install_modules", []),
                 "settings": [(f["name"], f["label"], f["hint"]) + ((tuple(f["choices"]),) if f["choices"] else ())
                              for f in app["settings"]]}
         if app.get("description"):
@@ -1334,6 +1334,9 @@ class Clusters:
                 "python_env": "env_settings" in spec,       # JupyterLab's conda environment, modules and project
                 "conda_env": conf.get("conda_env"),        # None: the tunnel's default ("default"); "": none
                 "modules": conf.get("modules") or [],
+                "install_modules": (conf.get("install_modules") if conf.get("install_modules") is not None
+                                    else spec.get("install_modules", [])),
+                "install_modules_default": spec.get("install_modules", []),
                 "project": conf.get("project") or "",
                 "fields": [{"name": f[0], "label": f[1], "hint": f[2], "choices": list(f[3]) if len(f) > 3 else None}
                            for f in spec.get("settings", [])],
@@ -1361,7 +1364,7 @@ class Clusters:
         if isinstance(values, dict) and set(values) & secret_names:
             raise ConsoleError(422, "secret fields cannot be stored in plaintext app settings")
         conf = json.loads(json.dumps(conf))
-        unknown = set(body) - {"tunnel_args", "conda_env", "modules", "project", "settings"}
+        unknown = set(body) - {"tunnel_args", "conda_env", "modules", "install_modules", "project", "settings"}
         if unknown:
             raise ConsoleError(400, f"unknown settings {sorted(unknown)}")
         if "tunnel_args" in body:
@@ -1381,6 +1384,12 @@ class Clusters:
             if not isinstance(mods, list) or not all(isinstance(m, str) and APP_MODULE_RE.fullmatch(m) for m in mods):
                 raise ConsoleError(422, "modules must be module names like JupyterLab/4.2.0")
             conf["modules"] = mods
+        if "install_modules" in body:
+            try:
+                conf["install_modules"] = console_packages.check_install_modules(body["install_modules"],
+                                                                               allow_default=True)
+            except console_packages.PackageError as e:
+                raise ConsoleError(422, str(e)) from e
         if "project" in body:
             project = body["project"] or ""
             if project and (not isinstance(project, str) or not APP_PROJECT_RE.fullmatch(project)):
@@ -1420,7 +1429,9 @@ class Clusters:
 
     def app_installable(self, app):
         """Whether the app's tunnel has an install.sh (in this machine's hpclib, or the package it came from)."""
-        tunnel = APPS[app]["tunnel"]
+        return self.tunnel_installable(APPS[app]["tunnel"])
+
+    def tunnel_installable(self, tunnel):
         if "install.sh" in self.packages.install_files(tunnel):
             return True
         directory = self.packages.tunnel_dir(tunnel) or os.path.join(HPCLIB_DIR, "tunnels", tunnel)
@@ -1434,6 +1445,11 @@ class Clusters:
         fields = {f[0] for f in spec.get("settings", [])}
         out = {k: v for k, (v, _) in self.packages.defaults(spec["tunnel"]).items() if k in fields}
         out.update(conf.get("settings") or {})
+        # Saved with all other tunnel settings so SSH and the REST installation use the same modules.
+        # An explicit [] clears the package's defaults; None (or an absent field) restores them.
+        if self.tunnel_installable(spec["tunnel"]):
+            mods = conf.get("install_modules")
+            out["HPCLIB_INSTALL_MODULES"] = ":".join(spec.get("install_modules", []) if mods is None else mods)
         if "env_settings" in spec:
             if conf.get("conda_env") is not None:
                 out["CONDA_ENVIRONMENT"] = conf["conda_env"]
@@ -1453,7 +1469,7 @@ class Clusters:
         stage, digest = self.package_stage(spec["tunnel"])
         if digest is not None or conf.get("pushed_package"):
             args += ["--push", stage]
-        if not spec.get("settings") and "env_settings" not in spec:
+        if not spec.get("settings") and "env_settings" not in spec and not self.app_installable(app):
             return args + list(actions)            # no settings of its own: the cluster's stay as they are
         for k, v in sorted(self.app_vars(spec, conf).items()):
             args += ["--set", f"{k}={v}"]

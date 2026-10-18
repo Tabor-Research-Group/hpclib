@@ -20,6 +20,9 @@
 #                     VSCODE_CONTAINER=/scratch/user/me/images/vscode.sif. With --save, all of them replace the
 #                     tunnel's settings file, $HPCTUNNELS_DATA_DIR/settings/TUNNEL.sh, which start_tunnel.sh
 #                     reads (so the job and install.sh see the same paths); without it they apply to this run.
+#                     HPCLIB_INSTALL_MODULES is accepted for every tunnel: an ordered colon-separated list of
+#                     modules to load before install.sh (including --check), e.g. WebProxy:GCC/12.2.0.
+#                     An empty value disables preloading. Saved modules also apply to REST installation.
 #   --install         run the tunnel's install.sh (--force: its --force, e.g. pull an image again)
 #                     exit 3 means it cannot run on this node: HPCLIB_INSTALL_ELSEWHERE asks the console to
 #                     continue on the REST node through POST /admin/tunnel-install (owner only).
@@ -144,8 +147,13 @@ TUNNEL_SETTINGS=""
 if tunnel_config_path=$(resolve_tunnel_file tunnel_config.sh); then
   source "$tunnel_config_path"
 fi
+TUNNEL_SETTINGS="$TUNNEL_SETTINGS HPCLIB_INSTALL_MODULES"
 settings_file="$HPCTUNNELS_DATA_DIR/settings/$TUNNEL_NAME.sh"
 
+valid_install_modules() {
+  [ -z "$1" ] || { [ "${#1}" -le 1024 ] && [[ "$1" =~ ^[A-Za-z0-9_.+][A-Za-z0-9_.+/-]{0,127}(:[A-Za-z0-9_.+][A-Za-z0-9_.+/-]{0,127})*$ ]] &&
+    [ "$(printf '%s' "$1" | tr ':' '\n' | wc -l)" -lt 32 ]; }
+}
 lines=()
 for kv in "${sets[@]}"; do
   name="${kv%%=*}"
@@ -155,6 +163,10 @@ for kv in "${sets[@]}"; do
     exit 2
   fi
   case "$value" in *$'\n'*|*$'\r'*) echo "setup_tunnel: $name must be one line" >&2; exit 2 ;; esac
+  if [ "$name" = HPCLIB_INSTALL_MODULES ] && ! valid_install_modules "$value"; then
+    echo "setup_tunnel: HPCLIB_INSTALL_MODULES must be up to 32 colon-separated module names (at most 1024 characters)" >&2
+    exit 2
+  fi
   lines+=("$(printf 'export %s=%q' "$name" "$value")")
 done
 if [ "$save" = true ]; then
@@ -174,6 +186,35 @@ installer="$TUNNEL_DIR/install.sh"
 can() { [ -f "$installer" ] && grep -q "^# hpclib-install:.*$1" "$installer"; }
 status() { printf 'HPCLIB_TUNNEL_STATUS %s %s\n' "$1" "$2"; }
 
+run_installer() (
+  cd "$TUNNEL_DIR" || exit 1
+  # Use the same module initialization paths as the jobs tunnel, including in a noninteractive REST child.
+  if [ -n "${HPCLIB_INSTALL_MODULES:-}" ]; then
+    if ! valid_install_modules "$HPCLIB_INSTALL_MODULES"; then
+      echo "setup_tunnel: invalid HPCLIB_INSTALL_MODULES; use colon-separated module names" >&2
+      exit 2
+    fi
+    if ! type module > /dev/null 2>&1; then
+      for module_init in /etc/profile.d/lmod.sh /etc/profile.d/modules.sh /usr/share/lmod/lmod/init/bash; do
+        if [ -f "$module_init" ]; then source "$module_init"; break; fi
+      done
+    fi
+    if ! type module > /dev/null 2>&1; then
+      echo "setup_tunnel: the module command is unavailable on $(hostname -s); cannot preload installation modules" >&2
+      exit 3
+    fi
+    IFS=: read -r -a install_modules <<< "$HPCLIB_INSTALL_MODULES"
+    for install_module in "${install_modules[@]}"; do
+      echo "loading installation module $install_module" >&2
+      if ! module load "$install_module"; then
+        echo "setup_tunnel: could not load installation module $install_module on $(hostname -s)" >&2
+        exit 3
+      fi
+    done
+  fi
+  HPCLIB_TUNNEL_DIR="$TUNNEL_DIR" bash ./install.sh "$@"
+)
+
 if [ "$install" = true ]; then
   if [ ! -f "$installer" ]; then
     echo "$TUNNEL_NAME has nothing to install"
@@ -184,7 +225,7 @@ if [ "$install" = true ]; then
     fi
     echo "running $installer ${args[*]}"
     installer_status=0
-    (cd "$TUNNEL_DIR" && HPCLIB_TUNNEL_DIR="$TUNNEL_DIR" bash ./install.sh "${args[@]}") || installer_status=$?
+    run_installer "${args[@]}" || installer_status=$?
     if [ "$installer_status" = 3 ]; then
       printf 'HPCLIB_INSTALL_ELSEWHERE %s\n' "install.sh cannot run on $(hostname -s); continue on the REST server's node"
       exit 3
@@ -320,10 +361,15 @@ if [ "$check" = true ]; then
     status nothing "nothing to install"
   elif ! can --check; then
     status unknown "its install.sh can't check; Install runs it"
-  elif out=$(cd "$TUNNEL_DIR" && HPCLIB_TUNNEL_DIR="$TUNNEL_DIR" bash ./install.sh --check 2>&1); then
+  elif out=$(run_installer --check 2>&1); then
     status installed "$(printf '%s\n' "$out" | tail -n 1)"
   else
-    status missing "$(printf '%s\n' "$out" | tail -n 1)"
+    check_status=$?
+    if [ "$check_status" = 3 ]; then
+      status unknown "$(printf '%s\n' "$out" | tail -n 1)"
+    else
+      status missing "$(printf '%s\n' "$out" | tail -n 1)"
+    fi
   fi
 fi
 

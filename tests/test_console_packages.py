@@ -136,6 +136,17 @@ class TestPackageStore(unittest.TestCase):
         self.assertFalse((Path(changed) / "tunnel/helpers").exists())
         self.assertTrue((Path(changed) / "tunnel/install.sh").is_file())
 
+    def test_install_modules_defaults_and_validation(self):
+        manifest, files = external_installer_package()
+        manifest["apps"]["demo"]["install_modules"] = ["GCC/12.2.0", "WebProxy"]
+        report = self.store.install(make_zip(manifest, files))
+        self.assertEqual(report["package"]["apps"]["demo"]["install_modules"], ["GCC/12.2.0", "WebProxy"])
+        for value in (None, "WebProxy", ["--force"], ["a;b"], [""], ["x"] * 33, ["a" * 129]):
+            with self.subTest(value=value):
+                manifest["apps"]["demo"]["install_modules"] = value
+                with self.assertRaises(console_packages.PackageError):
+                    self.store.inspect(make_zip(manifest, files))
+
     def test_install_files_list(self):
         manifest, files = external_installer_package()
         manifest["apps"]["demo"]["install_files"] = ["install.sh", "helpers/value.txt"]
