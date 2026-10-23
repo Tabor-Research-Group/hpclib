@@ -1545,6 +1545,10 @@ def apply_config(server, built):
     jobs.cluster_notes = built["cluster_notes"]
     jobs.poll_interval = built["poll_interval"]
     jobs.job_env = built["job_env"]
+    # the paths a job must not see or change (protect_sandbox) don't depend on the sandbox's settings: the new
+    # sandbox keeps them, or a settings change would leave jobs unprotected until the server restarts
+    old = jobs.sandbox
+    built["sandbox"].protect(hidden=getattr(old, "hidden", ()), read_only=getattr(old, "read_only_paths", ()))
     jobs.sandbox = built["sandbox"]
     if isinstance(jobs.runner, rest_local.LocalRunner):
         jobs.runner.sandbox = jobs.sandbox   # it checks the sandbox's limits

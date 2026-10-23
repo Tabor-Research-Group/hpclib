@@ -204,7 +204,7 @@ you in `/etc/subuid` and `/etc/subgid`, and lingering (`loginctl enable-linger`)
 | --- | --- | --- |
 | `limits` | per-job caps and **`max_concurrent_jobs`**; `null` means no cap | yes |
 | `cluster_notes` | free text the model reads in `cluster_info` | yes |
-| `sandbox` | method, image, read-only `binds`, extra `writable` paths, runtime `flags` (e.g. `--nv`), `scratch`, `network`, `storage`, `allow_unsandboxed` | yes |
+| `sandbox` | method, image, read-only `binds`, extra `writable` paths, runtime `flags`, `gpus` (`auto`: `--nv` for jobs that ask for GPUs; `always`; `never`), `scratch`, `network`, `storage`, `allow_unsandboxed` | yes |
 | `environments` | uv and pixi locations, modules to load before a sync, timeout, concurrent syncs | yes |
 | `environment` | variables for all jobs and syncs, template jobs only, or syncs only; names that would change `PATH`, the sandbox, hpclib or SLURM are refused | yes |
 | `poll_interval` | how often job states are refreshed | yes |

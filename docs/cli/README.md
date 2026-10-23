@@ -22,6 +22,7 @@ Run on **your machine**:
 | `install_hpclib HOST` | copy this hpclib to a cluster, if the cluster's is older |
 | `launch_tunnel -P PORT HOST TUNNEL` | start a tunnel on the cluster and forward its port here |
 | `stop_tunnel -P PORT HOST` | stop a tunnel and anything it left on the login node |
+| `clear_tunnel_ports -P PORT [-P PORT]... HOST` | clear what earlier tunnels left on those ports on every login node it can reach (`--no-hop`: only the one it lands on) |
 | `tunnel_setup HOST TUNNEL ...` | save a tunnel's settings on the cluster, install what it needs, check it |
 | `smbshell --on HOST ...` | SMB file transfers, run on the cluster |
 | `setup_agents HOST` | set a cluster up for an LLM client (REST server, templates, sandbox, tokens) |

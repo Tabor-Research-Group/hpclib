@@ -24,6 +24,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_rest_jobs import JobServerTestCase, fake_job  # noqa: E402
 import rest_sandbox  # noqa: E402
+import rest_jobs  # noqa: E402
 import rest_server  # noqa: E402
 
 
@@ -321,6 +322,44 @@ class TestSandboxedJobs(SandboxServerTestCase):
         res = self.run_job_script(job["job_id"], self.llm_root)
         self.assertEqual(res.returncode, 7)
         self.assertIn("before", res.stdout)
+
+    def test_gpu_jobs_get_the_gpus_in_the_sandbox(self):
+        """A job that asks SLURM for GPUs runs with --nv ("gpus": "auto", the default); always/never override."""
+        self.jobs.limits = rest_jobs.ResourceLimits(**dict(self.limits, max_gpus=4))
+        spec_path = self.templates / "hello" / "template.json"
+        spec = json.loads(spec_path.read_text())
+        spec["overridable"] = sorted(set(spec.get("overridable", [])) | {"gres"})
+        spec_path.write_text(json.dumps(spec))
+        def args_for(config, resources):
+            self.use_sandbox(dict({"method": "singularity"}, **config))
+            out = self.llm.submit_job("hello", params={"message": "x"}, resources=resources,
+                                      workdir=str(self.llm_root), dry_run=True)
+            line = next(l for l in out["script"].splitlines() if " exec --contain " in l)
+            return line, out["sandbox"]
+        line, plan = args_for({}, {"gres": "gpu:a100:2"})
+        self.assertIn(" --nv ", line)
+        self.assertEqual(plan["gpus"], "nvidia")
+        line, plan = args_for({}, {})
+        self.assertNotIn("--nv", line)
+        self.assertNotIn("gpus", plan)
+        self.assertIn(" --nv ", args_for({"gpus": "always"}, {})[0])
+        self.assertNotIn("--nv", args_for({"gpus": "never"}, {"gres": "gpu:1"})[0])
+        line = args_for({"flags": ["--nv"]}, {"gres": "gpu:1"})[0]
+        self.assertEqual(line.count("--nv"), 1)                              # given in flags: not twice
+        with self.assertRaises(ValueError):
+            rest_sandbox.Sandbox({"method": "singularity", "gpus": "yes"})
+
+    def test_settings_change_keeps_protected_paths(self):
+        """PUT /admin/config builds a new sandbox: it keeps what jobs must not see or change."""
+        import rest_server
+        sandbox = self.use_sandbox({"method": "singularity"})
+        sandbox.protect(hidden=[str(self.data)], read_only=[str(self.root)])
+        built = rest_server.updated_config({"sandbox": {"method": "singularity"}},
+                                           {"sandbox": {"method": "singularity", "gpus": "always"}})[1]
+        rest_server.apply_config(self.server, built)
+        self.assertEqual(self.jobs.sandbox.gpus, "always")
+        self.assertEqual(self.jobs.sandbox.hidden, (os.path.realpath(self.data),))
+        self.assertEqual(self.jobs.sandbox.read_only_paths, (os.path.realpath(self.root),))
 
     def test_missing_runtime_refuses_jobs(self):
         self.use_sandbox({"method": "auto"}, runtime=False)

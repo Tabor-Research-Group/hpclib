@@ -37,6 +37,12 @@ The front end depends only on the routes below; nothing here depends on it.
   POST /api/clusters/NAME/setup               setup_agents ({"work_dirs": [...], "binds": [...],
                                               "templates": "...", "rebuild": false})
   GET  /api/clusters/NAME/operation           the running or last install/setup/SSH setup, with its log
+  GET  /api/clusters/NAME/ports               the login-node ports this console's tunnels use, and which run now
+  POST /api/clusters/NAME/ports/clear         {"fresh_logins": false, "password"?, "max_logins"?}: clear what earlier
+                                              tunnels left on those ports on every login node (clear_tunnel_ports,
+                                              an operation); with fresh_logins, nodes the login can't reach are
+                                              cleared by logging in again until one lands there (a password and a
+                                              Duo push each time)
   GET  /api/apps                              the console's apps: agents, and tunnel apps (JupyterLab), with
                                               the package each came from (null: hpclib's own)
   GET  /api/packages                          apps and settings installed from packages (console_packages.py)
@@ -45,6 +51,7 @@ The front end depends only on the routes below; nothing here depends on it.
   GET  /api/apps/APP                          that app's session on every cluster: state (down, starting,
                                               queued, up), the job's queue status, and the URL to open
   POST /api/apps/APP/NAME/start|stop          launch_tunnel / stop_tunnel for it, over the login
+  POST /api/apps/APP/NAME/open                Data transfer: clear idle rclone filesystem clients, then return its URL
   GET  /api/apps/APP/NAME/log                 its tunnel's output
   GET  /api/apps/APP/NAME/settings, PUT ...   {"tunnel_args": [...], "install_modules": [...], "conda_env": ..., "modules": [...],
                                               "project": "/path/to/uv-or-pixi-project",
@@ -110,6 +117,7 @@ import concurrent.futures
 import contextlib
 import io
 import hmac
+import http.client
 import http.server
 import json
 import mimetypes
@@ -265,6 +273,8 @@ def load_package_apps(store=None):
                              for f in app["settings"]]}
         if app.get("description"):
             spec["description"] = app["description"]
+        if app.get("tab"):
+            spec["tab"] = dict(app["tab"])
         if app.get("shared"):
             spec["shared"] = True
             spec["instance_label"] = app.get("instance_label") or "instance"
@@ -631,6 +641,9 @@ class Logins:
             if self.HOST_KEY_RE.search(prompt):
                 return self._fail(attempt, "ssh doesn't know this host's key yet; connect once in a terminal "
                                            "(ssh " + attempt["host"] + ") to accept it, then try again", shown)
+            if self.CODE_RE.search(prompt) and attempt.get("no_code"):
+                return self._fail(attempt, "the cluster asks for a typed code, which these extra logins can't "
+                                           "answer", shown)
             if self.CODE_RE.search(prompt):
                 event = threading.Event()
                 challenge = secrets.token_urlsafe(18)
@@ -822,6 +835,47 @@ class Logins:
             reason = "timed out waiting for the login" if code is None else f"ssh exited with status {code}"
             self._fail(attempt, reason + (": " + " / ".join(said) if said else ""))
 
+    def run_fresh(self, profile, password, remote, stdin_text, extra=(), timeout=None):
+        """
+        One more login, of its own (not the console's ssh master, so it may land on another login node), that runs
+        `remote` with `stdin_text` on its standard input: the password and a Duo push are answered as for a
+        login; a typed code is not. Returns (exit code or None, stdout, the login's message). The password is
+        dropped once ssh has used it, or when this returns.
+        """
+        socket_path = self._serve()
+        nonce = secrets.token_urlsafe(24)
+        attempt = {"state": "starting", "message": "connecting", "started": time.time(), "finished": None,
+                   "prompts": [], "password": password or None, "password_used": False, "push_sent": False,
+                   "host": profile["host"], "no_code": True}
+        with self.lock:
+            self.by_nonce[nonce] = attempt
+        env = dict(os.environ, SSH_ASKPASS=self._askpass_program(), SSH_ASKPASS_REQUIRE="force",
+                   HPCLIB_ASKPASS_SOCKET=socket_path, HPCLIB_ASKPASS_NONCE=nonce)
+        env.setdefault("DISPLAY", ":0")
+        # ssh takes the first value of each option, so these come before the profile's own
+        command = ([self.ssh, "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "NumberOfPasswordPrompts=1",
+                    "-o", "ConnectTimeout=20", "-T"] + list(extra) + ssh_options(profile) + [profile["host"], remote])
+        try:
+            res = subprocess.run(command, input=stdin_text.encode(), capture_output=True, env=env,
+                                 timeout=timeout or (self.TIMEOUT + 300), start_new_session=True)
+            code, out, err = res.returncode, res.stdout.decode(errors="replace"), res.stderr.decode(errors="replace")
+        except subprocess.TimeoutExpired:
+            code, out, err = None, "", "timed out"
+        except OSError as e:
+            code, out, err = None, "", f"could not run ssh: {e}"
+        finally:
+            with self.lock:
+                self.by_nonce.pop(nonce, None)
+                attempt["password"] = None
+        if attempt["state"] == "failed":
+            message = attempt["message"]
+        elif code == 255 or code is None:
+            said = [line.strip() for line in err.splitlines() if line.strip()]
+            message = f"ssh failed{': ' + said[-1][:300] if said else ''}"
+        else:
+            message = "logged in"
+        return code, out, message
+
     def disconnect(self, profile):
         try:
             res = subprocess.run(self._base(profile) + ["-O", "exit", profile["host"]], stdin=subprocess.DEVNULL,
@@ -852,6 +906,7 @@ class Clusters:
         self.ops = {}
         self.app_procs = {}
         self.control_procs = {}      # (name, app): a row's control that asks for a password (kinit), beside its GUI
+        self._clear_requests = {}    # name -> clear_ports' options (its password too), until its operation ends
         self.packages = load_package_apps()
         self.secret_runner = self._run_with_input
 
@@ -1098,6 +1153,16 @@ class Clusters:
 
     def _wait_operation(self, record, proc, profile=None):
         code = proc.wait()
+        if record["kind"] == "clear_ports" and profile is not None:
+            try:
+                code = self._finish_clear_ports(profile, record, code)
+            except Exception as e:     # the log is gone, or something unexpected: say so, as a failure
+                code = 1
+                try:
+                    with open(self.ops_log_path(profile["name"]), "ab") as log:
+                        log.write(f"clear_tunnel_ports: {e}\n".encode())
+                except OSError:
+                    pass
         if record["kind"] == "tunnel_install" and profile is not None and code == 3:
             elsewhere = INSTALL_ELSEWHERE_RE.findall(self._operation_text(profile, record))
             if elsewhere:
@@ -1224,6 +1289,163 @@ class Clusters:
         if profile.get("host") not in login:
             login.append(profile["host"])
         return self.run_operation(profile, "install", ["install_hpclib"] + (["--force"] if force else []) + login)
+
+    # -- leftover tunnel ports on the cluster's login nodes ---------------------
+
+    PORT_LINE_RE = re.compile(r"^HPCLIB_PORT_(HERE|CLEARED|BUSY|PENDING) ([A-Za-z0-9][A-Za-z0-9._-]{0,62})(?: ([0-9]{1,5}))?\s*$", re.M)
+    CLEAR_LOGINS_MAX = 10
+
+    def login_ports(self, profile):
+        """The ports this console's tunnels use on the login nodes: the agents' and each app's, with whether it runs."""
+        name = profile["name"]
+        with self.lock:
+            agent_proc = self.procs.get(name)
+            app_procs = {app: p for (n, app), p in self.app_procs.items() if n == name}
+        out = []
+        if profile.get("port"):
+            running = (agent_proc is not None and agent_proc.poll() is None) or self.port_open(profile["port"])
+            out.append({"port": int(profile["port"]), "what": "agent tunnel", "app": None, "running": running})
+        fresh = agent_profiles.load(name) or profile
+        for app, conf in sorted((fresh.get("apps") or {}).items()):
+            if not conf.get("port"):
+                continue
+            proc = app_procs.get(app)
+            running = (proc is not None and proc.poll() is None) or self.port_open(conf["port"])
+            title = APPS[app]["title"] if app in APPS else app
+            out.append({"port": int(conf["port"]), "what": title, "app": app, "running": running})
+        return out
+
+    def clear_ports(self, profile, body):
+        """
+        clear_tunnel_ports over the login for the ports of tunnels that aren't running; then, with fresh_logins,
+        more logins until each node the login node couldn't reach has been reached (see _clear_ports_elsewhere).
+        """
+        if set(body) - {"fresh_logins", "password", "max_logins"}:
+            raise ConsoleError(400, 'send {"fresh_logins": true|false, "password"?, "max_logins"?}')
+        fresh = body.get("fresh_logins", False)
+        password = body.get("password")
+        limit = body.get("max_logins", self.CLEAR_LOGINS_MAX)
+        if not isinstance(fresh, bool):
+            raise ConsoleError(422, "fresh_logins: true or false")
+        if password is not None and (not isinstance(password, str) or len(password) > 1024 or "\n" in password):
+            raise ConsoleError(422, "`password` must be one line of text")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= self.CLEAR_LOGINS_MAX:
+            raise ConsoleError(422, f"max_logins: 1 to {self.CLEAR_LOGINS_MAX}")
+        ports = self.login_ports(profile)
+        idle = [p["port"] for p in ports if not p["running"]]
+        if not idle:
+            raise ConsoleError(409, "every tunnel of this cluster's is running; stop the ones whose ports you want "
+                                    "cleared (a running tunnel's port is left alone)")
+        args = ["clear_tunnel_ports"] + [a for p in idle for a in ("-P", str(p))] + ssh_options(profile) + [profile["host"]]
+        name = profile["name"]
+        with self.lock:
+            self._clear_requests[name] = {"fresh_logins": fresh, "password": password or None, "max_logins": limit}
+        try:
+            record = self.run_operation(profile, "clear_ports", args, title="clear leftover ports")
+        except BaseException:
+            with self.lock:
+                self._clear_requests.pop(name, None)
+            raise
+        return dict(record, skipped=[p for p in ports if p["running"]], ports=idle)
+
+    def _clear_ports_script(self):
+        """The script clear_tunnel_ports sends, from this machine's hpclib (for the extra logins)."""
+        res = subprocess.run(self.hpclib_argv(["_hpclib_clear_ports_script"]), capture_output=True, text=True,
+                             timeout=30, env=dict(os.environ, **self.HPCLIB_ENV), stdin=subprocess.DEVNULL)
+        if res.returncode != 0 or "_hpclib_clear_ports" not in res.stdout:
+            raise ConsoleError(500, "could not make the clearing script from this machine's hpclib")
+        return res.stdout
+
+    @staticmethod
+    def _login_addresses(host):
+        """The addresses the login name has (several when the site rotates logins through DNS), or []."""
+        name = host.rsplit("@", 1)[-1]
+        try:
+            infos = socket.getaddrinfo(name, 22, type=socket.SOCK_STREAM)
+        except OSError:
+            return []
+        seen = []
+        for family, _, _, _, addr in sorted(infos, key=lambda i: i[0] != socket.AF_INET):
+            if addr[0] not in seen:
+                seen.append(addr[0])
+        return seen
+
+    def _clear_ports_elsewhere(self, profile, pending, request, log):
+        """
+        Log in again, each time as a login of its own, until every node in `pending` ({node: {ports}}) has been
+        landed on and cleared there (--no-hop), or `max_logins` logins: first one per address of the login name (a
+        site that rotates its login nodes through DNS gives each its own), then the name itself. Stops at a
+        refused password, push or typed code. Returns the nodes still pending.
+        """
+        script = self._clear_ports_script()
+        host = profile["host"].rsplit("@", 1)[-1]
+        addresses = self._login_addresses(profile["host"])
+        targets = (addresses if len(addresses) > 1 else []) + [None] * self.CLEAR_LOGINS_MAX
+        password = request.get("password")
+        for attempt, address in enumerate(targets[:request["max_logins"]], 1):
+            if not pending:
+                break
+            ports = sorted({p for ps in pending.values() for p in ps})
+            extra = ["-o", f"HostName={address}", "-o", f"HostKeyAlias={host}"] if address else []
+            log.write(f"login {attempt} of at most {request['max_logins']}{' via ' + address if address else ''}, "
+                      f"for {', '.join(sorted(pending))}: approve the Duo push if one comes\n".encode())
+            code, out, message = self.logins.run_fresh(
+                profile, password, shlex.join(["bash", "-s", "--", "--no-hop"] + [str(p) for p in ports]), script, extra)
+            lines = self.PORT_LINE_RE.findall(out)
+            here = next((node for kind, node, _ in lines if kind == "HERE"), None)
+            if here is None:
+                log.write(f"  {self._one_line(message)}\n".encode())
+                if message != "logged in" and not message.startswith("ssh failed"):
+                    log.write(b"  stopping: the login itself was refused\n")
+                    break
+                continue
+            cleared = {int(port) for kind, node, port in lines if kind == "CLEARED" and node == here and port}
+            if here in pending:
+                pending[here] -= cleared
+                if not pending[here]:
+                    del pending[here]
+                    log.write(f"  landed on {here}: cleared {', '.join(map(str, sorted(cleared)))}\n".encode())
+                else:
+                    log.write(f"  landed on {here}: still in use there: "
+                              f"{', '.join(map(str, sorted(pending[here])))}\n".encode())
+            else:
+                log.write(f"  landed on {here}, which was already done\n".encode())
+        return pending
+
+    def _finish_clear_ports(self, profile, record, code):
+        name = profile["name"]
+        with self.lock:
+            request = self._clear_requests.pop(name, None) or {"fresh_logins": False, "max_logins": 0}
+        try:
+            lines = self.PORT_LINE_RE.findall(self._operation_text(profile, record))
+            pending, busy = {}, []
+            for kind, node, port in lines:
+                if kind == "PENDING" and port:
+                    pending.setdefault(node, set()).add(int(port))
+                elif kind == "BUSY" and port:
+                    busy.append(f"{node}:{port}")
+            with open(self.ops_log_path(name), "ab", buffering=0) as log:
+                if code == 0 and pending and request["fresh_logins"]:
+                    try:
+                        pending = self._clear_ports_elsewhere(profile, pending, request, log)
+                    except ConsoleError as e:
+                        log.write(f"clear_tunnel_ports: {e}\n".encode())
+                if code != 0 or not lines:
+                    log.write(b"clear_tunnel_ports did not finish on the login node; see above\n")
+                    return code or 1
+                left = [f"{node}:{port}" for node, ports in sorted(pending.items()) for port in sorted(ports)]
+                if left:
+                    log.write(f"HPCLIB_PORTS_LEFT {' '.join(left)}\n".encode())
+                    log.write((f"still to clear on {', '.join(sorted(pending))}: "
+                               + ("the logins didn't land there" if request["fresh_logins"] else
+                                  "allow extra logins to reach those nodes") + "\n").encode())
+                if busy:
+                    log.write(f"in use by something that isn't one of your tunnels: {', '.join(busy)}\n".encode())
+                if not left and not busy:
+                    log.write(b"every port is clear on every login node that had a record of it\n")
+                return 0 if not left and not busy else 1
+        finally:
+            request["password"] = None
 
     def setup_ssh(self, profile, body):
         if (profile.get("preset") or {}).get("ssh_keys") == "site-managed":
@@ -2189,7 +2411,53 @@ class Clusters:
         q = urllib.parse.quote
         login = f"{q(user, safe='')}:{q(password or '', safe='')}@" if user else ""
         url = f"http://{login}127.0.0.1:{port}{path}" + (f"?{query}" if query else "")
-        return dict(url=url, **({"username": user, "password": password} if user else {}))
+        # The stock GUI's login_token (and the older RCLONE marker) identifies rclone's RC API.
+        # Other SMB_GUI programs retain their ordinary Open link.
+        prepare_open = which == "RCLONE" or "login_token" in urllib.parse.parse_qs(query or "")
+        return dict(url=url, prepare_open=prepare_open,
+                    **({"username": user, "password": password} if user else {}))
+
+    def app_open(self, profile, app):
+        """Prepare Data transfer's GUI on an explicit Open click, never on a state/health poll."""
+        spec = self.app_spec(app)
+        if not spec.get("smb"):
+            raise ConsoleError(404, f"{spec['title']} has no Open preparation")
+        state = self._app_state(profile, app)
+        if state["state"] != "up" or not state.get("url"):
+            raise ConsoleError(409, f"start {spec['title']} on {profile['name']} before opening it")
+        if not state.get("prepare_open"):
+            return {"url": state["url"], "cache_cleared": False}
+        if not state.get("username") or not state.get("password"):
+            raise ConsoleError(409, "Data transfer has not supplied its GUI login yet; see Log")
+        auth = base64.b64encode(f"{state['username']}:{state['password']}".encode()).decode()
+
+        def rc(route):
+            # A fixed loopback destination, with no proxies or redirects. Credentials stay in memory.
+            conn = http.client.HTTPConnection("127.0.0.1", state["port"], timeout=5)
+            try:
+                conn.request("POST", "/" + route, body=b"{}",
+                             headers={"Authorization": "Basic " + auth, "Content-Type": "application/json"})
+                res = conn.getresponse()
+                if res.status != 200:
+                    raise ConsoleError(502, f"Data transfer cache refresh failed at {route} (HTTP {res.status}); "
+                                            "the app was not opened")
+                data = json.loads(res.read(1024 * 1024))
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                return data
+            except (OSError, http.client.HTTPException, ValueError):
+                raise ConsoleError(502, f"Data transfer cache refresh failed at {route}; "
+                                        "the app was not opened") from None
+            finally:
+                conn.close()
+
+        # Clearing the backend cache may close SMB connections. Check aggregate activity first.
+        stats = rc("core/stats")
+        if stats.get("transferring") or stats.get("checking"):
+            raise ConsoleError(409, "Data transfer is busy transferring or checking files; "
+                                    "wait for it to finish, then Open again")
+        rc("fscache/clear")
+        return {"url": state["url"], "cache_cleared": True}
 
     def app_sessions(self, app):
         self.app_spec(app)
@@ -2535,7 +2803,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         if parts == ["apps"] and verb == "GET":
             return 200, {"ok": True, "apps": [{"id": "agents", "title": "Agents"}] +
                          [{"id": k, "title": v["title"], "kind": v.get("kind", "tunnel"),
-                           "description": v.get("description"), "package": v.get("package")}
+                           "description": v.get("description"), "package": v.get("package"),
+                           "tab": v.get("tab")}
                           for k, v in APPS.items()]}
         if len(parts) >= 2 and parts[0] == "apps":
             return self.app_route(verb, parts[1], parts[2:])
@@ -2565,6 +2834,10 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 return 202, dict(c.install(profile, self.json_body()), ok=True)
             if rest == ["setup"] and verb == "POST":
                 return 202, dict(c.setup(profile, self.json_body()), ok=True)
+            if rest == ["ports"] and verb == "GET":
+                return 200, {"ok": True, "ports": c.login_ports(profile)}
+            if rest == ["ports", "clear"] and verb == "POST":
+                return 202, dict(c.clear_ports(profile, self.json_body()), ok=True)
             if rest == ["ssh", "setup"] and verb == "POST":
                 return 202, dict(c.setup_ssh(profile, self.json_body()), ok=True)
             if rest == ["operation"] and verb == "GET":
@@ -2611,6 +2884,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             return 202, dict(c.app_start(profile, app), ok=True)
         if action == ["stop"] and verb == "POST":
             return 200, dict(c.app_stop(profile, app), ok=True)
+        if action == ["open"] and verb == "POST":
+            return 200, dict(c.app_open(profile, app), ok=True)
         if action == ["answer"] and verb == "POST":
             proc = c.app_waiting(profile["name"], app)
             return 200, dict(c.answer_prompt(proc, self.json_body().get("answer")), ok=True)

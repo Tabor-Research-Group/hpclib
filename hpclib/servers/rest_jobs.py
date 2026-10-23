@@ -688,7 +688,7 @@ class JobTemplate:
     )
 
     def render(self, values, tasks=None, sandbox: 'rest_sandbox.Sandbox' = None, writable=(), prelude=None,
-               extra_ro=(), env=None):
+               extra_ro=(), env=None, gpus=0):
         """
         The full job script: shebang, exports, module loads, per-task
         values, then the body - which runs in `sandbox`, with `writable`
@@ -735,7 +735,7 @@ class JobTemplate:
             ]
         plan = {"method": "none", "reason": "not sandboxed"}
         if sandbox is not None:
-            launch, plan = sandbox.launch(shebang, body, writable, prelude=prelude, extra_ro=extra_ro)
+            launch, plan = sandbox.launch(shebang, body, writable, prelude=prelude, extra_ro=extra_ro, gpus=gpus)
             if launch is not None:
                 if lines[0].strip() == shebang.strip() and not lines[0].startswith("#!/bin/bash"):
                     lines[0] = "#!/bin/bash"   # the launcher is bash, whatever the body is
@@ -1726,8 +1726,10 @@ class JobManager:
         if environment is not None:
             prelude, extra_ro = self.environments.prelude(environment), self.environments.job_binds(environment)
         try:
+            # a job that asks SLURM for GPUs gets them in its sandbox too (--nv; the sandbox's `gpus` setting)
             script, sandbox_plan = template.render(values, tasks, sandbox=self.sandbox, writable=writable,
-                                                   prelude=prelude, extra_ro=extra_ro or (), env=self.job_env)
+                                                   prelude=prelude, extra_ro=extra_ro or (), env=self.job_env,
+                                                   gpus=parse_gres_gpus(resources.get("gres")))
         except rest_sandbox.SandboxError as e:
             raise RESTError(503, str(e), see="GET /sandbox describes what this node supports")
         args = [

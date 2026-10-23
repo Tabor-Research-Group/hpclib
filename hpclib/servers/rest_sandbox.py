@@ -65,7 +65,10 @@ Config, the `sandbox` key of the server's config.json:
    "scratch": "job",          # /tmp in the container: "job" (a per-job directory under
                               #   $TMPDIR, deleted afterwards), "session" (the runtime's small
                               #   in-memory default), or a directory
-   "flags": [],               # extra runtime flags, e.g. ["--nv"] for NVIDIA GPUs
+   "flags": [],               # extra runtime flags, for every job
+   "gpus": "auto",            # Singularity/Apptainer's --nv (NVIDIA GPUs and their driver in the container):
+                              #   "auto" for jobs that ask SLURM for GPUs (gres gpu), "always", or "never".
+                              #   Podman: put its device flag (e.g. --device nvidia.com/gpu=all) in `flags`
    "allow_unsandboxed": false}  # with "auto": run jobs unsandboxed if no runtime is found
 
 With no `sandbox` key, jobs run unsandboxed, as before; the server warns
@@ -162,7 +165,8 @@ PODMAN = "podman"
 SANDBOXED = ("singularity", "podman")
 NETWORKS = ("none", "default")
 CONFIG_KEYS = {"method", "runtime", "image", "binds", "writable", "scratch", "flags", "allow_unsandboxed", "network",
-               "storage"}
+               "storage", "gpus"}
+GPU_MODES = ("auto", "always", "never")
 # file systems where rootless podman's storage can't live: they refuse the chown to your subordinate ids that its
 # overlay layers need ("chown ...: operation not permitted")
 NETWORK_FILESYSTEMS = ("nfs", "nfs4", "cifs", "smb3", "smbfs", "fuse.sshfs", "lustre", "gpfs", "beegfs",
@@ -283,6 +287,9 @@ class Sandbox:
         self.binds = [_absolute(b, "binds") for b in _string_list(config, "binds")]
         self.writable = [_absolute(w, "writable") for w in _string_list(config, "writable")]
         self.flags = _string_list(config, "flags")
+        self.gpus = config.get("gpus", "auto")
+        if self.gpus not in GPU_MODES:
+            raise ValueError(f"sandbox `gpus` must be one of {', '.join(GPU_MODES)}")
         self.scratch = config.get("scratch", "job")
         if not isinstance(self.scratch, str) or not (self.scratch in ("job", "session") or os.path.isabs(
                 os.path.expanduser(self.scratch))):
@@ -507,7 +514,13 @@ class Sandbox:
             raise SandboxError(f"a sandboxed template body must be a shell or Python script, not {shebang!r}")
         return words
 
-    def launch(self, shebang, body, writable, prelude=None, extra_ro=(), network=False):
+    def gpu_flags(self, method, gpus):
+        """--nv for a Singularity/Apptainer job that asked for `gpus` GPUs (with "auto"), or always/never."""
+        if method != "singularity" or "--nv" in self.flags:
+            return []
+        return ["--nv"] if self.gpus == "always" or (self.gpus == "auto" and gpus > 0) else []
+
+    def launch(self, shebang, body, writable, prelude=None, extra_ro=(), network=False, gpus=0):
         """
         Lines for the end of the job script: start `body` in the
         sandbox and exit with its status. Returns (lines, plan).
@@ -518,6 +531,7 @@ class Sandbox:
         Apptainer always shares the host's), for environment syncs; "host"
         shares the host's network as Apptainer does (podman --network=host),
         for a service that talks to others on the node's loopback.
+        `gpus`: how many GPUs the job asked SLURM for (see `gpus` in the config).
         """
         plan = self.plan(writable, extra_ro)
         if plan["method"] == "none":
@@ -535,7 +549,10 @@ class Sandbox:
         if self.supports(runtime, "--no-mount"):
             args += ["--no-mount", "bind-paths"]   # site-wide binds would add paths behind our back
         args += self._bind_args(plan, "--bind")
-        args += self.flags
+        nv = self.gpu_flags(plan["method"], gpus)
+        if nv:
+            plan["gpus"] = "nvidia"
+        args += nv + self.flags
         quoted = " ".join(shlex.quote(a) for a in args)
         own_account = plan["host_image"] and "/etc" in plan["read_only"]
 
@@ -812,8 +829,8 @@ class Sandbox:
         """The configured sandbox, for /cluster and /sandbox."""
         out = {"configured": self.configured, "method": self.method, "runtime": self.runtime,
                "image": self.image, "binds": self.binds, "writable": self.writable, "scratch": self.scratch,
-               "flags": self.flags, "allow_unsandboxed": self.allow_unsandboxed, "network": self.network,
-               "storage": self.storage}
+               "flags": self.flags, "gpus": self.gpus, "allow_unsandboxed": self.allow_unsandboxed,
+               "network": self.network, "storage": self.storage}
         try:
             method, detail = self.resolve()
             out["effective"] = method

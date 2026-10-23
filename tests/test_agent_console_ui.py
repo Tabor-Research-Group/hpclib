@@ -100,6 +100,117 @@ class TestConsoleUI(unittest.TestCase):
         self.page.goto(self.base + "/fixture.html")
         self.page.wait_for_function("window.ready === true")
 
+    def transfer_row(self):
+        self.load()
+        self.page.evaluate("""async () => {
+          const {configure, el} = await import('/components.js');
+          const state = {cluster: 'demo', host: 'demo', port: 1234, state: 'up',
+                         prepare_open: true, url: '/must-not-open-before-reset',
+                         token_known: true, login: {state: 'connected'}, install: {state: 'nothing'}};
+          window.openRequests = [];
+          configure({api: async (path, options) => {
+            if (path.endsWith('/open')) {
+              window.openRequests.push({path, method: options.method});
+              return new Promise((resolve, reject) => {
+                window.finishOpen = () => resolve({url: '/opened-transfer.html', cache_cleared: true});
+                window.failOpen = () => reject(new Error('Data transfer is busy; wait for it to finish'));
+              });
+            }
+            return state;
+          }});
+          row.remove();
+          window.row = el('hpc-app-session', {app: 'transfer', 'app-title': 'Data transfer', cluster: 'demo'});
+          row.data = state;
+          document.getElementById('sessions').append(row);
+        }""")
+
+    def test_transfer_open_waits_for_cache_preparation_before_navigating(self):
+        self.transfer_row()
+        self.page.context.route("**/opened-transfer.html", lambda route:
+                                route.fulfill(body="<title>Transfer opened</title>", content_type="text/html"))
+        with self.page.expect_popup() as opened:
+            self.page.get_by_role("button", name="Open Data transfer", exact=True).click()
+        popup = opened.value
+        self.addCleanup(popup.close)
+        self.page.wait_for_function("!!window.finishOpen")
+        self.assertEqual(popup.url, "about:blank")
+        self.assertTrue(self.page.get_by_role("button", name="Open Data transfer", exact=True).is_disabled())
+        self.assertIsNone(popup.evaluate("window.opener"))
+        self.assertEqual(self.page.evaluate("window.openRequests"),
+                         [{"path": "apps/transfer/demo/open", "method": "POST"}])
+        self.page.evaluate("window.finishOpen()")
+        popup.wait_for_url("**/opened-transfer.html")
+        self.assertEqual(popup.title(), "Transfer opened")
+        self.assertFalse(self.errors)
+
+    def test_transfer_open_closes_reserved_tab_and_shows_failure(self):
+        self.transfer_row()
+        with self.page.expect_popup() as opened:
+            self.page.get_by_role("button", name="Open Data transfer", exact=True).click()
+        popup = opened.value
+        self.page.wait_for_function("!!window.failOpen")
+        with popup.expect_event("close"):
+            self.page.evaluate("window.failOpen()")
+        self.page.get_by_text("Data transfer is busy; wait for it to finish", exact=True).wait_for()
+        self.assertFalse(self.page.get_by_role("button", name="Open Data transfer", exact=True).is_disabled())
+        self.assertFalse(self.errors)
+
+    def test_transfer_open_with_blocked_popup_leaves_cache_alone(self):
+        self.transfer_row()
+        self.page.evaluate("window.open = () => null")
+        self.page.get_by_role("button", name="Open Data transfer", exact=True).click()
+        self.page.get_by_text("Allow pop-ups for this console, then Open again.", exact=True).wait_for()
+        self.assertEqual(self.page.evaluate("window.openRequests"), [])
+        self.assertFalse(self.errors)
+
+    def test_package_services_are_tabs_beside_sessions_with_independent_controls(self):
+        apps = [{"id": "cmccdb", "title": "CMCC DB (dev)"},
+                {"id": "cmccdb_preview", "title": "CMCCDB Preview",
+                 "tab": {"parent": "cmccdb", "id": "preview", "label": "Preview"}},
+                {"id": "cmccdb_rehearsal", "title": "CMCCDB Release Rehearsal",
+                 "tab": {"parent": "cmccdb", "id": "rehearsal", "label": "Release Rehearsal"}}]
+        requested = []
+        state = {"cluster": "demo", "host": "demo", "port": 30933, "state": "down",
+                 "login": {"state": "none"}, "install": {"state": "unchecked"}}
+
+        def respond(route):
+            endpoint = route.request.url.split("/api/", 1)[1].split("?", 1)[0]
+            requested.append(endpoint)
+            if endpoint == "apps":
+                out = {"apps": apps}
+            elif endpoint in ["apps/" + a["id"] for a in apps]:
+                app = next(a for a in apps if endpoint == "apps/" + a["id"])
+                out = {"title": app["title"], "sessions": [state]}
+            elif endpoint.endswith("/settings"):
+                out = {"tunnel_args": [], "conda_env": None, "modules": [], "install_modules": [],
+                       "project": "", "python_env": False, "job": False, "installable": True,
+                       "settings": {}, "defaults": {}, "fields": [], "secrets": [], "tokens": None}
+            elif endpoint.startswith("apps/"):
+                out = state
+            else:
+                out = {"prompts": [], "running": False, "proposals": [], "clusters": []}
+            route.fulfill(body=json.dumps(out), content_type="application/json")
+
+        self.page.route("**/api/**", respond)
+        self.page.add_init_script("localStorage.setItem('agent-console-key', 'fixture-key')")
+        self.page.goto(self.base + "/index.html#/cmccdb/sessions")
+        self.page.locator('hpc-app-session[app="cmccdb"]').wait_for()
+        self.assertEqual(self.page.locator("#apps a").all_text_contents(), ["Agents", "CMCC DB (dev)"])
+        self.assertEqual(self.page.locator("#pages a").all_text_contents(),
+                         ["Sessions", "Preview", "Release Rehearsal"])
+        for label, service in (("Preview", "cmccdb_preview"), ("Release Rehearsal", "cmccdb_rehearsal")):
+            self.page.locator("#pages").get_by_role("link", name=label, exact=True).click()
+            self.page.locator('hpc-app-session[app="' + service + '"]').wait_for()
+            self.assertEqual(self.page.locator("#app-title").inner_text(), "CMCC DB (dev)")
+            self.assertEqual(self.page.locator("#pages a.active").inner_text(), label)
+            self.page.get_by_role("button", name="Settings…", exact=True).click()
+            self.page.locator("hpc-panel").wait_for()
+            self.assertIn("apps/" + service + "/demo/settings", requested)
+        self.page.goto(self.base + "/index.html#/cmccdb_preview/sessions")
+        self.page.locator('hpc-app-session[app="cmccdb_preview"]').wait_for()
+        self.assertEqual(self.page.locator("#pages a.active").inner_text(), "Preview")
+        self.assertEqual(self.errors, [])
+
     def test_copy_last_block_fetches_complete_output_for_tunnel_and_operation_logs(self):
         self.page.context.grant_permissions(["clipboard-read", "clipboard-write"])
         self.load()
@@ -365,6 +476,52 @@ class TestConsoleUI(unittest.TestCase):
             self.page.get_by_role('button', name=button, exact=True).wait_for(state='detached')
         self.assertEqual(store.keys()['keys'], [])
         self.assertEqual(store.authorized()['entries'], [])
+        self.assertEqual(self.errors, [])
+
+    def test_settings_clear_leftover_ports_warns_about_extra_logins(self):
+        cluster = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 20735,
+                   'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'down'}}
+        posted, ops = [], iter([{'kind': 'clear_ports', 'state': 'running', 'log': ['login 1 of at most 3']},
+                                {'kind': 'clear_ports', 'state': 'succeeded',
+                                 'log': ['every port is clear on every login node that had a record of it']}])
+        def handler(route, path):
+            answers = {
+                'clusters': {'clusters': [cluster]}, 'clusters/demo': cluster,
+                'clusters/demo/settings': {'modes': ['all', 'new', 'review'], 'auto_approve_templates': 'new',
+                                           'tunnel_args': [], 'connection_hours': 12, 'rest_on': 'job'},
+                'clusters/demo/ports': {'ports': [{'port': 20735, 'what': 'agent tunnel', 'app': None, 'running': False},
+                                                  {'port': 31000, 'what': 'PAI', 'app': 'pai', 'running': True}]},
+            }
+            if path == 'clusters/demo/ports/clear':
+                posted.append(route.request.post_data_json)
+                route.fulfill(status=202, body=json.dumps({'ok': True}), content_type='application/json')
+                return True
+            if path == 'clusters/demo/operation':
+                route.fulfill(body=json.dumps(next(ops, {'kind': 'clear_ports', 'state': 'succeeded', 'log': []})),
+                              content_type='application/json')
+                return True
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/settings/demo")
+        self.page.get_by_text('31000: PAI (running; left alone)').wait_for()
+        self.page.get_by_role('button', name='Clear leftover ports…', exact=True).click()
+        self.page.get_by_role('dialog').wait_for()
+        dialog = self.page.locator('hpc-dialog[heading^="Clear leftover ports"]')
+        dialog.get_by_text('this can take many logins', exact=False).wait_for()
+        password = dialog.get_by_label('Password (for the extra logins)')
+        self.assertTrue(password.is_disabled())
+        self.assertIn('20735', dialog.inner_text())
+        self.assertNotIn('31000', dialog.inner_text())
+        dialog.get_by_label('Allow extra logins to reach the other nodes').check()
+        password.fill('s3cret')
+        dialog.get_by_label('At most this many logins').fill('3')
+        dialog.get_by_role('button', name='Clear', exact=True).click()
+        self.page.get_by_text('Done: nothing is left on the ports.').wait_for(timeout=15000)
+        self.assertEqual(posted, [{'fresh_logins': True, 'password': 's3cret', 'max_logins': 3}])
+        self.assertIn('every port is clear', self.page.locator('pre.file').inner_text())
         self.assertEqual(self.errors, [])
 
     def test_console_menu_opens_and_preserves_user_stylesheet(self):

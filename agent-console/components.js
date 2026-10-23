@@ -869,6 +869,7 @@ export class HpcAppSession extends TunnelRow {
   makeButtons() {
     return {
       start: action("Start", async () => { await fetcher(this.base + "/start", { method: "POST" }); await this.refresh(); }, { primary: true }),
+      open: action(`Open ${this.appTitle}`, () => this.openApp(), { primary: true }),
       stop: action("Stop", async () => { await fetcher(this.base + "/stop", { method: "POST" }); await this.refresh(); }),
       log: action("Log", () => this.toggleLog()),
       settings: action("Settings…", () => {
@@ -893,6 +894,20 @@ export class HpcAppSession extends TunnelRow {
   }
 
   opMine(op) { return op.app === this.app; }
+
+  async openApp() {
+    // Reserve the tab during the click, before awaiting the API, so popup blockers allow it.
+    const tab = window.open("about:blank", "_blank");
+    if (!tab) throw new Error("Allow pop-ups for this console, then Open again.");
+    tab.opener = null;
+    try {
+      const out = await fetcher(this.base + "/open", { method: "POST" });
+      tab.location.replace(out.url);
+    } catch (err) {
+      tab.close();
+      throw err;
+    }
+  }
 
   updated() {
     const s = this._data;
@@ -1096,7 +1111,8 @@ export class HpcAppSession extends TunnelRow {
     b.stop.disabled = s.state === "down" && !s.started_here;
     const up = s.state === "up";
     const open = up && s.url
-      ? el("a", { class: "button primary", href: s.url, target: "_blank", rel: "noopener noreferrer" }, `Open ${this.appTitle}`)
+      ? (s.prepare_open ? b.open : el("a", { class: "button primary", href: s.url, target: "_blank", rel: "noopener noreferrer" },
+                                     `Open ${this.appTitle}`))
       : null;
     const notInstalled = missing && s.state === "down";       // nothing to start until Install (in Settings…)
     const stateText = notInstalled ? "not installed" : up ? `running${s.version ? ` (${s.version})` : ""}`

@@ -877,6 +877,9 @@ async function serverSettings(c) {
   }));
   const binds = el("textarea", { rows: 3 }, (sandbox.binds || []).join("\n"));
   const writable = el("textarea", { rows: 2 }, (sandbox.writable || []).join("\n"));
+  const gpus = el("select", {}, [["auto", "For jobs that ask for GPUs (default)"], ["always", "For every job"],
+    ["never", "Never"]].map(([v, label]) => el("option", { value: v, selected: v === (sandbox.gpus || "auto") }, label)));
+  const flags = el("input", { value: (sandbox.flags || []).join(" "), size: 30, placeholder: "none" });
   const notes = el("textarea", { rows: 4 }, raw.cluster_notes || "");
   const envBoxes = Object.fromEntries(ENV_SCOPES.map(([k, label]) => {
     const box = el("hpc-env-editor", { label });
@@ -885,6 +888,14 @@ async function serverSettings(c) {
     return [k, box];
   }));
 
+  const sandboxSection = () => {
+    const out = Object.assign({}, sandbox, { binds: lines(binds.value), writable: lines(writable.value),
+                                             gpus: gpus.value, flags: words(flags.value) });
+    // defaults stay out of the file (and away from servers older than the `gpus` setting)
+    if (out.gpus === "auto" && !("gpus" in sandbox)) delete out.gpus;
+    if (!out.flags.length && !("flags" in sandbox)) delete out.flags;
+    return out;
+  };
   const tool = (text) => { const t = text.trim(); return t === "off" ? null : (t || "auto"); };
   const collect = () => {
     const lim = {};
@@ -910,7 +921,7 @@ async function serverSettings(c) {
       environments,
       environment: Object.keys(environment).length ? environment : null,
       limits: lim,
-      sandbox: Object.assign({}, sandbox, { binds: lines(binds.value), writable: lines(writable.value) }),
+      sandbox: sandboxSection(),
       cluster_notes: notes.value.trim() || null,
     };
   };
@@ -955,6 +966,9 @@ async function serverSettings(c) {
     el("div", { class: "row" },
       field("Extra read-only directories", binds, "one per line, e.g. /software"),
       field("Extra writable directories", writable, "one per line; besides the token's own")),
+    el("div", { class: "row" },
+      field("NVIDIA GPUs in jobs", gpus, "Singularity/Apptainer's --nv; a job asks for GPUs with gres, e.g. gpu:a100:1"),
+      field("Extra runtime flags", flags, "space-separated, for every job; podman GPUs: --device nvidia.com/gpu=all")),
     el("h4", {}, "Environment variables"),
     el("p", { class: "muted" }, "Set in every template job (after its modules load) and every environment sync. " +
       "Agents see the names in cluster_info, and a job can print the values; don't put secrets here that " +
@@ -967,6 +981,95 @@ async function serverSettings(c) {
       el("div", { class: "actions" }, saveJson)));
 }
 
+// Each tunnel records its port on the login node it started on. A login that lands on another node leaves the
+// earlier records (and whatever they still hold) there, which a start reports as "also started on login2".
+async function portSettings(c) {
+  const head = el("h3", {}, "Login-node ports ", el("span", { class: "muted" }, "· leftovers of earlier tunnels"));
+  const { ports } = await api(cluster(c.name) + "/ports");
+  const list = el("ul", {}, ports.map((p) => el("li", {}, `${p.port}: ${p.what}`,
+    p.running ? el("span", { class: "muted" }, " (running; left alone)") : null)));
+  const out = el("pre", { class: "file", hidden: true });
+  const status = el("p", { class: "muted" });
+  let timer = null;
+  const follow = () => {
+    clearInterval(timer);
+    timer = setInterval(async () => {
+      if (!out.isConnected) { clearInterval(timer); return; }
+      let op;
+      try { op = await api(cluster(c.name) + "/operation?lines=60"); } catch (err) { status.textContent = err.message; return; }
+      out.hidden = false;
+      out.textContent = (op.log || []).join("\n");
+      out.scrollTop = out.scrollHeight;
+      if (op.kind !== "clear_ports" || op.state !== "running") {
+        clearInterval(timer);
+        status.className = op.state === "succeeded" ? "saved" : "error-box";
+        status.textContent = op.state === "succeeded" ? "Done: nothing is left on the ports." :
+          "Not everything could be cleared; the end of the output says what is left.";
+        clear.disabled = false;
+      }
+    }, 2000);
+  };
+  const clear = el("button", { type: "button" }, "Clear leftover ports…");
+  clear.addEventListener("click", () => clearPortsDialog(c, ports, () => {
+    clear.disabled = true;
+    status.className = "muted";
+    status.textContent = "Clearing…";
+    follow();
+  }));
+  if (!ports.some((p) => !p.running)) clear.disabled = true;
+  return el("section", { class: "card" }, head,
+    el("p", { class: "muted" }, "A tunnel's port is recorded on the login node it started on. When a later login " +
+      "lands on another node, the earlier tunnel's job and forwards can stay behind, and starting notes " +
+      "“a tunnel on port … was also started on login2”. Clearing stops them on every login node."),
+    list, el("div", { class: "actions" }, clear), status, out);
+}
+
+function clearPortsDialog(c, ports, onStarted) {
+  const idle = ports.filter((p) => !p.running);
+  const extra = el("input", { type: "checkbox" });
+  const password = el("input", { type: "password", autocomplete: "current-password", size: 28, disabled: true });
+  const count = el("input", { type: "number", min: 1, max: 10, value: 6, size: 4, disabled: true });
+  extra.addEventListener("change", () => { password.disabled = count.disabled = !extra.checked; });
+  const go = el("button", { class: "primary", type: "button" }, "Clear");
+  const cancel = el("button", { type: "button" }, "Cancel");
+  const status = el("p", { class: "muted" });
+  const dialog = el("hpc-dialog", { heading: `Clear leftover ports: ${c.name}`, transient: true },
+    el("p", {}, `Ports ${idle.map((p) => p.port).join(", ")} on every login node of ${c.name}: earlier tunnels' ` +
+      "jobs are cancelled and what they left listening is stopped. Running tunnels are left alone. Through your " +
+      "current login this reaches the login node it is on, and others the cluster lets it reach with its own SSH keys."),
+    el("p", { class: "warning" }, "⚠ Nodes it can't reach that way can only be cleared by logging in again " +
+      "until a login lands on them. Which node a login lands on is up to the cluster, so this can take many " +
+      "logins, and every one asks for your password and sends a Duo push to approve. Leave it off to clear " +
+      "only what your current login can reach; the result lists the nodes that are left."),
+    el("label", {}, extra, " Allow extra logins to reach the other nodes"),
+    el("div", { class: "row" }, field("Password (for the extra logins)", password, "kept in memory until they finish"),
+      field("At most this many logins", count, "1 to 10")),
+    status, el("div", { class: "actions" }, go, cancel));
+  cancel.addEventListener("click", () => dialog.close());
+  dialog.addEventListener("close", () => { password.value = ""; });
+  go.addEventListener("click", async () => {
+    const body = { fresh_logins: extra.checked };
+    if (extra.checked) {
+      if (password.value) body.password = password.value;
+      body.max_logins = Math.max(1, Math.min(10, Number(count.value) || 6));
+    }
+    password.value = "";
+    go.disabled = true;
+    try {
+      await api(cluster(c.name) + "/ports/clear", { method: "POST", body });
+    } catch (err) {
+      status.className = "error-box";
+      status.textContent = err.message;
+      go.disabled = false;
+      return;
+    }
+    dialog.close();
+    onStarted();
+  });
+  dialog.showModal();
+  cancel.focus();
+}
+
 async function settingsPage() {
   const { clusters } = await api("clusters");
   if (!clusters.length) return [el("h2", {}, "Settings"), el("p", { class: "muted" }, "No agent profiles yet; run setup_agents.")];
@@ -975,7 +1078,7 @@ async function settingsPage() {
   const pick = el("hpc-cluster-picker", { value: c.name });
   pick.clusters = clusters;
   pick.addEventListener("change", () => { location.hash = "#/settings/" + encodeURIComponent(pick.value); });
-  const sections = await Promise.all([tunnelSettings(c), serverSettings(c).catch(errorBox)]);
+  const sections = await Promise.all([tunnelSettings(c), portSettings(c).catch(errorBox), serverSettings(c).catch(errorBox)]);
   return [el("h2", {}, "Settings"), el("div", { class: "toolbar" }, pick), sections];
 }
 
@@ -1191,11 +1294,12 @@ const APPS_UI = {
     pages: { clusters: ["Clusters", clustersPage], proposals: ["Proposals", proposalsPage],
              activity: ["Activity", activityPage], files: ["Files", filesPage], keys: ["SSH keys", sshKeysPage], settings: ["Settings", settingsPage] },
   },
-  // the tunnel apps (JupyterLab, VS Code, PAI, ...) come from GET /api/apps, each with a Sessions page
+  // Tunnel services come from GET /api/apps. A package may display a service as
+  // a tab beside another app's Sessions page, retaining its own API and settings.
 };
 
-function addApp(id, title, kind = "tunnel", description = null) {
-  APPS_UI[id] = { title, kind, description, default: "sessions",
+function addApp(id, title, kind = "tunnel", description = null, tab = null, registry = APPS_UI) {
+  registry[id] = { title, kind, description, tab, default: "sessions",
                   pages: { sessions: ["Sessions", () => appPage(id)] } };
 }
 addApp("jupyter", "JupyterLab");     // until the console says which it has
@@ -1204,7 +1308,21 @@ async function loadApps() {
   if (!key) return;
   try {
     const { apps } = await api("apps");
-    for (const a of apps) if (a.id !== "agents" && !APPS_UI[a.id]) addApp(a.id, a.title, a.kind, a.description);
+    const next = { agents: APPS_UI.agents };
+    for (const a of apps) if (a.id !== "agents") addApp(a.id, a.title, a.kind, a.description, a.tab, next);
+    // Second pass: package order need not place the parent before its tabs.
+    for (const a of apps) {
+      if (!a.tab) continue;
+      const parent = next[a.tab.parent];
+      if (!parent || parent.tab || a.tab.id === "sessions" || Object.hasOwn(parent.pages, a.tab.id)) {
+        throw new Error(`Invalid tab for ${a.id}`);
+      }
+      parent.pages[a.tab.id] = [a.tab.label, () => appPage(a.id)];
+    }
+    // Replace only after a complete response. Refresh also removes obsolete
+    // entries/tabs after a package upgrade or removal.
+    for (const id of Object.keys(APPS_UI)) if (id !== "agents") delete APPS_UI[id];
+    Object.assign(APPS_UI, next);
   } catch { /* an older console: JupyterLab only */ }
 }
 
@@ -1214,9 +1332,11 @@ function pageHref(app, page) {
 
 function route() {
   const segs = location.hash.replace(/^#\/?/, "").split("?")[0].split("/");
-  if (segs[0] in APPS_UI && segs[0] !== "agents") {
+  if (Object.hasOwn(APPS_UI, segs[0]) && segs[0] !== "agents") {
     const app = APPS_UI[segs[0]];
-    return { app: segs[0], page: segs[1] in app.pages ? segs[1] : app.default };
+    // Bookmarks from before grouping still reach the same service's controls.
+    if (app.tab) return { app: app.tab.parent, page: app.tab.id };
+    return { app: segs[0], page: Object.hasOwn(app.pages, segs[1]) ? segs[1] : app.default };
   }
   if (segs[0] === "agents") segs.shift();
   return { app: "agents", page: segs[0] in APPS_UI.agents.pages ? segs[0] : "clusters" };
@@ -1225,7 +1345,7 @@ function route() {
 const badge = el("span", { id: "badge", class: "badge", hidden: true });
 
 function drawChrome({ app, page }) {
-  document.getElementById("apps").replaceChildren(...Object.entries(APPS_UI).map(([id, a]) =>
+  document.getElementById("apps").replaceChildren(...Object.entries(APPS_UI).filter(([, a]) => !a.tab).map(([id, a]) =>
     el("a", { href: pageHref(id, a.default), class: id === app ? "active" : null }, a.title)));
   document.getElementById("app-title").textContent = APPS_UI[app].title;
   document.getElementById("pages").replaceChildren(...Object.entries(APPS_UI[app].pages).map(([id, [label]]) =>
@@ -1305,7 +1425,7 @@ async function render() {
 takeKeyFromHash();
 key = key || storedKey();
 window.addEventListener("hashchange", () => { takeKeyFromHash(); render(); });
-document.getElementById("refresh").addEventListener("click", render);
+document.getElementById("refresh").addEventListener("click", () => loadApps().then(render));
 document.getElementById("add-package").addEventListener("click", () => packagesDialog());
 
 // ---------------------------------------------------------------- packages

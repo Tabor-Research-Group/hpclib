@@ -105,7 +105,11 @@ or a container's forwarder. A process that isn't marked (another user's program,
 start) is listed and left alone, and the tunnel asks you to pick another port.
 
 Login nodes behind one host name may differ between connections. If the stale tunnel was started on another
-login node, `stop_tunnel` says which, so you can reach that node directly.
+login node, `stop_tunnel` says which. To clear those nodes, run `clear_tunnel_ports -P PORT [-P PORT]... host`, or
+use Settings → Login-node ports in the console. It clears the node the login lands on. For each other node with a
+record, it cancels the recorded job and clears that node through a non-interactive SSH hop (`ssh -o BatchMode=yes
+NODE`), and it lists the nodes it can't reach. The console can then log in again until a login lands on each of
+those nodes; see [Settings](interface/agents.md#login-node-ports).
 
 ## Where a tunnel is found
 

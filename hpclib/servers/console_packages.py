@@ -71,6 +71,13 @@ its login (setup_tunnel.sh --downloads):
 A package with only `settings` is a settings package: e.g. a group's SMB server and its rclone remotes, which
 don't belong in hpclib itself.
 
+An app can appear as a tab beside another app's Sessions page using
+`tab: {"parent": "app_id", "id": "preview", "label": "Preview"}`. The parent must
+be a different top-level app in the same package. Tab IDs are unique per parent
+and cannot be `sessions`; nested tabs are not supported. The service's app ID,
+tunnel, settings, secrets and API routes stay independent. The manifest's app
+order determines tab order; Sessions always comes first.
+
 `clusters` maps preset IDs to {title, host, port, description, documentation_url,
 ssh_keys, defaults}. Defaults holds tunnel_args, rest_on, connection_hours, optional work_dir,
 app_settings and rest_config. The latter are native profile/setup defaults, filled with the
@@ -131,7 +138,7 @@ MAX_FILES = 5000
 MAX_SETTINGS_FILE = 1 << 20
 APP_KEYS = {"title", "tunnel", "description", "open_path", "health_path", "token_regex", "password_regex", "login_user",
             "settings", "secrets", "downloads", "install_files", "install_modules",
-            "shared", "instance_label", "reinstall", "tokens"}
+            "shared", "instance_label", "reinstall", "tokens", "tab"}
 LOGIN_USER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 DOWNLOAD_KEYS = {"label", "description", "kinds"}
 DOWNLOAD_KIND_KEYS = {"id", "label", "placeholder", "pattern"}
@@ -444,6 +451,17 @@ def check_manifest(manifest, members, builtin_tunnels):
                "shared": spec.get("shared", False), "instance_label": None, "reinstall": None, "tokens": None,
                "downloads": None, "install_files": install_files,
                "install_modules": check_install_modules(spec.get("install_modules", []))}
+        if spec.get("tab") is not None:
+            tab = spec["tab"]
+            if not isinstance(tab, dict) or set(tab) != {"parent", "id", "label"}:
+                raise PackageError(f"app {app_id}: tab is {{parent, id, label}}")
+            if not isinstance(tab["parent"], str) or not APP_ID_RE.fullmatch(tab["parent"]):
+                raise PackageError(f"app {app_id}: tab.parent must be an app id")
+            if (not isinstance(tab["id"], str) or not APP_ID_RE.fullmatch(tab["id"]) or
+                    tab["id"] == "sessions"):
+                raise PackageError(f"app {app_id}: tab.id must be a page id other than sessions")
+            app["tab"] = {"parent": tab["parent"], "id": tab["id"],
+                          "label": _text(tab["label"], f"apps.{app_id}.tab.label", 40)}
         if not isinstance(app["shared"], bool):
             raise PackageError(f"app {app_id}: shared is true or false")
         if spec.get("instance_label") is not None:
@@ -527,6 +545,21 @@ def check_manifest(manifest, members, builtin_tunnels):
             app["secrets"].append({"name": f["name"], "label": _text(f.get("label"), "label", 80),
                                    "hint": _text(f.get("hint", ""), "hint", 400, required=False) or ""})
         out["apps"][app_id] = app
+
+    # Tabs belong to a top-level app in this package. Services keep their own IDs,
+    # settings and tunnels; only their location in the console changes.
+    tab_ids = set()
+    for app_id, app in out["apps"].items():
+        tab = app.get("tab")
+        if not tab:
+            continue
+        parent = out["apps"].get(tab["parent"])
+        if parent is None or tab["parent"] == app_id or parent.get("tab"):
+            raise PackageError(f"app {app_id}: tab.parent must name a different top-level app in this package")
+        page = (tab["parent"], tab["id"])
+        if page in tab_ids:
+            raise PackageError(f"app {app_id}: duplicate tab id {tab['id']!r} in {tab['parent']}")
+        tab_ids.add(page)
 
     # All apps sharing a tunnel must agree on its files. Refuse file/directory collisions before staging.
     for tunnel, entry in out["tunnels"].items():
@@ -834,7 +867,12 @@ def summary(manifest):
     for preset, spec in manifest.get("clusters", {}).items():
         lines.append(f"cluster preset {spec['title']} ({preset}): {spec['host']}:{spec['port']}, SSH keys {spec['ssh_keys']}")
     for app_id, app in manifest["apps"].items():
-        lines.append(f"app {app['title']} ({app_id}), tunnel {app['tunnel']}")
+        tab = app.get("tab")
+        if tab:
+            lines.append(f"tab {tab['label']} in {manifest['apps'][tab['parent']]['title']} "
+                         f"({app_id}), tunnel {app['tunnel']}")
+        else:
+            lines.append(f"app {app['title']} ({app_id}), tunnel {app['tunnel']}")
         for dest in app.get("install_files", {}):
             lines.append(f"app {app_id}: install file {dest}")
         if app.get("downloads"):

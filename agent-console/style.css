@@ -160,6 +160,7 @@ textarea {
   color: var(--fg);
 }
 .saved { color: var(--good); }
+.warning { color: var(--warn); }
 details { margin-top: var(--space-lg); }
 summary { cursor: pointer; color: var(--muted); }
 .field select, .field input:not([size]) { align-self: flex-start; }

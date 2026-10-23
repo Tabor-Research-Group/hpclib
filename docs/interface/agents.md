@@ -109,7 +109,7 @@ compute connection settings, and the REST API.
 
 ## Settings
 
-Each cluster has two cards.
+Each cluster has three cards.
 
 ### Tunnel (kept on this machine)
 
@@ -122,6 +122,30 @@ Each cluster has two cards.
 
 These apply the next time the tunnel starts.
 
+### Login-node ports
+
+The ports this console's tunnels use on the cluster's login nodes (the agent tunnel's and each app's), and which of
+them run now. A tunnel records its port on the login node it started on. When a later login lands on a different
+node, the earlier tunnel's job and forwards can stay behind there, and starting a tunnel then notes it:
+
+```
+note: a tunnel on port 20735 was also started on login2-20735; clear it there if it is stale
+```
+
+**Clear leftover ports…** clears the ports of the tunnels that aren't running, on every login node that has a
+record of them. Running tunnels are left alone. It runs over your current login (`clear_tunnel_ports`):
+
+- the node that login is on is cleared as a start would clear it;
+- for each other node with a record, the recorded job is cancelled (any login node can do that), and the node is
+  cleared through an SSH hop from the login node, using the cluster's own keys without prompting.
+
+Nodes the hop can't reach are listed at the end. To clear those too, tick **Allow extra logins** and give your
+password. The console then logs in again, each time as a separate login, until one lands on each remaining node.
+It tries each address of the login name once (a site that rotates logins through DNS gives each its own), then the
+name itself, up to the number you allow (at most 10). Every one of these logins asks for your password and sends a
+Duo push. It stops at a refused password or push, and at a typed code, which extra logins can't answer. The
+password stays in memory until the extra logins finish.
+
 ### Server (`config.json` on the cluster)
 
 Shown while the tunnel is up. Changes are checked by the server and take effect immediately, without a restart;
@@ -133,6 +157,8 @@ the previous file is kept on the cluster as `config.json.replaced-TIME`.
 | Environment syncs | modules to load before `uv sync`/`pixi install` (e.g. a web proxy), where uv and pixi are, the sync timeout |
 | Environment variables | `NAME=value` lines for all jobs and syncs, template jobs only, or syncs only (e.g. a license server, `HTTPS_PROXY`) |
 | Sandbox directories | extra read-only directories jobs can see, and extra writable ones |
+| NVIDIA GPUs in jobs | Singularity/Apptainer's `--nv`: for jobs that ask SLURM for GPUs (`gres`, e.g. `gpu:a100:1`; the default), for every job, or never |
+| Extra runtime flags | added to every sandboxed job's runtime command; podman needs its own GPU flag here (`--device nvidia.com/gpu=all`) |
 | Notes for agents | free text the agent reads in `cluster_info`, e.g. which modules or partitions to prefer |
 
 **Jobs at once** is the cap on concurrent agent jobs (default 4). An array job counts as many slots as its

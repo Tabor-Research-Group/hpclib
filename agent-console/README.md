@@ -38,6 +38,14 @@ otherwise a password saved for sync jobs), both through the password dialog. Age
 (top right) checks a package zip, shows what it adds (apps, tunnels, settings and their values), installs it,
 and lists and removes installed ones (see "Console packages" in hpclib's README). Its apps join the top bar.
 
+**Open Data transfer** clears the stock rclone GUI's filesystem-client cache before opening it,
+so it reconnects using the current session configuration, including remotes supplied by settings
+packages. If rclone reports active transfers or file checks, Open leaves the cache alone and asks
+you to retry when they finish. A failed reset shows an error without opening the GUI. Start already
+creates a fresh rclone process; background status refreshes never clear the cache. Custom GUIs
+keep their ordinary Open link. This refresh uses the running session's configuration; changes saved
+in the console's Settings still require Stop and Start to reach that session.
+
 Agents pages:
 
 | Page | Shows | Actions |

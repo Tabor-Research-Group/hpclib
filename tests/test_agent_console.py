@@ -74,6 +74,7 @@ class FakeShell:
         self.secret_seen = []                                                    # whatever it printed with a token
         self.downloads = []                                                      # what --downloads list says is there
         self.downloads_error = None                                              # what --downloads says instead
+        self.clear_output = ""                                                   # what clear_tunnel_ports prints
         self.smb_status = {"host": "files.example.edu", "user": "me", "auth": "auto", "kinit": "host",
                            "rclone_kerberos": True, "ticket": None, "credentials": False, "image": True}
 
@@ -135,6 +136,8 @@ class FakeShell:
                 else:
                     self.downloads = [d for d in self.downloads if d["name"] != rest[2]]
                     log.write(b"HPCLIB_DOWNLOAD_REMOVED " + json.dumps({"removed": rest[2]}).encode() + b"\n")
+        if args[0] == "clear_tunnel_ports":
+            log.write(self.clear_output.encode())
         if args[0] == "smbshell" and "status" in args:      # like tunnels/data-transfer/smbshell.sh status --json
             log.write(("HPCLIB_SMB_STATUS " + json.dumps(self.smb_status) + "\n").encode())
         return subprocess.Popen(["sleep", "30" if args[0] in ("agent_tunnel", "launch_tunnel") else "0"], start_new_session=True)
@@ -445,6 +448,130 @@ class TestClusters(ConsoleTestCase):
         self.assertEqual(self.call("GET", f"/api/clusters/{self.dead}")[1]["tunnel"]["state"], "down")
         self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/tunnel/start",
                                    {"auto_approve_templates": "yes"})[0], 400)
+
+
+class TestClearPorts(ConsoleTestCase):
+    """Settings → Clear leftover ports: clear_tunnel_ports over the login, then (if allowed) extra logins."""
+
+    def setUp(self):
+        super().setUp()
+        self.clusters.logins.alive = lambda profile: True
+        self.port = agent_profiles.load(self.dead)["port"]
+
+    def wait_op(self):
+        for _ in range(100):
+            out = self.call("GET", f"/api/clusters/{self.dead}/operation")[1]
+            if out.get("state") != "running":
+                return out
+            time.sleep(0.05)
+        return out
+
+    def test_ports_and_running_ones_left_alone(self):
+        ports = self.call("GET", f"/api/clusters/{self.live}/ports")[1]["ports"]
+        self.assertEqual([(p["what"], p["running"]) for p in ports], [("agent tunnel", True)])   # its server answers
+        self.assertEqual(self.call("POST", f"/api/clusters/{self.live}/ports/clear", {})[0], 409)
+        ports = self.call("GET", f"/api/clusters/{self.dead}/ports")[1]["ports"]
+        self.assertEqual(ports, [{"port": self.port, "what": "agent tunnel", "app": None, "running": False}])
+
+    def test_validation(self):
+        for body in ({"fresh_logins": "yes"}, {"max_logins": 0}, {"max_logins": 11}, {"password": "a\nb"},
+                     {"fresh_logins": True, "max_logins": True}):
+            self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/ports/clear", body)[0], 422, body)
+        self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/ports/clear", {"other": 1})[0], 400)
+
+    def test_cleared_through_the_login(self):
+        self.shell.clear_output = (f"HPCLIB_PORT_HERE login1\nHPCLIB_PORT_CLEARED login1 {self.port}\n"
+                                   f"HPCLIB_PORT_CLEARED login2 {self.port}\n")
+        status, out = self.call("POST", f"/api/clusters/{self.dead}/ports/clear", {})
+        self.assertEqual(status, 202, out)
+        self.assertEqual(self.shell.calls[-1], ["clear_tunnel_ports", "-P", str(self.port), "me@dead.example.edu"])
+        op = self.wait_op()
+        self.assertEqual((op["kind"], op["state"]), ("clear_ports", "succeeded"), op)
+        self.assertIn("every port is clear", "\n".join(op["log"]))
+
+    def test_pending_without_extra_logins(self):
+        self.shell.clear_output = (f"HPCLIB_PORT_HERE login1\nHPCLIB_PORT_CLEARED login1 {self.port}\n"
+                                   f"HPCLIB_PORT_PENDING login3 {self.port}\n")
+        with mock.patch.object(self.clusters.logins, "run_fresh") as fresh:
+            self.call("POST", f"/api/clusters/{self.dead}/ports/clear", {"fresh_logins": False})
+            op = self.wait_op()
+        fresh.assert_not_called()
+        self.assertEqual(op["state"], "failed")
+        log = "\n".join(op["log"])
+        self.assertIn(f"HPCLIB_PORTS_LEFT login3:{self.port}", log)
+        self.assertIn("allow extra logins", log)
+
+    def test_extra_logins_until_the_node_is_reached(self):
+        self.shell.clear_output = (f"HPCLIB_PORT_HERE login1\nHPCLIB_PORT_PENDING login3 {self.port}\n"
+                                   f"HPCLIB_PORT_PENDING login2 {self.port}\n")
+        landings = iter(["login1", "login3", "login1", "login2", "login2"])
+        calls = []
+
+        def fresh(profile, password, remote, script, extra=()):
+            calls.append((password, remote, list(extra)))
+            self.assertIn("_hpclib_clear_ports", script)
+            node = next(landings)
+            return 0, f"HPCLIB_PORT_HERE {node}\nHPCLIB_PORT_CLEARED {node} {self.port}\n", "logged in"
+
+        with mock.patch.object(self.clusters.logins, "run_fresh", side_effect=fresh), \
+                mock.patch.object(self.clusters, "_login_addresses", return_value=["10.0.0.1", "10.0.0.2"]), \
+                mock.patch.object(self.clusters, "_clear_ports_script", return_value="_hpclib_clear_ports \"$@\""):
+            status, out = self.call("POST", f"/api/clusters/{self.dead}/ports/clear",
+                                    {"fresh_logins": True, "password": "s3cret", "max_logins": 6})
+            self.assertEqual(status, 202, out)
+            self.assertNotIn("s3cret", json.dumps(out))
+            op = self.wait_op()
+        self.assertEqual(op["state"], "succeeded", op)
+        self.assertNotIn("s3cret", json.dumps(op))
+        self.assertEqual(len(calls), 4)                                   # stopped once both nodes were reached
+        self.assertEqual(calls[0], ("s3cret", f"bash -s -- --no-hop {self.port}", ["-o", "HostName=10.0.0.1",
+                                                                                 "-o", "HostKeyAlias=dead.example.edu"]))
+        self.assertEqual(calls[2][2], [])                                 # then the name itself
+        log = "\n".join(op["log"])
+        self.assertIn("landed on login3: cleared", log)
+        self.assertIn("approve the Duo push", log)
+        self.assertNotIn("s3cret", log)
+        self.assertEqual(self.clusters._clear_requests, {})
+
+    def test_refused_login_stops(self):
+        self.shell.clear_output = f"HPCLIB_PORT_HERE login1\nHPCLIB_PORT_PENDING login3 {self.port}\n"
+        fresh = mock.Mock(return_value=(None, "", "the password was not accepted"))
+        with mock.patch.object(self.clusters.logins, "run_fresh", fresh), \
+                mock.patch.object(self.clusters, "_login_addresses", return_value=[]), \
+                mock.patch.object(self.clusters, "_clear_ports_script", return_value="x _hpclib_clear_ports"):
+            self.call("POST", f"/api/clusters/{self.dead}/ports/clear", {"fresh_logins": True, "password": "bad"})
+            op = self.wait_op()
+        self.assertEqual(fresh.call_count, 1)
+        self.assertEqual(op["state"], "failed")
+        self.assertIn("the login itself was refused", "\n".join(op["log"]))
+
+    def test_fresh_login_command_and_prompts(self):
+        """run_fresh: its own connection (no master), the password once, a push; a typed code is refused."""
+        logins = agent_console.Logins(ssh="ssh")
+        seen = {}
+
+        def run(command, **kwargs):
+            seen["command"], seen["env"] = command, kwargs["env"]
+            nonce = kwargs["env"]["HPCLIB_ASKPASS_NONCE"]
+            seen["answers"] = [logins.handle_prompt(nonce, "Password: "), logins.handle_prompt(nonce, "Duo two-factor")]
+            return subprocess.CompletedProcess(command, 0, b"HPCLIB_PORT_HERE login2\n", b"")
+
+        profile = agent_profiles.load(self.dead)
+        with mock.patch.object(subprocess, "run", side_effect=run), \
+                mock.patch.object(logins, "_askpass_program", return_value="/bin/true"):
+            code, out, message = logins.run_fresh(profile, "pw", "bash -s -- --no-hop 1", "script", ["-o", "HostName=h"])
+        self.assertEqual((code, message), (0, "logged in"))
+        self.assertEqual(seen["answers"], [{"answer": "pw"}, {"answer": "1"}])
+        self.assertEqual(seen["command"][:5], ["ssh", "-o", "ControlMaster=no", "-o", "ControlPath=none"])
+        self.assertEqual(seen["command"][-2:], ["me@dead.example.edu", "bash -s -- --no-hop 1"])
+        self.assertEqual(logins.by_nonce, {})
+        with mock.patch.object(subprocess, "run", side_effect=lambda command, **kw: (
+                seen.update(code=logins.handle_prompt(kw["env"]["HPCLIB_ASKPASS_NONCE"], "Enter verification code:")),
+                subprocess.CompletedProcess(command, 255, b"", b"Permission denied"))[1]), \
+                mock.patch.object(logins, "_askpass_program", return_value="/bin/true"):
+            code, out, message = logins.run_fresh(profile, "pw", "true", "")
+        self.assertIn("error", seen["code"])
+        self.assertIn("typed code", message)
 
 
 class TestSettings(ConsoleTestCase):
@@ -1311,6 +1438,83 @@ class TestTransferGui(ConsoleTestCase):
     def printed(self, line):
         self.log.write_text(self.log.read_text() + line + "\r\n")
 
+    def serve_rclone(self):
+        self.start()
+        calls = []
+        state = {"stats": {"transferring": [], "checking": []}, "fail": {}}
+
+        class Rclone(FakeApp):
+            def do_POST(self):
+                calls.append((self.path, self.headers.get("Authorization"),
+                              json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))))
+                status, body = state["fail"].get(self.path, (200, state["stats"] if self.path == "/core/stats" else {}))
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                if status == 302:
+                    self.send_header("Location", "/must-not-follow")
+                self.end_headers()
+                self.wfile.write(body if isinstance(body, bytes) else json.dumps(body).encode())
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), Rclone)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.printed("HPCLIB_TRANSFER_GUI port=%d user=hpclib pass=0a1b2c query=login_token=fixture" % self.port)
+        return calls, state
+
+    def test_open_clears_idle_cache_once_and_polls_do_not(self):
+        calls, _ = self.serve_rclone()
+        for _ in range(2):
+            state = self.call("GET", self.route)[1]
+            self.assertTrue(state["prepare_open"])
+        self.assertEqual(calls, [])
+        self.assertEqual(self.call("POST", self.route + "/open", {}, key=None)[0], 401)
+        self.assertEqual(calls, [])
+        status, out = self.call("POST", self.route + "/open", {})
+        self.assertEqual(status, 200, out)
+        self.assertTrue(out["cache_cleared"])
+        self.assertEqual(out["url"], state["url"])
+        self.assertEqual(calls, [("/core/stats", "Basic aHBjbGliOjBhMWIyYw==", {}),
+                                 ("/fscache/clear", "Basic aHBjbGliOjBhMWIyYw==", {})])
+        self.call("GET", self.route)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("0a1b2c", json.dumps(agent_profiles.load(self.dead)))
+
+    def test_open_preserves_active_transfers_and_checks(self):
+        calls, state = self.serve_rclone()
+        for active in ("transferring", "checking"):
+            with self.subTest(active=active):
+                calls.clear()
+                state["stats"] = {active: [{"name": "private-name"}]}
+                status, out = self.call("POST", self.route + "/open", {})
+                self.assertEqual(status, 409, out)
+                self.assertIn("wait for it to finish", out["error"])
+                self.assertNotIn("private-name", json.dumps(out))
+                self.assertEqual([c[0] for c in calls], ["/core/stats"])
+
+    def test_open_propagates_reset_failures_without_secrets_or_redirects(self):
+        calls, state = self.serve_rclone()
+        cases = [("/core/stats", 401, {"error": "0a1b2c private response"}),
+                 ("/core/stats", 200, b"not json"),
+                 ("/core/stats", 200, []),
+                 ("/core/stats", 302, {}),
+                 ("/fscache/clear", 500, {"error": "0a1b2c private response"})]
+        for route, code, body in cases:
+            with self.subTest(route=route, code=code, body=body):
+                calls.clear()
+                state["fail"] = {route: (code, body)}
+                status, out = self.call("POST", self.route + "/open", {})
+                self.assertEqual(status, 502, out)
+                self.assertIn(route.lstrip("/"), out["error"])
+                self.assertNotIn("0a1b2c", json.dumps(out))
+                self.assertNotIn("private response", json.dumps(out))
+                self.assertEqual([c[0] for c in calls], ["/core/stats"] +
+                                 (["/fscache/clear"] if route == "/fscache/clear" else []))
+
+    def test_open_requires_running_gui_and_stays_out_of_other_apps(self):
+        self.assertEqual(self.call("POST", self.route + "/open", {})[0], 409)
+        self.assertEqual(self.call("POST", f"/api/apps/jupyter/{self.dead}/open", {})[0], 404)
+
     def test_start_and_open(self):
         self.assertEqual(self.call("GET", self.route)[1]["state"], "down")
         self.start()
@@ -1340,10 +1544,15 @@ class TestTransferGui(ConsoleTestCase):
         state = self.call("GET", self.route)[1]
         self.assertEqual(state["url"], f"http://127.0.0.1:{self.port}/browse?root=research%2Fours")
         self.assertNotIn("username", state)
+        self.assertFalse(state["prepare_open"])
+        status, out = self.call("POST", self.route + "/open", {})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out, {"url": state["url"], "cache_cleared": False, "ok": True})
         # an hpclib on the cluster from before SMB_GUI: rclone's line, opened as before
         self.printed("HPCLIB_RCLONE_GUI port=%d user=hpclib pass=0a1b2c" % self.port)
         self.assertEqual(self.call("GET", self.route)[1]["url"],
                          f"http://hpclib:0a1b2c@127.0.0.1:{self.port}/?login_token=aHBjbGliOjBhMWIyYw%3D%3D")
+        self.assertTrue(self.call("GET", self.route)[1]["prepare_open"])
 
     def test_signing_in_beside_the_gui(self):
         script = self.tmp / "fake-kinit"

@@ -1590,8 +1590,10 @@ function _hpclib_clear_port {
     echo "stopped a leftover waiting page on $port" >&2
   fi
   for other in "$(_hpclib_sessions_root)"/ports/*-"$port"; do
-    if [ -f "$other" ] && [ "$other" != "$file" ]; then
-      echo "note: a tunnel on port $port was also started on ${other##*/ports/}; clear it there if it is stale" >&2
+    # (HPCLIB_PORT_NOTES=0: clear_tunnel_ports, which deals with them itself)
+    if [ -f "$other" ] && [ "$other" != "$file" ] && [ "${HPCLIB_PORT_NOTES:-1}" != 0 ]; then
+      echo "note: a tunnel on port $port was also started on ${other##*/ports/}; clear it there if it is stale" \
+        "(Settings → Clear leftover ports in the console)" >&2
     fi
   done
   for tries in 1 2 3 4 5 6 7 8 9 10; do
@@ -1637,6 +1639,100 @@ _hpclib_clear_port \"\$1\" && echo \"port \$1 is free on \$(hostname -s)\""
   fi
   # the forward this machine's ssh master holds for the tunnel
   HPCLIB_ECHO_COMMANDS= pssh -O cancel -L "127.0.0.1:$port:127.0.0.1:$port" "${login_args[@]}" 2>/dev/null || true
+}
+
+# Each tunnel records its port on the login node it started on (sessions/ports/NODE-PORT, in the shared home).
+# A login that lands on another node leaves those records, and what they hold, where they were: start_tunnel.sh
+# notes them ("a tunnel on port P was also started on login2"). Runs ON a login node:
+#   _hpclib_clear_ports [--no-hop] PORT...
+# clears each PORT on this node (as a start does) and then, for each other node with a record of it: cancels the
+# recorded job from here (Slurm is the same on every login node) unless a record of a port not being cleared uses
+# that job, and clears what is left on that node through a non-interactive ssh hop to it (the cluster's own keys,
+# BatchMode, known host keys only). One line per outcome, for the console:
+#   HPCLIB_PORT_HERE NODE
+#   HPCLIB_PORT_CLEARED NODE PORT      HPCLIB_PORT_BUSY NODE PORT (held by something that isn't one of your tunnels)
+#   HPCLIB_PORT_PENDING NODE PORT      (no hop to that node: a login that lands there has to clear it)
+# --no-hop: this node only (a login made to land on a node that couldn't be reached).
+function _hpclib_clear_ports {
+  local hop=true here root f p port node pid job listed out script keep=" "
+  if [ "${1:-}" = --no-hop ]; then hop=false; shift; fi
+  for port in "$@"; do
+    case "$port" in ''|*[!0-9]*) echo "_hpclib_clear_ports: not a port: $port" >&2; return 2 ;; esac
+  done
+  here=$(hostname -s)
+  root="$(_hpclib_sessions_root)/ports"
+  echo "HPCLIB_PORT_HERE $here"
+  # the jobs of ports that aren't being cleared (tunnels that may be running) are never cancelled
+  for f in "$root"/*; do
+    [ -f "$f" ] || continue
+    listed=false
+    for p in "$@"; do [ "${f##*-}" = "$p" ] && listed=true; done
+    if [ "$listed" = false ] && read -r pid job < "$f" && [ -n "${job:-}" ]; then keep="$keep$job "; fi
+  done
+  script="$(declare -f _hpclib_sessions_root _hpclib_port_file _hpclib_port_free _hpclib_port_holders _hpclib_wait_job_end _hpclib_clear_port)
+_hpclib_clear_port \"\$1\""
+  for port in "$@"; do
+    if HPCLIB_PORT_NOTES=0 _hpclib_clear_port "$port"; then echo "HPCLIB_PORT_CLEARED $here $port"; else echo "HPCLIB_PORT_BUSY $here $port"; fi
+    [ "$hop" = true ] || continue
+    for f in "$root"/*-"$port"; do
+      [ -f "$f" ] || continue
+      node=${f##*/}
+      node=${node%-"$port"}
+      [ "$node" != "$here" ] || continue
+      if ! [[ "$node" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]]; then
+        echo "skipping $f: not a node name" >&2
+        continue
+      fi
+      pid='' job=''
+      read -r pid job < "$f" || true
+      if [ -n "$job" ] && [[ "$job" =~ ^[0-9_]+$ ]] && [[ "$keep" != *" $job "* ]]; then
+        if out=$(squeue -h -j "$job" -o %i 2>&1) && [ -n "$out" ]; then
+          echo "cancelling job $job, which the tunnel on $node:$port started" >&2
+          scancel "$job" 2> /dev/null || true
+          _hpclib_wait_job_end "$job" || true
+        fi
+      fi
+      if timeout 90 ssh -T -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$node" \
+          "bash -s -- $port" <<< "$script" > /dev/null 2>&1; then
+        echo "HPCLIB_PORT_CLEARED $node $port"
+      else
+        echo "HPCLIB_PORT_PENDING $node $port"
+      fi
+    done
+  done
+}
+
+# The lines of a script that runs _hpclib_clear_ports with its arguments on the login node it is sent to.
+function _hpclib_clear_ports_script {
+  printf '%s\n' "$(declare -f _hpclib_sessions_root _hpclib_port_file _hpclib_port_free _hpclib_port_holders \
+    _hpclib_wait_job_end _hpclib_clear_port _hpclib_clear_ports)" '_hpclib_clear_ports "$@"'
+}
+
+# Clear what earlier tunnels left on their ports on every login node it can reach from the one this login lands
+# on (see _hpclib_clear_ports), from your own machine:
+#   clear_tunnel_ports -P PORT [-P PORT]... [--no-hop] [ssh options] [user@]host
+# Don't name the port of a tunnel that is running: it is stopped too.
+function clear_tunnel_ports {
+  local usage='usage: clear_tunnel_ports -P PORT [-P PORT]... [--no-hop] [ssh options] [user@]host'
+  local ports=() login_args=() hosts=() flags=() port
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -P) ports+=("${2:-}"); shift 2 || shift ;;
+      -P*) ports+=("${1#-P}"); shift ;;
+      --no-hop) flags+=(--no-hop); shift ;;
+      -h|--help) echo "$usage"; return 0 ;;
+      *) login_args+=("$1"); shift ;;
+    esac
+  done
+  hosts=($(mcargs "$SSH_FLAGS" "$SSH_LONG_FLAGS" "${login_args[@]}"))
+  if [ "${#ports[@]}" -eq 0 ] || [ "${#hosts[@]}" -ne 1 ]; then
+    echo "$usage" >&2
+    return 2
+  fi
+  for port in "${ports[@]}"; do
+    case "$port" in ''|*[!0-9]*) echo "$usage" >&2; return 2 ;; esac
+  done
+  _hpclib_clear_ports_script | HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$(printf '%q ' bash -s -- "${flags[@]}" "${ports[@]}")"
 }
 
 LAUNCH_TUNNEL_DEFAULT_APP="Safari"
