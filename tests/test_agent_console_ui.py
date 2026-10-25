@@ -581,6 +581,35 @@ class TestConsoleUI(unittest.TestCase):
         self.assertEqual(self.page.locator('#pages a.active').inner_text(), 'Files')
         self.assertEqual(self.errors, [])
 
+    def test_start_agent_tunnel_waits_while_it_starts(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
+             'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'starting', 'started_here': True}}
+        answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c, 'health': {'hpclib_version': '1.0.0'},
+                   'apps': {'apps': [{'id': 'agents', 'title': 'Agents'}]},
+                   'clusters/demo/jobs': {'at': 0, 'queued': [], 'running': [], 'finished': [],
+                                          'counts': {'queued': 0, 'running': 0, 'finished': 0, 'failed': 0}},
+                   'clusters/demo/storage': {'scanned': None, 'scan': {'state': 'idle'}, 'dirs': [], 'quota': None}}
+        def handler(route, path):
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        for where in ("#/c", "#/c/demo/overview"):
+            self.page.goto(self.base + "/" + where)
+            button = self.page.locator('hpc-action-button[label="Starting agent tunnel…"]').first
+            button.wait_for()
+            self.assertTrue(button.evaluate("b => b.button.disabled"), where)
+        self.assertEqual(self.page.locator('.cluster-head .chip.starting').inner_text(), 'agent tunnel starting')
+        # once it asks for a password, the step is to answer it
+        c['tunnel'] = {'state': 'starting', 'started_here': True, 'prompt': {'kind': 'password', 'text': 'Password:'}}
+        self.page.get_by_role('button', name='Enter password…', exact=True).wait_for(timeout=12000)
+        # once it is up, the page follows by itself
+        c['tunnel'] = {'state': 'up', 'hpclib_version': '1.0.0'}
+        self.page.get_by_text('agent tunnel up').wait_for(timeout=12000)
+        self.assertEqual(self.page.locator('section.next-step').count(), 0)
+        self.assertEqual(self.errors, [])
+
     def test_console_menu_opens_and_preserves_user_stylesheet(self):
         with mock.patch.object(agent_console, "open_with_default_application") as opener:
             self.load_console()

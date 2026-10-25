@@ -81,6 +81,9 @@ Endpoints (all responses are JSON unless noted)    scope
   GET    /jobs/status?id=J[&tasks=1]                read
   GET    /jobs/wait?id=J[&timeout=S]                read
   POST   /jobs/cancel?id=J                          submit
+  GET    /actions[?refresh=1]   tunnel actions (rest_actions.py): the owner sees all, with   read
+                                 which are on; an agent the ones it may run; with availability
+  POST   /actions/run  {"tunnel", "action", "params"}   the action's own scope; off until the owner turns it on
   POST   /slurm/{sbatch,squeue,sacct,scontrol,scancel}
            body: {"args": [...], "cwd": "...", "input": "..."}   slurm
   GET    /slurm/{squeue,sacct}?arg=...&arg=...&cwd=...          slurm
@@ -140,8 +143,9 @@ import traceback
 import urllib.parse
 
 try:
-    from . import rest_envs, rest_jobs, rest_local, rest_sandbox, ssh_keys, rest_installs
+    from . import rest_envs, rest_jobs, rest_local, rest_sandbox, ssh_keys, rest_installs, rest_actions
 except ImportError:  # run as a script from the servers directory
+    import rest_actions
     import rest_envs
     import rest_jobs
     import rest_local
@@ -538,8 +542,10 @@ class RESTServer(http.server.ThreadingHTTPServer):
 
     def __init__(self, address, handler_class, auth: TokenAuth, whitelist: PathWhitelist,
                  command_timeout=120, max_upload=1 << 30, disable_file_changes=False,
-                 jobs: 'rest_jobs.JobManager' = None, audit: AuditLog = None, config_path=None):
+                 jobs: 'rest_jobs.JobManager' = None, audit: AuditLog = None, config_path=None,
+                 actions: 'rest_actions.TunnelActions' = None):
         self.auth = auth
+        self.actions = actions if actions is not None else rest_actions.TunnelActions({})
         self.config_path = config_path   # for GET/PUT /admin/config
         self.whitelist = whitelist
         self.agent_whitelist = whitelist.with_deny(agent_protected_paths())
@@ -790,6 +796,9 @@ class HPCRESTHandler(RESTHandler):
             ("GET", "/envs"): "read",
             ("POST", "/envs/sync"): "envs",
             ("GET", "/envs/sync"): "read",
+            # each action needs its own scope too (rest_actions.py)
+            ("GET", "/actions"): "read",
+            ("POST", "/actions/run"): "read",
         },
         **{("POST", f"/slurm/{c}"): "slurm" for c in SLURM_COMMANDS},
         **{("GET", f"/slurm/{c}"): "slurm" for c in READ_ONLY_COMMANDS},
@@ -823,6 +832,8 @@ class HPCRESTHandler(RESTHandler):
             ("GET", "/envs"): self.do_environment_info,
             ("POST", "/envs/sync"): self.do_sync_environment,
             ("GET", "/envs/sync"): self.do_sync_status,
+            ("GET", "/actions"): self.do_actions,
+            ("POST", "/actions/run"): self.do_run_action,
             # owner only: not in ROUTE_SCOPES, so they need the `*` scope
             ("GET", "/admin/proposals"): self.do_admin_proposals,
             ("GET", "/admin/proposals/diff"): self.do_admin_proposal_diff,
@@ -958,6 +969,26 @@ class HPCRESTHandler(RESTHandler):
         if verb != "GET":
             self.audit_detail = {"ssh": route, "operation": verb}
         return 200, dict(result, ok=True)
+
+    # tunnel actions (rest_actions.py)
+    def do_actions(self):
+        owner = self.identity.has_scope("*")
+        return 200, self.server.actions.describe(self.identity, owner, refresh=owner and self.query_flag("refresh"))
+
+    def do_run_action(self):
+        body = self.read_json()
+        if set(body) - {"tunnel", "action", "params"}:
+            raise RESTError(400, 'send {"tunnel", "action", "params": {...}}')
+        tunnel, action = body.get("tunnel"), body.get("action")
+        if not isinstance(tunnel, str) or not rest_actions.TUNNEL_RE.fullmatch(tunnel) or \
+                not isinstance(action, str) or not rest_actions.NAME_RE.fullmatch(action):
+            raise RESTError(422, "tunnel and action: their names, as GET /actions lists them")
+        detail = {}
+        try:
+            return self.server.actions.run(self.identity, tunnel, action, body.get("params") or {}, self.whitelist,
+                                           not self.server.disable_file_changes, jobs=self.server.jobs, audit=detail)
+        finally:
+            self.audit_detail = detail or {"tunnel": tunnel, "action": action}
 
     def do_health(self):
         wl = self.whitelist
@@ -1418,7 +1449,7 @@ class HPCRESTHandler(RESTHandler):
 
 CONFIG_KEYS = {"limits", "templates_dir", "jobs_db", "audit_log", "tokens_file", "cluster_notes",
                "poll_interval", "proposals_dir", "module_command", "sandbox", "environments", "environment",
-               "scheduler"}
+               "scheduler", "tunnel_actions"}
 
 def load_config(path):
     """
@@ -1460,12 +1491,14 @@ def load_config(path):
         raise ValueError("`environments` must be an object")
     rest_jobs.check_env_section(config.get("environment"))
     rest_local.check_scheduler_section(config.get("scheduler"))
+    rest_actions.check_config(config.get("tunnel_actions"))
     config["path"] = path
     return config
 
 # Sections of config.json the owner may change while the server runs (PUT /admin/config);
 # paths, the module command and tokens stay as setup_agents wrote them.
-EDITABLE_CONFIG = ("limits", "cluster_notes", "environments", "environment", "sandbox", "poll_interval")
+EDITABLE_CONFIG = ("limits", "cluster_notes", "environments", "environment", "sandbox", "poll_interval",
+                   "tunnel_actions")
 CONFIG_LOCK = threading.Lock()
 
 
@@ -1513,7 +1546,9 @@ def updated_config(raw, changes):
         raise ValueError("`poll_interval` must be between 1 and 600 seconds")
     sandbox = rest_sandbox.Sandbox(new.get("sandbox"), data_dir=rest_data_dir())
     env = rest_jobs.check_env_section(new.get("environment"))
+    actions = rest_actions.check_config(new.get("tunnel_actions"))
     built = {
+        "tunnel_actions": actions,
         "job_env": env["jobs"],
         "limits": _check_limits(new.get("limits", {})),
         "cluster_notes": notes,
@@ -1540,6 +1575,8 @@ def write_config_file(path, config):
 
 def apply_config(server, built):
     """Use a validated config from now on, without restarting."""
+    if "tunnel_actions" in built:
+        server.actions.config = built["tunnel_actions"]
     jobs = server.jobs
     jobs.limits = built["limits"]
     jobs.cluster_notes = built["cluster_notes"]
@@ -1933,7 +1970,9 @@ def protect_sandbox(sandbox, config, auth=None):
     directory holding it is bound: hpclib's data (tokens, the owner token, templates, the job database) and ~/.ssh
     are hidden; what runs unsandboxed later (agent_protected_paths) is bound read-only.
     """
-    hidden = protected_paths(config, auth) + [os.path.expanduser("~/.ssh")]
+    # ~/.ssh, and the SMB login (Data transfer's Kerberos ticket and saved password) that tunnel actions use for
+    # you: a job may not read either
+    hidden = protected_paths(config, auth) + [os.path.expanduser("~/.ssh"), os.path.expanduser("~/.config/hpclib/smb")]
     sandbox.protect(hidden=hidden, read_only=[p for p in agent_protected_paths() if p not in hidden])
     return sandbox
 
@@ -2012,6 +2051,7 @@ def main(argv=None, handler_class=HPCRESTHandler):
             command_timeout=opts.command_timeout, max_upload=opts.max_upload,
             disable_file_changes=opts.disable_file_changes,
             jobs=jobs, audit=audit, config_path=config["path"],
+            actions=rest_actions.TunnelActions(config.get("tunnel_actions")),
         )
     except KeyboardInterrupt:
         pass

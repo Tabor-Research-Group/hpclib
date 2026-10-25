@@ -2491,7 +2491,7 @@ class Clusters:
         "kdestroy": ("logout", False, None),
         "save_credentials": ("save-credentials", True,
                              "The SMB server's password, saved on the cluster (mode 600, in rclone's reversible "
-                             "encoding) so sync jobs can sign in without you: there is no Kerberos there."),
+                             "encoding) so sync jobs can sign in without prompting."),
         "forget_credentials": ("forget-credentials", False, None),
     }
 
@@ -2510,6 +2510,16 @@ class Clusters:
         if auth.get("host"):
             tools.append({"id": "folder", "kind": "info", "label": "Folder",
                           "text": auth.get("root") or "none: smbshell paths are SHARE/PATH"})
+        if auth.get("auth") == "password":
+            text = ("a saved password is used by smbshell and sync jobs" if auth.get("credentials") else
+                    "password sign-in selected: save a password for sync jobs (smbshell asks for it otherwise)")
+            tools.append({"id": "signin", "kind": "info", "label": "Signing in", "text": text})
+            controls.append({"id": "forget_credentials", "label": "Forget saved password",
+                             "confirm": "Remove the password saved on the cluster? Sync jobs can't sign in "
+                                        "without it while password sign-in is selected."} if auth.get("credentials") else
+                            {"id": "save_credentials", "label": "Save password for sync jobs", "primary": True})
+            controls.append({"id": "status", "label": "Refresh"})
+            return tools, controls
         kerberos = bool(auth.get("kinit")) and auth.get("rclone_kerberos")
         ticket = auth.get("ticket")
         by_address = bool(re.fullmatch(r"[0-9.]+|.*:.*", auth.get("host") or ""))

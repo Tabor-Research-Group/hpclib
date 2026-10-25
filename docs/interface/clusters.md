@@ -26,7 +26,7 @@ Its address is `#/c/NAME/TAB`, so a tab can be bookmarked.
 | Installed | hpclib, the agent setup and each app: whether it is installed, what the cluster reported, and Check / Install / Update; **Check all** checks every app |
 | Storage | the work directories' sizes and file counts, their largest folders, and the site's quota report. **Scan now** runs `du` over your login at low priority, at most 5 minutes per directory (a longer scan is marked partial); the result is kept on this machine |
 | Files | the cluster's files through its REST server (needs the agent tunnel), as the Files page was |
-| Agents | **Tunnel and setup**: the agent profile's row (start and stop the agent tunnel, its log, Update hpclib, Setup…, Set up SSH); **Activity**: what agents did here; **SSH keys** |
+| Agents | **Tunnel and setup**: the agent profile's row (start and stop the agent tunnel, its log, Update hpclib, Setup…, Set up SSH), the MCP server's name, and **Tunnel actions** (what tunnels may do for agents with your access: on or off per tunnel and per action, and whether each can run now); **Activity**: what agents did here; **SSH keys** |
 | Settings | the cluster's settings: its agent tunnel's job, ports (with **Clear leftover ports…**) and the REST server's limits and sandbox |
 
 ## An app's page

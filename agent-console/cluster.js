@@ -72,6 +72,9 @@ function ago(t) {
 
 const login = (c) => (c.login || {}).state === "connected";
 const tunnelUp = (c) => (c.tunnel || {}).state === "up";
+// starting: asked to start (here or elsewhere) and not up yet; Start again would only start a second one
+const tunnelStarting = (c) => ["starting", "queued"].includes((c.tunnel || {}).state);
+const tunnelTone = (c) => tunnelUp(c) ? "up" : tunnelStarting(c) ? "starting" : (c.tunnel || {}).state === "error" ? "error" : "down";
 
 // Slurm's reasons, said plainly (the code stays in the tooltip)
 const REASONS = {
@@ -91,16 +94,56 @@ function nextStep(c, local, go) {
     return ["Update hpclib", () => go("update"), `The cluster runs hpclib ${c.tunnel.hpclib_version}; this console has ${local}.`];
   }
   if (!c.set_up) return ["Set up agents", () => go("setup"), "Agents can't use this cluster until it is set up."];
+  if (tunnelStarting(c) && c.tunnel.prompt) {
+    const hostkey = c.tunnel.prompt.kind === "hostkey";
+    return [hostkey ? "Review host key…" : "Enter password…", () => go("answer"),
+            `The agent tunnel is starting and ${hostkey ? "asks you to trust a node's host key" : "asks for your password"}.`];
+  }
+  if (tunnelStarting(c)) {
+    return ["Starting agent tunnel…", null, "The agent tunnel is starting: its job may wait in the queue before the " +
+            "REST server answers. This page follows it.", { disabled: true }];
+  }
   if (!tunnelUp(c)) {
     return ["Start agent tunnel", () => go("start"), "Agents, jobs history, server settings and installs that need the cluster's REST server wait for it."];
   }
   return null;
 }
 
+// the step's button: a waiting step's is disabled (and does nothing)
+function stepAction(step, primary = true) {
+  const extra = step[3] || {};
+  return action(step[0], step[1] || (() => {}), { primary, ...(extra.disabled ? { disabled: true, title: "starting" } : {}) });
+}
+
+// while a tunnel starts, its state is asked for every 5 s (cheap: the local port and its health) and the page is
+// drawn again once it changes (up, a password prompt, or stopped)
+let followTimer = null;
+function followWhileStarting(clusters) {
+  clearTimeout(followTimer);
+  const starting = clusters.filter(tunnelStarting);
+  if (!starting.length) return;
+  const here = location.hash;
+  const was = (c) => `${c.tunnel.state}|${!!c.tunnel.prompt}`;
+  const check = async () => {
+    if (location.hash !== here) return;
+    try {
+      const now = await Promise.all(starting.map((c) => ctx.api(path(c.name))));
+      if (now.some((c, i) => was(c) !== was(starting[i]))) return ctx.render();
+    } catch { /* try again */ }
+    followTimer = setTimeout(check, 5000);
+  };
+  followTimer = setTimeout(check, 5000);
+}
+
 async function runStep(c, what) {
   const { api } = ctx;
   if (what === "login") {
     document.dispatchEvent(new CustomEvent("hpc-login", { detail: { cluster: c, then: () => ctx.render() } }));
+    return;
+  }
+  if (what === "answer") {
+    document.dispatchEvent(new CustomEvent("hpc-prompt", { detail: { label: c.name, answer: path(c.name, "tunnel/answer"),
+                                                                     prompt: c.tunnel.prompt } }));
     return;
   }
   if (what === "update") await api(path(c.name, "install"), { method: "POST", body: {} });
@@ -113,7 +156,7 @@ async function runStep(c, what) {
 function stepButton(c, local, primary = true) {
   const step = nextStep(c, local, (what) => runStep(c, what));
   if (!step) return null;
-  return action(step[0], step[1], { primary });
+  return stepAction(step, primary);
 }
 
 async function jobsSummary(name) {
@@ -162,14 +205,14 @@ export async function clustersHome() {
       el("td", {}, el("a", { href: `#/c/${enc(c.name)}/overview`, class: "cluster-link" }, c.name),
         el("div", { class: "muted small" }, c.host)),
       el("td", {}, chip(login(c) ? "logged in" : "not logged in", login(c) ? "up" : "down")),
-      el("td", {}, chip(tunnelUp(c) ? "up" : (c.tunnel || {}).state || "down",
-                        tunnelUp(c) ? "up" : ["starting", "queued"].includes((c.tunnel || {}).state) ? "starting" : "down")),
+      el("td", {}, chip(tunnelUp(c) ? "up" : (c.tunnel || {}).state || "down", tunnelTone(c))),
       el("td", {}, c.tunnel && c.tunnel.hpclib_version ? [c.tunnel.hpclib_version, older ? [" ", chip("update", "starting")] : null]
         : el("span", { class: "muted" }, "—")),
       jobsCell, storeCell,
       el("td", { class: "next" }, stepButton(c, local) ||
         el("a", { class: "button", href: `#/c/${enc(c.name)}/overview` }, "Open")));
   });
+  followWhileStarting(clusters);
   return [
     el("div", { class: "toolbar" }, el("h2", {}, "Clusters"),
       el("span", { class: "muted" }, local ? `hpclib ${local} on this machine` : ""),
@@ -192,13 +235,14 @@ export async function clusterPage(name, tab, sub = "") {
     el("div", {}, el("h2", {}, c.name), el("div", { class: "muted" }, `${c.host} · MCP ${c.mcp_name || "—"}`)),
     el("div", { class: "chips" },
       chip(login(c) ? "logged in" : "not logged in", login(c) ? "up" : "down"),
-      chip(`agent tunnel ${tunnelUp(c) ? "up" : (c.tunnel || {}).state || "down"}`, tunnelUp(c) ? "up" : "down")),
+      chip(`agent tunnel ${tunnelUp(c) ? "up" : (c.tunnel || {}).state || "down"}`, tunnelTone(c))),
     el("div", { class: "actions" }, login(c)
       ? action("Log out", async () => { await api(path(name, "logout"), { method: "POST" }); ctx.render(); })
       : action("Log in", () => runStep(c, "login"), { primary: true })));
   const pages = { overview, jobs: jobsTab, apps: appsTab, installed, storage: storageTab, files, agents, settings,
                   widget: widgetTab };
   const body = await (tab === "apps" && sub ? appPage(c, sub) : (pages[tab] || overview)(c, local, sub));
+  followWhileStarting([c]);
   return [head, body];
 }
 
@@ -219,7 +263,7 @@ async function overview(c, local) {
   const missing = states.filter((s) => s && s.install && s.install.state === "missing");
   return el("div", {},
     step ? el("section", { class: "next-step" }, el("div", {}, el("strong", {}, "Next: "), step[2]),
-      action(step[0], step[1], { primary: true })) : null,
+      stepAction(step)) : null,
     el("div", { class: "tiles" },
       tile("Agent tunnel", el("hpc-state", { state: (c.tunnel || {}).state || "down" }),
         tunnelUp(c) ? `REST server on ${(c.tunnel || {}).hostname || "a compute node"}` : "agents can't reach the cluster",
@@ -478,7 +522,89 @@ async function agents(c, local, sub) {
       "agent tunnel. Setup installs the job templates, the sandboxed server's config and the agent's token."),
     el("table", { class: "rows" },
       el("thead", {}, el("tr", {}, ["Cluster", "Tunnel", "Login", "Port", "Token", ""].map((h) => el("th", {}, h)))), row),
-    mcpNameCard(c));
+    mcpNameCard(c), tunnelActionsCard(c));
+}
+
+// Tunnel actions (rest_actions.py on the cluster): what each tunnel offers agents, which are on, and whether each
+// can run now. Off until turned on here; an action that writes outside the cluster (data-transfer's put) is off
+// even then until turned on by itself.
+function tunnelActionsCard(c) {
+  const box = el("section", { class: "card", id: "tunnel-actions" });
+  const head = el("h3", {}, "Tunnel actions");
+  const intro = el("p", { class: "muted" }, "Operations a tunnel runs for agents with your access, such as copying " +
+    "files to and from your group's SMB server with your sign-in. They run as you, outside the agents' sandbox, " +
+    "with typed, checked parameters, and each call is in the audit log (Activity). Agents see only what is on.");
+  if (!tunnelUp(c) || !c.has_owner_token) {
+    box.append(head, intro, el("p", { class: "muted" }, "Start the agent tunnel to see and change them."));
+    return box;
+  }
+  const notice = el("p", { class: "notice", role: "status" });
+  const draw = async (refresh = false) => {
+    const [{ tunnels }, conf] = await Promise.all([
+      ctx.api(path(c.name, `rest/actions${refresh ? "?refresh=1" : ""}`)), ctx.api(path(c.name, "rest/admin/config"))]);
+    const section = JSON.parse(JSON.stringify((conf.config || {}).tunnel_actions || {}));
+    const save = async (message) => {
+      await ctx.api(path(c.name, "rest/admin/config"), { method: "PUT", body: { changes: { tunnel_actions: section } } });
+      notice.textContent = message;
+      await draw();
+    };
+    const cards = tunnels.map((t) => {
+      if (t.error) return el("div", { class: "error-box small" }, `${t.tunnel}: ${t.error}`);
+      const entry = section[t.tunnel] = section[t.tunnel] || { enabled: false };
+      const avail = t.availability;
+      const status = !t.enabled ? chip("off", "down")
+        : !avail ? chip("checking…", "down")
+        : avail.available ? chip("available", "up") : chip("not available", "starting");
+      const detail = avail && avail.available && avail.detail
+        ? Object.entries(avail.detail).filter(([, v]) => v).map(([k, v]) =>
+          `${k}: ${typeof v === "object" ? Object.values(v).filter(Boolean).join(" until ") : v}`).join(" · ")
+        : avail && avail.reason;
+      const on = el("input", { type: "checkbox", checked: t.enabled, "aria-label": `Turn on ${t.title} actions` });
+      on.addEventListener("change", () => {
+        entry.enabled = on.checked;
+        save(on.checked ? `${t.title}: agents may use its actions that are on.` : `${t.title}: off for agents.`)
+          .catch((err) => box.prepend(ctx.errorBox(err)));
+      });
+      const rows = t.actions.map((a) => {
+        const box2 = el("input", { type: "checkbox", checked: a.enabled, disabled: !t.enabled,
+                                   "aria-label": `Turn on ${t.tunnel}/${a.name}` });
+        box2.addEventListener("change", async () => {
+          if (box2.checked && a.writes === "remote" && !await confirmDialog(`Let agents ${a.title.toLowerCase()}?`,
+              `${a.title} writes outside the cluster with your access (${t.title}). Agents could add or replace ` +
+              "files there. Turn it on only while you want agents to do this.", "Turn on")) {
+            box2.checked = false;
+            return;
+          }
+          entry.actions = entry.actions || {};
+          if (box2.checked === a.default) delete entry.actions[a.name]; else entry.actions[a.name] = box2.checked;
+          save(`${t.tunnel}/${a.name}: ${box2.checked ? "on" : "off"}.`).catch((err) => box.prepend(ctx.errorBox(err)));
+        });
+        const params = Object.entries(a.params).map(([k, p]) => `${k} (${p.type}${p.access ? `, ${p.access}` : ""})`).join(", ");
+        return el("tr", {},
+          el("td", {}, box2),
+          el("td", {}, el("strong", {}, a.title), " ", el("span", { class: "muted small" }, `${t.tunnel}/${a.name}`),
+            el("div", { class: "muted small" }, a.description),
+            el("div", { class: "muted small" }, `${a.mode === "job" ? "runs as a SLURM job" : "answers at once"} · ` +
+              `needs the ${a.scope} scope · ${params || "no parameters"}`)),
+          el("td", {}, el("span", { class: "chips" },
+            a.writes === "remote" ? chip("writes outside the cluster", "error") : null,
+            a.writes === "cluster" ? chip("writes to your directories", "starting") : null,
+            !a.default ? chip("off by default", "down") : null)));
+      });
+      return el("div", { class: "action-tunnel" },
+        el("div", { class: "toolbar" }, el("label", {}, on, " ", el("strong", {}, t.title)), status,
+          el("span", { class: "muted small" }, detail || "")),
+        t.description ? el("p", { class: "muted small" }, t.description) : null,
+        el("table", { class: "compact" }, el("tbody", {}, rows)));
+    });
+    box.replaceChildren(head, intro, notice,
+      el("div", { class: "toolbar" }, action("Check availability", () => draw(true))),
+      ...(cards.length ? cards : [el("p", { class: "muted" }, "No installed tunnel offers actions on this cluster " +
+        "(update hpclib there: Installed).")]));
+  };
+  box.append(head, intro, el("p", { class: "muted" }, "Loading…"));
+  draw().catch((err) => box.replaceChildren(head, intro, ctx.errorBox(err)));
+  return box;
 }
 
 // What LLM clients call this cluster's MCP server; renaming it updates mcp.json and the clients kept up to date

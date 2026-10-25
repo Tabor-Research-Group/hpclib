@@ -1459,6 +1459,28 @@ class TestDataTransfer(ConsoleTestCase):
         self.assertEqual(pushed[:3], ["tunnel_setup", self.host, "data-transfer"])
         self.assertIn("SMB_ROOT=research/our_group", pushed)
 
+    def test_password_mode_controls_with_kerberos_available(self):
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            for host in ("files.example.edu", "10.0.0.12"):
+                for ticket in (None, {"principal": "me@AUTH.EXAMPLE.EDU", "expires": "later"}):
+                    for saved in (False, True):
+                        with self.subTest(host=host, ticket=bool(ticket), saved=saved):
+                            self.shell.smb_status.update(host=host, auth="password", kinit="host",
+                                                         rclone_kerberos=True, ticket=ticket, credentials=saved)
+                            status, out = self.call("POST", self.route + "/control/status", {})
+                            self.assertEqual(status, 200, out)
+                            state = self.call("GET", self.route)[1]
+                            control = "forget_credentials" if saved else "save_credentials"
+                            self.assertEqual([c["id"] for c in state["controls"]], [control, "status"])
+                            signin = {t["id"]: t["text"] for t in state["tools"]}["signin"]
+                            if saved:
+                                self.assertIn("a saved password is used", signin)
+                                self.assertIn("password sign-in is selected", state["controls"][0]["confirm"])
+                            else:
+                                self.assertIn("password sign-in selected", signin)
+                                self.assertEqual(state["controls"][0]["label"], "Save password for sync jobs")
+                                self.assertTrue(state["controls"][0]["primary"])
+
     def test_kinit_in_the_page(self):
         with mock.patch.object(self.clusters.logins, "alive", return_value=True):
             status, out = self.call("POST", self.route + "/control/kinit", {})

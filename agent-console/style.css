@@ -409,3 +409,4 @@ table + .card { margin-top: var(--space-xl); }
 iframe.widget-frame { display: block; width: 100%; border: none; background: transparent; color-scheme: normal; }
 .widget.bare iframe.widget-frame { min-height: 300px; }
 .widgets-table th { padding-top: var(--space-lg); color: var(--fg); }
+.action-tunnel + .action-tunnel { margin-top: var(--space-xl); border-top: 1px solid var(--line); padding-top: var(--space-lg); }

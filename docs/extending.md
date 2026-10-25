@@ -1,6 +1,6 @@
 # Extending hpclib
 
-hpclib has five extension points:
+hpclib has six extension points:
 
 | To add | Write | Lives |
 | --- | --- | --- |
@@ -8,6 +8,7 @@ hpclib has five extension points:
 | a page in the console for it | an **app**: an entry in `APPS`, or a package | `hpclib/servers/agent_console.py`, or a zip |
 | apps, tunnels or settings that don't belong in hpclib | a **console package** | a zip installed with Packages |
 | a dashboard on the console's pages | a **widget**: one HTML file, in a package | a zip installed with Packages |
+| something a tunnel does for agents with your access | **tunnel actions**: an `actions.json` in the tunnel | the tunnel's folder |
 | a kind of job an agent may run | a **job template** | `~/.local/tunnels/rest/templates/NAME` on a cluster |
 
 ## Adding a tunnel
@@ -494,6 +495,47 @@ The data a widget reads (cluster names, job names, sizes) isn't secret, but it i
 any package, from people you trust. On Interface Settings → Widgets, each can be hidden and moved within its
 place. `examples/console-widgets/gpu-queue` is a complete package with two widgets from one file; build it with
 `python3 hpclib/servers/console_packages.py build examples/console-widgets/gpu-queue`.
+
+## Tunnel actions
+
+A tunnel can offer agents typed operations that the cluster's REST server runs **for them, as you**, outside their
+sandbox: Data transfer's copy to and from your SMB server, with your Kerberos ticket. They are declared, not
+programmed against the server: an `actions.json` beside the tunnel's scripts (the full format is at the top of
+`hpclib/servers/rest_actions.py`):
+
+```json
+{"title": "SMB server", "description": "...",
+ "available": {"run": ["smbshell.sh", "status", "--json", "--brief"], "line": "HPCLIB_SMB_STATUS",
+               "require": ["host", "image"], "any": ["ticket", "credentials"], "show": ["host", "ticket"],
+               "message": "not signed in to the SMB server", "cache": 30},
+ "actions": {
+   "list": {"description": "...", "mode": "sync", "scope": "read",
+            "params": {"remote": {"type": "remote-path", "default": ""}},
+            "run": ["smbshell.sh", "ls", "{remote}", "--json"]},
+   "put": {"description": "...", "mode": "job", "scope": "submit", "writes": "remote", "default": false,
+           "params": {"local": {"type": "cluster-path", "access": "read"}, "remote": {"type": "remote-path"}},
+           "run": ["smbshell.sh", "submit", "{job_options}", "action-put", "--scope", "{scope_file}",
+                   "--helper", "{helper}", "{local}", "{remote}"]}}}
+```
+
+- **Off until you turn it on.** Installing a tunnel offers its actions; they run only once the owner turns the
+  tunnel on for a cluster (the cluster's **Agents** tab, or `tunnel_actions` in the REST config). An action marked
+  `"default": false` (anything that writes outside the cluster) stays off even then until turned on by itself.
+- **Typed parameters, checked by the server.** `cluster-path` is resolved like the files API, inside the token's
+  directories; `access: write` must name a new directory. `remote-path` is relative to the tunnel's own root (no
+  leading `/` or `-`, no `..`). `string` needs a `pattern`; `integer` and `boolean` are what they say. Each fills
+  one whole argument of `run`, which runs without a shell, from the tunnel's folder.
+- **Jobs like any other.** A `job` action passes `{job_options}` (which name the agent and the action) to sbatch
+  and prints the job's ID: the job is recorded with the template jobs, so `job_status`, `wait_for_job`, cancel and
+  the concurrent-job cap apply, and the console labels it "agent: TUNNEL/ACTION".
+- **Availability.** `available` runs a quick status command; the action answers 409 with the tunnel's `message`
+  while it says no (for Data transfer: no ticket and no saved password).
+- **Never the agent's path.** An action's job copies between the agent's directory and a staging folder of yours
+  with `{helper}` (`action_paths.py`), which follows no links and checks the token's directories (`{scope_file}`)
+  again when the job runs: an agent can't swap in a link to `~/.ssh` while the job waits.
+- **Audited.** Every call, with its parameters, is in the REST server's audit log (Activity).
+
+Agents see the actions through two MCP tools, `list_tunnel_actions` and `run_tunnel_action`.
 
 ## Writing job templates
 

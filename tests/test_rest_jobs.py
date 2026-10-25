@@ -753,7 +753,7 @@ class TestMCP(JobServerTestCase):
             "cluster_info", "sandbox_info", "list_templates", "submit_job", "list_jobs", "job_status", "wait_for_job",
             "cancel_job", "list_files", "read_file", "tail_file", "read_guide", "list_modules",
             "search_modules", "list_template_proposals", "propose_template", "environment_info",
-            "sync_environment", "sync_status"]))
+            "sync_environment", "sync_status", "list_tunnel_actions", "run_tunnel_action"]))
         self.assertTrue(field(by_name["cluster_info"].annotations, "readOnlyHint"))
         self.assertTrue(field(by_name["cancel_job"].annotations, "destructiveHint"))
         schema = field(by_name["submit_job"], "inputSchema")

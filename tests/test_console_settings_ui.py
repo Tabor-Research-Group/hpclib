@@ -171,6 +171,67 @@ class TestConsoleSettingsUI(unittest.TestCase):
         self.assertEqual(renamed, [{"name": "grace-gpu"}])
         self.assertEqual(self.errors, [])
 
+    def test_tunnel_actions_are_turned_on_and_put_needs_its_own_yes(self):
+        demo = {"name": "demo", "host": "me@demo.example", "mcp_name": "hpclib-demo", "set_up": True, "port": 20735,
+                "has_owner_token": True, "login": {"state": "connected"}, "tunnel": {"state": "up"}}
+        config = {"tunnel_actions": {}}
+        puts = []
+
+        def actions():
+            entry = config["tunnel_actions"].get("data-transfer", {})
+            on = entry.get("enabled", False)
+            chosen = entry.get("actions", {})
+            acts = [{"name": n, "title": t, "description": d, "mode": m, "scope": "submit", "writes": w, "default": dflt,
+                     "enabled": on and chosen.get(n, dflt), "permitted": True,
+                     "params": {"remote": {"type": "remote-path"}}}
+                    for n, t, d, m, w, dflt in (("list", "List a folder", "l", "sync", None, True),
+                                                ("get", "Copy from the SMB server", "g", "job", "cluster", True),
+                                                ("put", "Copy to the SMB server", "p", "job", "remote", False))]
+            t = {"tunnel": "data-transfer", "title": "SMB server", "description": "files", "enabled": on, "actions": acts}
+            if on:
+                t["availability"] = {"available": True, "detail": {"host": "files.example.edu"}}
+            return {"tunnels": [t]}
+
+        def handler(route, path):
+            if path == "clusters/demo/rest/admin/config":
+                if route.request.method == "PUT":
+                    puts.append(route.request.post_data_json["changes"]["tunnel_actions"])
+                    config["tunnel_actions"] = puts[-1]
+                route.fulfill(body=json.dumps({"config": config}), content_type="application/json")
+                return True
+            if path == "clusters/demo/rest/actions":
+                route.fulfill(body=json.dumps(actions()), content_type="application/json")
+                return True
+            if path in ("clusters", "clusters/demo"):
+                route.fulfill(body=json.dumps({"clusters": [demo]} if path == "clusters" else demo),
+                              content_type="application/json")
+                return True
+            return self.handler(route, path)
+        console_ui.TestConsoleUI.load_console(self, handler)
+        self.page.goto(self.base + "/#/c/demo/agents")
+        card = self.page.locator("#tunnel-actions")
+        put = card.get_by_label("Turn on data-transfer/put", exact=True)
+        put.wait_for()
+        self.assertTrue(put.is_disabled())                        # the tunnel is off
+        card.get_by_label("Turn on SMB server actions", exact=True).check()
+        card.get_by_text("available", exact=True).wait_for()
+        self.assertEqual(puts[-1], {"data-transfer": {"enabled": True}})
+        self.assertTrue(card.get_by_label("Turn on data-transfer/get", exact=True).is_checked())
+        self.assertFalse(card.get_by_label("Turn on data-transfer/put", exact=True).is_checked())
+        # writing outside the cluster asks first: Cancel leaves it off
+        card.get_by_label("Turn on data-transfer/put", exact=True).click()
+        dialog = self.page.locator("hpc-dialog[heading^='Let agents copy to the smb server']")
+        dialog.get_by_role("button", name="Cancel", exact=True).click()
+        self.page.wait_for_function("!document.querySelector('[aria-label=\"Turn on data-transfer/put\"]').checked")
+        self.assertEqual(len(puts), 1)
+        self.assertFalse(card.get_by_label("Turn on data-transfer/put", exact=True).is_checked())
+        card.get_by_label("Turn on data-transfer/put", exact=True).click()
+        dialog.get_by_role("button", name="Turn on", exact=True).click()
+        card.get_by_text("data-transfer/put: on.").wait_for()
+        self.assertEqual(puts[-1], {"data-transfer": {"enabled": True, "actions": {"put": True}}})
+        self.assertTrue(card.get_by_label("Turn on data-transfer/put", exact=True).is_checked())
+        self.assertEqual(self.errors, [])
+
     def test_about_copies_the_link(self):
         self.page.context.grant_permissions(["clipboard-read", "clipboard-write"])
         self.open("#/about")

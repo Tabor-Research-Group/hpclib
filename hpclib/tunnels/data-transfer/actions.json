@@ -1,0 +1,49 @@
+{
+  "title": "SMB server",
+  "description": "Files on your group's SMB server (Data transfer's SMB_HOST and SMB_ROOT), with your sign-in: a Kerberos ticket or the saved password from the console's Data transfer page. Paths are relative to the server folder (SMB_ROOT).",
+  "available": {
+    "run": ["smbshell.sh", "status", "--json", "--brief"],
+    "line": "HPCLIB_SMB_STATUS",
+    "require": ["host", "image"],
+    "any": ["ticket", "credentials"],
+    "show": ["host", "root", "user", "ticket", "credentials"],
+    "message": "not signed in to the SMB server: sign in from the console's Data transfer page (Kerberos), or save a password there",
+    "cache": 30
+  },
+  "actions": {
+    "list": {
+      "title": "List a folder on the SMB server",
+      "description": "The files and folders in REMOTE (a path relative to the server folder; empty: the folder itself), as rclone lsjson entries: Path, Name, Size, ModTime, IsDir.",
+      "mode": "sync",
+      "scope": "read",
+      "params": {"remote": {"type": "remote-path", "default": "", "description": "a folder relative to the server folder"}},
+      "run": ["smbshell.sh", "ls", "{remote}", "--json"],
+      "timeout": 120
+    },
+    "get": {
+      "title": "Copy from the SMB server",
+      "description": "Copies REMOTE (a file or folder on the server) into LOCAL, a new directory in your work directories, as a SLURM job; follow it with job_status or wait_for_job.",
+      "mode": "job",
+      "scope": "submit",
+      "writes": "cluster",
+      "params": {"remote": {"type": "remote-path", "description": "a file or folder relative to the server folder"},
+                 "local": {"type": "cluster-path", "access": "write", "description": "a new directory to copy into (it must not exist)"}},
+      "run": ["smbshell.sh", "submit", "{job_options}", "action-get", "--scope", "{scope_file}", "--helper", "{helper}", "{remote}", "{local}"],
+      "output": "{data_dir}/sessions/data-transfer/transfer-{job_id}.log",
+      "timeout": 120
+    },
+    "put": {
+      "title": "Copy to the SMB server",
+      "description": "Copies LOCAL (a file or folder in your work directories) to REMOTE, a folder on the server, as a SLURM job. It adds and replaces files there; it deletes nothing. Off unless the cluster's owner turns it on.",
+      "mode": "job",
+      "default": false,
+      "scope": "submit",
+      "writes": "remote",
+      "params": {"local": {"type": "cluster-path", "access": "read", "description": "a file or folder in your work directories"},
+                 "remote": {"type": "remote-path", "description": "a folder relative to the server folder"}},
+      "run": ["smbshell.sh", "submit", "{job_options}", "action-put", "--scope", "{scope_file}", "--helper", "{helper}", "{local}", "{remote}"],
+      "output": "{data_dir}/sessions/data-transfer/transfer-{job_id}.log",
+      "timeout": 120
+    }
+  }
+}

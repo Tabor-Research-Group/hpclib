@@ -96,8 +96,9 @@ Moving files between a cluster and an SMB file server with rclone. Per cluster, 
 
 - **Install** pulls the data-transfer-tools image.
 - **Start** runs a web GUI on the cluster's **login node** (no job), reached through your login: by default
-  rclone's own, for browsing and copying between the SMB server (`smb`), the cluster's files (`cluster`), and any
-  remotes a settings package adds. **Open** signs you in to it automatically; **Copy username** and **Copy
+  rclone's own, for browsing and copying between the SMB server (`smb`, which opens at the settings' folder when
+  one is set; `smb-server` is then the whole server), the cluster's files (`cluster`), and any remotes a settings
+  package adds. **Open** signs you in to it automatically; **Copy username** and **Copy
   password** are there if the browser asks anyway. **Stop** ends it.
 - **Kerberos log in (kinit)** gets a ticket with `kinit`, where the cluster has Kerberos; the GUI and jobs use it
   while it lasts. It can run while the GUI does.
@@ -105,6 +106,12 @@ Moving files between a cluster and an SMB file server with rclone. Per cluster, 
   reversible encoding) so batch transfers (`smbshell submit`) can run unattended.
 
 Without a ticket or a saved password, Start asks for the SMB password, which is kept only in memory until Stop.
+
+**Agents and the SMB server.** Data transfer also offers agents three [tunnel actions](../extending.md#tunnel-actions),
+which you turn on per cluster on its **Agents** tab: **list** a folder, **get** (copy from the server into a new
+directory in the agent's work directories) and **put** (copy to the server). They use your sign-in, so they work
+only while you have a Kerberos ticket or a saved password, and **put** stays off until you turn it on by itself.
+Copies run as SLURM jobs and go through a staging folder of yours, so an agent's links never lead them elsewhere.
 
 Settings: the SMB server, the share and folder paths are relative to, user name, domain, Kerberos realm, how to
 sign in, which **GUI** Start opens, and where the image is kept. GUI is `rclone` (the default), the name of a GUI

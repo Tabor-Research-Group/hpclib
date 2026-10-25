@@ -184,6 +184,14 @@ class RESTClient:
     def cancel_job(self, job_id):
         return self.request("POST", "/jobs/cancel", query={"id": job_id})
 
+    # tunnel actions (rest_actions.py)
+    def actions(self, refresh=False):
+        return self.request("GET", "/actions", query={"refresh": 1} if refresh else None)
+
+    def run_action(self, tunnel, action, params=None):
+        return self.request("POST", "/actions/run", body={"tunnel": tunnel, "action": action, "params": params or {}},
+                            timeout=max(self.timeout, 960))
+
     # Python environments (uv, pixi)
     def environment(self, project=None, manager="auto", environment="default"):
         query = {"project": project, "manager": manager, "environment": environment} if project else None

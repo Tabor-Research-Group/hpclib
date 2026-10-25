@@ -35,7 +35,8 @@ connected to it, and once PAI is installed its Install button is **Update**: it 
 proto-auto-interface checkout and pulls the app's image again (its Image setting says from where). **Data transfer** runs on the login node, not in a job: per cluster it installs the
 data-transfer-tools image, starts a web GUI for the SMB server (rclone's, or the one its GUI setting names), and
 signs you in to the server for `smbshell` beside it (Kerberos log in with kinit where the cluster has it,
-otherwise a password saved for sync jobs), both through the password dialog. Agents keeps its addresses (`#/clusters`, `#/files?...`); other apps live under
+or a password saved for sync jobs). Selecting password sign-in offers **Save password for sync jobs** even
+when Kerberos is available; both methods use the password dialog. Agents keeps its addresses (`#/clusters`, `#/files?...`); other apps live under
 `#/APP/PAGE`, e.g. `#/vscode/sessions`. A new tunnel app is an entry in `APPS` in
 `hpclib/servers/agent_console.py`, or, for one that doesn't belong in hpclib, a package: **Packages**
 (top right) checks a package zip, shows what it adds (apps, tunnels, settings and their values), installs it,

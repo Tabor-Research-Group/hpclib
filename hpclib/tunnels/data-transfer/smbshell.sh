@@ -15,7 +15,10 @@
 #   smbshell find-spn                               which name the server has in Kerberos (for SMB_SPN), when
 #                                                   cifs/SMB_HOST is "not found in Kerberos database"
 #   smbshell save-credentials | forget-credentials  a saved password, for jobs where there is no Kerberos
-#   smbshell status [--json]                        the image, and how it would sign in
+#   smbshell status [--json [--brief]]              the image, and how it would sign in (--brief: without asking
+#                                                   the image's rclone about Kerberos, for quick checks)
+#   smbshell action-get|action-put --scope F --helper H ...   what an agent's tunnel action runs in its job
+#                                                   (actions.json here; see hpclib/servers/rest_actions.py)
 #   smbshell shell                                  a shell in the image, with the server as rclone's "smb:"
 #   smbshell gui --port PORT                        a web GUI on 127.0.0.1:PORT of this node, signed in for this
 #                                                   session only (the console's Data transfer page forwards it to
@@ -34,7 +37,8 @@
 #   HPCLIB_GUI_USER    a login made for this session (random): require it, since anyone on this node can reach
 #   HPCLIB_GUI_PASS    127.0.0.1:PORT
 #   HPCLIB_GUI_DIR     a private directory in memory, removed when it stops
-#   RCLONE_CONFIG      rclone's remotes, signed in: smb (the server), cluster (this node's files), and the extras
+#   RCLONE_CONFIG      rclone's remotes, signed in: smb (the server; with SMB_ROOT, that folder, and smb-server the
+#                      whole server), cluster (this node's files), and the extras
 #   SMBSHELL_RCLONE    rclone in the image with that config: "$SMBSHELL_RCLONE" lsjson smb:SHARE/DIR
 # It prints one line on standard output once it serves, saying where to open it:
 #   HPCLIB_TRANSFER_GUI port=PORT [path=/start] [user=USER pass=PASS] [query=a=1&b=2]   (values without spaces)
@@ -294,10 +298,49 @@ PY
     SMBSHELL_DIR="$here" sbatch --parsable --job-name=smb-transfer --array="0-$((n - 1))" \
       --output="$logdir/transfer-%A_%a.log" $defaults "${opts[@]}" "$here/sbatch_script.sh" --manifest "$lines"
   else
-    case "${1:-}" in get|put|sync) ;; *) die "submit get|put|sync ..., or submit --manifest FILE" ;; esac
+    case "${1:-}" in get|put|sync|action-get|action-put) ;; *) die "submit get|put|sync ..., or submit --manifest FILE" ;; esac
     SMBSHELL_DIR="$here" sbatch --parsable --job-name=smb-transfer --output="$logdir/transfer-%j.log" \
       $defaults "${opts[@]}" "$here/sbatch_script.sh" "$@"
   fi
+}
+
+# -- tunnel actions --------------------------------------------------------------------------------
+# An agent's action (actions.json) runs these in its job, as you: the paths it names are in the agent's directories,
+# which the agent can change while the job waits. So rclone never sees them: it copies to or from a staging
+# directory of ours, and action_paths.py (--helper) moves files between that and the agent's path without
+# following links, checking the path against the token's directories (--scope) when the job runs.
+action_args() {  # sets SCOPE HELPER, and ARGS to the rest
+  SCOPE='' HELPER=''
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --scope) SCOPE="$2"; shift 2 ;;
+      --helper) HELPER="$2"; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  [ -f "$SCOPE" ] && [ -f "$HELPER" ] || die "an action needs --scope FILE --helper action_paths.py"
+  ARGS=("$@")
+}
+action_staging() {
+  mkdir -p -m 700 "$logdir/actions"
+  STAGING=$(mktemp -d "$logdir/actions/staging-${SLURM_JOB_ID:-$$}-XXXXXX") || die "no staging directory"
+  trap 'rm -rf "$STAGING"; rm -f "$SCOPE"' EXIT
+}
+action_get() {  # action-get --scope F --helper H REMOTE DEST: into DEST, a new directory
+  action_args "$@"
+  [ "${#ARGS[@]}" -eq 2 ] || die "usage: smbshell action-get --scope F --helper H REMOTE DEST"
+  action_staging
+  ( transfer get "${ARGS[0]}" "$STAGING/data" ) || exit 1
+  python3 "$HELPER" place "$STAGING/data" "${ARGS[1]}" --scope "$SCOPE" || exit 1
+  echo "smbshell: copied ${ARGS[0]} into ${ARGS[1]}"
+}
+action_put() {  # action-put --scope F --helper H SRC REMOTE: SRC (a file or directory) to REMOTE
+  action_args "$@"
+  [ "${#ARGS[@]}" -eq 2 ] || die "usage: smbshell action-put --scope F --helper H SRC REMOTE"
+  action_staging
+  python3 "$HELPER" stage-in "${ARGS[0]}" "$STAGING" --scope "$SCOPE" || exit 1
+  ( transfer put "$STAGING/$(basename "${ARGS[0]}")" "${ARGS[1]}" ) || exit 1
+  echo "smbshell: copied ${ARGS[0]} to ${ARGS[1]}"
 }
 
 status() {
@@ -310,7 +353,8 @@ status() {
     principal=$(krb klist 2>/dev/null | sed -n 's/^Default principal: *//p' | head -n 1)
     expires=$(krb klist 2>/dev/null | grep -i -m 1 krbtgt | awk '{print $3, $4}')
   fi
-  if [ "$image" = true ] && [ -n "$runtime" ] && img rclone help backend smb 2>/dev/null | grep -qi kerberos; then
+  if [ "${2:-}" != --brief ] && [ "$image" = true ] && [ -n "$runtime" ] &&
+     img rclone help backend smb 2>/dev/null | grep -qi kerberos; then
     kerb_rclone=true
   fi
   if [ "${1:-}" = --json ]; then
@@ -340,6 +384,8 @@ case "$cmd" in
   ''|-h|--help|help) usage ;;
   ls|get|put|sync) transfer "$cmd" "$@" ;;
   submit) submit "$@" ;;
+  action-get) action_get "$@" ;;
+  action-put) action_put "$@" ;;
   jobs) squeue -u "$(id -un)" --name=smb-transfer -o "%.12i %.10T %.10M %.12l %R" ;;
   login)
     [ -n "$(kinit_where)" ] || die "no kinit here or in the image; use smbshell save-credentials (or a password each time)"
@@ -419,9 +465,11 @@ PY
   rclone) sign_in; img rclone "$@" ;;
   gui)
     # rclone's web GUI on this (login) node, for as long as this runs. Its remotes are in a config file in a
-    # private directory in memory (/dev/shm or XDG_RUNTIME_DIR), removed when it stops: smb (the server),
-    # cluster (this node's files), and any in $HPCTUNNELS_DATA_DIR/settings/data-transfer.d/rclone.conf (which
-    # a settings package installs, e.g. an alias for a group's folder: [ours] type = alias remote = smb:SHARE/DIR).
+    # private directory in memory (/dev/shm or XDG_RUNTIME_DIR), removed when it stops: smb (the server; with
+    # SMB_ROOT set, that folder, as for the other commands, and smb-server the whole server), cluster (this
+    # node's files), and any in $HPCTUNNELS_DATA_DIR/settings/data-transfer.d/rclone.conf (which a settings
+    # package installs, e.g. an alias for a group's folder: [ours] type = alias remote = smb:SHARE/DIR; their
+    # smb: means the whole server, as it always has).
     # Its own login is a random user and password, printed once for the console to open it with.
     port=''
     while [ "$#" -gt 0 ]; do
@@ -476,19 +524,31 @@ PY
     extra_remotes="${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/settings/data-transfer.d/rclone.conf"
     extra_names=$( [ -f "$extra_remotes" ] && sed -n 's/^\[\(.*\)\][[:space:]]*$/\1/p' "$extra_remotes" | tr '\n' ' ')
     case " $extra_names " in
-      *" smb "*|*" cluster "*) die "$extra_remotes may not define smb or cluster, which smbshell makes" ;;
+      *" smb "*|*" smb-server "*|*" cluster "*)
+        die "$extra_remotes may not define smb, smb-server or cluster, which smbshell makes" ;;
     esac
+    # smb opens at the settings' folder (SMB_ROOT, a SHARE/FOLDER), like smbshell's other commands; the server
+    # itself is then smb-server, and the extra remotes' smb: (written for the whole server) points there
+    root="${SMB_ROOT:-}"
+    root="${root#/}"; root="${root%/}"
+    server_remote=smb
+    [ -n "$root" ] && server_remote=smb-server
     (
       umask 077
-      printf '[smb]\ntype = smb\nhost = %s\nuser = %s\n' "$SMB_HOST" "$RCLONE_CONFIG_SMB_USER"
+      printf '[%s]\ntype = smb\nhost = %s\nuser = %s\n' "$server_remote" "$SMB_HOST" "$RCLONE_CONFIG_SMB_USER"
       [ -n "${RCLONE_CONFIG_SMB_DOMAIN:-}" ] && printf 'domain = %s\n' "$RCLONE_CONFIG_SMB_DOMAIN"
       [ -n "${RCLONE_CONFIG_SMB_PASS:-}" ] && printf 'pass = %s\n' "$RCLONE_CONFIG_SMB_PASS"
       [ -n "${RCLONE_CONFIG_SMB_USE_KERBEROS:-}" ] && printf 'use_kerberos = true\n'
       [ -n "${RCLONE_CONFIG_SMB_SPN:-}" ] && printf 'spn = %s\n' "$RCLONE_CONFIG_SMB_SPN"
+      [ -n "$root" ] && printf '\n[smb]\ntype = alias\nremote = smb-server:%s\n' "$root"
       printf '\n[cluster]\ntype = local\n'
       if [ -f "$extra_remotes" ]; then
         printf '\n'
-        cat "$extra_remotes"
+        if [ -n "$root" ]; then
+          sed 's/^\([[:space:]]*remote[[:space:]]*=[[:space:]]*\)smb:/\1smb-server:/' "$extra_remotes"
+        else
+          cat "$extra_remotes"
+        fi
       fi
     ) > "$conf"
     unset RCLONE_CONFIG_SMB_TYPE RCLONE_CONFIG_SMB_HOST RCLONE_CONFIG_SMB_USER RCLONE_CONFIG_SMB_DOMAIN \
@@ -504,7 +564,7 @@ PY
       # rclone's GUI takes its login in the address for the page, and again (login_token) for its API calls
       token=$(printf '%s:%s' "$gui_user" "$gui_pass" | base64 | tr -d '\n' | tr '+/' '-_' | sed 's/=/%3D/g')
       echo "HPCLIB_TRANSFER_GUI port=$port user=$gui_user pass=$gui_pass query=login_token=$token"
-      echo "smbshell: rclone's web GUI on 127.0.0.1:$port of $(hostname -s); remotes: smb, cluster${extra_names:+, ${extra_names% }}" >&2
+      echo "smbshell: rclone's web GUI on 127.0.0.1:$port of $(hostname -s); remotes: smb${root:+ ($root), smb-server}, cluster${extra_names:+, ${extra_names% }}" >&2
       ( img_exec rclone rcd --config "$conf" --rc-web-gui --rc-web-gui-no-open-browser --rc-addr "127.0.0.1:$port" \
           --rc-user "$gui_user" --rc-pass "$gui_pass" --retries 1 --low-level-retries 1 < /dev/null ) &
     else
@@ -520,7 +580,7 @@ PY
       chmod 700 "$run_dir/rclone"
       run=(bash "$gui_prog")                     # a settings package's NAME.gui.sh isn't executable
       [ "$gui_prog" = "$gui" ] && [ -x "$gui" ] && run=("$gui")
-      echo "smbshell: $gui on 127.0.0.1:$port of $(hostname -s); remotes: smb, cluster${extra_names:+, ${extra_names% }}" >&2
+      echo "smbshell: $gui on 127.0.0.1:$port of $(hostname -s); remotes: smb${root:+ ($root), smb-server}, cluster${extra_names:+, ${extra_names% }}" >&2
       ( export HPCLIB_GUI_PORT="$port" HPCLIB_GUI_USER="$gui_user" HPCLIB_GUI_PASS="$gui_pass" \
                HPCLIB_GUI_DIR="$run_dir" RCLONE_CONFIG="$conf" SMBSHELL_RCLONE="$run_dir/rclone"
         exec "${run[@]}" < /dev/null ) &

@@ -835,10 +835,16 @@ PY2
 grep -q -- '--rc-web-gui --rc-web-gui-no-open-browser --rc-addr 127.0.0.1:27555 --rc-user hpclib --rc-pass ' "$sb/log" ||
   fail "rcd: $(cat "$sb/log")"
 sed -n '/^--- config$/,/^--- end$/p' "$sb/log" > "$sb/gui.conf"
-for want in '[smb]' 'type = smb' 'host = files.example.edu' 'domain = EXAMPLE' 'pass = OBS:hunter2' \
-            '[cluster]' 'type = local' '[ours]' 'remote = smb:research/our_group'; do
+# with SMB_ROOT, smb opens at that folder (as for ls/get/put) and smb-server is the whole server, which the
+# settings file's remotes (written for smb: as the server) now name
+for want in '[smb-server]' 'type = smb' 'host = files.example.edu' 'domain = EXAMPLE' 'pass = OBS:hunter2' \
+            '[smb]' 'type = alias' 'remote = smb-server:research/our_group' \
+            '[cluster]' 'type = local' '[ours]'; do
   grep -qxF "$want" "$sb/gui.conf" || fail "gui config lacks '$want': $(cat "$sb/gui.conf")"
 done
+[ "$(grep -cxF 'remote = smb-server:research/our_group' "$sb/gui.conf")" = 2 ] ||
+  fail "the settings file's alias still names smb: $(cat "$sb/gui.conf")"
+grep -q 'remote = smb:' "$sb/gui.conf" && fail "a remote still points at smb: $(cat "$sb/gui.conf")"
 grep -qF '[lab]' "$sb/gui.conf" && fail 'the gui config still has a [lab] remote of its own'
 # a GUI of your own (SMB_GUI=NAME: NAME.gui.sh, as a settings package leaves it, not executable): signed in, with
 # the session's remotes, a login to require, and rclone in the image to call; it says where to open it
@@ -860,6 +866,12 @@ grep -q "^rclone --config $sb/run/hpclib-rclone-gui\.[A-Za-z0-9]*/rclone.conf ls
   fail "own gui's rclone: $(cat "$sb/log")"
 grep -q "^binds=.*$sb/run/hpclib-rclone-gui\." "$sb/log" || fail "own gui's rclone sees no config: $(cat "$sb/log")"
 grep -q -- '--rc-web-gui' "$sb/log" && fail "rclone's GUI ran too: $(cat "$sb/log")"
+# without SMB_ROOT, smb is the server itself, and there is no smb-server
+sed -n '/^--- config$/,/^--- end$/p' "$sb/log" > "$sb/gui2.conf"
+if [ -s "$sb/gui2.conf" ]; then
+  grep -qxF '[smb]' "$sb/gui2.conf" && grep -qxF 'type = smb' "$sb/gui2.conf" && ! grep -qF 'smb-server' "$sb/gui2.conf" ||
+    fail "gui config without SMB_ROOT: $(cat "$sb/gui2.conf")"
+fi
 # one that isn't there, or isn't a name, stops before asking for a password
 for gui in nope 'a b'; do
   out=$(env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \

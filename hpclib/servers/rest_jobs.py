@@ -1792,6 +1792,24 @@ class JobManager:
             self.registry.record(job)
         return 201, dict(self.job_view(self.registry.get(job_id)), duplicate=False, sandbox=sandbox_plan)
 
+    def check_capacity(self, wanted=1):
+        """Refuse (429) when API jobs already use the concurrent-job cap; call it holding submit_lock."""
+        active = [j for j in self.refresh(self.registry.list(limit=1000, active_only=True)) if not j["terminal"]]
+        cap = self.limits["max_concurrent_jobs"]
+        used = sum(self._slots(j) for j in active)
+        if cap is not None and used + wanted > cap:
+            raise RESTError(429, f"API jobs already use {used} of {cap} concurrent slots and this needs {wanted}; "
+                                 "wait for jobs to finish or cancel one", active_jobs=[j["job_id"] for j in active])
+
+    def record_action_job(self, token_name, action, params, job_id, output, workdir):
+        """A job a tunnel action submitted (rest_actions.py): recorded like a template job, its template TUNNEL/ACTION."""
+        now = time.time()
+        self.registry.record({"job_id": job_id, "token": token_name, "template": action, "params": params,
+                              "resources": {}, "workdir": workdir, "job_name": action, "idempotency_key": None,
+                              "submitted": now, "state": "PENDING", "updated": now, "label": action,
+                              "output": output or ""})
+        return self.job_view(self.registry.get(job_id))
+
     def job_view(self, job, status=None, include_tasks=False):
         if status is None:
             status = job.get("status_details")

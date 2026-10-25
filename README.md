@@ -624,7 +624,8 @@ smbshell gui --port 27555                                 # a web GUI on the log
 
 **The GUI** (Data transfer's Start, Open and Stop): `smbshell gui` on the cluster's login node, over the
 console's ssh login, which forwards its port; Open goes straight in. By default (`SMB_GUI=rclone`) it is rclone's
-own web GUI (`rclone rcd --rc-web-gui`). Its remotes are `smb` (the server) and `cluster` (the node's files: home,
+own web GUI (`rclone rcd --rc-web-gui`). Its remotes are `smb` (the server; with `SMB_ROOT` set, that folder, as for
+`smbshell ls/get/put`, and then `smb-server` for the whole server) and `cluster` (the node's files: home,
 `/scratch`), for browsing and copying between them, plus any in
 `~/.local/tunnels/settings/data-transfer.d/rclone.conf` on the cluster (a settings package puts them there, e.g.
 an alias for your group's folder; see Console packages below). Start asks for the SMB password (unless there is a

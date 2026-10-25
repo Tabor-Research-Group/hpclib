@@ -267,6 +267,27 @@ def build_server(client: RESTClient, enable_file_writes=False, local_roots=None)
         return await call(client.sync_status, sync_id, wait_seconds)
 
     @server.tool(annotations=read_only, description=(
+        "Tunnel actions this cluster offers you: typed operations a tunnel runs for you with the cluster "
+        "owner's own access, such as copying files to and from the group's SMB server. Each lists its "
+        "parameters (types: cluster-path, a path in your directories; remote-path, a path relative to the "
+        "tunnel's own folder; string, integer, boolean), its mode (sync: the result comes back; job: it submits a "
+        "SLURM job, followed with job_status or wait_for_job) and whether it is available now (an SMB action "
+        "needs the owner signed in to the server). Only actions the owner turned on are listed."))
+    async def list_tunnel_actions() -> dict[str, Any]:
+        return await call(client.actions)
+
+    @server.tool(annotations=changes, description=(
+        "Run a tunnel action from list_tunnel_actions: tunnel and action are their names, params their "
+        "parameters by name. A copy into the cluster (cluster-path with access write) goes into a new directory, "
+        "which must not exist yet. Job-mode actions return the job (job_id); sync ones their result."))
+    async def run_tunnel_action(
+        tunnel: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")],
+        action: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")],
+        params: Annotated[Optional[dict[str, Any]], Field(description="the action's parameters by name")] = None,
+    ) -> dict[str, Any]:
+        return await call(client.run_action, tunnel, action, params or {})
+
+    @server.tool(annotations=read_only, description=(
         "Template proposals waiting for the cluster owner's review."))
     async def list_template_proposals() -> dict[str, Any]:
         return await call(client.proposals)
