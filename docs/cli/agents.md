@@ -35,7 +35,7 @@ Common options:
 | `--local-root DIR` | a folder on your machine the agent may push from and pull into (repeatable); default `~/Documents/Claude` |
 | `--no-local-root` | no local file access for the agent |
 | `--python-module MOD` / `--remote-python PATH` | choose the cluster's Python explicitly |
-| `--mcp-name NAME` | the MCP server's name (default `hpclib-` and the first part of the host name, e.g. `hpclib-grace`) |
+| `--mcp-name NAME` | the MCP server's name: letters, digits, `-` and `_` (default `hpclib-` and the first part of the host name, e.g. `hpclib-grace`). A later rename keeps the old name in the profile, so the console can remove it from LLM clients |
 | `--port N`, `--process-port N`, `--new-ports` | the tunnel's ports (picked at random, then kept) |
 | `--no-sandbox` | leave jobs unsandboxed (not recommended) |
 | `--rebuild` | regenerate templates, config, the sandbox image and the agent token; old copies are kept on the cluster |

@@ -69,7 +69,7 @@ class TestActivityUI(unittest.TestCase):
 
     def load_activity(self):
         console_ui.TestConsoleUI.load_console(self, self.fixture)
-        self.page.get_by_role("link", name="Activity", exact=True).click()
+        self.page.goto(self.base + "/#/activity")      # the all-clusters page, from before the cluster pages
         self.page.get_by_role("button", name="Check now", exact=True).wait_for()
 
     def rows(self):
@@ -100,7 +100,7 @@ class TestActivityUI(unittest.TestCase):
         self.assertEqual(self.page.locator(".activity-details").get_by_text("0:0", exact=True).count(), 1)
         self.page.get_by_role("button", name="Preview output", exact=True).click()
         self.page.locator("pre.log").wait_for()
-        self.assertEqual(self.page.get_by_role("link", name="Open in Files").get_attribute("href"), "#/files?cluster=demo&path=%2Fwork%2Ffinished.log")
+        self.assertEqual(self.page.get_by_role("link", name="Open in Files").get_attribute("href"), "#/c/demo/files?path=%2Fwork%2Ffinished.log")
         for width in (1440, 900, 480):
             self.page.set_viewport_size({"width": width, "height": 900})
             sizes = self.page.locator("hpc-panel.log-panel").evaluate("p => ({width:p.getBoundingClientRect().width, parent:p.parentElement.getBoundingClientRect().width, log:p.querySelector('pre').clientWidth, scroll:p.querySelector('pre').scrollWidth})")
@@ -157,7 +157,7 @@ class TestActivityUI(unittest.TestCase):
         self.page.wait_for_function("document.querySelector('tr[data-job-id=\"201\"]') !== null")
         self.assertEqual(self.page.locator(".activity-details").count(), 0)
         self.assertEqual(self.rows().count(), 1)
-        self.page.get_by_role("link", name="Clusters", exact=True).click()
+        self.page.locator("#pages").get_by_role("link", name="Clusters", exact=True).click()   # Agents → Clusters
         before = len([path for _, path, _ in self.calls if path.endswith("/rest/jobs")])
         self.page.wait_for_timeout(5500)
         self.assertEqual(len([path for _, path, _ in self.calls if path.endswith("/rest/jobs")]), before)
@@ -166,7 +166,7 @@ class TestActivityUI(unittest.TestCase):
     def test_no_owner_connection_has_a_clear_empty_state(self):
         self.clusters = []
         console_ui.TestConsoleUI.load_console(self, self.fixture)
-        self.page.get_by_role("link", name="Activity", exact=True).click()
+        self.page.goto(self.base + "/#/activity")
         self.page.get_by_text("Start a cluster tunnel with an owner token to check jobs and requests.", exact=True).wait_for()
         self.assertFalse(any("/rest/jobs" in path for _, path, _ in self.calls))
         self.assertEqual(self.errors, [])

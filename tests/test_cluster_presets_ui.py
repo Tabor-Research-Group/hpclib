@@ -47,10 +47,15 @@ class TestClusterPresetsUI(unittest.TestCase):
                 if attempt.get('code_event'):
                     logins._fail(attempt, 'test finished')
 
+    def open_agents_tab(self, host):
+        # the new cluster is listed on the clusters page (added from there); its profile's row is on its Agents tab
+        self.page.locator('table.overview-table tr').filter(has_text=host).locator('a.cluster-link').click()
+        self.page.locator('#pages').get_by_role('link', name='Agents', exact=True).click()
+
     def test_portable_settings_and_editable_username_directory(self):
         self.zip_file.write_bytes(package_tests.make_zip(PORTABLE))
         self.page.goto(self.base + '/#key=ui-test-key')
-        self.page.get_by_role('button', name='Add App or Settings', exact=True).click()
+        self.page.get_by_role('button', name='Packages', exact=True).click()
         self.page.locator('hpc-dialog input[type=file]').set_input_files(str(self.zip_file))
         self.page.get_by_role('button', name='Install', exact=True).click()
         self.page.get_by_role('button', name='Add cluster', exact=True).wait_for()
@@ -67,6 +72,7 @@ class TestClusterPresetsUI(unittest.TestCase):
         username.fill('finaluser')
         self.assertEqual(work.input_value(), '/work/my-agent-files')
         self.page.locator('section.card').get_by_role('button', name='Add cluster', exact=True).click()
+        self.open_agents_tab('finaluser@entropy.chem.tamu.edu')
         self.page.locator('hpc-cluster-row').filter(has_text='finaluser@entropy.chem.tamu.edu').wait_for()
         profile = agent_profiles.all_profiles()[0]
         self.assertEqual(profile['work_dirs'], ['/work/my-agent-files'])
@@ -77,7 +83,7 @@ class TestClusterPresetsUI(unittest.TestCase):
 
     def test_zip_install_create_profile_and_tacc_mfa_through_real_console(self):
         self.page.goto(self.base + '/#key=ui-test-key')
-        self.page.get_by_role('button', name='Add App or Settings', exact=True).click()
+        self.page.get_by_role('button', name='Packages', exact=True).click()
         self.page.locator('hpc-dialog input[type=file]').set_input_files(str(self.zip_file))
         self.page.get_by_role('button', name='Install', exact=True).click()
         self.page.get_by_role('button', name='Add cluster', exact=True).wait_for()
@@ -87,6 +93,7 @@ class TestClusterPresetsUI(unittest.TestCase):
         self.page.get_by_label('Cluster work directory', exact=True).fill('/work/testuser/agents')
         self.page.get_by_label('Cluster allocation', exact=True).fill('Project-123')
         self.page.locator('section.card').get_by_role('button', name='Add cluster', exact=True).click()
+        self.open_agents_tab('testuser@ls6.tacc.utexas.edu')
         row = self.page.locator('hpc-cluster-row').filter(has_text='Lonestar6 (TACC)')
         row.wait_for()
         self.assertTrue(row.get_by_role('button', name='Set up SSH', exact=True).is_disabled())
@@ -128,7 +135,7 @@ class TestClusterPresetsUI(unittest.TestCase):
             else: return False
             route.fulfill(body=json.dumps(result), content_type='application/json'); return True
         ui.TestConsoleUI.load_console(self, handler)
-        self.page.get_by_role('link', name='SSH keys', exact=True).click()
+        self.page.goto(self.base + '/#/c/lonestar/agents/keys')
         self.page.get_by_role('button', name='Copy public key', exact=True).wait_for()
         self.assertFalse(self.page.get_by_role('button', name='Copy public key', exact=True).is_disabled())
         for label in ('Create key', 'Save comment', 'Delete key', 'Add authorized key', 'Save host binding'):

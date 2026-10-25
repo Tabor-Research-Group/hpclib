@@ -17,6 +17,22 @@ there is no owner token).
 The front end depends only on the routes below; nothing here depends on it.
 
   GET  /api/health
+  GET  /api/about                            versions (running and on disk), paths, packages, this process
+  GET  /api/diagnostics                      about, preferences and every cluster's state, for a bug report
+                                              (token-like strings redacted)
+  GET  /api/preferences                      this machine's preferences (console_prefs.py)
+  PUT  /api/preferences                      {section: {...}}: notifications, new_cluster, llm_clients, interface
+  GET  /api/ports                            every local port the profiles hold, free / its tunnel's / taken
+  PUT  /api/ports/range                      {"low", "high"} (or {"reset": true}): where new ports are picked
+  POST /api/clusters/NAME/new-ports          {"app": APP or null}: new local ports while it is stopped
+                                              (the agent tunnel's also rewrites mcp.json and the LLM clients')
+  PUT  /api/clusters/NAME/mcp-name           {"name"}: the cluster's MCP server name (mcp.json, kept-up-to-date clients)
+  GET  /api/llm-clients                      Claude Desktop, Claude Code, Cursor, ChatGPT: which entries each has
+  POST /api/llm-clients/ID/write             add or update every cluster's entry (mcp_clients.py)
+  POST /api/llm-clients/ID/remove            {"name"}: remove an hpclib entry no cluster has any more
+  GET  /api/watch                            each tunnel's port open or not, and Stops asked for here
+  GET  /api/widgets                          the installed packages' widgets (slot, topics they read, height)
+  GET  /api/widgets/PACKAGE/ID               {"html"}: a widget's page, which the front end shows sandboxed
   POST /api/styles/open                      create console/user.css from default-styles.css if absent,
                                               then ask the OS to open it with its default CSS application
   GET  /api/clusters                          profiles + tunnel state, no token values
@@ -37,6 +53,11 @@ The front end depends only on the routes below; nothing here depends on it.
   POST /api/clusters/NAME/setup               setup_agents ({"work_dirs": [...], "binds": [...],
                                               "templates": "...", "rebuild": false})
   GET  /api/clusters/NAME/operation           the running or last install/setup/SSH setup, with its log
+  GET  /api/clusters/NAME/jobs                every job of yours on the cluster (squeue, and sacct for the last day) over
+                                              the login: queued, running and finished, each labelled with what started it
+  POST /api/clusters/NAME/jobs/cancel         {"job": ID}: scancel an agent's or another job (apps stop with their Stop)
+  GET  /api/clusters/NAME/storage             the last storage scan of the work directories (du), and the quota
+  POST /api/clusters/NAME/storage/scan        start a new scan over the login (in the background)
   GET  /api/clusters/NAME/ports               the login-node ports this console's tunnels use, and which run now
   POST /api/clusters/NAME/ports/clear         {"fresh_logins": false, "password"?, "max_logins"?}: clear what earlier
                                               tunnels left on those ports on every login node (clear_tunnel_ports,
@@ -122,6 +143,7 @@ import http.server
 import json
 import mimetypes
 import os
+import platform
 import re
 import secrets
 import shlex
@@ -142,6 +164,8 @@ sys.path.insert(0, os.path.join(HPCLIB_DIR, "lib"))
 import agent_profiles  # noqa: E402
 sys.path.insert(0, HERE)
 import console_packages  # noqa: E402
+import console_prefs  # noqa: E402
+import mcp_clients  # noqa: E402
 
 VERSION = "0.1"
 DEFAULT_PORT = 27180
@@ -329,6 +353,50 @@ def local_hpclib_version():
     except OSError:
         return None
     return m.group(1) if m else None
+
+
+STARTED_VERSION = local_hpclib_version()     # what this process loaded; the file may be newer (About says so)
+STARTED_AT = time.time()
+REDACT_RE = re.compile(r"[A-Za-z0-9_+=-]{32,}")      # token_urlsafe(32) and the like; not paths
+
+
+def git_info(directory):
+    """The checkout's branch and commit, read from .git (no git command), or None outside one."""
+    git = os.path.join(directory, ".git")
+    try:
+        with open(os.path.join(git, "HEAD")) as f:
+            head = f.read().strip()
+    except OSError:
+        return None
+    if not head.startswith("ref: "):
+        return {"branch": None, "commit": head[:12]}
+    ref = head[5:]
+    commit = None
+    try:
+        with open(os.path.join(git, ref)) as f:
+            commit = f.read().strip()
+    except OSError:
+        try:
+            with open(os.path.join(git, "packed-refs")) as f:
+                for line in f:
+                    if line.rstrip().endswith(" " + ref):
+                        commit = line.split()[0]
+        except OSError:
+            pass
+    return {"branch": ref.rsplit("/", 1)[-1], "commit": commit[:12] if commit else None}
+
+
+def redact(value):
+    """Strings for diagnostics: token-like runs hidden, the home directory as ~."""
+    if isinstance(value, dict):
+        return {k: redact(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(v) for v in value]
+    if isinstance(value, str):
+        return REDACT_RE.sub("[redacted]", value.replace(os.path.expanduser("~"), "~"))
+    return value
+
+
 REST_ROUTE_RE = re.compile(r"[A-Za-z0-9_./-]{1,256}")
 PROFILE_KEYS = ("name", "host", "port", "process_port", "work_dirs", "binds", "local_roots", "token_name", "preset",
                 "mcp_name", "created", "updated", "setup_config")
@@ -889,6 +957,80 @@ class Logins:
         return {"logged_out": res.returncode == 0, "detail": (res.stderr or res.stdout).strip()}
 
 
+
+
+def parse_rss(value):
+    """sacct's MaxRSS ("123456K", "1.5G") in KiB."""
+    m = re.fullmatch(r"([0-9.]+)([KMGT]?)", (value or "").strip())
+    if not m:
+        return 0.0
+    return float(m.group(1)) * {"": 1 / 1024, "K": 1, "M": 1024, "G": 1024 ** 2, "T": 1024 ** 3}[m.group(2)]
+
+
+def parse_storage(text):
+    """CLUSTER_STORAGE_SCRIPT's lines: {"dirs": [{path, kb, files, partial, missing, children: [...]}], "quota"}."""
+    dirs, current, quota = [], None, None
+    for line in text.splitlines():
+        kind, _, rest = line.partition("|")
+        if kind == "M":
+            dirs.append({"path": rest, "missing": True, "kb": None, "files": None, "children": []})
+        elif kind == "D":
+            state, _, path = rest.partition("|")
+            current = {"path": path, "partial": state != "ok", "kb": None, "files": None, "children": []}
+            dirs.append(current)
+        elif kind == "S" and current is not None:
+            kb, _, path = rest.partition("|")
+            if not kb.isdigit():
+                continue
+            if path.rstrip("/") == current["path"].rstrip("/"):
+                current["kb"] = int(kb)
+            else:
+                current["children"].append({"path": path, "kb": int(kb)})
+        elif kind == "I":
+            count, _, path = rest.partition("|")
+            for d in dirs:
+                if d["path"] == path and count.isdigit():
+                    d["files"] = int(count)
+        elif kind == "Q":
+            quota = {"command": rest, "lines": []}
+        elif kind == "q" and quota is not None:
+            quota["lines"].append(rest)
+    for d in dirs:
+        d["children"] = sorted(d["children"], key=lambda c: c["kb"], reverse=True)[:12]
+    return {"dirs": dirs, "quota": quota}
+
+# -- every job of yours on a cluster, and its storage (the cluster page's Jobs and Storage tabs) -----------------
+
+# Runs ON the login node: squeue (queued and running) and a day of sacct (finished), one marked line each.
+CLUSTER_JOBS_SCRIPT = r"""
+squeue -h -u "$USER" -o 'Q|%i|%j|%T|%r|%P|%M|%l|%D|%C|%b|%m|%N|%S|%k' 2>&1
+sacct -n -P -u "$USER" -S now-1day -o JobID,JobName,State,ExitCode,Elapsed,End,Partition,MaxRSS,ReqMem,Comment \
+  2>/dev/null | sed 's/^/A|/'
+"""
+
+# Runs ON the login node: STORAGE_TIMEOUT DIR...: each directory's size by its children (du -k --max-depth=1) and
+# file count, at low priority and with a time limit (then marked partial), and the site's quota report.
+CLUSTER_STORAGE_SCRIPT = r"""
+limit="$1"; shift
+tmp=$(mktemp) || exit 1
+trap 'rm -f "$tmp"' EXIT
+for d in "$@"; do
+  case "$d" in "~/"*) d="$HOME/${d#\~/}" ;; esac
+  if [ ! -d "$d" ]; then printf 'M|%s\n' "$d"; continue; fi
+  state=ok
+  timeout "$limit" nice -n 19 du -k --max-depth=1 -- "$d" > "$tmp" 2>/dev/null || state=partial
+  printf 'D|%s|%s\n' "$state" "$d"
+  sed 's/^\([0-9]*\)\t/S|\1|/' "$tmp"
+  files=$(timeout "$limit" nice -n 19 du -s --inodes -- "$d" 2>/dev/null | cut -f1)
+  printf 'I|%s|%s\n' "${files:-}" "$d"
+done
+for q in showquota myquota; do
+  if command -v "$q" > /dev/null 2>&1; then printf 'Q|%s\n' "$q"; timeout 60 "$q" 2>&1 | head -n 40 | sed 's/^/q|/'; exit 0; fi
+done
+if command -v quota > /dev/null 2>&1; then printf 'Q|quota -s\n'; timeout 60 quota -s 2>&1 | head -n 40 | sed 's/^/q|/'; fi
+"""
+
+
 class Clusters:
     """The agent profiles, plus the tunnels this console started."""
 
@@ -907,6 +1049,9 @@ class Clusters:
         self.app_procs = {}
         self.control_procs = {}      # (name, app): a row's control that asks for a password (kinit), beside its GUI
         self._clear_requests = {}    # name -> clear_ports' options (its password too), until its operation ends
+        self.script_runner = self._login_script
+        self.storage_scans = {}      # name -> {"state": "running", "started": ...} while a storage scan runs
+        self.stops = {}              # (name, app or None) -> when Stop was asked for here (notifications skip those)
         self.packages = load_package_apps()
         self.secret_runner = self._run_with_input
 
@@ -1178,6 +1323,15 @@ class Clusters:
                 self._record_setup(profile, record["app"], self._operation_text(profile, record))
             except Exception:    # the log or the profile is gone: the next Check says
                 pass
+        if record["kind"] == "setup" and code == 0 and profile is not None:
+            # its MCP entry may be new or changed: give it to the LLM clients the console keeps up to date
+            try:
+                synced = self.sync_llm_clients()
+                with open(self.ops_log_path(profile["name"]), "ab") as log:
+                    for cid, result in synced.items():
+                        log.write(f"MCP entries for {mcp_clients.CLIENTS[cid]['title']}: {result}\n".encode())
+            except Exception:     # the clients' state shows on Console Settings
+                pass
         with self.lock:
             record.update(state="succeeded" if code == 0 else "failed", exit_code=code, finished=time.time())
 
@@ -1289,6 +1443,148 @@ class Clusters:
         if profile.get("host") not in login:
             login.append(profile["host"])
         return self.run_operation(profile, "install", ["install_hpclib"] + (["--force"] if force else []) + login)
+
+
+    # -- every job of yours on a cluster, and its storage --------------------------------------------------------
+
+    def _login_script(self, profile, script, args=(), wait=60):
+        """`script` run with bash on the cluster's login node over the console's login: (exit code, stdout, stderr)."""
+        argv = self.hpclib_argv(["pssh"] + ssh_options(profile) + [profile["host"], shlex.join(["bash", "-s", "--", *args])])
+        try:
+            res = subprocess.run(argv, input=script.encode(), capture_output=True, timeout=wait,
+                                 env=dict(os.environ, **self.HPCLIB_ENV), start_new_session=True)
+        except subprocess.TimeoutExpired:
+            raise ConsoleError(504, f"{profile['name']} did not answer within {wait} s")
+        return res.returncode, res.stdout.decode(errors="replace"), res.stderr.decode(errors="replace")
+
+    def job_source(self, name, comment):
+        """What started a job, from what hpclib stamps on its jobs: {kind, label, app?, token?}."""
+        m = re.match(r"hpclib-rest:([^:]+):(.+)$", comment or "")
+        if m or (name or "").startswith("hpcrest-"):
+            template = m.group(2) if m else name[len("hpcrest-"):]
+            return {"kind": "agent", "label": f"agent: {template}", "token": m.group(1) if m else None}
+        tunnel = (name or "").rsplit("-", 1)[0] if "-" in (name or "") else None
+        if tunnel == "rest":
+            return {"kind": "agent-tunnel", "label": "agent tunnel"}
+        for app, spec in APPS.items():
+            if tunnel and spec.get("tunnel") == tunnel:
+                if spec.get("shared"):
+                    return {"kind": "shared", "label": f"{spec['title']} ({spec.get('instance_label') or 'shared'})",
+                            "app": app}
+                return {"kind": "app", "label": spec["title"], "app": app}
+        return {"kind": "other", "label": "other"}
+
+    QUEUED_STATES = {"PENDING", "REQUEUED", "SUSPENDED", "REQUEUE_HOLD", "RESV_DEL_HOLD", "SPECIAL_EXIT"}
+
+    def cluster_jobs(self, profile):
+        """Every job of yours on the cluster: squeue's queued and running jobs, and the last day's finished ones."""
+        if not self.logins.alive(profile):
+            raise ConsoleError(409, f"log in to {profile['name']} first: its jobs are read over the console's login")
+        code, out, err = self.script_runner(profile, CLUSTER_JOBS_SCRIPT, (), 60)
+        if code != 0 and "Q|" not in out:
+            raise ConsoleError(502, f"squeue failed on {profile['name']}: "
+                                    f"{self._one_line((err or out).strip().splitlines()[-1] if (err or out).strip() else code)}")
+        queued, running, active = [], [], set()
+        for line in out.splitlines():
+            if not line.startswith("Q|"):
+                continue
+            f = line[2:].split("|", 13)
+            if len(f) < 14:
+                continue
+            job = {"id": f[0], "name": f[1], "state": f[2], "reason": f[3], "partition": f[4], "elapsed": f[5],
+                   "time_limit": f[6], "nodes": f[7], "cpus": f[8], "gres": "" if f[9] in ("N/A", "(null)") else f[9],
+                   "memory": f[10], "node_list": f[11], "start": "" if f[12] in ("N/A", "Unknown") else f[12],
+                   "source": self.job_source(f[1], f[13])}
+            active.add(f[0].split("_")[0])
+            (queued if f[2] in self.QUEUED_STATES else running).append(job)
+        finished, steps = {}, {}
+        for line in out.splitlines():
+            if not line.startswith("A|"):
+                continue
+            f = line[2:].split("|", 9)
+            if len(f) < 10:
+                continue
+            jid = f[0]
+            if "." in jid:            # a step: its peak memory belongs to the job
+                steps.setdefault(jid.split(".")[0], []).append(f[7])
+                continue
+            if jid.split("_")[0] in active or f[2].split()[0] in ("RUNNING", "PENDING"):
+                continue
+            finished[jid] = {"id": jid, "name": f[1], "state": f[2].split()[0], "exit_code": f[3], "elapsed": f[4],
+                             "end": f[5], "partition": f[6], "requested_memory": f[8],
+                             "source": self.job_source(f[1], f[9])}
+        for jid, job in finished.items():
+            peaks = [parse_rss(v) for v in steps.get(jid, []) if v]
+            job["peak_memory_mb"] = round(max(peaks) / 1024, 1) if peaks else None
+        done = sorted(finished.values(), key=lambda j: j["end"], reverse=True)
+        # an app's session ends at its time limit or with Stop: only jobs that do work count as failed
+        failed = sum(1 for j in done if j["state"] != "COMPLETED" and j["source"]["kind"] in ("agent", "other"))
+        return {"cluster": profile["name"], "at": time.time(), "queued": queued, "running": running,
+                "finished": done, "counts": {"queued": len(queued), "running": len(running),
+                                             "finished": len(done), "failed": failed}}
+
+    def cancel_job(self, profile, body):
+        """scancel one job of yours that an agent or something else started; an app's job stops with the app."""
+        job = str((body or {}).get("job") or "")
+        if not re.fullmatch(r"[0-9]+(_[0-9]+)?", job) or set(body) - {"job"}:
+            raise ConsoleError(400, 'send {"job": "JOB ID"}')
+        listed = self.cluster_jobs(profile)
+        found = next((j for j in listed["queued"] + listed["running"] if j["id"] == job), None)
+        if found is None:
+            raise ConsoleError(404, f"job {job} is not queued or running on {profile['name']} (as you)")
+        kind = found["source"]["kind"]
+        if kind in ("app", "shared", "agent-tunnel"):
+            raise ConsoleError(409, {"app": f"stop {found['source']['label']} from its Apps row instead (Stop)",
+                                     "shared": f"{found['source']['label']}: use End database job on its Apps row",
+                                     "agent-tunnel": "stop the agent tunnel from Overview instead"}[kind])
+        code, out, err = self.script_runner(profile, 'scancel "$1"\n', (job,), 60)
+        if code != 0:
+            raise ConsoleError(502, f"scancel {job} failed: {self._one_line(err or out)}")
+        return {"cancelled": job}
+
+    STORAGE_TIMEOUT = 300
+
+    def storage_path(self, name):
+        return os.path.join(console_dir(), "storage", f"{name}.json")
+
+    def storage(self, profile):
+        name = profile["name"]
+        try:
+            with open(self.storage_path(name)) as f:
+                out = json.load(f)
+        except (OSError, ValueError):
+            out = {"scanned": None, "dirs": [], "quota": None}
+        with self.lock:
+            scan = self.storage_scans.get(name)
+        out["scan"] = dict(scan) if scan else {"state": "idle"}
+        out["work_dirs"] = list(profile.get("work_dirs") or [])
+        return out
+
+    def start_storage_scan(self, profile):
+        name = profile["name"]
+        if not self.logins.alive(profile):
+            raise ConsoleError(409, f"log in to {name} first: the scan runs over the console's login")
+        dirs = list(profile.get("work_dirs") or []) + ["~/.local/tunnels"]
+        with self.lock:
+            if (self.storage_scans.get(name) or {}).get("state") == "running":
+                return dict(self.storage_scans[name])
+            scan = self.storage_scans[name] = {"state": "running", "started": time.time()}
+        threading.Thread(target=self._storage_scan, args=(profile, dirs, scan), daemon=True).start()
+        return dict(scan)
+
+    def _storage_scan(self, profile, dirs, scan):
+        try:
+            code, out, err = self.script_runner(profile, CLUSTER_STORAGE_SCRIPT, (str(self.STORAGE_TIMEOUT), *dirs),
+                                                2 * self.STORAGE_TIMEOUT + 120)
+            result = parse_storage(out)
+            result["scanned"] = time.time()
+            os.makedirs(os.path.dirname(self.storage_path(profile["name"])), mode=0o700, exist_ok=True)
+            write_private(self.storage_path(profile["name"]), json.dumps(result))
+            state = {"state": "done", "finished": time.time()}
+        except Exception as e:
+            state = {"state": "failed", "finished": time.time(), "error": self._one_line(getattr(e, "payload", {}).get("error") or e)}
+        with self.lock:
+            scan.update(state)
 
     # -- leftover tunnel ports on the cluster's login nodes ---------------------
 
@@ -1516,7 +1812,25 @@ class Clusters:
         with contextlib.redirect_stdout(io.StringIO()):
             agent_profiles.cmd_init(name, host)
         agent_profiles.cmd_set(name, "login=", *[f"login+={a}" for a in login + [host]])
-        return self.describe(agent_profiles.load(name), tunnel=False)
+        # this machine's defaults for new clusters (Console Settings); a preset's own values replace them
+        prefs = console_prefs.load(console_dir())
+        fresh = agent_profiles.load(name)
+        fresh["connection_hours"] = prefs["new_cluster"]["connection_hours"]
+        pattern = prefs["new_cluster"].get("mcp_name_pattern") or agent_profiles.DEFAULT_MCP_PATTERN
+        taken = {p.get("mcp_name") for p in agent_profiles.all_profiles() if p["name"] != name}
+        # not a name an LLM client already uses for something else
+        first = agent_profiles.mcp_name_for(host, taken, pattern)
+        if not self._owned_mcp_name(first) and any(mcp_clients.has_other(cid, first, {"command": None, "args": None})
+                                                   for cid in mcp_clients.CLIENTS):
+            taken.add(first)
+        mcp_name = agent_profiles.mcp_name_for(host, taken, pattern)
+        if mcp_name != fresh.get("mcp_name"):
+            fresh["mcp_name"] = mcp_name
+        config = console_prefs.cluster_config(prefs)
+        if config is not None:
+            fresh["setup_config"] = config
+        agent_profiles.save(fresh)
+        return self.describe(fresh, tunnel=False)
 
     def preset_specs(self):
         try:
@@ -1574,7 +1888,7 @@ class Clusters:
         if apps:
             fresh["apps"] = apps
         if config is not None:
-            fresh["setup_config"] = config
+            fresh["setup_config"] = console_prefs.cluster_config(console_prefs.load(console_dir()), config)
         agent_profiles.save(fresh)
         return self.describe(fresh, tunnel=False)
 
@@ -1757,6 +2071,18 @@ class Clusters:
         return [{"name": m["name"], "version": m["version"], "description": m["description"],
                  "installed": m.get("installed"), "sha256": m.get("sha256"), "apps": sorted(m["apps"]),
                  "summary": console_packages.summary(m)} for m, _ in self.packages.installed()]
+
+    def widgets(self):
+        try:
+            return self.packages.widgets()
+        except console_packages.PackageError as e:
+            raise ConsoleError(500, str(e)) from e
+
+    def widget_html(self, package, widget_id):
+        try:
+            return {"html": self.packages.widget_html(package, widget_id)}
+        except (console_packages.PackageError, OSError) as e:
+            raise ConsoleError(404, f"no widget {package}/{widget_id}") from e
 
     def package_add(self, data, dry_run=False):
         """Check (dry_run) or install a package zip; its apps are there at once."""
@@ -2519,6 +2845,7 @@ class Clusters:
     def app_stop(self, profile, app, wait=30):
         self.app_spec(app)
         name = profile["name"]
+        self.stops[(name, app)] = time.time()
         _, conf = self.app_config(profile, app)
         log = self._open_log(name, f"stop_tunnel -P {conf['port']} {profile['host']}", self.app_log_path(name, app))
         try:
@@ -2582,6 +2909,7 @@ class Clusters:
 
     def stop_tunnel(self, profile, wait=30):
         name = profile["name"]
+        self.stops[(name, None)] = time.time()
         log = self._open_log(name, f"agent_stop {name}")
         try:
             stopper = self.shell_runner(["agent_stop", name], log)
@@ -2617,6 +2945,249 @@ class Clusters:
         except FileNotFoundError:
             return {"cluster": name, "lines": [], "path": path}
         return {"cluster": name, "lines": text.splitlines()[-lines:], "path": path}
+
+    # -- this machine: ports, LLM clients, notifications, diagnostics --------
+
+    def _tunnel_running(self, profile, app):
+        """Whether the tunnel (agent: app None) holds its port: started here, or answering behind it."""
+        name = profile["name"]
+        with self.lock:
+            proc = self.app_procs.get((name, app)) if app else self.procs.get(name)
+        if proc is not None and proc.poll() is None:
+            return True
+        if app is None:
+            return self.tunnel_state(profile)["state"] in ("up", "starting")
+        if app not in APPS:
+            return False
+        try:
+            return self._app_state(profile, app)["state"] in ("up", "queued", "starting")
+        except Exception:       # noqa: BLE001  (a removed app, an unreadable profile: not running here)
+            return False
+
+    def ports_report(self):
+        rows, running = [], {}
+        for profile, app, which, port in agent_profiles.all_ports():
+            key = (profile["name"], app)
+            title = ("agent tunnel" if app is None else
+                     APPS[app]["title"] if app in APPS else f"{app} (no longer installed)")
+            free = agent_profiles.port_free(port)
+            if not free and key not in running:
+                running[key] = self._tunnel_running(profile, app)
+            status = "free" if free else ("tunnel" if running[key] else "taken")
+            rows.append({"cluster": profile["name"], "app": app, "title": title, "which": which, "port": port,
+                         "status": status})
+        lo, hi = agent_profiles.port_range()
+        return {"range": [lo, hi], "default_range": list(agent_profiles.PORT_RANGE), "ports": rows}
+
+    def set_port_range(self, body):
+        try:
+            if body.get("reset"):
+                lo, hi = agent_profiles.set_port_range(None, None)
+            else:
+                lo, hi = agent_profiles.set_port_range(body.get("low"), body.get("high"))
+        except ValueError as e:
+            raise ConsoleError(422, str(e)) from e
+        return {"range": [lo, hi]}
+
+    def _write_mcp_port(self, profile):
+        """
+        mcp.json after the agent tunnel's port or MCP name changed: the entry under the profile's name, with its
+        --url on the port (the rest of the entry stays).
+        """
+        path = os.path.join(agent_profiles.profile_dir(profile["name"]), "mcp.json")
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            servers = data["mcpServers"]
+            entry = servers.get(profile["mcp_name"]) or next(iter(servers.values()))
+            args = entry["args"]
+            i = args.index("--url")
+            args[i + 1] = f"http://127.0.0.1:{profile['port']}"
+        except (OSError, ValueError, KeyError, TypeError, IndexError, StopIteration, AttributeError):
+            return False                 # not set up yet: setup_agents writes it with the new port and name
+        data["mcpServers"] = {profile["mcp_name"]: entry}
+        agent_profiles.write_private(path, json.dumps(data, indent=2) + "\n")
+        return True
+
+    def rename_mcp(self, profile, body):
+        """A new MCP name for the cluster: its mcp.json, and the LLM clients kept up to date (the old name goes)."""
+        name = body.get("name")
+        fresh = agent_profiles.load(profile["name"]) or profile
+        old = fresh.get("mcp_name")
+        try:
+            agent_profiles.check_mcp_name(name, fresh["name"])
+        except ValueError as e:
+            raise ConsoleError(422, str(e)) from e
+        if name == old:
+            return {"mcp_name": name, "llm_clients": {}}
+        mine = self._mcp_wanted().get(old) or {"command": None, "args": None}
+        if not self._owned_mcp_name(name):
+            for cid in mcp_clients.CLIENTS:
+                if mcp_clients.has_other(cid, name, mine):
+                    raise ConsoleError(409, f"{mcp_clients.CLIENTS[cid]['title']} already has an MCP server called "
+                                            f"{name}; pick another name")
+        agent_profiles.rename_mcp(fresh, name)
+        agent_profiles.save(fresh)
+        self._write_mcp_port(fresh)
+        return {"mcp_name": name, "previous": old, "llm_clients": self.sync_llm_clients(drop=[old] if old else [])}
+
+    def new_ports(self, profile, body):
+        """Pick new local ports for the agent tunnel (app: null) or an app, which must be stopped."""
+        app = body.get("app")
+        name = profile["name"]
+        if app is not None:
+            self.app_spec(app)
+        if self._tunnel_running(profile, app):
+            what = "the agent tunnel" if app is None else APPS[app]["title"]
+            raise ConsoleError(409, f"stop {what} on {name} first; its ports change only while it is stopped")
+        fresh = agent_profiles.load(name) or profile
+        if app is None:
+            old = [fresh.get("port"), fresh.get("process_port")]
+            fresh["port"] = agent_profiles.random_port(taken=old)
+            fresh["process_port"] = agent_profiles.random_port(taken=old + [fresh["port"]])
+            agent_profiles.save(fresh)
+            out = {"cluster": name, "app": None, "port": fresh["port"], "process_port": fresh["process_port"],
+                   "mcp_updated": self._write_mcp_port(fresh)}
+            if out["mcp_updated"]:
+                out["llm_clients"] = self.sync_llm_clients()
+            return out
+        conf = fresh.setdefault("apps", {}).setdefault(app, {})
+        old = [conf.get("port"), conf.get("process_port")]
+        conf["port"] = agent_profiles.random_port(taken=old)
+        conf["process_port"] = agent_profiles.random_port(taken=old + [conf["port"]])
+        agent_profiles.save(fresh)
+        return {"cluster": name, "app": app, "port": conf["port"], "process_port": conf["process_port"]}
+
+    @staticmethod
+    def _mcp_wanted():
+        return mcp_clients.wanted_entries(agent_profiles.all_profiles(), agent_profiles.profile_dir)
+
+    @staticmethod
+    def _owned_mcp_name(name):
+        """Names the console may change in an LLM client: hpclib-*, and any a profile has or had."""
+        if name.startswith("hpclib-"):
+            return True
+        return any(name == p.get("mcp_name") or name in (p.get("previous_mcp_names") or [])
+                   for p in agent_profiles.all_profiles())
+
+    def llm_clients(self):
+        enabled = console_prefs.load(console_dir())["llm_clients"]
+        wanted = self._mcp_wanted()
+        return [dict(mcp_clients.status(cid, wanted, self._owned_mcp_name), enabled=enabled.get(cid, False))
+                for cid in mcp_clients.CLIENTS]
+
+    @staticmethod
+    def _client(cid):
+        if cid not in mcp_clients.CLIENTS:
+            raise ConsoleError(404, f"no LLM client {cid!r}; the console knows {sorted(mcp_clients.CLIENTS)}")
+        return cid
+
+    def llm_client_write(self, cid):
+        self._client(cid)
+        try:
+            changed = mcp_clients.write(cid, self._mcp_wanted())
+        except (mcp_clients.ClientError, OSError) as e:
+            raise ConsoleError(422, str(e)) from e
+        return {"changed": changed, "client": mcp_clients.status(cid, self._mcp_wanted(), self._owned_mcp_name)}
+
+    def llm_client_remove(self, cid, body):
+        self._client(cid)
+        name = body.get("name")
+        st = mcp_clients.status(cid, self._mcp_wanted(), self._owned_mcp_name)
+        if name not in st["stale"]:
+            raise ConsoleError(422, "only an hpclib entry that no cluster has any more can be removed here")
+        try:
+            mcp_clients.remove(cid, name)
+        except (mcp_clients.ClientError, OSError) as e:
+            raise ConsoleError(422, str(e)) from e
+        return {"removed": name, "client": mcp_clients.status(cid, self._mcp_wanted(), self._owned_mcp_name)}
+
+    def sync_llm_clients(self, drop=()):
+        """
+        Write the entries to each enabled, installed client (first removing the drop names, a cluster's old MCP
+        names): {client: [changed names] or 'error: ...'}.
+        """
+        enabled = console_prefs.load(console_dir())["llm_clients"]
+        wanted = self._mcp_wanted()
+        out = {}
+        for cid, on in enabled.items():
+            if not on or cid not in mcp_clients.CLIENTS or not mcp_clients.available(cid):
+                continue
+            try:
+                st = mcp_clients.status(cid, wanted, self._owned_mcp_name)
+                for old in drop:
+                    if old in st["stale"]:
+                        mcp_clients.remove(cid, old)
+                out[cid] = mcp_clients.write(cid, wanted) or "up to date"
+            except (mcp_clients.ClientError, OSError) as e:
+                out[cid] = f"error: {e}"
+        return out
+
+    def watch(self):
+        """Each tunnel's local port, open or not (cheap: no health calls), for the page's notifications."""
+        out = []
+        for p in agent_profiles.all_profiles():
+            name = p["name"]
+            with self.lock:
+                proc = self.procs.get(name)
+                procs = {a: self.app_procs.get((name, a)) for a in (p.get("apps") or {})}
+            out.append({"cluster": name, "app": None, "title": "agent tunnel", "up": self.port_open(p["port"]),
+                        "started_here": proc is not None and proc.poll() is None,
+                        "stopped": self.stops.get((name, None))})
+            for app, conf in sorted((p.get("apps") or {}).items()):
+                if app not in APPS or not isinstance(conf, dict) or not conf.get("port"):
+                    continue
+                aproc = procs.get(app)
+                out.append({"cluster": name, "app": app, "title": APPS[app]["title"],
+                            "up": self.port_open(conf["port"]),
+                            "started_here": aproc is not None and aproc.poll() is None,
+                            "stopped": self.stops.get((name, app))})
+        return {"at": time.time(), "tunnels": out}
+
+    def about(self):
+        on_disk = local_hpclib_version()
+        return {"hpclib_version": STARTED_VERSION, "hpclib_version_on_disk": on_disk,
+                "restart_for": on_disk if on_disk and STARTED_VERSION and on_disk != STARTED_VERSION else None,
+                "console_version": VERSION, "hpclib_dir": HPCLIB_DIR, "git": git_info(os.path.dirname(HPCLIB_DIR)),
+                "python": platform.python_version(), "python_path": sys.executable,
+                "platform": platform.platform(), "console_dir": console_dir(), "agents_dir": agent_profiles.root(),
+                "pid": os.getpid(), "started": STARTED_AT, "clusters": len(self.names()),
+                "packages": [{"name": p.get("name"), "version": p.get("version")} for p in self.packages_list()]}
+
+    def diagnostics(self):
+        """What a bug report needs, without tokens, passwords or keys: versions, settings, every cluster's state."""
+        profiles = agent_profiles.all_profiles()
+
+        def one(p):
+            d = self.describe(p)
+            t, lg = d.get("tunnel") or {}, d.get("login") or {}
+            apps = {}
+            for app in sorted(p.get("apps") or {}):
+                if app not in APPS:
+                    continue
+                try:
+                    s = self._app_state(p, app)
+                    apps[app] = {k: s.get(k) for k in ("state", "error", "port", "started_here")}
+                    apps[app]["install"] = (s.get("install") or {}).get("state")
+                except Exception as e:   # noqa: BLE001
+                    apps[app] = {"error": f"{type(e).__name__}: {e}"}
+            return {"name": p["name"], "host": p.get("host"), "set_up": d.get("set_up"),
+                    "preset": (p.get("preset") or {}).get("id"), "rest_on": p.get("rest_on") or "job",
+                    "connection_hours": d.get("connection_hours"),
+                    "tunnel": {k: t.get(k) for k in ("state", "error", "hpclib_version", "server", "started_here",
+                                                     "last_exit", "port")},
+                    "login": {k: lg.get(k) for k in ("state", "message")},
+                    "operation": d.get("operation"), "apps": apps}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(profiles)))) as pool:
+            clusters = list(pool.map(one, profiles))
+        prefs = console_prefs.load(console_dir())
+        prefs.pop("interface", None)
+        clients = [{"id": c["id"], "available": c["available"], "enabled": c["enabled"], "error": c["error"],
+                    "entries": {e["name"]: e["state"] for e in c["entries"]}, "stale": c["stale"]}
+                   for c in self.llm_clients()]
+        return redact({"generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "about": self.about(),
+                       "preferences": prefs, "port_range": list(agent_profiles.port_range()),
+                       "llm_clients": clients, "apps": sorted(APPS), "clusters": clusters})
 
     def for_live(self, fn):
         """fn(profile) on every cluster whose tunnel port answers, in parallel."""
@@ -2793,6 +3364,34 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         if parts == ["health"] and verb == "GET":
             return 200, {"ok": True, "console": VERSION, "clusters": len(c.names()), "pid": os.getpid(),
                          "hpclib_version": local_hpclib_version()}
+        if parts == ["preferences"] and verb == "GET":
+            return 200, dict(console_prefs.load(console_dir()), ok=True)
+        if parts == ["preferences"] and verb == "PUT":
+            try:
+                return 200, dict(console_prefs.update(console_dir(), self.json_body()), ok=True)
+            except console_prefs.PrefsError as e:
+                raise ConsoleError(422, str(e)) from e
+        if parts == ["ports"] and verb == "GET":
+            return 200, dict(c.ports_report(), ok=True)
+        if parts == ["ports", "range"] and verb == "PUT":
+            return 200, dict(c.set_port_range(self.json_body()), ok=True)
+        if parts == ["llm-clients"] and verb == "GET":
+            return 200, {"ok": True, "clients": c.llm_clients()}
+        if len(parts) == 3 and parts[0] == "llm-clients" and parts[2] == "write" and verb == "POST":
+            return 200, dict(c.llm_client_write(parts[1]), ok=True)
+        if len(parts) == 3 and parts[0] == "llm-clients" and parts[2] == "remove" and verb == "POST":
+            return 200, dict(c.llm_client_remove(parts[1], self.json_body()), ok=True)
+        if parts == ["watch"] and verb == "GET":
+            return 200, dict(c.watch(), ok=True)
+        if parts == ["about"] and verb == "GET":
+            return 200, dict(c.about(), ok=True, url=f"http://127.0.0.1:{self.server.port}",
+                             static=bool(self.server.static_dir))
+        if parts == ["diagnostics"] and verb == "GET":
+            return 200, dict(c.diagnostics(), ok=True)
+        if parts == ["widgets"] and verb == "GET":
+            return 200, {"ok": True, "widgets": c.widgets()}
+        if len(parts) == 3 and parts[0] == "widgets" and verb == "GET":
+            return 200, dict(c.widget_html(parts[1], parts[2]), ok=True)
         if parts == ["packages"] and verb == "GET":
             return 200, {"ok": True, "packages": c.packages_list()}
         if parts == ["packages"] and verb == "POST":
@@ -2834,10 +3433,22 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 return 202, dict(c.install(profile, self.json_body()), ok=True)
             if rest == ["setup"] and verb == "POST":
                 return 202, dict(c.setup(profile, self.json_body()), ok=True)
+            if rest == ["jobs"] and verb == "GET":
+                return 200, dict(c.cluster_jobs(profile), ok=True)
+            if rest == ["jobs", "cancel"] and verb == "POST":
+                return 200, dict(c.cancel_job(profile, self.json_body()), ok=True)
+            if rest == ["storage"] and verb == "GET":
+                return 200, dict(c.storage(profile), ok=True)
+            if rest == ["storage", "scan"] and verb == "POST":
+                return 202, dict(c.start_storage_scan(profile), ok=True)
             if rest == ["ports"] and verb == "GET":
                 return 200, {"ok": True, "ports": c.login_ports(profile)}
             if rest == ["ports", "clear"] and verb == "POST":
                 return 202, dict(c.clear_ports(profile, self.json_body()), ok=True)
+            if rest == ["mcp-name"] and verb == "PUT":
+                return 200, dict(c.rename_mcp(profile, self.json_body()), ok=True)
+            if rest == ["new-ports"] and verb == "POST":
+                return 200, dict(c.new_ports(profile, self.json_body()), ok=True)
             if rest == ["ssh", "setup"] and verb == "POST":
                 return 202, dict(c.setup_ssh(profile, self.json_body()), ok=True)
             if rest == ["operation"] and verb == "GET":
@@ -3079,6 +3690,9 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
     def serve_static(self, path):
         # One optional user file outside --static; never expose the console's other files.
         # Handle it before the SPA fallback, which would otherwise return HTML when it is absent.
+        if path == "/interface.css":      # the Interface Settings page's values (preferences.json)
+            css = console_prefs.interface_css(console_prefs.load(console_dir()))
+            return self.send_bytes(200, "text/css; charset=utf-8", css.encode(), cache=False)
         if path == "/user.css":
             try:
                 with open(os.path.join(console_dir(), "user.css"), "rb") as f:

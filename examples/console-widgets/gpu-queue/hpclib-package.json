@@ -1,0 +1,14 @@
+{
+  "format": 1,
+  "name": "gpu-queue",
+  "version": "0.1.0",
+  "description": "An example of console widgets: your GPU jobs, queued and running, on the clusters page and on each cluster's Overview.",
+  "widgets": [
+    {"id": "gpu-queue", "title": "GPU jobs", "slot": "home", "entry": "widgets/gpu-queue.html",
+     "reads": ["clusters", "jobs"], "height": 160,
+     "description": "Queued and running jobs that asked for GPUs, on every cluster you're logged in to."},
+    {"id": "gpu-jobs", "title": "GPU jobs here", "slot": "cluster.overview", "entry": "widgets/gpu-queue.html",
+     "reads": ["jobs"], "height": 160,
+     "description": "This cluster's queued and running GPU jobs, with why each waits."}
+  ]
+}

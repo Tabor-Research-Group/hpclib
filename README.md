@@ -79,11 +79,12 @@ Everything about a cluster is kept in its **agent profile**, `~/.config/hpclib/a
 | `mcp.json` | the MCP client entry |
 
 The ports, one for your machine and the login node and one for the compute node, are picked at random (20000 to
-32000) when the profile is made and then kept, so you don't collide with other users of the cluster or with your
+32000, or the range set on the console's Console Settings) when the profile is made and then kept, so you don't collide with other users of the cluster or with your
 other clusters; `--new-ports` picks new ones, and `--port`/`--process-port` set them. The agent token is named
 after this machine (`agent-HOSTNAME`, or `--token-name`), so each of your machines can have its own and be revoked
-on its own, and the MCP server is named after the cluster (`hpclib-entropy`, or `--mcp-name`), so several
-clusters can be configured side by side. Options given on a later run update the profile, and a later run needs
+on its own, and the MCP server is named after the cluster (`hpclib-entropy`, or `--mcp-name`, or renamed in the
+console), so several clusters can be configured side by side. The console can write each cluster's entry into
+Claude Desktop, Claude Code, Cursor and ChatGPT (the desktop app and Codex) for you (Console Settings → LLM clients). Options given on a later run update the profile, and a later run needs
 only the address: `setup_agents user@login.example`. The MCP entry lets the agent push files from and pull them
 into `~/Documents/Claude`, the Claude desktop app's own working folder (created if missing;
 `$HPCLIB_AGENT_LOCAL_ROOT` changes the default). `--local-root DIR` (repeatable) replaces it with your own
@@ -653,7 +654,7 @@ signing in beside the GUI: Kerberos log in (kinit) where the cluster has kinit, 
 jobs, both through its password dialog, plus Install/Check for the image and the settings above.
 
 **Console packages**: apps and settings that don't belong in hpclib (one group's server, a project's test
-instance) come as zip files, installed with the console's **Add App or Settings** button, which shows what a
+instance) come as zip files, installed with the console's **Packages** button, which shows what a
 package adds before installing it, and lists and removes the installed ones. A package is a folder with
 `hpclib-package.json` at its top, zipped:
 

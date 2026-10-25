@@ -1,8 +1,11 @@
 # Agents in the interface
 
-The **Agents** app manages the clusters your LLM clients use. Its pages are Clusters, Proposals, Activity,
-Files, SSH keys and Settings. Pages that read from a cluster (everything but Clusters) need that cluster's agent tunnel
-to be **up**, since they talk to its REST server.
+The agent side of each cluster is on that cluster's page (see [Clusters](clusters.md)): its **Agents** tab has
+**Tunnel and setup** (the row described under Clusters below), **Activity** and **SSH keys**, its **Files** and
+**Settings** tabs are the pages of those names, and **Proposals** is in the top bar, for every cluster. The pages
+below, with a cluster picker, still open from their old addresses (`#/clusters`, `#/activity`, `#/keys`,
+`#/settings`). Pages that read from a cluster (everything but Clusters) need that cluster's agent tunnel to be
+**up**, since they talk to its REST server.
 
 ## Clusters
 

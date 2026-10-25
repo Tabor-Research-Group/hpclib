@@ -9,6 +9,7 @@ import io
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
 import textwrap
@@ -572,6 +573,75 @@ class TestClearPorts(ConsoleTestCase):
             code, out, message = logins.run_fresh(profile, "pw", "true", "")
         self.assertIn("error", seen["code"])
         self.assertIn("typed code", message)
+
+
+class TestClusterJobsAndStorage(ConsoleTestCase):
+    """The cluster page's Jobs and Storage: squeue/sacct and du over the login, labelled and parsed."""
+
+    SQUEUE = ("Q|101|hpcrest-xtb_opt|PENDING|Priority|cpu|0:00|1:00:00|1|4|N/A|8G||N/A|hpclib-rest:llm:xtb_opt\n"
+              "Q|102|rest-k2v9x|RUNNING|None|cpu|3:12:40|8:00:00|1|1|N/A|1G|g042|2026-10-23T07:00:00|\n"
+              "Q|103|vscode-p0c3a|RUNNING|None|cpu|0:10:00|8:00:00|1|4|N/A|16G|g010|2026-10-23T10:00:00|\n"
+              "Q|104|orca_scan|RUNNING|None|cpu|0:12:02|12:00:00|1|24|N/A|96G|g088|2026-10-23T10:02:00|\n"
+              "A|90|hpcrest-jax_bench|FAILED|1:0|00:02:41|2026-10-23T10:31:57|gpu||64G|hpclib-rest:llm:jax_bench\n"
+              "A|90.batch|batch|FAILED|1:0|00:02:41|2026-10-23T10:31:57||5242880K|64G|\n"
+              "A|91|vscode-a1|TIMEOUT|0:15|08:00:12|2026-10-23T06:12:40|cpu||16G|\n"
+              "A|101|hpcrest-xtb_opt|PENDING|0:0|00:00:00|Unknown|cpu||8G|\n")
+
+    def setUp(self):
+        super().setUp()
+        self.clusters.logins.alive = lambda profile: True
+        self.ran = []
+
+        def runner(profile, script, args=(), wait=60):
+            self.ran.append((script, tuple(args)))
+            if "squeue" in script:
+                return 0, self.SQUEUE, ""
+            if "scancel" in script:
+                return 0, "", ""
+            return 0, ("D|ok|/scratch/me/llm\nS|2048|/scratch/me/llm/models\nS|512|/scratch/me/llm/runs\n"
+                       "S|2600|/scratch/me/llm\nI|1234|/scratch/me/llm\nM|/home/me/.local/tunnels\n"
+                       "Q|showquota\nq|Disk  Usage  Limit\nq|/scratch  612G  1T\n"), ""
+        self.clusters.script_runner = runner
+
+    def test_jobs_grouped_and_labelled(self):
+        status, out = self.call("GET", f"/api/clusters/{self.dead}/jobs")
+        self.assertEqual(status, 200, out)
+        self.assertEqual([j["id"] for j in out["queued"]], ["101"])
+        self.assertEqual(out["queued"][0]["source"], {"kind": "agent", "label": "agent: xtb_opt", "token": "llm"})
+        self.assertEqual([j["source"]["kind"] for j in out["running"]], ["agent-tunnel", "app", "other"])
+        self.assertEqual([j["id"] for j in out["finished"]], ["90", "91"])          # 101 is still queued
+        self.assertEqual(out["finished"][0]["peak_memory_mb"], 5120.0)
+        self.assertEqual(out["counts"], {"queued": 1, "running": 3, "finished": 2, "failed": 1})   # the VS Code timeout isn't
+
+    def test_cancel_only_agent_and_other_jobs(self):
+        self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/jobs/cancel", {"job": "103"})[0], 409)   # an app
+        self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/jobs/cancel", {"job": "102"})[0], 409)   # the tunnel
+        self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/jobs/cancel", {"job": "999"})[0], 404)
+        self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/jobs/cancel", {"job": "1;rm"})[0], 400)
+        status, out = self.call("POST", f"/api/clusters/{self.dead}/jobs/cancel", {"job": "104"})
+        self.assertEqual((status, out["cancelled"]), (200, "104"))
+        self.assertEqual(self.ran[-1][1], ("104",))
+
+    def test_storage_scan_and_cache(self):
+        self.assertIsNone(self.call("GET", f"/api/clusters/{self.dead}/storage")[1]["scanned"])
+        self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/storage/scan")[0], 202)
+        for _ in range(50):
+            out = self.call("GET", f"/api/clusters/{self.dead}/storage")[1]
+            if out["scan"]["state"] != "running":
+                break
+            time.sleep(0.05)
+        self.assertEqual(out["scan"]["state"], "done", out)
+        llm, tunnels = out["dirs"]
+        self.assertEqual((llm["path"], llm["kb"], llm["files"], llm["partial"]), ("/scratch/me/llm", 2600, 1234, False))
+        self.assertEqual([c["kb"] for c in llm["children"]], [2048, 512])
+        self.assertTrue(tunnels["missing"])
+        self.assertEqual(out["quota"], {"command": "showquota", "lines": ["Disk  Usage  Limit", "/scratch  612G  1T"]})
+        self.assertEqual(self.ran[-1][1][1:], ("/scratch/me/llm", "~/.local/tunnels"))
+        self.assertEqual(stat.S_IMODE(os.stat(self.clusters.storage_path(self.dead)).st_mode), 0o600)
+
+    def test_scripts_parse(self):
+        for script in (agent_console.CLUSTER_JOBS_SCRIPT, agent_console.CLUSTER_STORAGE_SCRIPT):
+            self.assertEqual(subprocess.run(["bash", "-n"], input=script, text=True).returncode, 0)
 
 
 class TestSettings(ConsoleTestCase):

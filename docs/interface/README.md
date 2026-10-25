@@ -12,15 +12,19 @@ done from the page.
 1. [Getting started](getting-started.md): start the console, add a cluster, log in, connect an LLM client.
 2. [Agents](agents.md): the Clusters, Proposals, Activity, Files and Settings pages.
 3. [Apps](apps.md): JupyterLab, VS Code, PAI, Data transfer, and apps added from packages.
+4. [Clusters](clusters.md): one page per cluster, with its apps, jobs, what is installed, storage, files and agents.
+5. [The console menu](console-settings.md): dark mode, Interface Settings, Console Settings (notifications, ports,
+   LLM clients, defaults for new clusters) and About.
 
 ## How the page is laid out
 
-The **top bar** switches between apps. **Agents** is always first; then come the tunnel apps hpclib ships
-(**JupyterLab**, **VS Code**, **Data transfer**, **PAI**) and any added from packages. On the right,
-**Add App or Settings** installs packages.
+The **top bar** holds what spans clusters: **Clusters**, the home page, with one row per cluster;
+**Proposals**, the templates agents proposed on any cluster, with a count; and, on the right, **Packages**,
+which lists and installs packages. The **☰** menu at the far left has what belongs to this machine: the dark-mode
+switch, Interface Settings, Console Settings and About.
 
-Each app has its own pages under its name. Agents has Clusters, Proposals, Activity, Files and Settings; the
-tunnel apps have a Sessions page with one row per cluster.
+Everything else is on a cluster's page: its Overview, Jobs, Apps (each app has its own page there, with its
+settings), Installed, Storage, Files, Agents and Settings tabs. See [Clusters](clusters.md).
 
 Rows refresh themselves: every few seconds while something is happening (a login, a tunnel starting, an
 install), and every 30 seconds otherwise. You don't need to reload the page to follow a tunnel.

@@ -20,9 +20,12 @@ python3 -m http.server 8000 --bind 127.0.0.1 -d agent-console
 # open http://127.0.0.1:8000/?api=http://127.0.0.1:27180
 ```
 
-A top bar switches between the console's apps, each with its own header and pages: **Agents** (the agents'
-REST tunnels: the pages below) and the tunnel apps the console lists (`GET /api/apps`): **JupyterLab**,
-**VS Code** and **PAI**, each a session per cluster in a SLURM job behind its own tunnel (Start, Open, Stop, Log,
+The top bar holds what spans clusters: **Clusters** (`#/c`, one row per cluster), **Proposals** and
+**Packages**. A cluster's page (`#/c/NAME/TAB`, `cluster.js`) has its Overview, Jobs, Apps, Installed, Storage,
+Files, Agents (the agent profile's row, Activity, SSH keys) and Settings; `#/c/NAME/apps/APP` is one app there
+with its settings in place, and a package's tabs for it. The older pages below still open from their addresses.
+The tunnel apps the console lists (`GET /api/apps`): **JupyterLab**, **VS Code** and **PAI**, each a session per
+cluster in a SLURM job behind its own tunnel (Start, Open, Stop, Log,
 Settings: the job's time/memory/CPUs/partition, JupyterLab's conda environment, modules or uv/pixi project, and
 the tunnel's own settings such as VS Code's container path). Open goes straight in, with the token JupyterLab
 printed; VS Code shows a **Copy password** button. Once you're logged in, each row checks whether the tunnel is
@@ -34,9 +37,9 @@ data-transfer-tools image, starts a web GUI for the SMB server (rclone's, or the
 signs you in to the server for `smbshell` beside it (Kerberos log in with kinit where the cluster has it,
 otherwise a password saved for sync jobs), both through the password dialog. Agents keeps its addresses (`#/clusters`, `#/files?...`); other apps live under
 `#/APP/PAGE`, e.g. `#/vscode/sessions`. A new tunnel app is an entry in `APPS` in
-`hpclib/servers/agent_console.py`, or, for one that doesn't belong in hpclib, a package: **Add App or Settings**
+`hpclib/servers/agent_console.py`, or, for one that doesn't belong in hpclib, a package: **Packages**
 (top right) checks a package zip, shows what it adds (apps, tunnels, settings and their values), installs it,
-and lists and removes installed ones (see "Console packages" in hpclib's README). Its apps join the top bar.
+and lists and removes installed ones (see "Console packages" in hpclib's README). Its apps join each cluster's Apps tab.
 
 **Open Data transfer** clears the stock rclone GUI's filesystem-client cache before opening it,
 so it reconnects using the current session configuration, including remotes supplied by settings
@@ -87,7 +90,7 @@ be adjusted with `HPCLIB_TUNNEL_STOP_WAIT` on the login node.
 
 ## Job activity
 
-**Agents → Activity → Jobs** tracks recent agent-API submissions and their finished outcomes.
+A cluster's **Agents → Activity → Jobs** tracks recent agent-API submissions and their finished outcomes.
 Filter by agent token, state, submission time, or job ID/template/label. Job details include scheduler
 information, array tasks, and bounded output previews; **Follow** refreshes every five seconds.
 **Requests** keeps the existing audit log view. This does not import jobs from the separate `job-queue`
@@ -95,8 +98,8 @@ registry. See the [Activity guide](../docs/interface/agents.md#activity) for his
 
 ## Packaged cluster configurations
 
-Packages can add configuration choices to **Agents → Clusters → Add cluster**. Install the
-package through **Add App or Settings**, choose its configuration, then enter your own cluster
+Packages can add configuration choices to **Clusters → Add cluster**. Install the
+package through **Packages**, choose its configuration, then enter your own cluster
 username, absolute work directory and allocation. Resource defaults are editable. Adding creates
 a local profile; log in and choose **Set up…** afterwards. Package installation, replacement and
 removal preserve existing profiles and credentials.
@@ -110,15 +113,37 @@ See the [cluster preset package format](../docs/cluster-presets.md).
 
 ## SSH keys
 
-**Agents → Clusters → Set up SSH** creates or reuses a compute identity in the shared
+A cluster's **Agents → Tunnel and setup → Set up SSH** creates or reuses a compute identity in the shared
 cluster home after login. **Agents → SSH keys** lists identities and provides public-key
 copying, key creation/deletion, targeted authorization editing, and host identity bindings.
 General management requires a live REST tunnel and owner token. Private key contents stay
 on the cluster. See the [SSH key guide and REST reference](../docs/ssh-keys.md).
 
+## The console menu
+
+The top-left hamburger menu holds what belongs to this machine rather than a cluster (`settings.js`):
+
+- a **dark-mode switch** (sun and moon). It is kept in this browser (`localStorage`, read by `theme.js` before
+  the page draws) and sets `data-theme` on `<html>`; **Match system** removes the choice.
+- **Interface Settings** (`#/interface`): every variable in `default-styles.css`, grouped and described, with
+  light and dark values for the themed colours. Changes preview as you type; **Save** keeps them in
+  `preferences.json`, served as `/interface.css`. Links to the default stylesheet and `user.css`.
+- **Console Settings** (`#/console`): browser notifications (a tunnel dropping, a password or host-key prompt, an
+  agent's job finishing, a new proposal), the local port range and each tunnel's ports (**New ports** while it is
+  stopped), the LLM clients that get each cluster's MCP entry (Claude Desktop, Claude Code, Cursor, and ChatGPT
+  through Codex's `config.toml`; see `hpclib/servers/mcp_clients.py`), and defaults for new clusters (login time,
+  work directory, MCP name pattern, GPU mode and limit). A cluster's MCP name is changed on its Agents tab.
+- **About** (`#/about`): the hpclib this console runs and the one on disk (restart when they differ), paths, the
+  console's link, and **Copy diagnostics** (no tokens, passwords or keys).
+- **Open Stylesheet**, below.
+
+Packages can also add **widgets** (`widgets.js`): one HTML file each, shown in a sandboxed iframe (no
+`allow-same-origin`, a CSP with no network) on the clusters page, each cluster's Overview or a tab, fed read-only
+topics (clusters, jobs, storage, apps, theme) by `postMessage`. See "Console widgets" in `docs/extending.md`.
+
 ## User styling
 
-The top-left hamburger menu has **Open Stylesheet**. On its first use, the console copies the
+The menu's **Open Stylesheet** (also on Interface Settings) opens `user.css`. On its first use, the console copies the
 bundled [`default-styles.css`](default-styles.css) to `~/.config/hpclib/console/user.css`, then asks
 the operating system to open it with the default application associated with CSS files. If
 `HPCLIB_CONSOLE_DIR` is set, the destination is `$HPCLIB_CONSOLE_DIR/user.css` instead.
@@ -126,7 +151,8 @@ An existing `user.css` is always preserved, including an empty one. The console 
 detect an editor. Saving changes and reloading the browser applies them.
 
 With `launch-tunnel-manager` or `agent_console --static ...`, the page loads `default-styles.css`
-(the complete default variable inventory), then `style.css` (the UI rules), then the optional `user.css`.
+(the complete default variable inventory), then `style.css` (the UI rules), then `/interface.css` (the values saved
+on Interface Settings), then the optional `user.css`, which wins over all of them.
 Keep personal styling in `user.css` so it survives updates to hpclib. You can also create it yourself:
 
 ```bash
@@ -145,10 +171,15 @@ For example, `user.css` can contain:
   --dialog-max-width: 640px;
   --log-max-width: 800px;
 }
+/* dark: the system's (unless the menu's switch chose light), or the switch's */
 @media (prefers-color-scheme: dark) {
-  :root { --accent: #a78bfa; }
+  :root:not([data-theme="light"]) { --accent: #a78bfa; }
 }
+:root[data-theme="dark"] { --accent: #a78bfa; }
 ```
+
+A `user.css` copied before the switch existed has a plain `@media (prefers-color-scheme: dark) { :root { ... } }`
+block; it still works with the system's theme, but wins over the switch's Light. Change its selector as above.
 
 The [complete UI variable reference](UI_VARIABLES.md) lists every variable, its default and its purpose,
 including dark-theme defaults and component parts. Variables also reach panel and dialog shadow DOM.

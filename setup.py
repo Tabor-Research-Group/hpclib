@@ -21,6 +21,7 @@ setuptools.setup(
     author="",
     author_email="",
     classifiers=[
+        "Development Status :: 5 - Production/Stable",
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: Apache Software License",
         "Operating System :: OS Independent",

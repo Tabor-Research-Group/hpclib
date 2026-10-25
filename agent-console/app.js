@@ -8,6 +8,9 @@
 // The page's building blocks are custom elements, in components.js (see its header).
 import { configure, el, action, confirmDialog, LOGIN_BUSY, LOGIN_LABEL, HpcClusterPicker } from "./components.js";
 import { activityPage as buildActivity } from "./activity.js";
+import * as clusterUI from "./cluster.js";
+import * as settingsUI from "./settings.js";
+import * as widgetsUI from "./widgets.js";
 
 const params = new URLSearchParams(location.search);
 // ?api= may only name a console on this machine (127.0.0.1 or localhost): the session key goes with every call, and a
@@ -44,7 +47,7 @@ function takeKeyFromHash() {
   const m = location.hash.match(/^#key=([^&]+)/);
   if (!m) return;
   storeKey(decodeURIComponent(m[1]));
-  history.replaceState(null, "", location.pathname + location.search + "#/clusters");
+  history.replaceState(null, "", location.pathname + location.search + "#/c");
 }
 function askForKey() {
   const dialog = document.getElementById("key-dialog");
@@ -54,7 +57,8 @@ document.getElementById("key-form").addEventListener("submit", (e) => {
   e.preventDefault();
   storeKey(document.getElementById("key-input").value.trim());
   document.getElementById("key-dialog").close();
-  loadApps().then(render);
+  Promise.all([loadApps(), settingsUI.loadPreferences(), widgetsUI.load()]).then(render);
+  settingsUI.loadPreferences().then(settingsUI.restartWatch);
 });
 
 // ---------------------------------------------------------------- API
@@ -127,6 +131,8 @@ openStylesheetButton.addEventListener("click", async () => {
 document.addEventListener("pointerdown", (e) => {
   if (!consoleMenu.contains(e.target)) consoleMenu.open = false;
 });
+consoleMenu.querySelectorAll("a.menu-item").forEach((a) => a.addEventListener("click", () => { consoleMenu.open = false; }));
+settingsUI.initThemeSwitch();
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && consoleMenu.open) {
     e.preventDefault();
@@ -244,6 +250,14 @@ function addClusterForm(onAdded) {
   const jump = el("input", { placeholder: "optional: [user@]jumphost", size: 24 });
   const work = el("input", { placeholder: "/scratch/user/me/llm", size: 32 });
   const binds = el("input", { placeholder: "optional: /software", size: 24 });
+  // this machine's default (Console Settings), with the login's user, until a directory is typed
+  const pattern = (settingsUI.preferences()?.new_cluster || {}).work_dir_pattern;
+  let typed = false;
+  work.addEventListener("input", () => { typed = true; });
+  host.addEventListener("input", () => {
+    const user = host.value.trim().split("@")[0];
+    if (pattern && !typed) work.value = host.value.includes("@") && user ? pattern.replaceAll("{user}", user) : "";
+  });
   const add = action("Add, then log in and set up", async () => {
     if (!work.value.trim()) throw new Error("give a work directory on the cluster");
     const c = await api("clusters", { method: "POST", body: { host: host.value.trim(),
@@ -387,24 +401,31 @@ function promptDialog(label, answerPath, prompt, { onCancel = null } = {}) {
   dialog.showModal();
 }
 
-async function clustersPage() {
-  const [{ clusters }, health, presetList] = await Promise.all([api("clusters"), api("health"), api("cluster-presets")]);
-  const presets = presetList.presets || [];
-  const local = health.hpclib_version;
-  const addArea = el("div");
+// "Add cluster" and the form it opens (a preset's, or a custom cluster's): [button, area]
+function addClusterControls() {
+  const addArea = el("div", { class: "add-cluster" });
   const addBtn = el("button", { type: "button" }, "Add cluster");
-  addBtn.addEventListener("click", () => {
+  let presets = null;
+  addBtn.addEventListener("click", async () => {
     if (addArea.firstChild) { addArea.replaceChildren(); return; }
+    try { presets = presets || (await api("cluster-presets")).presets || []; } catch (err) { addArea.replaceChildren(errorBox(err)); return; }
     const choose = el("select", { "aria-label": "Cluster configuration" }, el("option", { value: "" }, "Custom cluster"),
       presets.map((spec) => el("option", { value: spec.id }, spec.title)));
     const form = el("div");
     const draw = () => {
       const preset = presets.find((spec) => spec.id === choose.value);
-      form.replaceChildren(preset ? presetClusterForm(preset, render) : addClusterForm(() => {}));
+      form.replaceChildren(preset ? presetClusterForm(preset, render) : addClusterForm(render));
     };
     choose.addEventListener("change", draw); draw();
     addArea.replaceChildren(field("Configuration", choose), form);
   });
+  return [addBtn, addArea];
+}
+
+async function clustersPage() {
+  const [{ clusters }, health] = await Promise.all([api("clusters"), api("health")]);
+  const local = health.hpclib_version;
+  const [addBtn, addArea] = addClusterControls();
   // each cluster's rows refresh themselves (components.js), so this page is drawn once
   const rows = clusters.map((c) => {
     const row = el("hpc-cluster-row", { cluster: c.name, local });
@@ -422,10 +443,14 @@ async function clustersPage() {
   ];
 }
 
-async function sshKeysPage() {
+async function sshKeysPage(only = null) {
+  // only: a cluster page's (its Agents tab): that cluster, no picker
   const { clusters } = await api("clusters");
-  const pick = el("hpc-cluster-picker", { live: true });
+  const pick = el("hpc-cluster-picker", { live: true, value: only, hidden: !!only });
   pick.clusters = clusters;
+  if (only && !pick.options.some((c) => c.name === only)) {
+    return el("p", { class: "muted" }, `Start ${only}'s agent tunnel (Tunnel and setup) to manage its SSH keys.`);
+  }
   const body = el("div", { class: "ssh-manager" });
   const status = el("span", { class: "muted", role: "status" });
   let generation = 0;
@@ -533,7 +558,7 @@ async function sshKeysPage() {
   pick.addEventListener("change", () => load().catch(() => {}));
   if (pick.options.length) await load().catch(() => {});
   else status.textContent = "Start a cluster REST tunnel with an owner token to manage keys. Set up compute SSH from the Clusters page.";
-  return [el("div", { class: "toolbar" }, el("h2", {}, "SSH keys"), pick,
+  return [el("div", { class: "toolbar" }, only ? null : el("h2", {}, "SSH keys"), pick,
     action("Reload keys", load, { disabled: !pick.options.length }), status), body];
 }
 
@@ -587,8 +612,8 @@ async function proposalsPage() {
   ];
 }
 
-async function activityPage() {
-  return buildActivity({ api, filesHash, setFollowing: (callback) => {
+async function activityPage(only = null) {
+  return buildActivity({ api, filesHash, only, setFollowing: (callback) => {
     stopFollowing();
     if (callback) followTimer = setInterval(callback, 5000);
   } });
@@ -605,16 +630,17 @@ const IMAGE_TYPES = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", g
 const filesBase = {};   // each cluster's top directory (its base_dir)
 
 // The Files page's state lives in the address, so it can be linked to:
-//   #/files?cluster=NAME&path=/a/directory   that directory
-//   #/files?cluster=NAME&path=/a/file.log    its directory, with the file open in the viewer
+//   #/c/NAME/files?path=/a/directory          that directory (the cluster's Files tab)
+//   #/c/NAME/files?path=/a/file.log           its directory, with the file open in the viewer
+//   #/files?cluster=NAME&path=...             the same, from before the cluster pages (still read)
 // NAME is the profile name, the login host or the MCP name.
 function filesQuery() {
   return new URLSearchParams(location.hash.split("?")[1] || "");
 }
 function filesHash(clusterName, path) {
-  const q = new URLSearchParams({ cluster: clusterName });
+  const q = new URLSearchParams();
   if (path) q.set("path", path);
-  return "#/files?" + q.toString();
+  return clusterUI.href(clusterName, "files") + (path ? "?" + q.toString() : "");
 }
 
 const ext = (name) => (name.match(/\.([^.]+)$/) || [])[1]?.toLowerCase() || "";
@@ -712,19 +738,20 @@ async function viewFile(c, entry, box) {
   }
 }
 
-async function filesPage() {
+async function filesPage(only = null) {
+  // only: a cluster page's (its Files tab): that cluster, no picker
   const { clusters } = await api("clusters");
   const q = filesQuery();
   const legacy = decodeURIComponent((location.hash.match(/^#\/files\/([^?]+)/) || [])[1] || "");
-  const wanted = q.get("cluster") || legacy;
-  const pick = el("hpc-cluster-picker", { live: true, value: wanted || null });
+  const wanted = only || q.get("cluster") || legacy;
+  const pick = el("hpc-cluster-picker", { live: true, value: wanted || null, hidden: !!only });
   pick.clusters = clusters;
   pick.addEventListener("change", () => { location.hash = filesHash(pick.value); });
   const matches = (x) => HpcClusterPicker.matches(x, wanted);
   if (wanted && !pick.options.some(matches)) {
     const known = clusters.find(matches);
     return [el("h2", {}, "Files"), errorBox(new Error(known
-      ? `${known.name}: start its tunnel (and log in) on the Clusters page to browse its files.`
+      ? `${known.name}: start its agent tunnel (Agents → Tunnel and setup) to browse its files.`
       : `No cluster called ${wanted}.`))];
   }
   const c = pick.selected;
@@ -769,7 +796,7 @@ async function filesPage() {
   });
   if (open) viewFile(c.name, open, viewer);   // same size rules as View: large files aren't loaded
   return [
-    el("h2", {}, "Files"),
+    only ? null : el("h2", {}, "Files"),
     el("div", { class: "toolbar" }, pick, home, up, el("code", {}, listing.path)),
     viewer,
     entries.length ? el("table", {},
@@ -1332,6 +1359,18 @@ function pageHref(app, page) {
 
 function route() {
   const segs = location.hash.replace(/^#\/?/, "").split("?")[0].split("/");
+  // the cluster-first pages: #/c (the clusters) and #/c/NAME/TAB (one cluster)
+  if (segs[0] === "c") {
+    const tab = clusterUI.CLUSTER_TABS.some(([id]) => id === segs[2]) || segs[2] === "widget" ? segs[2] : "overview";
+    return { app: "c", page: segs[1] ? "cluster" : "home", cluster: segs[1] ? decodeURIComponent(segs[1]) : null, tab,
+             sub: decodeURIComponent(segs[3] || "") };
+  }
+  // links to a cluster's files from before the cluster pages (#/files?cluster=NAME, #/files/NAME) open its Files tab
+  const oldFiles = segs[0] === "files" && (filesQuery().get("cluster") || decodeURIComponent(segs[1] || ""));
+  if (oldFiles) return { app: "c", page: "cluster", cluster: oldFiles, tab: "files", sub: "" };
+  if (segs[0] === "proposals") return { app: "proposals", page: "proposals" };
+  // this machine's pages, from the console menu
+  if (Object.hasOwn(MENU_PAGES, segs[0])) return { app: "menu", page: segs[0] };
   if (Object.hasOwn(APPS_UI, segs[0]) && segs[0] !== "agents") {
     const app = APPS_UI[segs[0]];
     // Bookmarks from before grouping still reach the same service's controls.
@@ -1339,18 +1378,46 @@ function route() {
     return { app: segs[0], page: Object.hasOwn(app.pages, segs[1]) ? segs[1] : app.default };
   }
   if (segs[0] === "agents") segs.shift();
-  return { app: "agents", page: segs[0] in APPS_UI.agents.pages ? segs[0] : "clusters" };
+  if (!(segs[0] in APPS_UI.agents.pages)) return { app: "c", page: "home", cluster: null, tab: "overview", sub: "" };
+  return { app: "agents", page: segs[0] };
 }
 
 const badge = el("span", { id: "badge", class: "badge", hidden: true });
 
-function drawChrome({ app, page }) {
-  document.getElementById("apps").replaceChildren(...Object.entries(APPS_UI).filter(([, a]) => !a.tab).map(([id, a]) =>
-    el("a", { href: pageHref(id, a.default), class: id === app ? "active" : null }, a.title)));
-  document.getElementById("app-title").textContent = APPS_UI[app].title;
+// The top bar holds what spans clusters: Clusters (home), Proposals, and Packages (a button). Everything about one
+// cluster, its apps included, is under #/c/NAME. The pages from before (#/clusters, #/activity, #/APP, ...) still
+// open, under their own headers, from old links.
+const MENU_PAGES = { interface: ["Interface Settings", () => settingsUI.interfacePage()],
+                     console: ["Console Settings", () => settingsUI.consolePage()], about: ["About", () => settingsUI.aboutPage()] };
+
+function drawChrome({ app, page, cluster: name, tab, sub }) {
+  document.getElementById("apps").replaceChildren(
+    el("a", { href: "#/c", class: !["proposals", "menu"].includes(app) ? "active" : null }, "Clusters"),
+    el("a", { href: "#/proposals", class: app === "proposals" ? "active" : null }, "Proposals", " ", badge));
+  const title = document.getElementById("app-title");
+  if (app === "proposals" || app === "menu") {
+    const heading = app === "menu" ? MENU_PAGES[page][0] : "Proposals";
+    title.replaceChildren(heading);
+    document.getElementById("pages").replaceChildren();
+    document.title = `${heading} · hpclib console`;
+    return;
+  }
+  if (app === "c") {
+    // on a cluster's page, its name is a switcher: the same tab on another cluster
+    if (name) {
+      const pick = el("hpc-cluster-picker", { value: name, "aria-label": "Cluster", class: "cluster-switch" });
+      pick.addEventListener("change", () => { location.hash = clusterUI.href(pick.value, tab, tab === "widget" ? sub : ""); });
+      title.replaceChildren(pick);
+    } else title.replaceChildren("Clusters");
+    document.getElementById("pages").replaceChildren(...(name ? clusterUI.tabs().map(([id, label, key]) =>
+      el("a", { href: clusterUI.href(name, id, key), class: id === tab && (id !== "widget" || key === sub) ? "active" : null },
+         label)) : []));
+    document.title = `${name || "Clusters"} · hpclib console`;
+    return;
+  }
+  title.replaceChildren(APPS_UI[app].title);
   document.getElementById("pages").replaceChildren(...Object.entries(APPS_UI[app].pages).map(([id, [label]]) =>
-    el("a", { href: pageHref(app, id), class: id === page ? "active" : null }, label,
-       app === "agents" && id === "proposals" ? [" ", badge] : null)));
+    el("a", { href: pageHref(app, id), class: id === page ? "active" : null }, label)));
   document.title = `${APPS_UI[app].title} · hpclib console`;
 }
 
@@ -1365,7 +1432,11 @@ function setBadge(n) {
 }
 
 async function refreshBadge() {
-  try { setBadge((await api("proposals")).proposals.length); } catch { /* shown on the page */ }
+  try {
+    const { proposals } = await api("proposals");
+    setBadge(proposals.length);
+    settingsUI.noteProposals(proposals);
+  } catch { /* shown on the page */ }
 }
 
 // ---------------------------------------------------------------- what rows ask of the page
@@ -1397,6 +1468,7 @@ async function checkPrompts(delay = 0) {
       const waiting = new Set(prompts.map(promptKey));
       for (const k of [...snoozed]) if (!waiting.has(k)) snoozed.delete(k);
       const p = prompts.find((x) => !snoozed.has(promptKey(x)));
+      if (p) settingsUI.notePrompt(p, promptKey(p));
       if (p && !promptDialogOpen) {
         promptDialog(p.app ? `${p.title} on ${p.cluster}` : p.cluster, p.answer, p.prompt,
                      { onCancel: () => snoozed.add(promptKey(p)) });
@@ -1415,7 +1487,11 @@ async function render() {
   main.replaceChildren(el("p", { class: "muted" }, "Loading…"));
   let content;
   try {
-    content = await APPS_UI[where.app].pages[where.page][1]();
+    content = where.app === "c"
+      ? await (where.cluster ? clusterUI.clusterPage(where.cluster, where.tab, where.sub) : clusterUI.clustersHome())
+      : where.app === "proposals" ? await proposalsPage()
+      : where.app === "menu" ? await MENU_PAGES[where.page][1]()
+      : await APPS_UI[where.app].pages[where.page][1]();
   } catch (err) {
     content = errorBox(err);
   }
@@ -1425,7 +1501,7 @@ async function render() {
 takeKeyFromHash();
 key = key || storedKey();
 window.addEventListener("hashchange", () => { takeKeyFromHash(); render(); });
-document.getElementById("refresh").addEventListener("click", () => loadApps().then(render));
+document.getElementById("refresh").addEventListener("click", () => Promise.all([loadApps(), widgetsUI.load()]).then(render));
 document.getElementById("add-package").addEventListener("click", () => packagesDialog());
 
 // ---------------------------------------------------------------- packages
@@ -1436,7 +1512,7 @@ async function packagesDialog() {
   const list = el("div", {});
   const report = el("div", {});
   const file = el("input", { type: "file", accept: ".zip,application/zip" });
-  const dialog = el("hpc-dialog", { heading: "Add App or Settings", transient: true },
+  const dialog = el("hpc-dialog", { heading: "Packages", transient: true },
     el("p", { class: "muted" }, "A package is a zip file with an hpclib-package.json: apps for this console, the " +
       "tunnels they run on your clusters, cluster configurations, and settings (such as a group's SMB server). Its scripts run on your " +
       "clusters as you, so install only packages you trust."),
@@ -1488,7 +1564,19 @@ async function packagesDialog() {
   dialog.showModal();
   try { await drawList(); } catch (err) { list.replaceChildren(errorBox(err)); }
 }
-loadApps().then(render);
+clusterUI.init({
+  api, errorBox, render: () => render(),
+  settingsCards: (c) => Promise.all([tunnelSettings(c), portSettings(c).catch(errorBox), serverSettings(c).catch(errorBox)]),
+  addCluster: addClusterControls,
+  files: (name) => filesPage(name),
+  activity: (name) => activityPage(name),
+  sshKeys: (name) => sshKeysPage(name),
+  appSettings: (app, s, row) => appSettingsForm(app, s, row),
+});
+settingsUI.init({ api, errorBox, field, key: () => key });
+widgetsUI.init({ api, errorBox, preferences: () => settingsUI.preferences() });
+Promise.all([loadApps(), settingsUI.loadPreferences(), widgetsUI.load()]).then(render);
+settingsUI.loadPreferences().then(settingsUI.restartWatch);
 checkPrompts();
 refreshBadge();
 setInterval(refreshBadge, 60000);

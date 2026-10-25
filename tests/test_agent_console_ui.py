@@ -193,19 +193,28 @@ class TestConsoleUI(unittest.TestCase):
 
         self.page.route("**/api/**", respond)
         self.page.add_init_script("localStorage.setItem('agent-console-key', 'fixture-key')")
-        self.page.goto(self.base + "/index.html#/cmccdb/sessions")
+        # the top bar holds only what spans clusters; apps live on each cluster's page, a package's tabs beside
+        # their parent app there
+        self.page.goto(self.base + "/index.html#/c/demo/apps/cmccdb")
         self.page.locator('hpc-app-session[app="cmccdb"]').wait_for()
-        self.assertEqual(self.page.locator("#apps a").all_text_contents(), ["Agents", "CMCC DB (dev)"])
-        self.assertEqual(self.page.locator("#pages a").all_text_contents(),
-                         ["Sessions", "Preview", "Release Rehearsal"])
+        self.assertEqual(self.page.locator("#apps a").all_text_contents(), ["Clusters", "Proposals "])
+        self.assertEqual(self.page.locator("nav.subtabs a").all_text_contents(),
+                         ["CMCC DB (dev)", "Preview", "Release Rehearsal"])
+        self.assertEqual(self.page.locator("#pages a.active").inner_text(), "Apps")
         for label, service in (("Preview", "cmccdb_preview"), ("Release Rehearsal", "cmccdb_rehearsal")):
-            self.page.locator("#pages").get_by_role("link", name=label, exact=True).click()
+            self.page.locator("nav.subtabs").get_by_role("link", name=label, exact=True).click()
             self.page.locator('hpc-app-session[app="' + service + '"]').wait_for()
-            self.assertEqual(self.page.locator("#app-title").inner_text(), "CMCC DB (dev)")
-            self.assertEqual(self.page.locator("#pages a.active").inner_text(), label)
-            self.page.get_by_role("button", name="Settings…", exact=True).click()
-            self.page.locator("hpc-panel").wait_for()
+            self.assertEqual(self.page.locator("nav.subtabs a.active").inner_text(), label)
+            # its settings are on the page, so the row has no Settings… button
+            self.page.locator(".app-settings hpc-panel").wait_for()
             self.assertIn("apps/" + service + "/demo/settings", requested)
+            self.assertFalse(self.page.get_by_role("button", name="Settings…", exact=True).is_visible())
+        # the cluster's Apps tab lists the package's apps too, each linking to its page
+        self.page.locator("#pages").get_by_role("link", name="Apps", exact=True).click()
+        self.page.locator('hpc-app-session[app="cmccdb_rehearsal"]').wait_for()
+        self.page.locator('hpc-app-session[app="cmccdb_preview"]').get_by_role("link", name="CMCCDB Preview").click()
+        self.page.locator("nav.subtabs a.active").filter(has_text="Preview").wait_for()
+        # bookmarks from before still open the cross-cluster page
         self.page.goto(self.base + "/index.html#/cmccdb_preview/sessions")
         self.page.locator('hpc-app-session[app="cmccdb_preview"]').wait_for()
         self.assertEqual(self.page.locator("#pages a.active").inner_text(), "Preview")
@@ -432,6 +441,7 @@ class TestConsoleUI(unittest.TestCase):
                 route.fulfill(status=e.status, body=json.dumps({'error': str(e)}), content_type='application/json')
             return True
         self.load_console(handler)
+        self.page.goto(self.base + "/#/c/demo/agents")     # the cluster's Agents tab: its profile's row, SSH keys
         def save(label):
             button = self.page.get_by_role('button', name=label, exact=True)
             old = button.element_handle()
@@ -524,6 +534,53 @@ class TestConsoleUI(unittest.TestCase):
         self.assertIn('every port is clear', self.page.locator('pre.file').inner_text())
         self.assertEqual(self.errors, [])
 
+    def test_cluster_pages_show_state_jobs_and_next_step(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
+             'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up', 'hpclib_version': '0.2.70'}}
+        job = {'id': '7', 'name': 'hpcrest-xtb', 'state': 'PENDING', 'reason': 'Priority', 'partition': 'cpu', 'elapsed': '0:00',
+               'time_limit': '1:00:00', 'cpus': '4', 'memory': '8G', 'gres': '', 'node_list': '', 'start': '',
+               'source': {'kind': 'agent', 'label': 'agent: xtb', 'token': 'llm'}}
+        other = dict(c, name='other', host='me@other.example', login={'state': 'none'}, tunnel={'state': 'down'})
+        answers = {'clusters': {'clusters': [c, other]}, 'clusters/demo': c, 'clusters/other': other,
+                   'health': {'hpclib_version': '0.2.78'},
+                   'apps': {'apps': [{'id': 'agents', 'title': 'Agents'}]},
+                   'clusters/demo/jobs': {'at': 0, 'queued': [job], 'running': [], 'finished': [],
+                                          'counts': {'queued': 1, 'running': 0, 'finished': 0, 'failed': 0}},
+                   'clusters/demo/storage': {'scanned': None, 'scan': {'state': 'idle'}, 'dirs': [], 'quota': None,
+                                             'work_dirs': ['/scratch/me/llm']}}
+        def handler(route, path):
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/c")
+        self.page.get_by_role('button', name='Update hpclib', exact=True).wait_for()
+        self.page.get_by_text('1 queued').first.wait_for()
+        self.page.get_by_role('link', name='demo', exact=True).click()
+        self.page.get_by_text('The cluster runs hpclib 0.2.70; this console has 0.2.78.').wait_for()
+        self.page.locator('#pages').get_by_role('link', name='Jobs', exact=True).click()
+        self.page.get_by_text('behind higher-priority jobs').wait_for()
+        self.assertEqual(self.page.locator('#pages a.active').inner_text(), 'Jobs')
+        self.assertEqual(self.page.locator('#pages a').all_text_contents(),
+                         ['Overview', 'Jobs', 'Apps', 'Installed', 'Storage', 'Files', 'Agents', 'Settings'])
+        self.assertEqual(self.page.locator('#apps a').all_text_contents(), ['Clusters', 'Proposals '])
+        # the cluster's name is a switcher: the same tab on another cluster
+        self.page.get_by_label('Cluster', exact=True).locator('select').select_option('other')
+        self.page.get_by_text("Log in to see this cluster's jobs.").wait_for()
+        self.assertTrue(self.page.url.endswith('#/c/other/jobs'), self.page.url)
+        # Agents: the profile's row (tunnel, setup), with Activity and SSH keys beside it
+        self.page.goto(self.base + "/#/c/demo/agents")
+        self.page.locator('hpc-cluster-row[cluster="demo"]').wait_for()
+        self.assertEqual(self.page.locator('nav.subtabs a').all_text_contents(), ['Tunnel and setup', 'Activity', 'SSH keys'])
+        self.page.goto(self.base + "/#/c/other/agents/activity")
+        self.page.get_by_text("Start other's agent tunnel", exact=False).wait_for()
+        # old links to a cluster's files open its Files tab
+        self.page.goto(self.base + "/#/files?cluster=other")
+        self.page.get_by_text('start its agent tunnel', exact=False).wait_for()
+        self.assertEqual(self.page.locator('#pages a.active').inner_text(), 'Files')
+        self.assertEqual(self.errors, [])
+
     def test_console_menu_opens_and_preserves_user_stylesheet(self):
         with mock.patch.object(agent_console, "open_with_default_application") as opener:
             self.load_console()
@@ -533,7 +590,7 @@ class TestConsoleUI(unittest.TestCase):
             self.page.keyboard.press("Enter")
             self.assertTrue(self.page.locator("#console-menu").evaluate("e => e.open"))
             self.page.keyboard.press("Tab")
-            self.assertEqual(self.page.evaluate("document.activeElement.id"), "open-stylesheet")
+            self.assertEqual(self.page.evaluate("document.activeElement.id"), "theme-switch")   # the dark-mode switch is first
             self.page.keyboard.press("Escape")
             self.assertFalse(self.page.locator("#console-menu").evaluate("e => e.open"))
             self.assertEqual(self.page.evaluate("document.activeElement.tagName"), "SUMMARY")

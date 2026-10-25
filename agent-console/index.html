@@ -6,22 +6,35 @@
   <meta name="referrer" content="no-referrer">
   <title>hpclib console</title>
   <link rel="icon" type="image/x-icon" href="icon.png">
+  <script src="theme.js"></script>
   <link rel="stylesheet" href="default-styles.css">
   <link rel="stylesheet" href="style.css">
-  <link rel="stylesheet" href="/user.css">
+  <link rel="stylesheet" id="interface-css" href="/interface.css">
+  <link rel="stylesheet" id="user-css" href="/user.css">
 </head>
 <body>
   <div id="topbar">
     <details id="console-menu">
       <summary aria-label="Console menu" title="Console menu"><span aria-hidden="true">☰</span></summary>
       <div id="console-menu-items">
-        <button id="open-stylesheet" type="button">Open Stylesheet</button>
+        <div class="theme-toggle">
+          <svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M5.3 18.7l1.6-1.6M17.1 6.9l1.6-1.6"/></svg>
+          <button id="theme-switch" type="button" role="switch" aria-checked="false" aria-label="Dark mode"
+                  title="Dark mode"><span class="knob"></span></button>
+          <svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 14.6A8.6 8.6 0 0 1 9.4 3.5a8.6 8.6 0 1 0 11.1 11.1z"/></svg>
+          <button id="theme-system" type="button" class="link-button" hidden>Match system</button>
+        </div>
+        <a class="menu-item" href="#/interface">Interface Settings</a>
+        <a class="menu-item" href="#/console">Console Settings</a>
+        <a class="menu-item" href="#/about">About</a>
+        <hr>
+        <button id="open-stylesheet" class="menu-item" type="button">Open Stylesheet</button>
       </div>
     </details>
     <span class="brand">hpclib</span>
     <nav id="apps"></nav>
     <span id="topstatus" class="muted"></span>
-    <button id="add-package" type="button" title="Install an app or settings from a package zip">Add App or Settings</button>
+    <button id="add-package" type="button" title="Installed packages; install apps or settings from a package zip">Packages</button>
   </div>
   <header>
     <strong id="app-title">Agents</strong>

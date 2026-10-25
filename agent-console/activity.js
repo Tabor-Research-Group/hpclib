@@ -17,10 +17,14 @@ const select = (label, values) => el("select", { "aria-label": label }, values.m
 const field = (label, control) => el("label", { class: "activity-filter" }, el("span", {}, label), control);
 const message = (text) => el("p", { class: "muted" }, text);
 
-export async function activityPage({ api, filesHash, setFollowing }) {
+export async function activityPage({ api, filesHash, setFollowing, only = null }) {
+  // only: a cluster page's (its Agents tab): that cluster only, so no picker
   const { clusters } = await api("clusters");
-  const pick = el("hpc-cluster-picker", { live: true, "aria-label": "Activity cluster" });
+  const pick = el("hpc-cluster-picker", { live: true, "aria-label": "Activity cluster", value: only, hidden: !!only });
   pick.clusters = clusters;
+  if (only && !pick.options.some((c) => c.name === only)) {
+    return message(`Start ${only}'s agent tunnel (Tunnel and setup) to see its agents' jobs and requests.`);
+  }
   if (!pick.options.length) return [el("h2", {}, "Activity"), message("Start a cluster tunnel with an owner token to check jobs and requests.")];
 
   const page = el("section", { class: "activity-page" });

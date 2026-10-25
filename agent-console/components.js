@@ -15,6 +15,7 @@
 //   <hpc-env-editor label="…">                             NAME=value lines, checked as you type (.rules, .value)
 //   <hpc-cluster-row cluster="…" local="0.2.24">           an agent profile's rows in a table: refreshes itself
 //   <hpc-app-session app="jupyter" app-title="…" cluster="…">   a tunnel app's session on one cluster, likewise
+//     (by-app: named by the app, for a cluster's page; app-href: its app page; app-page: on that page, no Settings…)
 //
 //   <hpclib-toolbar>                                      a row of tools under a cluster/tunnel row (an app with
 //                                                         `downloads`, like OpenCode, gets its Model Download here)
@@ -1120,9 +1121,17 @@ export class HpcAppSession extends TunnelRow {
     const line = this.installLine(s, loggedIn);
     this.installBox.replaceChildren(...(line ? [line] : []));
     const cluster = { name: s.cluster, host: s.host, connection_hours: lg.connection_hours };
+    // by-app: a row of one cluster's page (its Apps tab, or the app's page), named by the app; the login is on that
+    // page's header
+    const byApp = this.hasAttribute("by-app");
+    if (byApp) { b.start.hidden = b.start.disabled && !missing; b.stop.hidden = b.stop.disabled; }
+    // app-page: the row of the app's own page, whose settings are drawn on the page; app-href: that page
+    b.settings.hidden = this.hasAttribute("app-page");
+    const link = this.getAttribute("app-href");
+    const title = link ? el("a", { href: link, class: "cluster-link" }, this.appTitle) : el("strong", {}, this.appTitle);
     return [
-      [s.cluster, el("div", { class: "muted" }, `port ${s.port}`)],
-      this.loginCells(lg, cluster),
+      [byApp ? title : s.cluster, el("div", { class: "muted" }, `port ${s.port}`)],
+      ...(byApp ? [] : [this.loginCells(lg, cluster)]),
       [el("hpc-state", { state: s.state, label: stateText, ...(notInstalled ? { tone: "starting" } : {}) }),
        up && !s.token_known ? el("div", { class: "muted" }, "token not seen yet; see Log") : null,
        up && "username" in s ? el("div", { class: "muted" }, [`if asked to sign in: user ${s.username} `, b.copyUser]) : null,

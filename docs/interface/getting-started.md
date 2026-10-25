@@ -27,7 +27,7 @@ before.
 
 ## 2. Add a cluster
 
-On **Agents → Clusters**, click **Add cluster** and fill in the form:
+On **Clusters** (the home page), click **Add cluster** and fill in the form:
 
 | Field | What to enter |
 | --- | --- |
@@ -94,7 +94,7 @@ Ask your LLM client something like:
 > Use hpclib-grace to run the hello template with the message "hi from the agent", and show me the output.
 
 It will call `cluster_info`, submit the `hello` template (first as a dry run), wait for the job and read its
-output. You can watch each request on **Agents → Activity**.
+output. You can watch each request on the cluster's **Agents → Activity**.
 
 ## Next
 

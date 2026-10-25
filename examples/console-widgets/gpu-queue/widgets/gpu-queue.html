@@ -1,0 +1,68 @@
+<!doctype html>
+<!-- An hpclib console widget (see docs/extending.md, "Console widgets"). It runs sandboxed: it gets data only
+     through hpclibWidget(), from the topics its manifest reads, and can't reach the network or the console. -->
+<style>
+  body { color: var(--fg, CanvasText); }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line, #ddd); }
+  th { color: var(--muted, GrayText); font-weight: 500; }
+  a { color: var(--accent, LinkText); cursor: pointer; text-decoration: none; }
+  .n { font-variant-numeric: tabular-nums; }
+  .q { color: var(--warn, #b36b00); } .r { color: var(--good, #1f8a4c); }
+  .muted { color: var(--muted, GrayText); }
+  p { margin: 4px 0; }
+</style>
+<div id="out"><p class="muted">Loading…</p></div>
+<script type="module">
+  const hpc = await hpclibWidget();
+  const out = document.getElementById("out");
+  const here = hpc.context.cluster;          // set on a cluster's Overview
+  const gpu = (job) => /gpu/i.test(job.gres || "");
+  const text = (tag, value, cls) => { const e = document.createElement(tag); e.textContent = value; if (cls) e.className = cls; return e; };
+  let clusters = [];
+
+  hpc.subscribe("theme", ({ vars }) => {
+    for (const [name, value] of Object.entries(vars)) document.documentElement.style.setProperty(name, value);
+  });
+  if (!here) hpc.subscribe("clusters", (list) => { clusters = list; });
+
+  hpc.subscribe("jobs", ({ byCluster }) => {
+    out.replaceChildren();
+    if (here) {
+      const j = byCluster[here];
+      if (!j) return out.append(text("p", "Log in to see this cluster's jobs.", "muted"));
+      if (j.error) return out.append(text("p", j.error, "muted"));
+      const rows = [...j.queued.filter(gpu).map((x) => [x, "queued"]), ...j.running.filter(gpu).map((x) => [x, "running"])];
+      if (!rows.length) return out.append(text("p", "No GPU jobs queued or running.", "muted"));
+      const table = document.createElement("table");
+      table.append(...rows.map(([job, state]) => {
+        const tr = document.createElement("tr");
+        tr.append(text("td", job.name), text("td", job.gres), text("td", state, state === "queued" ? "q" : "r"),
+                  text("td", state === "queued" ? (job.reason || "") : `${job.elapsed} of ${job.time_limit}`, "muted"));
+        return tr;
+      }));
+      out.append(table);
+      return;
+    }
+    const names = Object.keys(byCluster);
+    if (!names.length) return out.append(text("p", "Log in to a cluster to see its GPU jobs.", "muted"));
+    const table = document.createElement("table");
+    const head = document.createElement("tr");
+    head.append(text("th", "Cluster"), text("th", "Queued"), text("th", "Running"));
+    table.append(head);
+    for (const name of names.sort()) {
+      const j = byCluster[name];
+      const tr = document.createElement("tr");
+      const link = text("a", name);
+      link.addEventListener("click", () => hpc.navigate(`#/c/${encodeURIComponent(name)}/jobs`));
+      const td = document.createElement("td");
+      td.append(link);
+      tr.append(td, ...(j.error ? [text("td", "can't read", "muted"), text("td", "")]
+        : [text("td", String(j.queued.filter(gpu).length), "n q"), text("td", String(j.running.filter(gpu).length), "n r")]));
+      table.append(tr);
+    }
+    const off = clusters.filter((c) => c.login !== "connected").map((c) => c.name);
+    out.append(table);
+    if (off.length) out.append(text("p", `Not logged in: ${off.join(", ")}`, "muted"));
+  });
+</script>

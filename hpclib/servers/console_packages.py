@@ -68,6 +68,19 @@ its login (setup_tunnel.sh --downloads):
                                this as an operation with its log, like Install (it can take hours)
   --json remove KIND NAME      {"removed": NAME}; refuses (exit 1, saying why on standard error) what is in use
 
+`widgets` adds small dashboards to the console's pages: [{"id": "gpu-queue", "title": "GPU queue",
+"slot": "home", "entry": "widgets/gpu-queue.html", "reads": ["clusters", "jobs"], "height": 220}]. A slot is
+`home` (above the clusters list), `cluster.overview` (on each cluster's Overview) or `cluster.tab` (a tab on each
+cluster's page). The entry is one self-contained HTML file (inline scripts and styles; images as data: URLs),
+shown in a sandboxed frame with no network access: it can't read the console's key, call its API or act on a
+cluster. It gets data by subscribing to the topics it `reads` (clusters, jobs, storage, apps; and theme, the
+page's colours, always), through the helper the console puts in the page:
+
+    const hpc = await hpclibWidget();          // {widget, context: {cluster}, subscribe, navigate, resize}
+    hpc.subscribe("jobs", ({ byCluster }) => draw(byCluster));
+
+See docs/extending.md, "Console widgets".
+
 A package with only `settings` is a settings package: e.g. a group's SMB server and its rclone remotes, which
 don't belong in hpclib itself.
 
@@ -147,7 +160,12 @@ DOWNLOAD_KIND_RE = re.compile(r"[a-z][a-z0-9_-]{0,19}")
 DOWNLOAD_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}")
 TOKEN_KEYS = {"label", "scopes", "default_scope", "days", "description"}
 SCOPE_RE = re.compile(r"[a-z][a-z0-9_-]{0,19}")
-TOP_KEYS = {"format", "name", "version", "description", "apps", "tunnels", "settings", "clusters"}
+TOP_KEYS = {"format", "name", "version", "description", "apps", "tunnels", "settings", "clusters", "widgets"}
+WIDGET_KEYS = {"id", "title", "slot", "entry", "reads", "height", "description"}
+WIDGET_SLOTS = ("home", "cluster.overview", "cluster.tab")
+WIDGET_TOPICS = ("clusters", "jobs", "storage", "apps")      # and "theme", which every widget gets
+MAX_WIDGETS = 20
+MAX_WIDGET_FILE = 1 << 20
 CLUSTER_KEYS = {"title", "host", "port", "description", "documentation_url", "defaults", "ssh_keys"}
 CLUSTER_HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}")
 CLUSTER_ARG_RE = re.compile(r"--(time|mem|partition|account|qos|cpus-per-task|constraint)=[A-Za-z0-9:._,+-]{1,64}")
@@ -352,7 +370,7 @@ def check_manifest(manifest, members, builtin_tunnels):
         raise PackageError("`version` must be a short version string such as 1.0.2")
     out = {"format": FORMAT, "name": name, "version": version,
            "description": _text(manifest.get("description"), "description", 2000, required=False) or "",
-           "apps": {}, "tunnels": {}, "settings": {}, "clusters": {}}
+           "apps": {}, "tunnels": {}, "settings": {}, "clusters": {}, "widgets": []}
 
     clusters = manifest.get("clusters") or {}
     if not isinstance(clusters, dict):
@@ -603,8 +621,48 @@ def check_manifest(manifest, members, builtin_tunnels):
             if len(members[path]) > MAX_SETTINGS_FILE:
                 raise PackageError(f"settings.{tunnel}.files: {path} is larger than 1 MB")
         out["settings"][tunnel] = {"values": dict(values), "files": dict(files)}
-    if not out["apps"] and not out["settings"] and not out["tunnels"] and not out["clusters"]:
-        raise PackageError("the package adds nothing: give apps, tunnels, settings or cluster presets")
+    out["widgets"] = _check_widgets(manifest.get("widgets") or [], members)
+    if not out["apps"] and not out["settings"] and not out["tunnels"] and not out["clusters"] and not out["widgets"]:
+        raise PackageError("the package adds nothing: give apps, tunnels, settings, cluster presets or widgets")
+    return out
+
+
+def _check_widgets(widgets, members):
+    """
+    The `widgets` section: [{id, title, slot, entry, reads, height, description}]. A widget is one self-contained
+    HTML file (inline scripts and styles, images as data: URLs) the console shows in a sandboxed frame (see
+    agent-console/widgets.js): it can't reach the console's key or API, only the topics it `reads`.
+    """
+    if not isinstance(widgets, list) or len(widgets) > MAX_WIDGETS:
+        raise PackageError(f"`widgets` is a list of at most {MAX_WIDGETS} widgets")
+    out, seen = [], set()
+    for w in widgets:
+        if not isinstance(w, dict) or set(w) - WIDGET_KEYS:
+            raise PackageError(f"a widget has the keys {sorted(WIDGET_KEYS)}")
+        wid = w.get("id")
+        if not isinstance(wid, str) or not APP_ID_RE.fullmatch(wid) or wid in seen:
+            raise PackageError(f"widget id {wid!r}: lower-case letters, digits, _ and -, unique in the package")
+        seen.add(wid)
+        if w.get("slot") not in WIDGET_SLOTS:
+            raise PackageError(f"widget {wid}: slot is one of {', '.join(WIDGET_SLOTS)}")
+        entry = w.get("entry")
+        if not isinstance(entry, str) or not entry.endswith(".html") or entry not in members:
+            raise PackageError(f"widget {wid}: entry must be an .html file in the zip")
+        if len(members[entry]) > MAX_WIDGET_FILE:
+            raise PackageError(f"widget {wid}: {entry} is larger than 1 MB")
+        try:
+            members[entry].decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise PackageError(f"widget {wid}: {entry} isn't UTF-8") from e
+        reads = w.get("reads") or []
+        if not isinstance(reads, list) or not all(r in WIDGET_TOPICS for r in reads) or len(set(reads)) != len(reads):
+            raise PackageError(f"widget {wid}: reads is a list of {', '.join(WIDGET_TOPICS)}")
+        height = w.get("height", 200)
+        if isinstance(height, bool) or not isinstance(height, int) or not 60 <= height <= 1600:
+            raise PackageError(f"widget {wid}: height is pixels from 60 to 1600")
+        out.append({"id": wid, "title": _text(w.get("title"), f"widget {wid} title", 80), "slot": w["slot"],
+                    "entry": entry, "reads": list(reads), "height": height,
+                    "description": _text(w.get("description"), f"widget {wid} description", 500, required=False) or ""})
     return out
 
 
@@ -760,6 +818,22 @@ class PackageStore:
                 out[key] = dict(spec, id=key, package=manifest["name"], package_version=manifest["version"])
         return out
 
+    def widgets(self):
+        """Every installed widget, with its package: [{key: PACKAGE/ID, package, version, ...the manifest's}]."""
+        return [dict(w, key=f"{m['name']}/{w['id']}", package=m["name"], version=m["version"])
+                for m, _ in self.installed() for w in m.get("widgets") or []]
+
+    def widget_html(self, package, widget_id):
+        """The widget's HTML, as text."""
+        for m, d in self.installed():
+            if m["name"] != package:
+                continue
+            for w in m.get("widgets") or []:
+                if w["id"] == widget_id:
+                    with open(os.path.join(d, *w["entry"].split("/")), encoding="utf-8") as f:
+                        return f.read()
+        raise PackageError(f"no widget {package}/{widget_id}")
+
     def tunnel_dir(self, tunnel):
         for m, d in self.installed():
             if tunnel in m["tunnels"]:
@@ -880,6 +954,11 @@ def summary(manifest):
                          f"{', '.join(k['label'] for k in app['downloads']['kinds'])})")
     for tunnel, t in manifest["tunnels"].items():
         lines.append(f"tunnel {tunnel}: {t['files']} files{', with install.sh' if t['install'] else ''}")
+    for w in manifest.get("widgets") or []:
+        where = {"home": "the clusters page", "cluster.overview": "each cluster's Overview",
+                 "cluster.tab": "a tab on each cluster's page"}[w["slot"]]
+        lines.append(f"widget {w['title']} ({w['id']}) on {where}; reads {', '.join(w['reads']) or 'nothing'} "
+                     f"(sandboxed: no access to the console's key or actions)")
     for tunnel, s in manifest["settings"].items():
         for k, v in s["values"].items():
             lines.append(f"{tunnel} setting {k} = {v}")

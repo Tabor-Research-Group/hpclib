@@ -1,12 +1,13 @@
 # Extending hpclib
 
-hpclib has four extension points:
+hpclib has five extension points:
 
 | To add | Write | Lives |
 | --- | --- | --- |
 | a service you can tunnel to | a **tunnel** folder | `hpclib/tunnels/NAME`, or installed on a cluster |
 | a page in the console for it | an **app**: an entry in `APPS`, or a package | `hpclib/servers/agent_console.py`, or a zip |
-| apps, tunnels or settings that don't belong in hpclib | a **console package** | a zip installed with Add App or Settings |
+| apps, tunnels or settings that don't belong in hpclib | a **console package** | a zip installed with Packages |
+| a dashboard on the console's pages | a **widget**: one HTML file, in a package | a zip installed with Packages |
 | a kind of job an agent may run | a **job template** | `~/.local/tunnels/rest/templates/NAME` on a cluster |
 
 ## Adding a tunnel
@@ -335,7 +336,7 @@ our-lab/
 | `apps.APP.install_files` | installation files copied from the zip into that app's packaged tunnel before Check, Install or Start; see below |
 | `apps.APP.install_modules` | default ordered list of modules loaded before the installer; users can replace or clear it in app Settings |
 
-Build and check it, then install it from **Add App or Settings**:
+Build and check it, then install it from **Packages**:
 
 ```bash
 python3 hpclib/servers/console_packages.py build our-lab/       # writes our-lab-0.1.0.zip next to the folder
@@ -434,6 +435,65 @@ bash "$dir/launch.sh"
 
 The `opencode` package (OpenCode with an open-weight model) does this, and starts a REST server of its own with a
 token for the job alone, for hpclib's MCP server inside the sandbox.
+
+## Console widgets
+
+A widget is a small dashboard: one HTML file that a package shows on the clusters page, on each cluster's
+Overview, or as a tab on each cluster's page. It is lighter than an app (no tunnel, nothing on a cluster) and can
+do less: it only displays data the console gives it.
+
+```json
+{"format": 1, "name": "gpu-queue", "version": "0.1.0",
+ "widgets": [{"id": "gpu-queue", "title": "GPU jobs", "slot": "home",
+              "entry": "widgets/gpu-queue.html", "reads": ["clusters", "jobs"], "height": 160,
+              "description": "shown on Interface Settings"}]}
+```
+
+| Field | |
+| --- | --- |
+| `slot` | `home` (above the clusters list), `cluster.overview` (on each cluster's Overview, below its tiles) or `cluster.tab` (a tab on each cluster's page) |
+| `entry` | the widget's HTML file in the zip (at most 1 MB): self-contained, with inline scripts and styles and images as `data:` URLs |
+| `reads` | the topics it may subscribe to (below); the Packages dialog shows them before install |
+| `height` | its starting height in pixels (60 to 1600); it then follows its content |
+
+**The sandbox.** The console shows a widget in an `<iframe sandbox="allow-scripts">` (no `allow-same-origin`),
+with a Content-Security-Policy at the top of its page that allows inline scripts and styles and nothing from the
+network. So a widget can't read the console's session key or anything else on its page, can't call the console's
+API or a cluster's, and can't fetch or send anything. It talks to the console only through the helper the console
+puts in its page:
+
+```html
+<div id="out"></div>
+<script type="module">
+  const hpc = await hpclibWidget();     // {widget, context, subscribe, navigate, resize}
+  hpc.subscribe("theme", ({ vars }) => {  // the page's CSS variables, so it matches light and dark
+    for (const [k, v] of Object.entries(vars)) document.documentElement.style.setProperty(k, v);
+  });
+  hpc.subscribe("jobs", ({ byCluster }) => {
+    document.getElementById("out").textContent = Object.keys(byCluster).join(", ");
+  });
+</script>
+```
+
+| Topic | What it gets (again on every refresh) | Refreshed |
+| --- | --- | --- |
+| `clusters` | `[{name, host, mcp_name, set_up, work_dirs, login, tunnel, hpclib_version}]` | 30 s |
+| `jobs` | `{at, byCluster: {NAME: {queued, running, finished, counts}}}` for clusters you're logged in to (each cluster's Jobs tab, read with squeue and sacct over your login) | 60 s |
+| `storage` | `{byCluster: {NAME: the last storage scan}}` | 2 min |
+| `apps` | `{apps: [{id, title}], byCluster: {NAME: {APP: {state, version, port, install, ...}}}}`, never an app's URL, token or password | 30 s |
+| `theme` | `{dark, vars: {"--bg": ..., ...}}`; every widget may read it | on change |
+
+The console fetches each topic once for all the widgets on screen, and only while one wants it, so widgets add no
+logins of their own; they mustn't (and can't) poll. A topic the manifest doesn't `read` gets an
+`hpclib-error` event instead of data. `hpc.context.cluster` is the cluster on a cluster's page.
+`hpc.navigate("#/c/grace/jobs")` moves the console's page (only to its own `#/` addresses). The frame follows
+the height of its content; `hpc.resize(px)` sets it. A widget that navigates itself away from its page is
+removed.
+
+The data a widget reads (cluster names, job names, sizes) isn't secret, but it is yours: install widgets, like
+any package, from people you trust. On Interface Settings → Widgets, each can be hidden and moved within its
+place. `examples/console-widgets/gpu-queue` is a complete package with two widgets from one file; build it with
+`python3 hpclib/servers/console_packages.py build examples/console-widgets/gpu-queue`.
 
 ## Writing job templates
 

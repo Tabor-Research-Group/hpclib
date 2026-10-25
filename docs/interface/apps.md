@@ -114,11 +114,11 @@ section, for what such a program gets and must print).
 ## Adding apps and settings from packages
 
 Apps that don't belong in hpclib itself (a group's file server, a project's test instance) come as **package**
-zip files. Click **Add App or Settings** at the top right:
+zip files. Click **Packages** at the top right:
 
 1. Choose the zip. The console checks it and shows what it adds: apps, tunnels, and default settings with their
    values.
-2. **Install** it. Its apps join the top bar.
+2. **Install** it. Its apps join each cluster's Apps tab.
 3. The packaged tunnel and settings files go to a cluster the next time you Check, Install or Start the app
    there.
 

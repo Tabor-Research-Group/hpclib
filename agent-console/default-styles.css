@@ -1,5 +1,7 @@
 /* Default console UI variables. Open Stylesheet copies this file to user.css once.
-   Keep both theme blocks when editing; changes apply after a browser reload. */
+   Keep the theme blocks when editing; changes apply after a browser reload.
+   The theme follows the system unless the menu's dark-mode switch picks one (data-theme on <html>);
+   colours set on Interface Settings (interface.css) are laid over these, and user.css over both. */
 :root {
   /* Colours */
   /* Page, inputs, panel and dialog background */
@@ -141,8 +143,11 @@
 
   color-scheme: light dark;
 }
+/* the menu's switch: light even when the system is dark */
+:root[data-theme="light"] { color-scheme: light; }
+/* dark: the system's, unless the switch chose light; or the switch's */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #18181a;
     --fg: #ececee;
     --muted: #9a9aa0;
@@ -153,4 +158,16 @@
     --warn: #e6a23c;
     --bad: #ff6b6b;
   }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #18181a;
+  --fg: #ececee;
+  --muted: #9a9aa0;
+  --line: #333338;
+  --panel: #222226;
+  --accent: #6ea0ff;
+  --good: #4cc27f;
+  --warn: #e6a23c;
+  --bad: #ff6b6b;
 }

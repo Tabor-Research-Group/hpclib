@@ -1,7 +1,7 @@
 # Installable cluster configurations
 
 A console package may contain `clusters` without adding a tunnel app or executable scripts.
-Install its ZIP through **Add App or Settings**; the preset appears under
+Install its ZIP through **Packages**; the preset appears under
 **Agents → Clusters → Add cluster → Configuration**. The user supplies their username,
 absolute work directory and allocation, and can edit tunnel resource defaults.
 

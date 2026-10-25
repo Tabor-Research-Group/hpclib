@@ -123,9 +123,10 @@ unless you override the alias separately. Spacing, radii and font sizes remain i
 
 ### Dark theme overrides
 
-The following variables change when the operating system prefers dark mode.
-All other defaults stay the same. A later `:root` declaration in `user.css` overrides either theme;
-use your own dark-mode media query when you want distinct light and dark values.
+The following variables change in the dark theme: the system's (`@media (prefers-color-scheme: dark)` on
+`:root:not([data-theme="light"])`), or the one the menu's switch chose (`:root[data-theme="dark"]`).
+All other defaults stay the same. A later `:root` declaration in `user.css` overrides either theme; for distinct
+dark values use both selectors (see the README), or set them on Interface Settings.
 
 | Variable | Dark default |
 | --- | --- |
