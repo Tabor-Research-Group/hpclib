@@ -504,21 +504,82 @@ function defaultsCard(p) {
     el("div", { class: "actions" }, save));
 }
 
+// Update hpclib (console_update.py): check the clone's upstream on GitHub, fast-forward to it, and restart
+// the console so it runs the new code. Your own changes and commits are never touched: the card says what's in
+// the way instead.
+const when = (t) => t ? new Date(t * 1000).toLocaleString() : "never";
+
+export async function restartConsole(note) {
+  const before = await ctx.api("health");
+  await ctx.api("restart", { method: "POST" });
+  if (note) note.textContent = "Restarting the console…";
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    try {
+      const now = await ctx.api("health");
+      if (now.started !== before.started) { location.reload(); return; }    // (an exec keeps the pid)
+    } catch { /* not back yet */ }
+  }
+  throw new Error("The console didn't come back within a minute: start launch-tunnel-manager again.");
+}
+
+async function updateCard() {
+  const box = el("section", { class: "card", id: "update" });
+  const notice = el("p", { class: "notice", role: "status" });
+  const draw = async (st) => {
+    const restartFor = st.version && st.running && st.version !== st.running;
+    const restart = action("Restart the console", () => restartConsole(notice), { primary: restartFor });
+    const check = action("Check for updates", async () => draw(await ctx.api("update?fetch=1")));
+    const update = action("Update hpclib", async () => {
+      const out = await ctx.api("update", { method: "POST" });
+      await draw(out.status);
+      notice.textContent = out.updated
+        ? `Updated ${out.from.version || out.from.commit} → ${out.to.version || out.to.commit} (${out.commits.length} commit${out.commits.length === 1 ? "" : "s"}). Restart the console to run it.`
+        : "Already up to date.";
+    }, { primary: true, disabled: !st.can_update });
+    const where = st.git ? el("div", { class: "muted small" },
+      `${st.repo} · ${st.branch || "no branch"} ${st.commit || ""}`, st.upstream ? ` · follows ${st.upstream}` : "",
+      st.remote_url ? ` (${st.remote_url})` : "", ` · last checked ${when(st.fetched)}`) : null;
+    const state = !st.git ? el("p", { class: "error-box" }, st.reason)
+      : st.fetch_error ? el("p", { class: "error-box" }, `Couldn't check: ${st.fetch_error}`)
+      : st.reason ? el("p", { class: "error-box" }, st.reason)
+      : st.behind ? el("p", {}, el("strong", {}, `${st.behind} new commit${st.behind === 1 ? "" : "s"}`),
+          st.upstream_version && st.upstream_version !== st.version ? ` · hpclib ${st.upstream_version}` : "")
+      : el("p", { class: "muted" }, "Up to date with what was last fetched.");
+    const incoming = st.incoming && st.incoming.length ? el("ul", { class: "small" },
+      st.incoming.map((c) => el("li", {}, el("code", {}, c.commit), " ", c.subject))) : null;
+    box.replaceChildren(...[
+      el("h3", {}, "Update hpclib"),
+      el("p", {}, "Running ", el("strong", {}, st.running || "?"),
+        st.version && st.version !== st.running ? [" · ", el("strong", {}, st.version), " on disk (restart to run it)"] : ""),
+      where, state, incoming,
+      el("div", { class: "actions" }, check, update, restart),
+      notice,
+      el("p", { class: "muted small" }, "Update pulls the clone's branch from GitHub and only fast-forwards: local " +
+        "changes or commits stop it, and are left alone. Restarting keeps the page and its key; tunnels and apps keep " +
+        "running. Clusters then show Update hpclib, which copies the new version to them."),
+    ].filter(Boolean));
+  };
+  try { await draw(await ctx.api("update")); }
+  catch (err) { box.replaceChildren(el("h3", {}, "Update hpclib"), ctx.errorBox(err)); }
+  return box;
+}
+
 export async function consolePage() {
   const p = await loadPreferences();
   if (!p) throw new Error("This console is older than its page: restart it (launch-tunnel-manager).");
-  const [ports, clients, machine] = await Promise.all([portsCard(), clientsCard(), machineCard()]);
+  const [update, ports, clients, machine] = await Promise.all([updateCard(), portsCard(), clientsCard(), machineCard()]);
   return [
     el("h2", {}, "Console Settings"),
     el("p", { class: "muted" }, "Settings for this console on this machine, not for a cluster (those are on each " +
       "cluster's Settings tab)."),
-    el("nav", { class: "subtabs" }, [["notifications", "Notifications"], ["ports", "Local ports"],
+    el("nav", { class: "subtabs" }, [["update", "Update hpclib"], ["notifications", "Notifications"], ["ports", "Local ports"],
       ["llm-clients", "LLM clients"], ["new-cluster", "Defaults for new clusters"], ["machine", "This machine"]].map(([id, label]) => {
       const a = el("a", { href: `#/console` }, label);
       a.addEventListener("click", (e) => { e.preventDefault(); document.getElementById(id)?.scrollIntoView({ behavior: "smooth" }); });
       return a;
     })),
-    notificationsCard(p), ports, clients, defaultsCard(p), machine,
+    update, notificationsCard(p), ports, clients, defaultsCard(p), machine,
   ];
 }
 
@@ -549,7 +610,8 @@ export async function aboutPage() {
     a.restart_for ? el("section", { class: "next-step" },
       el("div", {}, el("strong", {}, "Restart to update: "),
         `hpclib ${a.restart_for} is on this machine; this console is still running ${a.hpclib_version}. ` +
-        "Quit launch-tunnel-manager and start it again."), null) : null,
+        "Restart the console to run it (tunnels and apps keep running)."),
+      action("Restart now", () => restartConsole(), { primary: true })) : null,
     el("section", { class: "card" },
       el("table", { class: "about" }, el("tbody", {},
         row("hpclib", el("strong", {}, a.hpclib_version || "unknown"), a.restart_for ? " " : "",

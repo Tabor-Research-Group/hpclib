@@ -18,6 +18,13 @@ The front end depends only on the routes below; nothing here depends on it.
 
   GET  /api/health
   GET  /api/about                            versions (running and on disk), paths, packages, this process
+  GET  /api/update[?fetch=1]                  the hpclib clone this console runs from (console_update.py): branch,
+                                              upstream, commits behind and ahead, what an update brings; fetch=1
+                                              asks the remote first
+  POST /api/update                            fetch and fast-forward it (refused when local changes or commits
+                                              are in the way); the console runs the new code after a restart
+  POST /api/restart                           start this console again (same port and session key), running the
+                                              hpclib now on disk; refused while a login or an operation runs
   GET  /api/diagnostics                      about, preferences and every cluster's state, for a bug report
                                               (token-like strings redacted)
   GET  /api/preferences                      this machine's preferences (console_prefs.py)
@@ -178,6 +185,7 @@ import local_platform  # noqa: E402
 sys.path.insert(0, HERE)
 import console_packages  # noqa: E402
 import console_prefs  # noqa: E402
+import console_update  # noqa: E402
 import mcp_clients  # noqa: E402
 
 VERSION = "0.1"
@@ -3386,7 +3394,38 @@ class ConsoleServer(http.server.ThreadingHTTPServer):
         self.static_dir = os.path.realpath(static_dir) if static_dir else None
         self.stylesheet_lock = threading.Lock()
         self.max_body = max_body
+        self.updater = console_update.Updater(os.path.dirname(HPCLIB_DIR))
+        self.restart_argv = None     # main() sets it: how to start this console again
         super().__init__(address, ConsoleHandler)
+
+    RESTART_KEY_VAR = "HPCLIB_CONSOLE_RESTART_KEY"   # the session key for the next process (not on its command line)
+
+    def restart(self):
+        """Start the console again in this process (exec), with the same port and session key, so the page carries
+        on. Tunnels and apps keep running (their ports show them up again); a login or an operation in progress
+        would be cut off, so they refuse it."""
+        if self.restart_argv is None:
+            raise ConsoleError(409, "this console wasn't started by agent_console's main(); restart it yourself")
+        c = self.clusters
+        busy = []
+        if c is not None:
+            with c.lock:
+                busy += [f"{name}: {op.get('kind')}" for name, op in c.ops.items() if op.get("state") == "running"]
+                busy += [f"{name}: storage scan" for name, s in c.storage_scans.items() if s.get("state") == "running"]
+            busy += [f"{name}: login" for name, a in list(c.logins.attempts.items())
+                     if a.get("state") in ("starting", "password_sent", "push_sent", "code_required")]
+        if busy:
+            raise ConsoleError(409, "wait for these to finish first: " + "; ".join(busy))
+        argv = list(self.restart_argv)
+
+        def again():
+            time.sleep(0.5)                      # the answer reaches the page first
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.environ[self.RESTART_KEY_VAR] = self.key
+            os.execv(argv[0], argv)              # this process's sockets aren't inherited: the port is free again
+        threading.Thread(target=again, daemon=True).start()
+        return {"restarting": True, "after": 0.5}
 
     @property
     def port(self):
@@ -3522,6 +3561,7 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             return 200, self.open_stylesheet()
         if parts == ["health"] and verb == "GET":
             return 200, {"ok": True, "console": VERSION, "clusters": len(c.names()), "pid": os.getpid(),
+                         "started": STARTED_AT,
                          "hpclib_version": local_hpclib_version()}
         if parts == ["platform"] and verb == "GET":
             return 200, dict(local_platform.describe(), ok=True)
@@ -3547,6 +3587,15 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         if parts == ["about"] and verb == "GET":
             return 200, dict(c.about(), ok=True, url=f"http://127.0.0.1:{self.server.port}",
                              static=bool(self.server.static_dir))
+        if parts == ["update"] and verb == "GET":
+            return 200, dict(self.server.updater.status(fetch=self.flag("fetch")), ok=True, running=STARTED_VERSION)
+        if parts == ["update"] and verb == "POST":
+            try:
+                return 200, dict(self.server.updater.update(), ok=True, running=STARTED_VERSION)
+            except console_update.UpdateError as e:
+                raise ConsoleError(e.status, str(e)) from e
+        if parts == ["restart"] and verb == "POST":
+            return 202, dict(self.server.restart(), ok=True)
         if parts == ["diagnostics"] and verb == "GET":
             return 200, dict(c.diagnostics(), ok=True)
         if parts == ["widgets"] and verb == "GET":
@@ -3907,7 +3956,8 @@ def parse_args(argv=None):
 
 def main(argv=None):
     opts = parse_args(argv)
-    key = opts.key or secrets.token_urlsafe(32)
+    key = opts.key or os.environ.pop(ConsoleServer.RESTART_KEY_VAR, None) or secrets.token_urlsafe(32)
+    restarted = bool(os.environ.get("HPCLIB_CONSOLE_RESTARTED"))
     session_file = os.path.join(console_dir(), "session")
     try:
         server = ConsoleServer(("127.0.0.1", opts.port), key, Clusters(), allow_origin=opts.allow_origin,
@@ -3917,6 +3967,18 @@ def main(argv=None):
                  f"pick another with --port")
     write_private(session_file, json.dumps({"url": f"http://127.0.0.1:{server.port}", "key": key,
                                             "pid": os.getpid()}) + "\n")
+    # a restart (Console Settings) runs this again: same port, the key through the environment, no new browser tab
+    given = list(sys.argv[1:] if argv is None else argv)
+    keep, skip = [], False
+    for a in given:
+        if skip:
+            skip = False
+        elif a in ("--key", "--port"):
+            skip = True
+        elif not (a == "--open" or a.startswith(("--key=", "--port="))):
+            keep.append(a)
+    server.restart_argv = [sys.executable, os.path.abspath(__file__), *keep, "--port", str(server.port)]
+    os.environ["HPCLIB_CONSOLE_RESTARTED"] = "1"
     url = f"http://127.0.0.1:{server.port}"
     print(f"hpclib Agent Console on {url}")
     print(f"  session key: {key}")
@@ -3926,7 +3988,7 @@ def main(argv=None):
         print(f"  browser calls allowed from: {opts.allow_origin}")
     if opts.static:
         print(f"  front end: {url}/#key={key}")
-        if opts.open:
+        if opts.open and not restarted:
             if local_platform.platform() == "wsl":       # the browser is Windows'
                 try:
                     local_platform.open_target(f"{url}/#key={key}")

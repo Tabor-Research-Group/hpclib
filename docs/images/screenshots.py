@@ -239,6 +239,16 @@ WIDGETS = [dict(w, key=f"gpu-queue/{w['id']}", package="gpu-queue", version="0.1
            for w in json.loads((WIDGET_DIR / "hpclib-package.json").read_text())["widgets"]]
 
 
+UPDATE = {"repo": "/Users/jdoe/hpclib", "git": True, "fetched": NOW - 60, "fetch_error": None, "branch": "master",
+          "upstream": "origin/master", "remote_url": "https://github.com/Tabor-Research-Group/hpclib.git",
+          "commit": "5011d93c2a41", "version": "1.4.0", "changed_files": [], "changed_count": 0, "behind": 3, "ahead": 0,
+          "upstream_commit": "9f3c67e0b1d2", "upstream_version": "1.4.1", "reason": None, "can_update": True,
+          "up_to_date": False, "running": "1.4.0",
+          "incoming": [{"commit": "9f3c67e0b1d2", "time": NOW - 3600, "subject": "Docs: screenshots of the console"},
+                       {"commit": "7905522aa1c3", "time": NOW - 7200, "subject": "Console Settings: Update hpclib"},
+                       {"commit": "825bcd5e44f0", "time": NOW - 9000, "subject": "LLM clients: paths you choose"}]}
+
+
 def answer(path, method):
     parts = path.split("/")
     if path == "widgets":
@@ -251,6 +261,8 @@ def answer(path, method):
         return PORTS
     if path == "llm-clients":
         return {"clients": CLIENTS}
+    if path == "update":
+        return UPDATE
     if path == "about":
         return ABOUT
     if path == "platform":
@@ -365,6 +377,7 @@ DOCS = [
     ("console-settings", "#/console", 1280, None, False, None, None),
     ("console-llm-clients", "#/console", 1280, None, False, client_change, "#llm-clients"),
     ("console-this-machine", "#/console", 1280, None, False, None, "#machine"),
+    ("console-update", "#/console", 1280, None, False, None, "#update"),
     ("about", "#/about", 1280, None, False, None, "main"),
     ("widgets-home", "#/c", 1280, None, True, None, "main"),
     ("widgets-overview", "#/c/hpclib-grace/overview", 1280, None, True, None, "main"),

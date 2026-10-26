@@ -52,11 +52,25 @@ class TestConsoleSettingsUI(unittest.TestCase):
                       "python_path": "/usr/bin/python3", "platform": "Linux", "console_dir": "/c", "agents_dir": "/a",
                       "pid": 1, "started": time.time(), "clusters": 1, "packages": [], "url": self.base, "static": True},
             "diagnostics": {"about": {"hpclib_version": "0.2.79"}, "clusters": []},
+            "update": self.update_answer(route.request.method),
         }
         if path in answers:
             route.fulfill(body=json.dumps(answers[path]), content_type="application/json")
             return True
         return False
+
+    def update_answer(self, method):
+        base = {"repo": "/home/me/hpclib", "git": True, "fetched": time.time(), "fetch_error": None, "branch": "master",
+                "upstream": "origin/master", "remote_url": "https://github.com/Tabor-Research-Group/hpclib.git",
+                "commit": "aaaa", "version": "1.4.1", "changed_files": [], "changed_count": 0, "behind": 2, "ahead": 0,
+                "upstream_version": "1.5.0", "reason": None, "can_update": True, "up_to_date": False,
+                "running": "1.4.1", "incoming": [{"commit": "bbbb", "time": 1, "subject": "Quota checks"},
+                                                 {"commit": "cccc", "time": 1, "subject": "WSL"}]}
+        if method == "POST":
+            after = dict(base, commit="cccc", version="1.5.0", behind=0, can_update=False, up_to_date=True, incoming=[])
+            return {"updated": True, "from": {"commit": "aaaa", "version": "1.4.1"},
+                    "to": {"commit": "cccc", "version": "1.5.0"}, "commits": base["incoming"], "status": after}
+        return base
 
     def open(self, hash_, notifications=False):
         if notifications:
@@ -257,6 +271,17 @@ class TestConsoleSettingsUI(unittest.TestCase):
             clients.get_by_role("button", name="Save", exact=True).click()
         prefs = json.loads((self.console / "preferences.json").read_text())
         self.assertEqual(prefs["llm_client_paths"]["cursor"], "/opt/cursor/mcp.json")
+        self.assertEqual(self.errors, [])
+
+    def test_update_hpclib(self):
+        self.open("#/console")
+        card = self.page.locator("#update")
+        card.get_by_text("2 new commits", exact=False).wait_for()
+        self.assertIn("Quota checks", card.inner_text())
+        card.get_by_role("button", name="Update hpclib", exact=True).click()
+        card.get_by_text("Updated 1.4.1 → 1.5.0 (2 commits). Restart the console to run it.", exact=False).wait_for()
+        self.assertIn("1.5.0 on disk (restart to run it)", card.inner_text())
+        self.assertIn("POST", [m for m, p, _ in self.calls if p == "update"])
         self.assertEqual(self.errors, [])
 
     def test_about_copies_the_link(self):

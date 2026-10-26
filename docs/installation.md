@@ -152,6 +152,13 @@ client completely and reopen it.
 
 ## Updating
 
+In the console: **Console Settings → Update hpclib**. **Check for updates** fetches from GitHub and lists the new
+commits; **Update hpclib** fast-forwards your clone to them; **Restart the console** then runs the new code
+(the page reloads; tunnels and apps keep running). It only fast-forwards: files you changed or commits of your
+own stop it, and stay as they are, with a note saying what's in the way. Then **Update hpclib** on each
+cluster (its row or Installed tab) copies the new version there. Rerunning the installer does the same for
+your machine. By hand:
+
 ```bash
 cd ~/hpclib && git pull                 # your machine
 install_hpclib user@login.example       # each cluster (or Update hpclib in the console)
