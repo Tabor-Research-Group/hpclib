@@ -8,7 +8,7 @@ for you, so in practice you install once locally and then point hpclib at each c
 
 | Where | Needs |
 | --- | --- |
-| your machine | macOS, Linux, or Windows through WSL ([below](#windows-wsl)); `bash` 3.2 or newer, OpenSSH, Python 3.7 or newer (for the console), `git` |
+| your machine | macOS, Linux, or Windows through WSL ([below](#windows-wsl)); `bash` 3.2 or newer, OpenSSH, Python 3.7 or newer (for the console), `git` (the installer checks) |
 | your machine, for agents | a Python with the MCP SDK (`pip install mcp`) for the MCP server |
 | cluster login node | `bash`, Python 3.9 or newer (found or loaded from a module by `setup_agents`), SLURM (`sbatch`, `squeue`) or podman |
 | cluster, for sandboxed agent jobs | Singularity or Apptainer; or rootless podman on a server without SLURM |
@@ -16,6 +16,19 @@ for you, so in practice you install once locally and then point hpclib at each c
 
 
 ## 1. Install hpclib on your machine
+
+The installer does all of this step (clone, launcher, shell functions, MCP SDK) in one line; run it again to
+update:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Tabor-Research-Group/hpclib/master/install.sh | bash          # macOS, Linux, WSL (or: wget -qO- ... | bash)
+```
+
+```powershell
+irm https://raw.githubusercontent.com/Tabor-Research-Group/hpclib/master/install.ps1 | iex                 # Windows PowerShell: WSL first, then the above inside it
+```
+
+Options and details are in the [README](../README.md#on-your-machine-the-tunnel-manager). By hand:
 
 Clone the repository somewhere permanent; updating is then `git pull`.
 
@@ -56,7 +69,8 @@ Install it into the Python your LLM client will launch:
 python3 -m pip install mcp            # or: python3 -m pip install "$HOME/hpclib[mcp]"
 ```
 
-Nothing on the cluster depends on it.
+Nothing on the cluster depends on it. The installer puts it in a virtual environment of its own,
+`~/.local/share/hpclib/mcp` (`$HPCLIB_MCP_VENV`), which `setup_agents` uses when `$HPCLIB_MCP_PYTHON` isn't set.
 
 ### Windows (WSL)
 

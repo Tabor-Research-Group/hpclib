@@ -10,6 +10,40 @@ using [the interface](hpclib/docs/interface/README.md) or [the command line](hpc
 
 ## installation
 
+### On your machine: the tunnel manager
+
+macOS, Linux, or WSL on Windows, in a terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Tabor-Research-Group/hpclib/master/install.sh | bash
+# or, without curl:
+wget -qO- https://raw.githubusercontent.com/Tabor-Research-Group/hpclib/master/install.sh | bash
+```
+
+Windows, in PowerShell (it sets up WSL with Ubuntu if there's none yet, then installs hpclib inside it):
+
+```powershell
+irm https://raw.githubusercontent.com/Tabor-Research-Group/hpclib/master/install.ps1 | iex
+```
+
+Then start the tunnel manager, which opens the console in your browser:
+
+```bash
+launch-tunnel-manager        # on Windows: "hpclib Tunnel Manager" in the Start menu
+```
+
+The installer clones hpclib into `~/hpclib`, links `launch-tunnel-manager` into `~/.local/bin` (and puts that on
+your `PATH`), loads hpclib's shell functions (`launch_tunnel`, `setup_agents`, ...) in new bash shells, and
+installs the MCP SDK the agents' MCP server needs into its own environment (`~/.local/share/hpclib/mcp`). It
+needs `git`, OpenSSH and Python 3.7 or newer (3.10 for the MCP SDK), and never root. Run it again to update.
+Options follow `bash -s --`: `--dir DIR`, `--branch NAME`, `--bin DIR`, `--no-mcp`, `--no-shell`, `--dry-run`
+(for example `curl -fsSL .../install.sh | bash -s -- --no-mcp`). On Windows, pass `-Distro NAME`, `-NoMcp` or
+`-NoShortcut` by running the script as a block:
+`& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Tabor-Research-Group/hpclib/master/install.ps1))) -Distro Ubuntu-24.04`.
+See [Windows (WSL)](docs/installation.md#windows-wsl) for what hpclib does differently there.
+
+### On a cluster
+
 On a login node run
 
 ```commandline

@@ -910,9 +910,10 @@ function _hpclib_agent_lines {  # _hpclib_agent_lines NAME KEY: a list-valued pr
 # The Python that will run rest_mcp.py: $HPCLIB_MCP_PYTHON, or the first
 # python3 that has the MCP SDK. Prints the path; returns 1 (printing plain
 # python3's path) if none has it.
-function _hpclib_mcp_python {
+function _hpclib_mcp_python {  # a Python with the MCP SDK: yours, install.sh's environment, or python3's
   local candidate
-  for candidate in "${HPCLIB_MCP_PYTHON:-}" "$(command -v python3)" /usr/local/bin/python3 /opt/homebrew/bin/python3; do
+  for candidate in "${HPCLIB_MCP_PYTHON:-}" "${HPCLIB_MCP_VENV:-$HOME/.local/share/hpclib/mcp}/bin/python" \
+      "$(command -v python3)" /usr/local/bin/python3 /opt/homebrew/bin/python3; do
     [ -n "$candidate" ] && [ -x "$candidate" ] || continue
     if "$candidate" -c 'import mcp' > /dev/null 2>&1; then
       printf '%s\n' "$candidate"
