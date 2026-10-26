@@ -11,6 +11,8 @@ below, with a cluster picker, still open from their old addresses (`#/clusters`,
 
 One row per cluster set up on this machine (one per agent profile). Each row shows:
 
+![A cluster's Agents tab: the agent tunnel's row, the MCP server's name and tunnel actions](../images/cluster-agents.png)
+
 | Column | What |
 | --- | --- |
 | Cluster | the login and the MCP server name (`hpclib-NAME`), which is what your LLM client calls it |
@@ -43,6 +45,8 @@ Agents can draft new job templates with the `propose_template` tool. This page l
 every live cluster. **Diff** shows the proposal's files next to the template it would replace, if any.
 **Approve** installs it as a template; **Reject** asks for a reason and sets the proposal
 aside on the cluster.
+
+![Template proposals from agents, waiting for review](../images/proposals.png)
 
 Whether proposals wait for you depends on the cluster's approval mode (Settings → Tunnel):
 
@@ -87,6 +91,8 @@ keeps at most 2000 while following.
 
 Browse the directories the agent token may use. Click a folder to open it; **View** shows a file in the page:
 
+![A cluster's files, through its REST server](../images/cluster-files.png)
+
 | Kind | How it is shown |
 | --- | --- |
 | text | in full up to 5 MB, otherwise the first 1 MB |
@@ -113,6 +119,8 @@ compute connection settings, and the REST API.
 ## Settings
 
 Each cluster has three cards.
+
+![A cluster's Settings tab](../images/cluster-settings.png)
 
 ### Tunnel (kept on this machine)
 

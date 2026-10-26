@@ -23,6 +23,14 @@ The **top bar** holds what spans clusters: **Clusters**, the home page, with one
 which lists and installs packages. The **☰** menu at the far left has what belongs to this machine: the dark-mode
 switch, Interface Settings, Console Settings and About.
 
+![The Clusters page: one row per cluster, with what each needs next](../images/clusters-list.png)
+
+![The ☰ menu: the dark-mode switch, Interface Settings, Console Settings and About](../images/menu.png)
+
+The page fits a phone too, which is handy for approving a Duo push or checking a job away from your desk:
+
+<img src="../images/clusters-phone.png" alt="The Clusters page at phone width" width="260">
+
 Everything else is on a cluster's page: its Overview, Jobs, Apps (each app has its own page there, with its
 settings), Installed, Storage, Files, Agents and Settings tabs. See [Clusters](clusters.md).
 

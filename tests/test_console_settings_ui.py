@@ -251,6 +251,7 @@ class TestConsoleSettingsUI(unittest.TestCase):
         clients = self.page.locator("#llm-clients")
         clients.get_by_text("/home/me/.cursor/mcp.json").wait_for()
         clients.get_by_role("button", name="Change", exact=True).click()
+        self.assertNotIn("null", clients.inner_text())
         clients.get_by_label("Cursor configuration file").fill("/opt/cursor/mcp.json")
         with self.page.expect_response(lambda r: r.url.endswith("/api/preferences") and r.request.method == "PUT"):
             clients.get_by_role("button", name="Save", exact=True).click()

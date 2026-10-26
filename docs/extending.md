@@ -443,6 +443,12 @@ A widget is a small dashboard: one HTML file that a package shows on the cluster
 Overview, or as a tab on each cluster's page. It is lighter than an app (no tunnel, nothing on a cluster) and can
 do less: it only displays data the console gives it.
 
+![A widget on the Clusters page (the gpu-queue example)](images/widgets-home.png)
+
+![The same package's widget on a cluster's Overview](images/widgets-overview.png)
+
+![Interface Settings, Widgets: hide and order them](images/widgets-interface.png)
+
 ```json
 {"format": 1, "name": "gpu-queue", "version": "0.1.0",
  "widgets": [{"id": "gpu-queue", "title": "GPU jobs", "slot": "home",

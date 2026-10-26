@@ -32,6 +32,10 @@ Then start the tunnel manager, which opens the console in your browser:
 launch-tunnel-manager        # on Windows: "hpclib Tunnel Manager" in the Start menu
 ```
 
+![The tunnel manager's Clusters page](docs/images/clusters-list.png)
+
+More screenshots are in [Using the interface](docs/interface/README.md).
+
 The installer clones hpclib into `~/hpclib`, links `launch-tunnel-manager` into `~/.local/bin` (and puts that on
 your `PATH`), loads hpclib's shell functions (`launch_tunnel`, `setup_agents`, ...) in new bash shells, and
 installs the MCP SDK the agents' MCP server needs into its own environment (`~/.local/share/hpclib/mcp`). It

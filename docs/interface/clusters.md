@@ -13,10 +13,14 @@ storage scan, and the one thing it needs next: **Log in**, **Update hpclib**, **
 **Start agent tunnel**. Click a cluster's name to open its page. **Add cluster** adds one (a package's cluster
 configuration, or a custom one).
 
+![The Clusters page](../images/clusters-list.png)
+
 ## A cluster's page
 
 The cluster's name, at the left of the tabs, is a switcher: pick another cluster to see the same tab there.
 Its address is `#/c/NAME/TAB`, so a tab can be bookmarked.
+
+![The Overview tab](../images/cluster-overview.png)
 
 | Tab | What it shows |
 | --- | --- |
@@ -29,6 +33,22 @@ Its address is `#/c/NAME/TAB`, so a tab can be bookmarked.
 | Agents | **Tunnel and setup**: the agent profile's row (start and stop the agent tunnel, its log, Update hpclib, Setup…, Set up SSH), the MCP server's name, and **Tunnel actions** (what tunnels may do for agents with your access: on or off per tunnel and per action, and whether each can run now); **Activity**: what agents did here; **SSH keys** |
 | Settings | the cluster's settings: its agent tunnel's job, ports (with **Clear leftover ports…**), **Quota checks**, and the REST server's limits and sandbox |
 
+### Jobs
+
+![The Jobs tab: queued, running and finished jobs, each labelled with what started it](../images/cluster-jobs.png)
+
+### Installed
+
+![The Installed tab: hpclib, the agent setup and each app, with Check, Install and Update](../images/cluster-installed.png)
+
+### Storage
+
+How the quotas are checked, and changed, is [below](#quotas).
+
+![The Storage tab: quotas, then each work directory's size by folder](../images/cluster-storage.png)
+
+![Settings, Quota checks](../images/cluster-quota-checks.png)
+
 ## An app's page
 
 `#/c/NAME/apps/APP` is one app on one cluster: its row (Open, Start, Stop, Log, and its tools, such as PAI's
@@ -37,12 +57,20 @@ the app's own fields; its secrets). Install output appears under the row. When a
 (CMCC DB's Preview), they are tabs at the top of the app's page. **APP on all clusters** opens the app's old page,
 one row per cluster.
 
+![PAI's page on a cluster: its row, what is installed, the job's options and its settings](../images/app-pai.png)
+
+A package's tabs for an app (here CMCC DB's Preview) are tabs at the top of the app's page:
+
+![An app page with a package's tab](../images/app-package-tab.png)
+
 **Cancel** on the Jobs tab is offered for agents' jobs and jobs started outside hpclib. An app's job stops with
 the app's **Stop**, PAI's database with **End database job**, and the agent tunnel with **Stop** on the
 Overview.
 
 Jobs are labelled from what hpclib puts on them: `hpcrest-TEMPLATE` names and the `hpclib-rest:TOKEN:TEMPLATE`
 comment for agents' jobs, `TUNNEL-ID` names for tunnels. A job `job-queue` or you submitted yourself is "other".
+
+## Quotas
 
 The quotas are two checks run over your login with the cluster's own commands: storage, the first of
 `showquota`, `myquota` or `quota -s`; project, `myproject` (TAMU HPRC). **Settings → Quota checks** changes

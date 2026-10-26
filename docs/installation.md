@@ -78,6 +78,8 @@ On Windows, hpclib runs in WSL 2 (Linux on Windows), while your browser and LLM 
 Install a distribution (`wsl --install` in PowerShell gives Ubuntu), then follow step 1 inside it: clone, source
 `hpclib.sh` in `~/.bashrc`, `pip install mcp`. Keep the clone in the Linux home (`~/hpclib`), not under `/mnt/c`.
 
+![Console Settings, This machine: the platform the console runs on, and the Windows profile folder](images/console-this-machine.png)
+
 hpclib detects WSL and then:
 
 - opens files and the console's page with `wslview` (from `wslu`, if installed) or `explorer.exe`, so they open

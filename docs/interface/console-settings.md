@@ -7,12 +7,18 @@ The **☰** menu at the top left holds what belongs to this console on this mach
 The switch at the top of the menu (sun, moon) picks the light or dark theme. Until you use it, the page follows
 your system's setting; **Match system** goes back to that. The choice is kept in this browser.
 
+![The ☰ menu in dark mode](../images/menu-dark.png)
+
+![A cluster's Jobs tab in dark mode](../images/cluster-jobs-dark.png)
+
 ## Interface Settings
 
 Every variable of the page's stylesheet, grouped (colours, typography, corners, spacing, sizes) with what each one
 changes. The colours that differ between themes have a light and a dark value. Empty fields use the default shown
 in them. Changes preview as you type; **Save** keeps them for this console, in any browser that opens it, and
 **Reset all** returns to the defaults.
+
+![Interface Settings](../images/interface-settings.png)
 
 **Widgets** lists the dashboards installed packages add (to the clusters page, each cluster's Overview, or a
 tab of their own): show or hide each, and move it up or down within its place. Widgets run sandboxed: they see
@@ -33,6 +39,16 @@ variable, `user.css` wins. **View the default stylesheet** shows the full set of
 | This machine | The platform the console runs on (detected: Linux, macOS, or WSL on Windows), which decides how it opens files and your browser and where the LLM clients' configuration is. Choose it if detection gets it wrong; `$HPCLIB_PLATFORM` wins over the choice. Under WSL, also your Windows profile folder as WSL sees it (`/mnt/c/Users/NAME`), found by asking Windows unless set here or in `$HPCLIB_WINDOWS_HOME`. See [Windows (WSL)](../installation.md#windows-wsl) |
 | Defaults for new clusters | How long an idle login is kept, the work directory **Add cluster** suggests (`{user}` is the login's user), the local folder for agents' files that **Add cluster** and **Set up…** suggest (`{cluster}`, `{user}`; empty suggests none), the Python on this machine for MCP servers (empty: found; each cluster's **Set up…** can change it), the MCP server's name (default `hpclib-{cluster}`; `{cluster}` is the first part of the host name, `{host}` all of it, `{user}` the login's user), and the REST server's GPU mode and GPUs-per-job limit. A package's cluster configuration keeps its own values where it sets them |
 
+![Console Settings](../images/console-settings.png)
+
+**LLM clients**, with **Change** open under Claude Desktop's path:
+
+![Console Settings, LLM clients](../images/console-llm-clients.png)
+
+**This machine**, under WSL:
+
+![Console Settings, This machine](../images/console-this-machine.png)
+
 ## A cluster's MCP name
 
 What LLM clients call a cluster's MCP server is set on its **Agents → Tunnel and setup** page: letters, digits,
@@ -47,3 +63,6 @@ The hpclib this console runs, and the one on disk if it is newer (restart `launc
 Python, the system and the console's folders; installed packages. **Copy link** copies the console's address
 with its session key, to open it in another browser on this machine. **Copy diagnostics** copies a report for a
 bug: versions, settings and every cluster's state, without tokens, passwords or keys.
+
+![About: versions, paths, this console's link and diagnostics](../images/about.png)
+

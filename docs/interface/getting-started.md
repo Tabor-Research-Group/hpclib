@@ -37,6 +37,8 @@ On **Clusters** (the home page), click **Add cluster** and fill in the form:
 | Extra read-only directories | software trees jobs need to read, e.g. `/software` (optional) |
 | Local folder for the agent's files | a folder on this machine the agent's `push_files` and `pull_files` copy from and into, e.g. `~/Documents/hpclib-agents` (created if missing; empty: none). Change it later with **Set up…** |
 
+![Add cluster: the login, the work directory on the cluster and the local folder for the agent's files](../images/clusters-add.png)
+
 Click **Add, then log in and set up**.
 
 ## 3. Log in
@@ -64,11 +66,21 @@ cluster's row. It:
 
 Setup takes a minute or two. You can rerun it later with **Set up…** on the row (for example after adding a
 work directory). Reruns keep your templates, configuration and tokens and only add what is new. The
-**Rebuild** checkbox regenerates them instead, keeping the old copies on the cluster.
+**Rebuild** checkbox regenerates them instead, keeping the old copies on the cluster. The same form sets the
+folders on your machine the agent's `push_files` and `pull_files` may use, the Python on your machine your LLM
+client runs the MCP server with, and the cluster's Python (a path or modules), when finding them isn't right:
+
+![Set up: work and read-only directories, the agent's local folders, and the Pythons](../images/cluster-setup.png)
 
 ## 5. Connect your LLM client
 
-Copy the MCP entry from the end of the setup output into your client:
+The easiest way: on **Console Settings → LLM clients** (☰ menu), click **Write entries** for your client, and
+tick **Keep up to date** so later setups, new ports and renames reach it too. If a client's configuration file
+isn't where the console looked, **Change** sets it.
+
+![Console Settings, LLM clients: each client's entries, its configuration file, and Change](../images/console-llm-clients.png)
+
+Or copy the MCP entry from the end of the setup output into your client:
 
 - **Claude Desktop**: Settings → Developer → Edit Config, and add the entry under `"mcpServers"`.
 - **Claude Code**: run the `claude mcp add-json ...` line the output shows.
@@ -81,6 +93,8 @@ is named after the cluster (for example `hpclib-grace`), so several clusters can
 Click **Start** on the cluster's row. The console runs the REST server tunnel: by default as a SLURM job, so the
 row shows **starting** and then **queued** while the job waits for a node. When it shows **up**, the agent can
 use the cluster.
+
+![A cluster's Overview: what it needs next, the agent tunnel, hpclib, jobs, storage and apps](../images/cluster-overview.png)
 
 On some clusters the login node asks for your password again to reach the compute node. A password dialog then
 opens on whatever page you are on. The first time a login node reaches a new compute node, a dialog shows that

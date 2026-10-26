@@ -363,10 +363,10 @@ function pathEditor(c, redraw, box) {
     auto.addEventListener("click", () => save(Object.assign({ [c.id]: "" }, cmd ? { claude_command: "" } : {})));
     const cancel = el("button", { type: "button", class: "link-button" }, "Cancel");
     cancel.addEventListener("click", () => wrap.replaceChildren(shown, " ", change));
-    wrap.replaceChildren(
+    wrap.replaceChildren(...[
       field("Configuration file", file, "empty: find it"),
       cmd ? field("claude program", cmd, "empty: find it on PATH") : null,
-      el("div", { class: "actions" }, saveBtn, auto, cancel));
+      el("div", { class: "actions" }, saveBtn, auto, cancel)].filter(Boolean));     // (null would show as "null")
     file.focus();
   });
   return wrap;

@@ -1064,12 +1064,12 @@ export class HpcAppSession extends TunnelRow {
         return null;
       }, { result: true }))));
     body.className = "";
-    body.replaceChildren(
+    body.replaceChildren(...[      // (a null would show as "null")
       out.note ? el("p", { class: "muted" }, out.note) : null,
       rows.length ? el("table", { class: "rows downloads" },
         el("thead", {}, el("tr", {}, ["Kind", "Name", "Size", "", ""].map((h) => el("th", {}, h)))),
         el("tbody", {}, rows))
-        : el("p", { class: "muted" }, "Nothing downloaded yet."));
+        : el("p", { class: "muted" }, "Nothing downloaded yet.")].filter(Boolean));
   }
 
   drawControls(controls) {

@@ -16,6 +16,8 @@ You don't need to set a cluster up for agents to use its apps.
 | **Log** | the tunnel's and the job's output |
 | **Settings…** | whether the app is installed (with **Check** and **Install**), the job's resources and the app's own settings for this cluster |
 
+![A cluster's Apps tab: each app's row, with only the buttons that apply](../images/cluster-apps.png)
+
 **Start** is refused while the app is known to be missing on the cluster: open **Settings…** and **Install** first.
 
 ### Install
