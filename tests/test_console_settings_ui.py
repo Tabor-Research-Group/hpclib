@@ -232,6 +232,32 @@ class TestConsoleSettingsUI(unittest.TestCase):
         self.assertTrue(card.get_by_label("Turn on data-transfer/put", exact=True).is_checked())
         self.assertEqual(self.errors, [])
 
+    def test_clusters_page_without_widgets_and_its_add_form(self):
+        self.open("#/c")
+        self.page.get_by_text("No clusters yet", exact=False).wait_for()
+        self.assertNotIn("null", self.page.locator("main").inner_text())        # no widget strip: nothing, not "null"
+        self.page.get_by_role("button", name="Add cluster", exact=True).click()
+        form = self.page.locator(".add-cluster")
+        form.get_by_label("Cluster configuration", exact=True).wait_for()
+        # the form is under the toolbar, as wide as the page, not beside the heading
+        toolbar = self.page.locator(".toolbar").first.bounding_box()
+        box = form.bounding_box()
+        self.assertGreaterEqual(box["y"], toolbar["y"] + toolbar["height"] - 1)
+        self.assertLess(box["x"], toolbar["x"] + 50)
+        self.assertEqual(self.errors, [])
+
+    def test_client_paths_are_changed_in_place(self):
+        self.open("#/console")
+        clients = self.page.locator("#llm-clients")
+        clients.get_by_text("/home/me/.cursor/mcp.json").wait_for()
+        clients.get_by_role("button", name="Change", exact=True).click()
+        clients.get_by_label("Cursor configuration file").fill("/opt/cursor/mcp.json")
+        with self.page.expect_response(lambda r: r.url.endswith("/api/preferences") and r.request.method == "PUT"):
+            clients.get_by_role("button", name="Save", exact=True).click()
+        prefs = json.loads((self.console / "preferences.json").read_text())
+        self.assertEqual(prefs["llm_client_paths"]["cursor"], "/opt/cursor/mcp.json")
+        self.assertEqual(self.errors, [])
+
     def test_about_copies_the_link(self):
         self.page.context.grant_permissions(["clipboard-read", "clipboard-write"])
         self.open("#/about")

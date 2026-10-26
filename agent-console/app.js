@@ -228,9 +228,27 @@ function setupForm(c, row) {
   // setup_agents' options, in the cluster's detail row; once started, the row shows its output
   const workDirs = el("textarea", { rows: 2, placeholder: "/scratch/user/me/llm" }, (c.work_dirs || []).join("\n"));
   const binds = el("textarea", { rows: 2, placeholder: "/software" }, (c.binds || []).join("\n"));
+  const localRoots = el("textarea", { rows: 2, placeholder: localRootSuggestion(c.name, c.host) || "~/Documents/hpclib-agents" },
+    (c.local_roots || []).join("\n"));
+  if (!c.set_up && !(c.local_roots || []).length) localRoots.value = localRootSuggestion(c.name, c.host);
+  // the Pythons: this machine's for the MCP server, and the cluster's for hpclib's servers (a path or modules)
+  const spec = c.python_spec || "";
+  const savedPath = spec.startsWith("path:") ? spec.slice(5) : "";
+  const savedModules = spec.startsWith("modules:") ? spec.slice(8) : "";
+  const mcpPython = el("input", { size: 34, value: c.mcp_python || (c.set_up ? "" : defaultMcpPython()),
+    placeholder: "found: the installer's environment, else python3 with mcp" });
+  const remotePython = el("input", { size: 30, value: savedPath,
+    placeholder: c.remote_python ? `found: ${c.remote_python}` : "found: Python 3.9+ on PATH or a module" });
+  const modules = el("input", { size: 30, value: savedModules, placeholder: "optional: Python/3.11.5" });
   const rebuild = el("input", { type: "checkbox" });
   const run = action(c.set_up ? "Run setup_agents again" : "Set up", async () => {
-    const body = { work_dirs: lines(workDirs.value), binds: lines(binds.value), rebuild: rebuild.checked };
+    const body = { work_dirs: lines(workDirs.value), binds: lines(binds.value), local_roots: lines(localRoots.value),
+                   mcp_python: mcpPython.value.trim(), rebuild: rebuild.checked };
+    // the cluster's Python: only when changed (finding it again takes a moment)
+    if (modules.value.trim() !== savedModules) {
+      if (modules.value.trim()) body.python_modules = words(modules.value);
+      else body.remote_python = remotePython.value.trim();
+    } else if (remotePython.value.trim() !== savedPath) body.remote_python = remotePython.value.trim();
     await api(cluster(c.name) + "/setup", { method: "POST", body });
     await row.refresh();
   }, { primary: true });
@@ -240,9 +258,26 @@ function setupForm(c, row) {
     el("div", { class: "row" },
       field("Work directories (agents may write here)", workDirs, "absolute paths on the cluster, one per line"),
       field("Extra read-only directories for jobs", binds, "e.g. a software tree, one per line")),
+    el("div", { class: "row" }, field("Local folders for the agent's files", localRoots, LOCAL_ROOT_HINT)),
+    el("div", { class: "row" },
+      field("Python for the MCP server (this machine)", mcpPython, "the program your LLM client starts; it needs the mcp package. Empty: find one"),
+      field("Python on the cluster", remotePython, "an absolute path, 3.9 or newer; empty: find one"),
+      field("…or modules that provide it", modules, "space-separated, loaded in order")),
     el("label", {}, rebuild, " Rebuild: regenerate templates and config and replace the agent token (old copies are kept)"),
     el("div", { class: "actions" }, run)));
 }
+
+// the folder on this machine for an agent's push_files/pull_files: Console Settings' suggestion, filled in
+const LOCAL_ROOT_HINT = "on this machine, one per line: push_files and pull_files copy only from and into these " +
+  "(created if missing); empty: none";
+function localRootSuggestion(name, host) {
+  const pattern = (settingsUI.preferences()?.new_cluster || {}).local_root_pattern || "";
+  const user = (host || "").split("@")[0];
+  const clusterName = (host || name || "").replace(/^.*@/, "").split(".")[0];
+  return pattern.replaceAll("{cluster}", clusterName).replaceAll("{user}", user);
+}
+
+const defaultMcpPython = () => (settingsUI.preferences()?.new_cluster || {}).mcp_python || "";
 
 function addClusterForm(onAdded) {
   const host = el("input", { placeholder: "user@login.cluster.edu", size: 32 });
@@ -250,19 +285,24 @@ function addClusterForm(onAdded) {
   const jump = el("input", { placeholder: "optional: [user@]jumphost", size: 24 });
   const work = el("input", { placeholder: "/scratch/user/me/llm", size: 32 });
   const binds = el("input", { placeholder: "optional: /software", size: 24 });
-  // this machine's default (Console Settings), with the login's user, until a directory is typed
+  const local = el("input", { placeholder: "~/Documents/hpclib-agents", size: 32 });
+  // this machine's defaults (Console Settings), with the login's user and cluster, until something is typed
   const pattern = (settingsUI.preferences()?.new_cluster || {}).work_dir_pattern;
-  let typed = false;
+  let typed = false, localTyped = false;
   work.addEventListener("input", () => { typed = true; });
+  local.addEventListener("input", () => { localTyped = true; });
   host.addEventListener("input", () => {
     const user = host.value.trim().split("@")[0];
     if (pattern && !typed) work.value = host.value.includes("@") && user ? pattern.replaceAll("{user}", user) : "";
+    if (!localTyped) local.value = host.value.includes("@") ? localRootSuggestion("", host.value.trim()) : "";
   });
   const add = action("Add, then log in and set up", async () => {
     if (!work.value.trim()) throw new Error("give a work directory on the cluster");
     const c = await api("clusters", { method: "POST", body: { host: host.value.trim(),
       port: port.value ? Number(port.value) : null, jump: jump.value.trim() || null } });
-    const setup = { work_dirs: [work.value.trim()], binds: words(binds.value) };
+    const setup = { work_dirs: [work.value.trim()], binds: words(binds.value),
+                    local_roots: local.value.trim() ? [local.value.trim()] : [] };
+    if (defaultMcpPython()) setup.mcp_python = defaultMcpPython();
     loginDialog(c, { onConnected: () => api(cluster(c.name) + "/setup", { method: "POST", body: setup }) });
     onAdded();
     return `Added ${c.name}.`;
@@ -273,6 +313,8 @@ function addClusterForm(onAdded) {
     el("div", { class: "row" }, field("Login", host), field("Port", port), field("Jump host", jump)),
     el("div", { class: "row" }, field("Work directory for agents", work, "absolute path on the cluster"),
       field("Extra read-only directories", binds, "space-separated")),
+    el("div", { class: "row" }, field("Local folder for the agent's files", local,
+      "on this machine: push_files and pull_files copy only from and into it (created if missing); empty: none")),
     el("div", { class: "actions" }, add));
 }
 
@@ -1529,7 +1571,8 @@ async function render() {
   } catch (err) {
     content = errorBox(err);
   }
-  if (mine === renderCount) main.replaceChildren(...[content].flat(3));
+  // a page may leave out a part (null: no widgets, say); replaceChildren would write it as the text "null"
+  if (mine === renderCount) main.replaceChildren(...[content].flat(3).filter((x) => x !== null && x !== undefined && x !== false));
 }
 
 takeKeyFromHash();

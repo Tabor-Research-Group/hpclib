@@ -213,10 +213,12 @@ export async function clustersHome() {
         el("a", { class: "button", href: `#/c/${enc(c.name)}/overview` }, "Open")));
   });
   followWhileStarting(clusters);
+  // the Add cluster form opens under the toolbar, full width (inside it, it was squeezed beside the heading)
+  const [addBtn, addArea] = ctx.addCluster();
   return [
     el("div", { class: "toolbar" }, el("h2", {}, "Clusters"),
-      el("span", { class: "muted" }, local ? `hpclib ${local} on this machine` : ""),
-      ...ctx.addCluster()),
+      el("span", { class: "muted" }, local ? `hpclib ${local} on this machine` : ""), addBtn),
+    addArea,
     widgets.strip("home"),
     clusters.length ? el("table", { class: "overview-table" },
       el("thead", {}, el("tr", {}, ["Cluster", "Login", "Agent tunnel", "hpclib", "Jobs", "Storage", ""].map((h) => el("th", {}, h)))),

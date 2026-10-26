@@ -11,7 +11,6 @@
 | `~/.config/hpclib/console/logs/` | tunnel, app and operation logs |
 | `~/.config/hpclib/console/packages/` | installed console packages |
 | `~/.ssh/connections/` | sockets of the shared ssh connections |
-| `~/Documents/Claude` | the default folder agents may push from and pull into |
 
 ## Files on a cluster
 
@@ -49,7 +48,7 @@
 | `HPCLIB_SSH_KEEPALIVE` | 30 s keepalives | ssh options for keepalives; empty turns them off |
 | `HPCLIB_REMOTE_INSTALL_LOCATION` | `hpclib` | where hpclib is on clusters, relative to the remote home unless absolute |
 | `HPCLIB_AGENTS_DIR` | `~/.config/hpclib/agents` | where agent profiles are kept |
-| `HPCLIB_AGENT_LOCAL_ROOT` | `~/Documents/Claude` | the default local folder for agents |
+| `HPCLIB_AGENT_LOCAL_ROOT` | none | the local folder for agents' files when `setup_agents` isn't given `--local-root` (it asks in a terminal otherwise) |
 | `HPCLIB_PYTHON` | `python3` | the Python `launch-tunnel-manager` runs |
 | `HPCLIB_CONSOLE_STATIC` | the clone's `agent-console/` | another folder for the console's web page |
 | `NO_COLOR`, `HPCLIB_COLOR=never` | | no colour in `setup_agents`' summary |

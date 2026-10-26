@@ -120,9 +120,10 @@ on its own, and the MCP server is named after the cluster (`hpclib-entropy`, or 
 console), so several clusters can be configured side by side. The console can write each cluster's entry into
 Claude Desktop, Claude Code, Cursor and ChatGPT (the desktop app and Codex) for you (Console Settings → LLM clients). Options given on a later run update the profile, and a later run needs
 only the address: `setup_agents user@login.example`. The MCP entry lets the agent push files from and pull them
-into `~/Documents/Claude`, the Claude desktop app's own working folder (created if missing;
-`$HPCLIB_AGENT_LOCAL_ROOT` changes the default). `--local-root DIR` (repeatable) replaces it with your own
-directories, and `--no-local-root` leaves the agent no local file access. `--config FILE` starts the cluster's config from your own
+into folders on your machine that you choose: `--local-root DIR` (repeatable; created if missing). Without it,
+the first run asks for one in a terminal (empty for none), or uses `$HPCLIB_AGENT_LOCAL_ROOT` when set; nothing
+is assumed. `--no-local-root` leaves the agent no local file access. The console asks in its Add cluster and
+Set up forms. `--config FILE` starts the cluster's config from your own
 JSON, `--no-sandbox` leaves jobs unsandboxed, `--no-install` skips `install_hpclib`, and ssh options go before the
 address as for `pssh`. Scripts that use `RESTClient.from_env()` pick a cluster with `eval "$(agent_env
 user@login.example)"`. Tokens from before profiles (`~/.config/hpclib/llm_token` and `rest_token`) are copied into

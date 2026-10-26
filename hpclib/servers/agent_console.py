@@ -53,7 +53,11 @@ The front end depends only on the routes below; nothing here depends on it.
   POST /api/clusters/NAME/login/answer        {"code", "challenge"}: answer the current MFA code prompt;
                                               codes are used once and never saved
   POST /api/clusters/NAME/install             install_hpclib over the login ({"force": true} reinstalls)
-  POST /api/clusters/NAME/setup               setup_agents ({"work_dirs": [...], "binds": [...],
+  POST /api/clusters/NAME/setup               setup_agents ({"work_dirs": [...], "binds": [...], "local_roots": [...]
+                                              (folders here for push_files/pull_files; [] none; created),
+                                              "mcp_python" (this machine's Python for the MCP server; "" finds
+                                              one), "remote_python" (the cluster's: a path, "" finds one) or
+                                              "python_modules" (modules that provide it),
                                               "templates": "...", "rebuild": false})
   GET  /api/clusters/NAME/operation           the running or last install/setup/SSH setup, with its log
   GET  /api/clusters/NAME/jobs                every job of yours on the cluster (squeue, and sacct for the last day) over
@@ -408,7 +412,7 @@ def redact(value):
 
 REST_ROUTE_RE = re.compile(r"[A-Za-z0-9_./-]{1,256}")
 PROFILE_KEYS = ("name", "host", "port", "process_port", "work_dirs", "binds", "local_roots", "token_name", "preset",
-                "mcp_name", "created", "updated", "setup_config")
+                "mcp_name", "created", "updated", "setup_config", "mcp_python", "python_spec", "remote_python")
 
 
 class ConsoleError(Exception):
@@ -424,6 +428,7 @@ def console_dir():
 
 # this machine's platform: the console's own Console Settings -> This machine (local_platform.py)
 local_platform.settings = lambda: console_prefs.load(console_dir())["system"]
+mcp_clients.overrides = lambda: console_prefs.load(console_dir())["llm_client_paths"]   # Console Settings -> LLM clients
 
 
 LOG_BLOCK_HEADER = re.compile(rb"(?m)^=== \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\r\n]* ===\r?$")
@@ -1844,10 +1849,26 @@ class Clusters:
                                   title="Set up cluster SSH")
 
     def setup(self, profile, body):
-        unknown = set(body) - {"work_dirs", "binds", "templates", "rebuild"}
+        unknown = set(body) - {"work_dirs", "binds", "local_roots", "templates", "rebuild", "mcp_python",
+                               "remote_python", "python_modules"}
         if unknown:
             raise ConsoleError(400, f"unknown setup options {sorted(unknown)}")
         args = ["setup_agents"]
+        if "mcp_python" in body:
+            args += ["--mcp-python", self._mcp_python(body["mcp_python"])]
+        modules = body.get("python_modules") or []
+        if not isinstance(modules, list) or len(modules) > 8 or not all(
+                isinstance(m, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+/-]{0,127}", m) for m in modules):
+            raise ConsoleError(422, "python_modules: module names, such as Python/3.11.5-GCCcore-13.2.0")
+        if modules:
+            args += [a for m in modules for a in ("--python-module", m)]
+        elif "remote_python" in body:
+            value = body["remote_python"]
+            if not isinstance(value, str) or (value.strip() and not CLUSTER_PATH_RE.fullmatch(value.strip())):
+                raise ConsoleError(422, "remote_python: an absolute path on the cluster, or empty to find one")
+            args += ["--remote-python", value.strip() or "auto"]
+        if "local_roots" in body:
+            args += [a for d in self._local_roots(body["local_roots"]) for a in ("--local-root", d)] or ["--no-local-root"]
         for key, flag in (("work_dirs", "--work-dir"), ("binds", "--bind")):
             values = body.get(key) or []
             if not isinstance(values, list) or not all(isinstance(v, str) and CLUSTER_PATH_RE.fullmatch(v)
@@ -1877,6 +1898,44 @@ class Clusters:
             write_private(path, json.dumps(config, indent=2) + "\n")
             args += ["--config", path]
         return self.run_operation(profile, "setup", args + [profile["name"]])
+
+    @staticmethod
+    def _mcp_python(value):
+        """This machine's Python for the cluster's MCP server: a program here ("" finds one: "auto")."""
+        if not isinstance(value, str) or len(value) > 1024 or re.search(r"[\0\n\r]", value):
+            raise ConsoleError(422, "mcp_python: the path of a Python on this machine, or empty to find one")
+        value = value.strip()
+        if not value:
+            return "auto"
+        if re.match(r"[A-Za-z]:[\\/]", value) and local_platform.platform() == "wsl":
+            value = local_platform.to_linux(value) or value
+        path = os.path.expanduser(value) if os.sep in value or value.startswith("~") else shutil.which(value)
+        if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+            raise ConsoleError(422, f"mcp_python: {value} isn't a program on this machine")
+        return os.path.abspath(path)
+
+    @staticmethod
+    def _local_roots(values):
+        """Folders on this machine for the agent's push_files/pull_files: full paths (~/ is your home; under WSL a
+        Windows path C:\\... means that folder), created if missing."""
+        if not isinstance(values, list) or len(values) > 16:
+            raise ConsoleError(422, "local_roots is a list of folders on this machine")
+        out = []
+        for v in values:
+            if not isinstance(v, str) or not v.strip() or len(v) > 1024 or re.search(r"[\0\n\r]", v):
+                raise ConsoleError(422, "local_roots: full paths of folders on this machine")
+            v = v.strip()
+            if re.match(r"[A-Za-z]:[\\/]", v) and local_platform.platform() == "wsl":
+                v = local_platform.to_linux(v) or v
+            v = os.path.expanduser(v)
+            if not os.path.isabs(v):
+                raise ConsoleError(422, f"local_roots: {v} isn't a full path (/... or ~/...)")
+            try:
+                os.makedirs(v, exist_ok=True)
+            except OSError as e:
+                raise ConsoleError(422, f"local_roots: can't create {v} ({e.strerror})") from e
+            out.append(os.path.realpath(v))
+        return out
 
     def add(self, body):
         """A profile for a new cluster, so it can be logged in to and set up."""

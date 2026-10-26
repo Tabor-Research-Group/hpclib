@@ -557,7 +557,7 @@ export class HpclibToolbarTool extends HTMLElement {
     this._caption.hidden = !this._caption.textContent;
   }
   /** Its content, replaced. */
-  set content(nodes) { this._body.replaceChildren(...[nodes].flat()); }
+  set content(nodes) { this._body.replaceChildren(...[nodes].flat().filter((x) => x !== null && x !== undefined && x !== false)); }
 }
 
 export class HpclibExtraControls extends HTMLElement {

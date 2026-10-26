@@ -29,7 +29,7 @@ and these actions:
 | **Start** / **Stop** | start or stop the agent tunnel (`agent_tunnel` / `agent_stop`) |
 | **Log** | the tunnel's output, refreshed while open |
 | **Update hpclib** | copy this machine's hpclib to the cluster (`install_hpclib`); a newer copy there is left alone |
-| **Set up…** (**Setup…** once set up) | rerun `setup_agents` with its work directories, read-only directories and the Rebuild option |
+| **Set up…** (**Setup…** once set up) | rerun `setup_agents` with its work directories, read-only directories, the local folders for the agent's files (`push_files`, `pull_files`), the Python on this machine for the MCP server and the one on the cluster (a path or modules; empty finds one), and the Rebuild option |
 | **Set up SSH** | initialize or reuse the shared-home compute key and its authorization; login required, REST tunnel not required |
 
 When hpclib on the cluster is older than yours, **Update hpclib**, then **Stop** and **Start** the tunnel so the

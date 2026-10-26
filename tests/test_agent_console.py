@@ -1019,6 +1019,50 @@ class TestManage(TestLogin):
             self.clusters.ops[name]["state"] = "running"                 # one at a time
             self.assertEqual(self.call("POST", f"/api/clusters/{name}/install", {})[0], 409)
 
+    def test_setup_asks_for_the_local_folder(self):
+        status, out = self.call("POST", "/api/clusters", {"host": "me@new.example.edu"})
+        name = out["name"]
+        folder = Path(self.tmp) / "agent files" / "new"
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            for bad in (["relative"], [""], "/x", ["/a\nb"]):
+                self.assertEqual(self.call("POST", f"/api/clusters/{name}/setup",
+                                           {"work_dirs": ["/ok"], "local_roots": bad})[0], 422, bad)
+            status, out = self.call("POST", f"/api/clusters/{name}/setup",
+                                    {"work_dirs": ["/scratch/me/llm"], "local_roots": [str(folder)]})
+            self.assertEqual(status, 202, out)
+            self.assertTrue(folder.is_dir())                                   # created
+            self.assertEqual(self.shell.calls[-1], ["setup_agents", "--local-root", os.path.realpath(folder),
+                                                    "--work-dir", "/scratch/me/llm", name])
+            self.wait_op(name)
+            self.call("POST", f"/api/clusters/{name}/setup", {"work_dirs": ["/w"], "local_roots": []})   # none
+            self.assertEqual(self.shell.calls[-1], ["setup_agents", "--no-local-root", "--work-dir", "/w", name])
+            self.wait_op(name)
+            self.call("POST", f"/api/clusters/{name}/setup", {"work_dirs": ["/w"]})   # not given: kept as it is
+            self.assertEqual(self.shell.calls[-1], ["setup_agents", "--work-dir", "/w", name])
+
+    def test_setup_chooses_the_pythons(self):
+        status, out = self.call("POST", "/api/clusters", {"host": "me@new.example.edu"})
+        name = out["name"]
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            for bad in ({"mcp_python": "/no/such/python"}, {"mcp_python": 3}, {"remote_python": "python3"},
+                        {"python_modules": ["Python 3"]}):
+                self.assertEqual(self.call("POST", f"/api/clusters/{name}/setup", dict(bad, work_dirs=["/w"]))[0],
+                                 422, bad)
+            status, out = self.call("POST", f"/api/clusters/{name}/setup",
+                                    {"work_dirs": ["/w"], "mcp_python": sys.executable, "remote_python": "/sw/py/bin/python3"})
+            self.assertEqual(status, 202, out)
+            self.assertEqual(self.shell.calls[-1], ["setup_agents", "--mcp-python", os.path.abspath(sys.executable),
+                                                    "--remote-python", "/sw/py/bin/python3", "--work-dir", "/w", name])
+            self.wait_op(name)
+            self.call("POST", f"/api/clusters/{name}/setup", {"work_dirs": ["/w"], "mcp_python": "", "remote_python": "",
+                                                              "python_modules": ["GCCcore/13.2.0", "Python/3.11.5"]})
+            self.assertEqual(self.shell.calls[-1], ["setup_agents", "--mcp-python", "auto", "--python-module",
+                                                    "GCCcore/13.2.0", "--python-module", "Python/3.11.5",
+                                                    "--work-dir", "/w", name])
+            self.wait_op(name)
+            self.call("POST", f"/api/clusters/{name}/setup", {"work_dirs": ["/w"], "remote_python": ""})
+            self.assertEqual(self.shell.calls[-1], ["setup_agents", "--remote-python", "auto", "--work-dir", "/w", name])
+
     def test_setup_cluster_ssh_uses_saved_login_without_a_rest_tunnel(self):
         route = f"/api/clusters/{self.dead}/ssh/setup"
         self.assertEqual(self.call("POST", route, {}, key=None)[0], 401)

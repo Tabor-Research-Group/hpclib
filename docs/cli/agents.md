@@ -32,9 +32,10 @@ Common options:
 | `--bind DIR` | a read-only directory jobs can see, e.g. a software tree (repeatable) |
 | `--templates LIST` | which bundled templates to copy, or `all` |
 | `--scopes LIST` | the agent token's scopes; default `read,submit,propose,files:write,envs` |
-| `--local-root DIR` | a folder on your machine the agent may push from and pull into (repeatable); default `~/Documents/Claude` |
+| `--local-root DIR` | a folder on your machine the agent may push from and pull into (repeatable; created if missing). Without it, the first run asks in a terminal (empty: none) or uses `$HPCLIB_AGENT_LOCAL_ROOT` |
 | `--no-local-root` | no local file access for the agent |
-| `--python-module MOD` / `--remote-python PATH` | choose the cluster's Python explicitly |
+| `--python-module MOD` / `--remote-python PATH` | choose the cluster's Python explicitly (`--remote-python auto` finds one again) |
+| `--mcp-python PATH` | the Python on this machine your LLM client runs the MCP server with (it needs the `mcp` package); kept in the profile. `auto` (the default) uses `$HPCLIB_MCP_PYTHON`, then the installer's environment (`~/.local/share/hpclib/mcp`), then a `python3` that has `mcp` |
 | `--mcp-name NAME` | the MCP server's name: letters, digits, `-` and `_` (default `hpclib-` and the first part of the host name, e.g. `hpclib-grace`). A later rename keeps the old name in the profile, so the console can remove it from LLM clients |
 | `--port N`, `--process-port N`, `--new-ports` | the tunnel's ports (picked at random, then kept) |
 | `--no-sandbox` | leave jobs unsandboxed (not recommended) |
@@ -58,7 +59,7 @@ It looks like this:
   "args": ["/path/to/hpclib/hpclib/servers/rest_mcp.py",
            "--url", "http://127.0.0.1:24117",
            "--token-file", "/Users/me/.config/hpclib/agents/me@grace.example/agent_token",
-           "--local-root", "/Users/me/Documents/Claude"]}}}
+           "--local-root", "/Users/me/Documents/hpclib-agents"]}}}
 ```
 
 Quit the client completely and reopen it. To print the entry again later:

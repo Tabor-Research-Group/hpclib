@@ -15,8 +15,15 @@ is copied beside it as FILE.before-hpclib; it is then replaced atomically, keepi
 else in it (in config.toml, the entry's own other keys too). A file that can't be read is left alone, and a
 config.toml change is checked by parsing the result before it is written.
 
+Where each client's configuration is, is found (see the *_path functions) unless Console Settings -> LLM clients
+gives a path (preferences.json's llm_client_paths: a file per client, and claude_command, the claude program). On
+Windows, Claude Desktop's file is looked for where its installers put it: %APPDATA%\\Claude, the Microsoft Store
+package's %LOCALAPPDATA%\\Packages\\Claude_*\\LocalCache\\Roaming\\Claude, and %LOCALAPPDATA%\\Claude-Data; the newest
+file found wins.
+
 Standard library only.
 """
+import glob
 import json
 import os
 import re
@@ -44,6 +51,31 @@ NO_WINDOWS_HOME = ("can't find your Windows profile folder from WSL: set it on C
                    "or in $HPCLIB_WINDOWS_HOME (e.g. /mnt/c/Users/NAME)")
 
 
+PATH_KEYS = ("claude_desktop", "claude_code", "cursor", "chatgpt", "claude_command")
+
+
+def _saved_paths():
+    paths = local_platform.console_preferences().get("llm_client_paths")
+    return paths if isinstance(paths, dict) else {}
+
+
+overrides = _saved_paths       # the console points this at its own preferences
+
+
+def override(key):
+    """The path Console Settings gives for a client (None: found automatically). Under WSL a Windows path
+    (C:\\Users\\...) is taken as Windows means it."""
+    value = (overrides() or {}).get(key) or ""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    if re.match(r"[A-Za-z]:[\\/]", value):
+        if local_platform.windows_side():
+            return local_platform.to_linux(value)
+        return value
+    return os.path.expanduser(value)
+
+
 def home():
     return os.path.expanduser(os.environ.get("HPCLIB_MCP_CLIENT_HOME") or "~")
 
@@ -61,6 +93,8 @@ def _windows(*parts):
 def _linux_claude():
     if os.environ.get("HPCLIB_CLAUDE_BIN"):
         return os.environ["HPCLIB_CLAUDE_BIN"]
+    if override("claude_command"):
+        return override("claude_command")
     found = shutil.which("claude")
     windows = local_platform.windows_side() and found and found.startswith("/mnt/")   # WSL appends Windows' PATH
     if found and not windows:
@@ -88,39 +122,78 @@ def entry_for(cid, entry):
     return local_platform.windows_entry(entry)
 
 
+DESKTOP_FILE = "claude_desktop_config.json"
+
+
+def find_windows_desktop_config(roaming, local):
+    """
+    Claude Desktop's configuration on Windows, where its installers keep it: %APPDATA%\\Claude (the classic
+    installer), the Microsoft Store package's LocalCache (%LOCALAPPDATA%\\Packages\\Claude_<id>\\LocalCache\\Roaming\\
+    Claude, what it sees as %APPDATA%\\Claude), and %LOCALAPPDATA%\\Claude-Data (and its folders, such as claude_<id>).
+    The newest file found wins; with none yet, the first of those folders that exists (the package's first: a
+    packaged app doesn't see the real %APPDATA%), else %APPDATA%\\Claude.
+    """
+    standard = os.path.join(roaming, "Claude", DESKTOP_FILE)
+    packaged = os.path.join(local, "Packages", "Claude_*", "LocalCache", "Roaming", "Claude")
+    data = os.path.join(local, "Claude-Data")
+    files = [standard] + glob.glob(os.path.join(packaged, DESKTOP_FILE))
+    for depth in range(4):
+        files += glob.glob(os.path.join(data, *(["*"] * depth), DESKTOP_FILE))
+    files = [f for f in files if os.path.isfile(f)]
+    if files:
+        return max(files, key=lambda f: os.stat(f).st_mtime)
+    for folder in sorted(glob.glob(packaged)) + sorted(glob.glob(os.path.join(data, "[Cc]laude*"))) + [data]:
+        if os.path.isdir(folder):
+            return os.path.join(folder, DESKTOP_FILE)
+    return standard
+
+
 def desktop_config_path():
+    if override("claude_desktop"):
+        return override("claude_desktop")
     if windows_client("claude_desktop"):
-        return _windows("AppData", "Roaming", "Claude", "claude_desktop_config.json")
+        h = windows_home()
+        if not h:
+            return None
+        return find_windows_desktop_config(os.path.join(h, "AppData", "Roaming"), os.path.join(h, "AppData", "Local"))
     h = home()
     if sys.platform == "darwin":
-        return os.path.join(h, "Library", "Application Support", "Claude", "claude_desktop_config.json")
+        return os.path.join(h, "Library", "Application Support", "Claude", DESKTOP_FILE)
     if sys.platform.startswith("win"):
-        return os.path.join(os.environ.get("APPDATA") or os.path.join(h, "AppData", "Roaming"), "Claude",
-                            "claude_desktop_config.json")
-    return os.path.join(h, ".config", "Claude", "claude_desktop_config.json")
+        return find_windows_desktop_config(os.environ.get("APPDATA") or os.path.join(h, "AppData", "Roaming"),
+                                           os.environ.get("LOCALAPPDATA") or os.path.join(h, "AppData", "Local"))
+    return os.path.join(h, ".config", "Claude", DESKTOP_FILE)
 
 
 def claude_binary():
     if windows_client("claude_code"):
-        return shutil.which("claude.exe")
+        return override("claude_command") or shutil.which("claude.exe")
     return _linux_claude()
 
 
 def claude_code_path():
+    if override("claude_code"):
+        return override("claude_code")
     return _windows(".claude.json") if windows_client("claude_code") else os.path.join(home(), ".claude.json")
 
 
 def codex_home():
+    if override("chatgpt"):
+        return os.path.dirname(override("chatgpt"))
     if os.environ.get("CODEX_HOME"):
         return os.path.expanduser(os.environ["CODEX_HOME"])
     return _windows(".codex") if windows_client("chatgpt") else os.path.join(home(), ".codex")
 
 
 def cursor_path():
+    if override("cursor"):
+        return override("cursor")
     return _windows(".cursor", "mcp.json") if windows_client("cursor") else os.path.join(home(), ".cursor", "mcp.json")
 
 
 def chatgpt_path():
+    if override("chatgpt"):
+        return override("chatgpt")
     h = codex_home()
     return os.path.join(h, "config.toml") if h else None
 
@@ -373,9 +446,11 @@ def status(cid, wanted, owned):
     spec = CLIENTS[cid]
     path = spec["path"]()
     out = {"id": cid, "title": spec["title"], "path": path, "available": available(cid), "after": spec["after"],
-           "detail": spec.get("detail"), "entries": [], "stale": [], "error": None, "windows": windows_client(cid)}
+           "detail": spec.get("detail"), "entries": [], "stale": [], "error": None, "windows": windows_client(cid),
+           "path_setting": (overrides() or {}).get(cid) or ""}
     if spec["kind"] == "cli":
         out["command"] = claude_binary()
+        out["command_setting"] = (overrides() or {}).get("claude_command") or ""
     try:
         if path is None:
             raise ClientError(NO_WINDOWS_HOME)

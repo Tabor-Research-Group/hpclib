@@ -910,9 +910,19 @@ function _hpclib_agent_lines {  # _hpclib_agent_lines NAME KEY: a list-valued pr
 # The Python that will run rest_mcp.py: $HPCLIB_MCP_PYTHON, or the first
 # python3 that has the MCP SDK. Prints the path; returns 1 (printing plain
 # python3's path) if none has it.
-function _hpclib_mcp_python {  # a Python with the MCP SDK: yours, install.sh's environment, or python3's
-  local candidate
-  for candidate in "${HPCLIB_MCP_PYTHON:-}" "${HPCLIB_MCP_VENV:-$HOME/.local/share/hpclib/mcp}/bin/python" \
+# The Python this machine runs the MCP server with: the cluster profile's own (setup_agents --mcp-python),
+# $HPCLIB_MCP_PYTHON, install.sh's environment, or a python3 that has the MCP SDK. The profile's and the
+# variable's are used as given (a warning follows if they lack the SDK); the others only if they have it.
+function _hpclib_mcp_python {  # _hpclib_mcp_python [PROFILE]
+  local candidate chosen=''
+  [ -n "${1:-}" ] && chosen=$(_hpclib_agent_profiles get "$1" mcp_python 2>/dev/null)
+  chosen="${chosen:-${HPCLIB_MCP_PYTHON:-}}"
+  if [ -n "$chosen" ]; then
+    printf '%s\n' "$chosen"
+    "$chosen" -c 'import mcp' > /dev/null 2>&1
+    return
+  fi
+  for candidate in "${HPCLIB_MCP_VENV:-$HOME/.local/share/hpclib/mcp}/bin/python" \
       "$(command -v python3)" /usr/local/bin/python3 /opt/homebrew/bin/python3; do
     [ -n "$candidate" ] && [ -x "$candidate" ] || continue
     if "$candidate" -c 'import mcp' > /dev/null 2>&1; then
@@ -920,7 +930,7 @@ function _hpclib_mcp_python {  # a Python with the MCP SDK: yours, install.sh's 
       return 0
     fi
   done
-  printf '%s\n' "${HPCLIB_MCP_PYTHON:-$(command -v python3)}"
+  command -v python3
   return 1
 }
 
@@ -947,7 +957,7 @@ function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROF
   mcp_name=$(_hpclib_agent_profiles get "$name" mcp_name)
   token_file=$(_hpclib_agent_profiles get "$name" token_file)
   pdir=$(_hpclib_agent_profiles dir "$name")
-  mcp_python=$(_hpclib_mcp_python) || mcp_ok=no
+  mcp_python=$(_hpclib_mcp_python "$name") || mcp_ok=no
   local_hpclib=$(cd -P "$HPCLIB_DIR" 2>/dev/null && pwd)
   while IFS= read -r d; do
     [ -n "$d" ] && allow="$allow --allow $d"
@@ -999,7 +1009,7 @@ function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROF
   printf '   %sThen quit the client completely (Claude Desktop: %s) and reopen it.%s\n' \
     "$_c_alert" "$quit_hint" "$_c_reset"
   if [ "$mcp_ok" = no ]; then
-    printf '   %s%s has no MCP SDK: run `%s -m pip install mcp`, or set HPCLIB_MCP_PYTHON and rerun%s\n' \
+    printf '   %s%s has no MCP SDK: run `%s -m pip install mcp`, or choose another with --mcp-python and rerun%s\n' \
       "$_c_warn" "$mcp_python" "$mcp_python" "$_c_reset"
   fi
   printf '\n%s3. Check it%s (with the tunnel up)\n' "$_c_head" "$_c_reset"
@@ -1035,8 +1045,8 @@ function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROF
 # Everything about the cluster is kept in a profile, ~/.config/hpclib/agents/
 # [user@]host/ (agent_profiles.py): the login, a pair of randomly chosen
 # ports, the work directories, the tokens, the MCP server name and the
-# local folders the agent may push and pull (by default ~/Documents/Claude,
-# the Claude desktop app's working folder). Reruns
+# local folders the agent may push and pull (--local-root; asked for the
+# first time when run in a terminal, else $HPCLIB_AGENT_LOCAL_ROOT or none). Reruns
 # and agent_tunnel/agent_stop read it, so later commands need only the
 # address (or the profile name). Options given on a rerun update it.
 #
@@ -1048,18 +1058,18 @@ function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROF
 function setup_agents {
   local usage='usage: setup_agents [--work-dir DIR ...] [--bind DIR ...] [--local-root DIR ...] [--templates LIST|all]
        [--config FILE] [--no-sandbox] [--rebuild] [--no-install] [--target DIR] [--name NAME]
-       [--no-local-root] [--python-module MODULE ...] [--remote-python PATH] [--port N] [--process-port N] [--new-ports] [--token-name NAME] [--token-file FILE]
+       [--no-local-root] [--python-module MODULE ...] [--remote-python PATH|auto] [--mcp-python PATH|auto] [--port N] [--process-port N] [--new-ports] [--token-name NAME] [--token-file FILE]
        [--owner-token-file FILE] [--mcp-name NAME] [--scopes LIST] [ssh options] [user@]host'
   local work_dirs=() binds=() local_roots=() login_args=() hosts=()
   local name='' token_name='' token_file='' owner_file='' port='' process_port='' mcp_name='' new_ports=no
-  local no_local_root=no python_modules=() remote_python=''
+  local no_local_root=no python_modules=() remote_python='' mcp_python=''
   local scopes="read,submit,propose,files:write,envs"
   local templates="hello,orca,python_project,writing_templates" base_config='' sandbox=yes rebuild=no install=yes
   local target="$HPCLIB_REMOTE_INSTALL_LOCATION"
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --work-dir|--token-name|--token-file|--owner-token-file|--scopes|--templates|--config|--bind|--target|\
---name|--port|--process-port|--mcp-name|--local-root|--python-module|--remote-python)
+--name|--port|--process-port|--mcp-name|--local-root|--python-module|--remote-python|--mcp-python)
         if [ "$#" -lt 2 ] || [ -z "$2" ]; then
           echo "setup_agents: $1 needs a value" >&2
           return 2
@@ -1081,6 +1091,7 @@ function setup_agents {
           --local-root) local_roots+=("$2") ;;
           --python-module) python_modules+=("$2") ;;
           --remote-python) remote_python="$2" ;;
+          --mcp-python) mcp_python="$2" ;;
         esac
         shift 2 ;;
       --no-sandbox) sandbox=no; shift ;;
@@ -1121,6 +1132,19 @@ function setup_agents {
   for d in "${local_roots[@]}"; do
     [ -d "$d" ] || { echo "setup_agents: --local-root $d is not a directory on this machine" >&2; return 2; }
   done
+  if [ -n "$mcp_python" ] && [ "$mcp_python" != auto ]; then
+    case "$mcp_python" in "~/"*) mcp_python="$HOME/${mcp_python#\~/}" ;; esac
+    if [ ! -x "$mcp_python" ] || [ -d "$mcp_python" ]; then
+      echo "setup_agents: --mcp-python $mcp_python is not a program on this machine" >&2
+      return 2
+    fi
+    "$mcp_python" -c 'import mcp' > /dev/null 2>&1 ||
+      echo "setup_agents: note: $mcp_python has no MCP SDK yet ($mcp_python -m pip install mcp)" >&2
+  fi
+  case "$remote_python" in
+    auto|/*|'') ;;
+    *) echo "setup_agents: --remote-python is an absolute path on the cluster, or auto" >&2; return 2 ;;
+  esac
   if [ -n "$base_config" ] && [ ! -f "$base_config" ]; then
     echo "setup_agents: $base_config does not exist" >&2
     return 2
@@ -1150,10 +1174,22 @@ function setup_agents {
     updates+=("local_roots=" "local_roots_off=yes")
   elif [ -z "$(_hpclib_agent_lines "$name" local_roots)" ] &&
       [ "$(_hpclib_agent_profiles get "$name" local_roots_off 2>/dev/null)" != yes ]; then
-    # By default the agent may use the Claude desktop app's own working folder.
-    d="${HPCLIB_AGENT_LOCAL_ROOT:-$HOME/Documents/Claude}"
-    if mkdir -p "$d" 2> /dev/null; then
-      updates+=("local_roots=$(cd -P "$d" && pwd)")
+    # The folder on this machine the agent's push_files/pull_files may use: asked for in a terminal (nothing is
+    # assumed), else $HPCLIB_AGENT_LOCAL_ROOT; none leaves the agent no local file access until a rerun sets one.
+    d="${HPCLIB_AGENT_LOCAL_ROOT:-}"
+    if [ -z "$d" ] && [ -t 0 ] && [ -t 1 ]; then
+      printf 'A folder on this machine the agent may copy files from and into (push_files, pull_files),\n'
+      printf 'e.g. ~/Documents/hpclib-agents; empty for none: '
+      IFS= read -r d || d=''
+    fi
+    case "$d" in "~/"*) d="$HOME/${d#\~/}" ;; "~") d="$HOME" ;; esac
+    if [ -z "$d" ]; then
+      updates+=("local_roots_off=yes")
+      echo "setup_agents: no local folder for the agent (add one later with --local-root DIR)"
+    elif mkdir -p "$d" 2> /dev/null; then
+      updates+=("local_roots=$(cd -P "$d" && pwd)" "local_roots_off=no")
+    else
+      echo "setup_agents: can't create $d; no local folder for the agent (rerun with --local-root DIR)" >&2
     fi
   fi
   [ -n "$token_name" ] && updates+=("token_name=$token_name")
@@ -1162,8 +1198,15 @@ function setup_agents {
   [ -n "$port" ] && updates+=("port=$port")
   [ -n "$process_port" ] && updates+=("process_port=$process_port")
   [ -n "$mcp_name" ] && updates+=("mcp_name=$mcp_name")
+  if [ "$mcp_python" = auto ]; then
+    updates+=("mcp_python=")
+  elif [ -n "$mcp_python" ]; then
+    updates+=("mcp_python=$mcp_python")
+  fi
   if [ "${#python_modules[@]}" -gt 0 ]; then
     updates+=("python_spec=modules:${python_modules[*]}")
+  elif [ "$remote_python" = auto ]; then
+    updates+=("python_spec=")              # found again (below, since --remote-python was given)
   elif [ -n "$remote_python" ]; then
     updates+=("python_spec=path:$remote_python")
   fi

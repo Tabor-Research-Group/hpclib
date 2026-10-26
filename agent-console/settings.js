@@ -336,6 +336,42 @@ async function portsCard() {
   return box;
 }
 
+// A client's configuration file (and Claude Code's claude program): found automatically, or the path saved in
+// llm_client_paths. "Change" edits it in place; "Find it" clears the setting.
+function pathEditor(c, redraw, box) {
+  const shown = el("span", { class: "muted small client-path" },
+    c.command !== undefined ? `${c.command || "claude: not found"} · ` : "", c.path || "—",
+    c.path_setting || c.command_setting ? " (set here)" : "");
+  const change = el("button", { type: "button", class: "link-button small" }, "Change");
+  const wrap = el("div", {}, shown, " ", change);
+  change.addEventListener("click", () => {
+    const file = el("input", { value: c.path_setting || "", size: 48, placeholder: c.path || "a full path",
+                               "aria-label": `${c.title} configuration file` });
+    const cmd = c.command !== undefined ? el("input", { value: c.command_setting || "", size: 48,
+      placeholder: c.command || "/path/to/claude", "aria-label": "claude program" }) : null;
+    const save = async (paths) => {
+      try {
+        prefs = await ctx.api("preferences", { method: "PUT", body: { llm_client_paths: paths } });
+        await redraw();
+      } catch (err) { box.prepend(ctx.errorBox(err)); }
+    };
+    const saveBtn = el("button", { type: "button", class: "primary" }, "Save");
+    saveBtn.addEventListener("click", () => save(Object.assign({ [c.id]: file.value.trim() },
+      cmd ? { claude_command: cmd.value.trim() } : {})));
+    const auto = el("button", { type: "button" }, "Find it");
+    auto.title = "forget the saved path and find the file again";
+    auto.addEventListener("click", () => save(Object.assign({ [c.id]: "" }, cmd ? { claude_command: "" } : {})));
+    const cancel = el("button", { type: "button", class: "link-button" }, "Cancel");
+    cancel.addEventListener("click", () => wrap.replaceChildren(shown, " ", change));
+    wrap.replaceChildren(
+      field("Configuration file", file, "empty: find it"),
+      cmd ? field("claude program", cmd, "empty: find it on PATH") : null,
+      el("div", { class: "actions" }, saveBtn, auto, cancel));
+    file.focus();
+  });
+  return wrap;
+}
+
 async function clientsCard() {
   const box = el("section", { class: "card", id: "llm-clients" });
   const notice = el("p", { class: "notice", role: "status" });
@@ -368,7 +404,7 @@ async function clientsCard() {
       return el("tr", {},
         el("td", {}, el("strong", {}, c.title), c.windows ? el("span", { class: "muted small" }, " · Windows, through wsl.exe") : null,
           c.detail ? el("div", { class: "muted small" }, c.detail) : null,
-          el("div", { class: "muted small" }, c.command ? `${c.command} · ${c.path}` : c.path)),
+          pathEditor(c, draw, box)),
         el("td", {}, summary,
           c.error ? el("div", { class: "error-box small" }, c.error) : null,
           c.entries.length && c.available ? el("div", { class: "muted small" },
@@ -440,6 +476,8 @@ function defaultsCard(p) {
   const hours = el("input", { type: "number", min: 1, max: 168, value: d.connection_hours, size: 5 });
   const pattern = el("input", { value: d.work_dir_pattern || "", placeholder: "/scratch/user/{user}/llm", size: 34 });
   const mcpName = el("input", { value: d.mcp_name_pattern || "hpclib-{cluster}", placeholder: "hpclib-{cluster}", size: 22 });
+  const localRoot = el("input", { value: d.local_root_pattern || "", placeholder: "~/Documents/hpclib-agents/{cluster}", size: 34 });
+  const mcpPython = el("input", { value: d.mcp_python || "", placeholder: "found: the installer's environment, else python3", size: 34 });
   const gpus = el("select", {}, [["auto", "when the job asks for GPUs"], ["always", "always"], ["never", "never"]]
     .map(([v, t]) => el("option", { value: v, selected: d.sandbox_gpus === v }, t)));
   const maxGpus = el("input", { type: "number", min: 0, max: 64, value: d.max_gpus ?? "", placeholder: "server default (0)", size: 10 });
@@ -447,7 +485,8 @@ function defaultsCard(p) {
     prefs = await ctx.api("preferences", { method: "PUT", body: { new_cluster: {
       connection_hours: Number(hours.value), work_dir_pattern: pattern.value.trim(), sandbox_gpus: gpus.value,
       max_gpus: maxGpus.value === "" ? null : Number(maxGpus.value),
-      mcp_name_pattern: mcpName.value.trim() || "hpclib-{cluster}" } } });
+      mcp_name_pattern: mcpName.value.trim() || "hpclib-{cluster}", local_root_pattern: localRoot.value.trim(),
+      mcp_python: mcpPython.value.trim() } } });
     return "Saved. Clusters added from now on start with these; each can change them on its own Settings tab.";
   });
   return el("section", { class: "card", id: "new-cluster" },
@@ -456,6 +495,8 @@ function defaultsCard(p) {
       field("Keep a login for (hours)", hours, "how long an idle ssh login is reused"),
       field("Work directory", pattern, "suggested by Add cluster; {user} is the login's user"),
       field("MCP server name", mcpName, "what LLM clients call it; {cluster}, {host}, {user}"),
+      field("Local folder for agents' files", localRoot, "on this machine, suggested by Add cluster and Set up; {cluster}, {user}; empty: none"),
+      field("Python for MCP servers", mcpPython, "on this machine, with the mcp package; empty: find one. Each cluster's Set up can change it"),
       field("NVIDIA GPUs in sandboxed jobs", gpus, "the REST server's --nv"),
       field("GPUs per job, at most", maxGpus, "empty: the server's default")),
     el("p", { class: "muted small" }, "A cluster configuration from a package keeps its own login time; the GPU " +

@@ -38,14 +38,20 @@ TITLES = {"linux": "Linux", "macos": "macOS", "wsl": "WSL (Linux on Windows)", "
 OSRELEASE = "/proc/sys/kernel/osrelease"
 
 
-def _console_settings():
-    """preferences.json's system section (the console's Console Settings), read where the console keeps it."""
+def console_preferences():
+    """The console's preferences.json (Console Settings), read where the console keeps it ({} if there's none)."""
     base = os.path.expanduser(os.environ.get("HPCLIB_CONSOLE_DIR") or "~/.config/hpclib/console")
     try:
         with open(os.path.join(base, "preferences.json")) as f:
-            system = json.load(f).get("system")
-    except (OSError, ValueError, AttributeError):
+            prefs = json.load(f)
+    except (OSError, ValueError):
         return {}
+    return prefs if isinstance(prefs, dict) else {}
+
+
+def _console_settings():
+    """preferences.json's system section."""
+    system = console_preferences().get("system")
     return system if isinstance(system, dict) else {}
 
 

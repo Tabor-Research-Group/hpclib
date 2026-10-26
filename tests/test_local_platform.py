@@ -234,5 +234,81 @@ class TestConsoleUnderWsl(ConsoleTestCase):
                 self.assertEqual(self.call("PUT", "/api/preferences", {"system": bad})[0], 422, bad)
 
 
+class TestWindowsClaudeDesktop(unittest.TestCase):
+    """Where Claude Desktop keeps its configuration on Windows: the classic installer's %APPDATA%\\Claude, the
+    Microsoft Store package's LocalCache, or %LOCALAPPDATA%\\Claude-Data."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(subprocess.run, ["rm", "-rf", str(self.tmp)])
+        self.roaming, self.local = self.tmp / "Roaming", self.tmp / "Local"
+        self.roaming.mkdir()
+        self.local.mkdir()
+
+    def find(self):
+        return mcp_clients.find_windows_desktop_config(str(self.roaming), str(self.local))
+
+    def test_search(self):
+        standard = self.roaming / "Claude" / "claude_desktop_config.json"
+        self.assertEqual(self.find(), str(standard))                   # nothing installed: the classic place
+        packaged = self.local / "Packages" / "Claude_pzs8sxrjxfjjc" / "LocalCache" / "Roaming" / "Claude"
+        packaged.mkdir(parents=True)
+        self.assertEqual(self.find(), str(packaged / "claude_desktop_config.json"))   # a packaged app's folder, no file yet
+        data = self.local / "Claude-Data" / "claude_pzs8sxrjxfjjc"
+        data.mkdir(parents=True)
+        (data / "claude_desktop_config.json").write_text("{}")
+        self.assertEqual(self.find(), str(data / "claude_desktop_config.json"))       # the only file
+        (packaged / "claude_desktop_config.json").write_text("{}")
+        os.utime(data / "claude_desktop_config.json", (1, 1))
+        self.assertEqual(self.find(), str(packaged / "claude_desktop_config.json"))   # the newest file
+
+    def test_wsl_uses_it(self):
+        home = self.tmp / "me"
+        cfg = home / "AppData" / "Local" / "Claude-Data" / "claude_x" / "claude_desktop_config.json"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text("{}")
+        with mock.patch.dict(os.environ, {"HPCLIB_PLATFORM": "wsl", "HPCLIB_WINDOWS_HOME": str(home)}), \
+                mock.patch.object(mcp_clients, "overrides", lambda: {}):
+            self.assertEqual(mcp_clients.desktop_config_path(), str(cfg))
+
+
+class TestClientPathSettings(ConsoleTestCase):
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ, {"HPCLIB_MCP_CLIENT_HOME": str(self.tmp / "home"), "HPCLIB_CLAUDE_BIN": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def client(self, cid):
+        return next(c for c in self.call("GET", "/api/llm-clients")[1]["clients"] if c["id"] == cid)
+
+    def test_paths_from_console_settings(self):
+        self.assertEqual(self.client("cursor")["path"], str(self.tmp / "home" / ".cursor" / "mcp.json"))
+        mine = self.tmp / "elsewhere" / "cursor.json"
+        claude = self.tmp / "bin" / "claude"
+        status, out = self.call("PUT", "/api/preferences", {"llm_client_paths": {
+            "cursor": str(mine), "chatgpt": str(self.tmp / "codex" / "config.toml"), "claude_command": str(claude)}})
+        self.assertEqual(status, 200, out)
+        c = self.client("cursor")
+        self.assertEqual((c["path"], c["path_setting"]), (str(mine), str(mine)))
+        self.assertEqual(self.client("chatgpt")["path"], str(self.tmp / "codex" / "config.toml"))
+        self.assertEqual(mcp_clients.codex_home(), str(self.tmp / "codex"))
+        self.assertEqual(self.client("claude_code")["command"], str(claude))
+        mine.parent.mkdir()
+        self.assertEqual(self.call("POST", "/api/llm-clients/cursor/write")[0], 200)
+        self.assertTrue(mine.is_file())
+        # empty: found again
+        self.call("PUT", "/api/preferences", {"llm_client_paths": {"cursor": ""}})
+        self.assertEqual(self.client("cursor")["path_setting"], "")
+        for bad in ({"cursor": "relative/mcp.json"}, {"cursor": "/a\nb"}, {"vscode": "/x"}, {"cursor": 3}):
+            self.assertEqual(self.call("PUT", "/api/preferences", {"llm_client_paths": bad})[0], 422, bad)
+
+    def test_windows_paths_under_wsl(self):
+        with mock.patch.dict(os.environ, {"HPCLIB_PLATFORM": "wsl", "PATH": "/usr/bin:/bin"}), \
+                mock.patch.object(local_platform, "to_linux", lambda p: "/mnt/c/Users/me/x.json"):
+            self.call("PUT", "/api/preferences", {"llm_client_paths": {"claude_desktop": "C:\\Users\\me\\x.json"}})
+            self.assertEqual(mcp_clients.desktop_config_path(), "/mnt/c/Users/me/x.json")
+
+
 if __name__ == "__main__":
     unittest.main()

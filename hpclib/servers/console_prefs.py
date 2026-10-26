@@ -4,9 +4,13 @@ The console's own preferences (this machine, not a cluster), kept in preferences
   notifications   which browser notifications the page shows: a tunnel dropping, a password or host-key prompt,
                   an agent's job finishing, a new template proposal
   new_cluster     defaults a cluster added from now on starts with: how long its login is kept, the work
-                  directory the Add cluster form suggests ({user} is the login's user), its MCP server's name
+                  directory the Add cluster form suggests ({user} is the login's user), the local folder it
+                  suggests for the agent's files ({cluster}, {user}; "" suggests none), the Python here it suggests
+                  for the MCP server ("" finds one), its MCP server's name
                   (hpclib-{cluster} unless changed), and the REST server's GPU mode and per-job GPU limit
   llm_clients     the LLM clients whose MCP configuration the console keeps up to date (see mcp_clients.py)
+  llm_client_paths  where each client's configuration file is, when finding it isn't right ("" finds it), and
+                  claude_command, the claude program Claude Code's entries are added with
   widgets         which packaged widgets are hidden, and their order (keys PACKAGE/ID)
   interface       values for the page's CSS variables (default-styles.css): "common" ones, and colours for the
                   light and dark themes; served as /interface.css, before the user's own user.css
@@ -29,11 +33,12 @@ LLM_CLIENTS = ("claude_desktop", "claude_code", "cursor", "chatgpt")
 DEFAULTS = {
     "notifications": {k: False for k in NOTIFICATIONS},
     "new_cluster": {"connection_hours": 12, "work_dir_pattern": "", "sandbox_gpus": "auto", "max_gpus": None,
-                    "mcp_name_pattern": "hpclib-{cluster}"},
+                    "mcp_name_pattern": "hpclib-{cluster}", "local_root_pattern": "", "mcp_python": ""},
     "llm_clients": {k: False for k in LLM_CLIENTS},
     "interface": {"common": {}, "light": {}, "dark": {}},
     "widgets": {"hidden": [], "order": []},
     "system": {"platform": "auto", "windows_home": ""},
+    "llm_client_paths": {k: "" for k in LLM_CLIENTS + ("claude_command",)},
 }
 PLATFORM_CHOICES = ("auto", "linux", "macos", "wsl")      # local_platform.CHOICES
 CSS_VAR_RE = re.compile(r"--[a-z][a-z0-9-]{0,47}")
@@ -103,6 +108,15 @@ def _new_cluster(values):
     if "mcp_name_pattern" in values and (not isinstance(mcp, str) or not MCP_PATTERN_RE.fullmatch(mcp)
                                          or not re.match(r"[A-Za-z0-9{]", mcp)):
         raise PrefsError("the MCP name is letters, digits, - and _, with {cluster}, {host} or {user} filled in")
+    local = values.get("local_root_pattern")
+    if "local_root_pattern" in values and local != "" and (
+            not isinstance(local, str) or len(local) > 512 or re.search(r"[\0\n\r]", local)
+            or not re.match(r"(/|~/|~$|[A-Za-z]:[\\/])", local) or re.search(r"\{(?!(?:cluster|user)\})", local)):
+        raise PrefsError("the local folder is a full path on this machine; {cluster} and {user} are filled in")
+    py = values.get("mcp_python")
+    if "mcp_python" in values and py != "" and (not isinstance(py, str) or len(py) > 1024
+                                                 or re.search(r"[\0\n\r]", py)):
+        raise PrefsError("mcp_python is the path of a Python on this machine, or empty to find one")
     if "sandbox_gpus" in values and values["sandbox_gpus"] not in GPU_MODES:
         raise PrefsError(f"sandbox_gpus is one of {', '.join(GPU_MODES)}")
     gpus = values.get("max_gpus")
@@ -151,6 +165,19 @@ def _system(values):
     return values
 
 
+def _client_paths(values):
+    keys = DEFAULTS["llm_client_paths"]
+    if not isinstance(values, dict) or set(values) - set(keys):
+        raise PrefsError(f"llm_client_paths has {', '.join(keys)}")
+    for k, v in values.items():
+        if v == "":
+            continue
+        if (not isinstance(v, str) or len(v) > 1024 or re.search(r"[\0\n\r]", v)
+                or not re.match(r"(/|~/|[A-Za-z]:[\\/])", v.strip())):
+            raise PrefsError(f"llm_client_paths.{k}: a full path (/..., ~/... or C:\\...), or empty to find it")
+    return {k: v.strip() for k, v in values.items()}
+
+
 CHECKS = {
     "notifications": lambda v: _bool_map(v, NOTIFICATIONS, "notifications"),
     "new_cluster": _new_cluster,
@@ -158,6 +185,7 @@ CHECKS = {
     "interface": _interface,
     "widgets": _widgets,
     "system": _system,
+    "llm_client_paths": _client_paths,
 }
 
 
