@@ -876,6 +876,40 @@ async function tunnelSettings(c) {
     el("div", { class: "actions" }, save));
 }
 
+// The cluster's quota checks (lib/quota.sh): kept on the cluster in $HPCTUNNELS_DATA_DIR/settings/quota.sh, so
+// hpclib_quota there, the REST server's GET /quota and the agents' check_quota use them too.
+const QUOTA_FIELDS = [
+  ["storage", "Storage quota check", "showquota, else myquota, else quota -s"],
+  ["project", "Project (allocation) check", "myproject (TAMU HPRC), when the cluster has it"]];
+async function quotaSettings(c) {
+  const head = el("h3", {}, "Quota checks ", el("span", { class: "muted" }, "· saved on the cluster"));
+  const st = await api(cluster(c.name) + "/storage");
+  const q = st.quotas || {};
+  const inputs = Object.fromEntries(QUOTA_FIELDS.map(([k, , dflt]) => [k, el("input", {
+    value: (q[k] || {}).saved || "", size: 40, placeholder: `default: ${dflt}`, "aria-label": `${k} quota check`,
+    maxlength: 1000 })]));
+  const env = (q.environment || []).length ? el("p", { class: "muted" }, `This console was started with ` +
+    `${q.environment.join(" and ")} set, which wins over these here (as the variables do on the cluster).`) : null;
+  const known = st.quotas ? null : el("p", { class: "muted" },
+    "What's saved shows here after the first check (Storage → Check quotas, or Save).");
+  const needLogin = (c.login || {}).state !== "connected";
+  const save = action("Save and check", async () => {
+    const body = Object.fromEntries(QUOTA_FIELDS.map(([k]) => [k, inputs[k].value.trim()]));
+    const out = await api(cluster(c.name) + "/quota/settings", { method: "PUT", body });
+    return QUOTA_FIELDS.map(([k]) => { const r = out.quotas[k] || {};
+      return `${k}: ${r.command ? `${r.command} (${r.source}${r.exit_code ? `, exit ${r.exit_code}` : ""})` : r.source === "none" ? "off" : "none found"}`; })
+      .join(" · ");
+  }, { primary: true, result: true, disabled: needLogin });
+  return el("section", { class: "card" }, head,
+    el("p", { class: "muted" }, "The commands that report your storage quota and your project's balance (on the " +
+      "Storage tab, and to agents). Leave one empty for the default; none turns it off. On the command line: " +
+      "hpclib_quota set storage|project COMMAND on the cluster, or HPCLIB_STORAGE_QUOTA_CHECK and " +
+      "HPCLIB_PROJECT_QUOTA_CHECK, which win."),
+    QUOTA_FIELDS.map(([k, label]) => field(label, inputs[k], "one line of shell, run with bash on the login node")),
+    env, known,
+    el("div", { class: "actions" }, save, needLogin ? el("span", { class: "muted small" }, "Log in to save: it's written on the cluster.") : null));
+}
+
 async function serverSettings(c) {
   const head = el("h3", {}, "Server ", el("span", { class: "muted" }, "· config.json on the cluster"));
   if (!c.tunnel || c.tunnel.state !== "up") {
@@ -1566,14 +1600,15 @@ async function packagesDialog() {
 }
 clusterUI.init({
   api, errorBox, render: () => render(),
-  settingsCards: (c) => Promise.all([tunnelSettings(c), portSettings(c).catch(errorBox), serverSettings(c).catch(errorBox)]),
+  settingsCards: (c) => Promise.all([tunnelSettings(c), portSettings(c).catch(errorBox), quotaSettings(c).catch(errorBox),
+                                     serverSettings(c).catch(errorBox)]),
   addCluster: addClusterControls,
   files: (name) => filesPage(name),
   activity: (name) => activityPage(name),
   sshKeys: (name) => sshKeysPage(name),
   appSettings: (app, s, row) => appSettingsForm(app, s, row),
 });
-settingsUI.init({ api, errorBox, field, key: () => key });
+settingsUI.init({ api, errorBox, field, key: () => key, render: () => render() });
 widgetsUI.init({ api, errorBox, preferences: () => settingsUI.preferences() });
 Promise.all([loadApps(), settingsUI.loadPreferences(), widgetsUI.load()]).then(render);
 settingsUI.loadPreferences().then(settingsUI.restartWatch);

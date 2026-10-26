@@ -1607,6 +1607,21 @@ class JobManager:
     def _slots(job):
         return (job.get("throttle") or 1) if job.get("array_size") else 1
 
+    def _capacity_jobs(self, wanted):
+        """Use cached reservations when they already prove a submission fits.
+
+        Registry-active jobs reserve their full array throttle (or one slot).
+        Stale active rows therefore overcount capacity after jobs finish. Only
+        refresh scheduler/task accounting when that upper bound would reject,
+        so we can reclaim completed jobs without polling thousands of queued
+        array tasks on every submission. Call while holding submit_lock.
+        """
+        active = self.registry.list(limit=1000, active_only=True)
+        cap = self.limits["max_concurrent_jobs"]
+        if cap is None or sum(self._slots(j) for j in active) + wanted <= cap:
+            return active
+        return [j for j in self.refresh(active) if not j["terminal"]]
+
     def _output_path(self, job):
         if job.get("array_size"):
             return os.path.join(job["workdir"], self.ARRAY_OUTPUT_PATTERN.replace("%A", str(job["job_id"])))
@@ -1765,10 +1780,10 @@ class JobManager:
                 existing = self.registry.find_idempotent(token_name, key)
                 if existing is not None:
                     return 200, dict(self.job_view(existing), duplicate=True)
-            active = [j for j in self.refresh(self.registry.list(limit=1000, active_only=True)) if not j["terminal"]]
+            wanted = throttle if tasks is not None else 1
+            active = self._capacity_jobs(wanted)
             cap = self.limits["max_concurrent_jobs"]
             used = sum(self._slots(j) for j in active)
-            wanted = throttle if tasks is not None else 1
             if cap is not None and used + wanted > cap:
                 raise RESTError(429, f"API jobs already use {used} of {cap} concurrent slots and this needs "
                                      f"{wanted}; wait for jobs to finish, cancel one, or lower `throttle`",
@@ -1794,7 +1809,7 @@ class JobManager:
 
     def check_capacity(self, wanted=1):
         """Refuse (429) when API jobs already use the concurrent-job cap; call it holding submit_lock."""
-        active = [j for j in self.refresh(self.registry.list(limit=1000, active_only=True)) if not j["terminal"]]
+        active = self._capacity_jobs(wanted)
         cap = self.limits["max_concurrent_jobs"]
         used = sum(self._slots(j) for j in active)
         if cap is not None and used + wanted > cap:

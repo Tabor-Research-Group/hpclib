@@ -434,6 +434,12 @@ class TestSubmit(JobServerTestCase):
         other = RESTClient(self.url, token=self.other_token).submit_job("hello", idempotency_key="run-1")
         self.assertNotEqual(other["job_id"], first["job_id"])
 
+    def test_under_capacity_submit_does_not_poll_other_jobs(self):
+        self.llm.submit_job("hello")
+        with mock.patch.object(self.jobs.runner, "query_states",
+                               side_effect=AssertionError("unnecessary capacity refresh")):
+            self.llm.submit_job("hello")
+
     def test_concurrency_limit(self):
         a = self.llm.submit_job("hello")
         self.llm.submit_job("hello")
@@ -447,6 +453,57 @@ class TestSubmit(JobServerTestCase):
             p = self.expect_error(502, self.llm.submit_job, "hello")
         self.assertIn("submission failed", p["stderr"])
         self.assertEqual(self.llm.jobs()["jobs"], [])
+
+
+
+class TestCapacityReservations(unittest.TestCase):
+    """Capacity admission should not require a large per-task status scan."""
+
+    def manager(self, active, cap=48):
+        manager = object.__new__(rest_jobs.JobManager)
+        manager.registry = mock.Mock()
+        manager.registry.list.return_value = active
+        manager.limits = {"max_concurrent_jobs": cap}
+        manager.refresh = mock.Mock()
+        return manager
+
+    def test_9500_queued_tasks_below_cap_need_no_accounting(self):
+        # Nineteen 500-task arrays at throttle one plus a six-task pilot:
+        # 9,506 queued/live tasks reserve only 25 concurrent slots.
+        active = [{"job_id": "pilot", "array_size": 6, "throttle": 6}]
+        active += [{"job_id": str(i), "array_size": 500, "throttle": 1}
+                   for i in range(19)]
+        manager = self.manager(active)
+        manager.refresh.side_effect = AssertionError("unnecessary scheduler scan")
+        manager.check_capacity(1)
+        manager.refresh.assert_not_called()
+        manager.registry.list.assert_called_once_with(limit=1000, active_only=True)
+
+    def test_full_cached_reservations_refresh_to_reclaim_completed_job(self):
+        active = [{"job_id": "old", "array_size": 500, "throttle": 1},
+                  {"job_id": "live", "array_size": 500, "throttle": 1}]
+        manager = self.manager(active, cap=2)
+        manager.refresh.return_value = [
+            dict(active[0], terminal=True), dict(active[1], terminal=False)]
+        manager.check_capacity(1)
+        manager.refresh.assert_called_once_with(active)
+
+    def test_full_or_unknown_reservations_still_reject(self):
+        active = [{"job_id": "live", "array_size": 500, "throttle": 2}]
+        manager = self.manager(active, cap=2)
+        manager.refresh.return_value = [dict(active[0], terminal=False, state="UNKNOWN")]
+        with self.assertRaises(rest_jobs.RESTError) as caught:
+            manager.check_capacity(1)
+        self.assertEqual(caught.exception.status, 429)
+        self.assertEqual(caught.exception.payload["active_jobs"], ["live"])
+
+    def test_accounting_failure_when_capacity_is_full_does_not_admit(self):
+        active = [{"job_id": "live", "array_size": 500, "throttle": 2}]
+        manager = self.manager(active, cap=2)
+        manager.refresh.side_effect = rest_jobs.RESTError(504, "sacct timed out")
+        with self.assertRaises(rest_jobs.RESTError) as caught:
+            manager.check_capacity(1)
+        self.assertEqual(caught.exception.status, 504)
 
 
 class TestJobTracking(JobServerTestCase):
@@ -753,7 +810,7 @@ class TestMCP(JobServerTestCase):
             "cluster_info", "sandbox_info", "list_templates", "submit_job", "list_jobs", "job_status", "wait_for_job",
             "cancel_job", "list_files", "read_file", "tail_file", "read_guide", "list_modules",
             "search_modules", "list_template_proposals", "propose_template", "environment_info",
-            "sync_environment", "sync_status", "list_tunnel_actions", "run_tunnel_action"]))
+            "sync_environment", "sync_status", "list_tunnel_actions", "run_tunnel_action", "check_quota"]))
         self.assertTrue(field(by_name["cluster_info"].annotations, "readOnlyHint"))
         self.assertTrue(field(by_name["cancel_job"].annotations, "destructiveHint"))
         schema = field(by_name["submit_job"], "inputSchema")

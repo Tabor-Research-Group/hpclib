@@ -5,6 +5,10 @@ setup_agents): Claude Desktop and Cursor through their JSON configuration files,
 config.toml (~/.codex/config.toml, or $CODEX_HOME's), which the ChatGPT desktop app, the Codex CLI and its IDE
 extension share; ChatGPT on the web can't run local servers.
 
+Under WSL (local_platform.py), Claude Desktop, Cursor and ChatGPT are Windows programs: their configuration is in
+your Windows profile folder (as WSL sees it, /mnt/c/Users/NAME), and their entries start the MCP server through
+wsl.exe. Claude Code installed in WSL is a Linux client; installed on Windows only (claude.exe), a Windows one.
+
 Only entries the console owns are touched: one per agent profile, under its MCP name (hpclib-NAME by default, or
 the name given to it), plus names a profile had before. Before the first change to a configuration file, the file
 is copied beside it as FILE.before-hpclib; it is then replaced atomically, keeping its permissions and everything
@@ -21,6 +25,12 @@ import subprocess
 import sys
 import tempfile
 
+try:
+    import local_platform
+except ImportError:  # imported without hpclib/lib on the path
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+    import local_platform
+
 BACKUP_SUFFIX = ".before-hpclib"
 CLAUDE_CANDIDATES = ("~/.claude/local/claude", "~/.local/bin/claude", "/opt/homebrew/bin/claude",
                      "/usr/local/bin/claude")
@@ -30,11 +40,57 @@ class ClientError(Exception):
     pass
 
 
+NO_WINDOWS_HOME = ("can't find your Windows profile folder from WSL: set it on Console Settings -> This machine, "
+                   "or in $HPCLIB_WINDOWS_HOME (e.g. /mnt/c/Users/NAME)")
+
+
 def home():
     return os.path.expanduser(os.environ.get("HPCLIB_MCP_CLIENT_HOME") or "~")
 
 
+def windows_home():
+    return local_platform.windows_home()[0]
+
+
+def _windows(*parts):
+    """A path in your Windows profile folder (None when it can't be found)."""
+    h = windows_home()
+    return os.path.join(h, *parts) if h else None
+
+
+def _linux_claude():
+    if os.environ.get("HPCLIB_CLAUDE_BIN"):
+        return os.environ["HPCLIB_CLAUDE_BIN"]
+    found = shutil.which("claude")
+    windows = local_platform.windows_side() and found and found.startswith("/mnt/")   # WSL appends Windows' PATH
+    if found and not windows:
+        return found
+    for c in CLAUDE_CANDIDATES:
+        p = os.path.expanduser(c)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def windows_client(cid):
+    """Whether this client is a Windows program the console reaches from WSL."""
+    if not local_platform.windows_side():
+        return False
+    if cid == "claude_code":
+        return _linux_claude() is None and shutil.which("claude.exe") is not None
+    return True
+
+
+def entry_for(cid, entry):
+    """The entry as the client runs it: through wsl.exe for a Windows client under WSL."""
+    if entry.get("command") is None or not windows_client(cid):
+        return entry
+    return local_platform.windows_entry(entry)
+
+
 def desktop_config_path():
+    if windows_client("claude_desktop"):
+        return _windows("AppData", "Roaming", "Claude", "claude_desktop_config.json")
     h = home()
     if sys.platform == "darwin":
         return os.path.join(h, "Library", "Application Support", "Claude", "claude_desktop_config.json")
@@ -45,20 +101,28 @@ def desktop_config_path():
 
 
 def claude_binary():
-    if os.environ.get("HPCLIB_CLAUDE_BIN"):
-        return os.environ["HPCLIB_CLAUDE_BIN"]
-    found = shutil.which("claude")
-    if found:
-        return found
-    for c in CLAUDE_CANDIDATES:
-        p = os.path.expanduser(c)
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
-    return None
+    if windows_client("claude_code"):
+        return shutil.which("claude.exe")
+    return _linux_claude()
+
+
+def claude_code_path():
+    return _windows(".claude.json") if windows_client("claude_code") else os.path.join(home(), ".claude.json")
 
 
 def codex_home():
-    return os.path.expanduser(os.environ.get("CODEX_HOME") or os.path.join(home(), ".codex"))
+    if os.environ.get("CODEX_HOME"):
+        return os.path.expanduser(os.environ["CODEX_HOME"])
+    return _windows(".codex") if windows_client("chatgpt") else os.path.join(home(), ".codex")
+
+
+def cursor_path():
+    return _windows(".cursor", "mcp.json") if windows_client("cursor") else os.path.join(home(), ".cursor", "mcp.json")
+
+
+def chatgpt_path():
+    h = codex_home()
+    return os.path.join(h, "config.toml") if h else None
 
 
 CHATGPT_APPS = ("/Applications/ChatGPT.app", "~/Applications/ChatGPT.app")
@@ -66,7 +130,10 @@ CHATGPT_APPS = ("/Applications/ChatGPT.app", "~/Applications/ChatGPT.app")
 
 def chatgpt_installed():
     """Codex's directory exists, or the ChatGPT desktop app or the codex command is installed."""
-    if os.path.isdir(codex_home()) or shutil.which("codex"):
+    h = codex_home()
+    if h and os.path.isdir(h):
+        return True
+    if shutil.which("codex.exe" if windows_client("chatgpt") else "codex"):
         return True
     return sys.platform == "darwin" and any(os.path.isdir(os.path.expanduser(a)) for a in CHATGPT_APPS)
 
@@ -74,11 +141,11 @@ def chatgpt_installed():
 CLIENTS = {
     "claude_desktop": {"title": "Claude Desktop", "kind": "file", "path": desktop_config_path,
                        "after": "Quit and reopen Claude Desktop to load changed entries."},
-    "claude_code": {"title": "Claude Code", "kind": "cli", "path": lambda: os.path.join(home(), ".claude.json"),
+    "claude_code": {"title": "Claude Code", "kind": "cli", "path": lambda: claude_code_path(),
                     "after": "New Claude Code sessions use them (user scope)."},
-    "cursor": {"title": "Cursor", "kind": "file", "path": lambda: os.path.join(home(), ".cursor", "mcp.json"),
+    "cursor": {"title": "Cursor", "kind": "file", "path": lambda: cursor_path(),
                "after": "Cursor reloads its MCP servers on its own; otherwise restart it."},
-    "chatgpt": {"title": "ChatGPT", "kind": "toml", "path": lambda: os.path.join(codex_home(), "config.toml"),
+    "chatgpt": {"title": "ChatGPT", "kind": "toml", "path": lambda: chatgpt_path(),
                 "detail": "the desktop app, the Codex CLI and its IDE extension (they share config.toml)",
                 "after": "Restart the ChatGPT desktop app, or start a new Codex session, to load changed entries."},
 }
@@ -285,6 +352,8 @@ def _read_servers(path):
 
 def available(cid):
     spec = CLIENTS[cid]
+    if spec["path"]() is None:
+        return False
     if spec["kind"] == "cli":
         return claude_binary() is not None
     if spec["kind"] == "toml":
@@ -304,14 +373,17 @@ def status(cid, wanted, owned):
     spec = CLIENTS[cid]
     path = spec["path"]()
     out = {"id": cid, "title": spec["title"], "path": path, "available": available(cid), "after": spec["after"],
-           "detail": spec.get("detail"), "entries": [], "stale": [], "error": None}
+           "detail": spec.get("detail"), "entries": [], "stale": [], "error": None, "windows": windows_client(cid)}
     if spec["kind"] == "cli":
         out["command"] = claude_binary()
     try:
+        if path is None:
+            raise ClientError(NO_WINDOWS_HOME)
         servers, _ = _read_servers(path)
     except ClientError as e:
         out["error"] = str(e)
         servers = {}
+    wanted = {name: entry_for(cid, entry) for name, entry in wanted.items()}
     for name, entry in sorted(wanted.items()):
         have = servers.get(name)
         out["entries"].append({"name": name, "state": "missing" if have is None else
@@ -382,8 +454,11 @@ def _claude(args, timeout=60):
 def write(cid, wanted):
     """Add or update every wanted entry; returns the names changed."""
     spec = CLIENTS[cid]
+    if spec["path"]() is None:
+        raise ClientError(NO_WINDOWS_HOME)
     if not available(cid):
         raise ClientError(f"{spec['title']} isn't installed on this machine")
+    wanted = {name: entry_for(cid, entry) for name, entry in wanted.items()}
     if spec["kind"] == "file":
         changed = []
 
@@ -416,6 +491,8 @@ def write(cid, wanted):
 
 def remove(cid, name):
     spec = CLIENTS[cid]
+    if spec["path"]() is None:
+        raise ClientError(NO_WINDOWS_HOME)
     if spec["kind"] == "file":
         _write_file(spec["path"](), lambda servers: servers.pop(name, None))
         return
@@ -435,4 +512,4 @@ def has_other(cid, name, entry):
         servers, _ = _read_servers(CLIENTS[cid]["path"]())
     except ClientError:
         return False
-    return name in servers and not _same(servers[name], entry)
+    return name in servers and not _same(servers[name], entry_for(cid, entry))

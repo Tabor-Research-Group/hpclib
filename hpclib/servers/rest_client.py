@@ -192,6 +192,13 @@ class RESTClient:
         return self.request("POST", "/actions/run", body={"tunnel": tunnel, "action": action, "params": params or {}},
                             timeout=max(self.timeout, 960))
 
+    # quotas (lib/quota.sh on the cluster)
+    def quota(self, kind="all", refresh=False):
+        query = {"kind": kind}
+        if refresh:
+            query["refresh"] = 1
+        return self.request("GET", "/quota", query=query, timeout=max(self.timeout, 180))
+
     # Python environments (uv, pixi)
     def environment(self, project=None, manager="auto", environment="default"):
         query = {"project": project, "manager": manager, "environment": environment} if project else None

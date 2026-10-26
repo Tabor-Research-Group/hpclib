@@ -111,6 +111,7 @@ What else an app runs keeps whatever protection you give its directories. PAI's 
 | `environment_info`, `sync_environment`, `sync_status` | uv/pixi environments (`/envs`) | partly |
 | `list_template_proposals`, `propose_template` | `/templates/proposals`, `/templates/propose` | partly |
 | `list_tunnel_actions`, `run_tunnel_action` | `GET /actions`, `POST /actions/run`: what tunnels do for agents with your access, such as copying to and from your SMB server (see [Tunnel actions](extending.md#tunnel-actions)); only those the owner turned on | partly |
+| `check_quota` | `GET /quota`: your storage quota and project balance from the cluster's own commands (`showquota`, `myproject` by default; see [Quotas](cli/README.md#quotas)), cached a minute | yes |
 | `list_local_files`, `push_files`, `pull_files` | files on your machine, only under `--local-root` folders | partly |
 | `write_file`, `make_directory` | only with `--enable-file-writes` and the `files:write` scope | |
 

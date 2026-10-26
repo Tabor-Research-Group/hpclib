@@ -8,7 +8,7 @@ for you, so in practice you install once locally and then point hpclib at each c
 
 | Where | Needs |
 | --- | --- |
-| your machine | macOS or Linux, `bash` 3.2 or newer, OpenSSH, Python 3.7 or newer (for the console), `git` |
+| your machine | macOS, Linux, or Windows through WSL ([below](#windows-wsl)); `bash` 3.2 or newer, OpenSSH, Python 3.7 or newer (for the console), `git` |
 | your machine, for agents | a Python with the MCP SDK (`pip install mcp`) for the MCP server |
 | cluster login node | `bash`, Python 3.9 or newer (found or loaded from a module by `setup_agents`), SLURM (`sbatch`, `squeue`) or podman |
 | cluster, for sandboxed agent jobs | Singularity or Apptainer; or rootless podman on a server without SLURM |
@@ -57,6 +57,30 @@ python3 -m pip install mcp            # or: python3 -m pip install "$HOME/hpclib
 ```
 
 Nothing on the cluster depends on it.
+
+### Windows (WSL)
+
+On Windows, hpclib runs in WSL 2 (Linux on Windows), while your browser and LLM clients stay Windows programs.
+Install a distribution (`wsl --install` in PowerShell gives Ubuntu), then follow step 1 inside it: clone, source
+`hpclib.sh` in `~/.bashrc`, `pip install mcp`. Keep the clone in the Linux home (`~/hpclib`), not under `/mnt/c`.
+
+hpclib detects WSL and then:
+
+- opens files and the console's page with `wslview` (from `wslu`, if installed) or `explorer.exe`, so they open
+  in your Windows programs; WSL forwards `127.0.0.1`, so the console and the tunnels' ports work from Windows;
+- writes the MCP entries for Claude Desktop, Cursor and ChatGPT into their Windows configuration
+  (`%APPDATA%\Claude\claude_desktop_config.json`, `%USERPROFILE%\.cursor\mcp.json`,
+  `%USERPROFILE%\.codex\config.toml`), as `wsl.exe -d DISTRO --exec PYTHON rest_mcp.py ...`, so they start the MCP
+  server in WSL, where the tunnels are. Claude Code installed in WSL gets the plain Linux entry; installed only on
+  Windows (`claude.exe`), the `wsl.exe` one. `setup_agents` prints the `wsl.exe` form too.
+
+It finds your Windows profile folder by asking Windows for `%USERPROFILE%`. If detection gets either wrong, set
+them on **Console Settings → This machine**, or in the environment, which wins: `HPCLIB_PLATFORM=wsl` (or
+`linux`, `macos`) and `HPCLIB_WINDOWS_HOME=/mnt/c/Users/NAME`. `python3 hpclib/lib/local_platform.py describe`
+shows what hpclib uses.
+
+Native Windows (outside WSL) isn't supported: hpclib's ssh connection sharing, login prompts and shell functions
+need a Unix system.
 
 ## 2. Install hpclib on a cluster
 

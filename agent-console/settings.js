@@ -366,7 +366,7 @@ async function clientsCard() {
             counts.different ? chip(`${counts.different} out of date`, "starting") : null,
             counts.missing ? chip(`${counts.missing} missing`, "starting") : null);
       return el("tr", {},
-        el("td", {}, el("strong", {}, c.title),
+        el("td", {}, el("strong", {}, c.title), c.windows ? el("span", { class: "muted small" }, " · Windows, through wsl.exe") : null,
           c.detail ? el("div", { class: "muted small" }, c.detail) : null,
           el("div", { class: "muted small" }, c.command ? `${c.command} · ${c.path}` : c.path)),
         el("td", {}, summary,
@@ -392,6 +392,46 @@ async function clientsCard() {
       el("table", { class: "compact" }, el("tbody", {}, items)));
   };
   await draw().catch((err) => box.replaceChildren(el("h3", {}, "LLM clients"), ctx.errorBox(err)));
+  return box;
+}
+
+// This machine (local_platform.py): which platform the console dispatches on (how it opens files and the browser,
+// and where the LLM clients' configuration is), detected unless chosen here; under WSL, the Windows profile folder.
+async function machineCard() {
+  const box = el("section", { class: "card", id: "machine" });
+  const draw = async () => {
+    const m = await ctx.api("platform");
+    const titles = { auto: `Detect (${m.detected === "wsl" ? "WSL" : m.detected === "macos" ? "macOS" : m.detected === "windows" ? "Windows" : "Linux"})`,
+                     linux: "Linux", macos: "macOS", wsl: "WSL (Linux on Windows)" };
+    const choice = el("select", { "aria-label": "Platform" }, m.choices.map((v) =>
+      el("option", { value: v, selected: v === m.setting }, titles[v] || v)));
+    const home = el("input", { value: m.windows_home_setting || "", size: 34, placeholder: m.windows_home
+      ? `found: ${m.windows_home}` : "/mnt/c/Users/NAME", "aria-label": "Windows profile folder" });
+    const homeField = field("Windows profile folder", home, "as WSL sees it; empty: ask Windows (%USERPROFILE%)");
+    const showHome = () => { homeField.hidden = !(choice.value === "wsl" || (choice.value === "auto" && m.detected === "wsl")); };
+    choice.addEventListener("change", showHome);
+    showHome();
+    const save = saveButton("Save", async () => {
+      prefs = await ctx.api("preferences", { method: "PUT", body: { system: {
+        platform: choice.value, windows_home: home.value.trim() } } });
+      if (ctx.render) ctx.render(); else await draw();     // the LLM clients' paths follow the platform
+      return "";
+    });
+    const now = el("p", { class: "muted" }, "Now: ", el("strong", {}, m.title),
+      ` (${{ env: "from $HPCLIB_PLATFORM, which wins over this setting", settings: "chosen here", detected: "detected" }[m.source] || m.source})`,
+      m.platform === "wsl" ? `. Files and pages open with ${m.opener}; Claude Desktop, Cursor and ChatGPT are ` +
+        `Windows programs, configured in ${m.windows_home || "your Windows profile folder (not found: set it below)"}, ` +
+        `whose entries start the MCP server in WSL with wsl.exe${m.wsl_distro ? ` -d ${m.wsl_distro}` : ""}.` : ".");
+    box.replaceChildren(
+      el("h3", {}, "This machine"),
+      el("p", { class: "muted" }, "How the console opens files and your browser, and where it finds the LLM clients' " +
+        "configuration, depend on the platform it runs on. It is detected; choose it here if detection gets it " +
+        "wrong (for example, WSL not recognized). setup_agents on the command line reads this too."),
+      now,
+      el("div", { class: "row" }, field("Platform", choice, "auto: detect it each time"), homeField),
+      el("div", { class: "actions" }, save));
+  };
+  await draw().catch((err) => box.replaceChildren(el("h3", {}, "This machine"), ctx.errorBox(err)));
   return box;
 }
 
@@ -426,18 +466,18 @@ function defaultsCard(p) {
 export async function consolePage() {
   const p = await loadPreferences();
   if (!p) throw new Error("This console is older than its page: restart it (launch-tunnel-manager).");
-  const [ports, clients] = await Promise.all([portsCard(), clientsCard()]);
+  const [ports, clients, machine] = await Promise.all([portsCard(), clientsCard(), machineCard()]);
   return [
     el("h2", {}, "Console Settings"),
     el("p", { class: "muted" }, "Settings for this console on this machine, not for a cluster (those are on each " +
       "cluster's Settings tab)."),
     el("nav", { class: "subtabs" }, [["notifications", "Notifications"], ["ports", "Local ports"],
-      ["llm-clients", "LLM clients"], ["new-cluster", "Defaults for new clusters"]].map(([id, label]) => {
+      ["llm-clients", "LLM clients"], ["new-cluster", "Defaults for new clusters"], ["machine", "This machine"]].map(([id, label]) => {
       const a = el("a", { href: `#/console` }, label);
       a.addEventListener("click", (e) => { e.preventDefault(); document.getElementById(id)?.scrollIntoView({ behavior: "smooth" }); });
       return a;
     })),
-    notificationsCard(p), ports, clients, defaultsCard(p),
+    notificationsCard(p), ports, clients, defaultsCard(p), machine,
   ];
 }
 
@@ -476,7 +516,9 @@ export async function aboutPage() {
             el("div", { class: "muted small" }, a.hpclib_dir + git)),
         row("Console", `API ${a.console_version} · process ${a.pid} · started ${new Date(a.started * 1000).toLocaleString()}`),
         row("Python", `${a.python} · ${a.python_path}`),
-        row("System", a.platform),
+        row("System", a.platform, a.local_platform ? el("div", { class: "muted small" },
+          `${a.local_platform.title} (${a.local_platform.source})` +
+          (a.local_platform.windows_home ? ` · Windows profile ${a.local_platform.windows_home}` : "")) : null),
         row("Settings", el("code", {}, a.console_dir), el("div", { class: "muted small" }, `clusters: ${a.agents_dir}`)),
         row("Packages", a.packages.length ? a.packages.map((p) => `${p.name} ${p.version}`).join(", ") : el("span", { class: "muted" }, "none")),
         row("Clusters", String(a.clusters))))),

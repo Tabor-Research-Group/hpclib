@@ -21,6 +21,9 @@ The front end depends only on the routes below; nothing here depends on it.
   GET  /api/diagnostics                      about, preferences and every cluster's state, for a bug report
                                               (token-like strings redacted)
   GET  /api/preferences                      this machine's preferences (console_prefs.py)
+  GET  /api/platform                         this machine's platform (local_platform.py: linux, macos, wsl), where
+                                              it came from, and under WSL the Windows profile folder the LLM
+                                              clients' configuration is in
   PUT  /api/preferences                      {section: {...}}: notifications, new_cluster, llm_clients, interface
   GET  /api/ports                            every local port the profiles hold, free / its tunnel's / taken
   PUT  /api/ports/range                      {"low", "high"} (or {"reset": true}): where new ports are picked
@@ -57,7 +60,12 @@ The front end depends only on the routes below; nothing here depends on it.
                                               the login: queued, running and finished, each labelled with what started it
   POST /api/clusters/NAME/jobs/cancel         {"job": ID}: scancel an agent's or another job (apps stop with their Stop)
   GET  /api/clusters/NAME/storage             the last storage scan of the work directories (du), and the quota
-  POST /api/clusters/NAME/storage/scan        start a new scan over the login (in the background)
+  POST /api/clusters/NAME/storage/scan        start a new scan over the login (in the background), with the quotas
+  GET  /api/clusters/NAME/quota[?kind=]       the quota checks (lib/quota.sh: storage and project) over the login,
+                                              kept with the storage scan
+  PUT  /api/clusters/NAME/quota/settings      {"storage"?, "project"?}: the cluster's checks (a command; "" for
+                                              the default, "none" to turn one off), saved on the cluster
+                                              ($HPCTUNNELS_DATA_DIR/settings/quota.sh), then checked
   GET  /api/clusters/NAME/ports               the login-node ports this console's tunnels use, and which run now
   POST /api/clusters/NAME/ports/clear         {"fresh_logins": false, "password"?, "max_logins"?}: clear what earlier
                                               tunnels left on those ports on every login node (clear_tunnel_ports,
@@ -162,6 +170,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HPCLIB_DIR = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(HPCLIB_DIR, "lib"))
 import agent_profiles  # noqa: E402
+import local_platform  # noqa: E402
 sys.path.insert(0, HERE)
 import console_packages  # noqa: E402
 import console_prefs  # noqa: E402
@@ -413,6 +422,10 @@ def console_dir():
     return os.path.expanduser(os.environ.get("HPCLIB_CONSOLE_DIR") or "~/.config/hpclib/console")
 
 
+# this machine's platform: the console's own Console Settings -> This machine (local_platform.py)
+local_platform.settings = lambda: console_prefs.load(console_dir())["system"]
+
+
 LOG_BLOCK_HEADER = re.compile(rb"(?m)^=== \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\r\n]* ===\r?$")
 TERMINAL_ESCAPE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]")
 
@@ -444,20 +457,8 @@ def last_log_block(path, max_bytes=8 << 20):
 
 
 def open_with_default_application(path):
-    """Use the OS file association; never choose or look for an editor ourselves."""
-    if sys.platform == "win32":
-        os.startfile(path)
-        return
-    command = "/usr/bin/open" if sys.platform == "darwin" else "xdg-open"
-    proc = subprocess.Popen([command, path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, start_new_session=True)
-    try:
-        status = proc.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        # Some desktop handlers stay running with the application. Leave them running.
-        return
-    if status:
-        raise OSError(f"the OS file opener exited with status {status}")
+    """Use the OS file association (local_platform: Windows' under WSL); never choose or look for an editor ourselves."""
+    local_platform.open_target(path)
 
 
 def write_private(path, text):
@@ -991,13 +992,44 @@ def parse_storage(text):
             for d in dirs:
                 if d["path"] == path and count.isdigit():
                     d["files"] = int(count)
-        elif kind == "Q":
-            quota = {"command": rest, "lines": []}
-        elif kind == "q" and quota is not None:
-            quota["lines"].append(rest)
     for d in dirs:
         d["children"] = sorted(d["children"], key=lambda c: c["kb"], reverse=True)[:12]
-    return {"dirs": dirs, "quota": quota}
+    quotas = parse_quota(text)
+    return {"dirs": dirs, "quotas": quotas, "quota": storage_quota(quotas)}
+
+
+def parse_quota(text):
+    """lib/quota.sh's `hpclib_quota --json` line: {host, settings_file, storage?, project?}, or None."""
+    for line in text.splitlines():
+        if line.startswith("HPCLIB_QUOTA "):
+            try:
+                out = json.loads(line[len("HPCLIB_QUOTA "):])
+            except ValueError:
+                return None
+            return out if isinstance(out, dict) else None
+    return None
+
+
+def storage_quota(quotas):
+    """The storage check as the Storage tab's older {command, lines}."""
+    check = (quotas or {}).get("storage") or {}
+    return {"command": check["command"], "lines": check.get("output") or []} if check.get("command") else None
+
+
+QUOTA_SH = os.path.join(HPCLIB_DIR, "lib", "quota.sh")
+QUOTA_ENV = ("HPCLIB_STORAGE_QUOTA_CHECK", "HPCLIB_PROJECT_QUOTA_CHECK")
+QUOTA_KINDS = ("all", "storage", "project")
+
+
+def quota_script(call):
+    """
+    lib/quota.sh's functions and then `call`, for bash -s on a cluster (so it works before hpclib is installed
+    there). Like cluster_quota, the console passes on its own HPCLIB_*_QUOTA_CHECK when they are set.
+    """
+    with open(QUOTA_SH) as f:
+        text = f.read()
+    env = "".join(f"export {v}={shlex.quote(os.environ[v])}\n" for v in QUOTA_ENV if os.environ.get(v))
+    return f"{env}{text}\n{call}\n"
 
 # -- every job of yours on a cluster, and its storage (the cluster page's Jobs and Storage tabs) -----------------
 
@@ -1009,7 +1041,8 @@ sacct -n -P -u "$USER" -S now-1day -o JobID,JobName,State,ExitCode,Elapsed,End,P
 """
 
 # Runs ON the login node: STORAGE_TIMEOUT DIR...: each directory's size by its children (du -k --max-depth=1) and
-# file count, at low priority and with a time limit (then marked partial), and the site's quota report.
+# file count, at low priority and with a time limit (then marked partial). The scan adds the quota checks
+# (quota_script) after it.
 CLUSTER_STORAGE_SCRIPT = r"""
 limit="$1"; shift
 tmp=$(mktemp) || exit 1
@@ -1024,10 +1057,6 @@ for d in "$@"; do
   files=$(timeout "$limit" nice -n 19 du -s --inodes -- "$d" 2>/dev/null | cut -f1)
   printf 'I|%s|%s\n' "${files:-}" "$d"
 done
-for q in showquota myquota; do
-  if command -v "$q" > /dev/null 2>&1; then printf 'Q|%s\n' "$q"; timeout 60 "$q" 2>&1 | head -n 40 | sed 's/^/q|/'; exit 0; fi
-done
-if command -v quota > /dev/null 2>&1; then printf 'Q|quota -s\n'; timeout 60 quota -s 2>&1 | head -n 40 | sed 's/^/q|/'; fi
 """
 
 
@@ -1051,6 +1080,7 @@ class Clusters:
         self._clear_requests = {}    # name -> clear_ports' options (its password too), until its operation ends
         self.script_runner = self._login_script
         self.storage_scans = {}      # name -> {"state": "running", "started": ...} while a storage scan runs
+        self.storage_lock = threading.Lock()   # the storage cache file: a scan and quota checks both write it
         self.stops = {}              # (name, app or None) -> when Stop was asked for here (notifications skip those)
         self.packages = load_package_apps()
         self.secret_runner = self._run_with_input
@@ -1554,6 +1584,7 @@ class Clusters:
                 out = json.load(f)
         except (OSError, ValueError):
             out = {"scanned": None, "dirs": [], "quota": None}
+        out.setdefault("quotas", None)
         with self.lock:
             scan = self.storage_scans.get(name)
         out["scan"] = dict(scan) if scan else {"state": "idle"}
@@ -1574,17 +1605,75 @@ class Clusters:
 
     def _storage_scan(self, profile, dirs, scan):
         try:
-            code, out, err = self.script_runner(profile, CLUSTER_STORAGE_SCRIPT, (str(self.STORAGE_TIMEOUT), *dirs),
-                                                2 * self.STORAGE_TIMEOUT + 120)
+            script = CLUSTER_STORAGE_SCRIPT + quota_script("hpclib_quota all --json")
+            code, out, err = self.script_runner(profile, script, (str(self.STORAGE_TIMEOUT), *dirs),
+                                                2 * self.STORAGE_TIMEOUT + 240)
             result = parse_storage(out)
             result["scanned"] = time.time()
-            os.makedirs(os.path.dirname(self.storage_path(profile["name"])), mode=0o700, exist_ok=True)
-            write_private(self.storage_path(profile["name"]), json.dumps(result))
+            if result["quotas"]:
+                result["quotas"]["checked"] = result["scanned"]
+            self._save_storage(profile["name"], result)
             state = {"state": "done", "finished": time.time()}
         except Exception as e:
             state = {"state": "failed", "finished": time.time(), "error": self._one_line(getattr(e, "payload", {}).get("error") or e)}
         with self.lock:
             scan.update(state)
+
+    def _save_storage(self, name, result):
+        with self.storage_lock:
+            os.makedirs(os.path.dirname(self.storage_path(name)), mode=0o700, exist_ok=True)
+            write_private(self.storage_path(name), json.dumps(result))
+
+    # -- quota checks (lib/quota.sh), with the cluster's own settings ------------
+
+    QUOTA_TIMEOUT = 200
+
+    def quota(self, profile, kind="all"):
+        """Runs the checks over the login; the answer replaces the storage scan's (for the kinds it has)."""
+        if kind not in QUOTA_KINDS:
+            raise ConsoleError(400, f"kind: one of {list(QUOTA_KINDS)}")
+        return self._quota_call(profile, 'hpclib_quota "$@"', (kind, "--json"))
+
+    def set_quota_checks(self, profile, body):
+        """{"storage"?, "project"?}: saved in the cluster's $HPCTUNNELS_DATA_DIR/settings/quota.sh (what the REST
+        server and hpclib_quota there use too); "" forgets one, "none" turns it off. Then both are checked."""
+        if not isinstance(body, dict) or not body or set(body) - {"storage", "project"}:
+            raise ConsoleError(400, 'send {"storage": COMMAND, "project": COMMAND} (either)')
+        args = []
+        for kind in ("storage", "project"):
+            if kind not in body:
+                continue
+            value = body[kind]
+            if not isinstance(value, str) or re.search(r"[\0\n\r]", value) or len(value) > 1000:
+                raise ConsoleError(400, f"{kind}: one line of shell, at most 1000 characters")
+            args.append(f"{kind}={value.strip() or 'default'}")
+        call = 'for kv in "$@"; do _hpclib_quota_set "${kv%%=*}" "${kv#*=}" || exit 3; done; hpclib_quota all --json'
+        return self._quota_call(profile, call, args)
+
+    def _quota_call(self, profile, call, args):
+        name = profile["name"]
+        if not self.logins.alive(profile):
+            raise ConsoleError(409, f"log in to {name} first: quotas are checked over the console's login")
+        code, out, err = self.script_runner(profile, quota_script(call), tuple(args), self.QUOTA_TIMEOUT)
+        quotas = parse_quota(out)
+        if quotas is None:
+            detail = self._one_line(err or out) if (err or out).strip() else f"exit {code}"
+            raise ConsoleError(502, f"the quota checks on {name} gave no answer: {detail}")
+        quotas["checked"] = time.time()
+        quotas["environment"] = [v for v in QUOTA_ENV if os.environ.get(v)]
+        with self.storage_lock:
+            try:
+                with open(self.storage_path(name)) as f:
+                    stored = json.load(f)
+            except (OSError, ValueError):
+                stored = {"scanned": None, "dirs": []}
+            merged = dict(stored.get("quotas") or {})
+            merged.update(quotas)
+            stored["quotas"] = merged
+            stored["quota"] = storage_quota(merged)
+            os.makedirs(os.path.dirname(self.storage_path(name)), mode=0o700, exist_ok=True)
+            write_private(self.storage_path(name), json.dumps(stored))
+        return {"quotas": merged}
 
     # -- leftover tunnel ports on the cluster's login nodes ---------------------
 
@@ -3160,7 +3249,8 @@ class Clusters:
                 "restart_for": on_disk if on_disk and STARTED_VERSION and on_disk != STARTED_VERSION else None,
                 "console_version": VERSION, "hpclib_dir": HPCLIB_DIR, "git": git_info(os.path.dirname(HPCLIB_DIR)),
                 "python": platform.python_version(), "python_path": sys.executable,
-                "platform": platform.platform(), "console_dir": console_dir(), "agents_dir": agent_profiles.root(),
+                "platform": platform.platform(), "local_platform": local_platform.describe(),
+                "console_dir": console_dir(), "agents_dir": agent_profiles.root(),
                 "pid": os.getpid(), "started": STARTED_AT, "clusters": len(self.names()),
                 "packages": [{"name": p.get("name"), "version": p.get("version")} for p in self.packages_list()]}
 
@@ -3374,6 +3464,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         if parts == ["health"] and verb == "GET":
             return 200, {"ok": True, "console": VERSION, "clusters": len(c.names()), "pid": os.getpid(),
                          "hpclib_version": local_hpclib_version()}
+        if parts == ["platform"] and verb == "GET":
+            return 200, dict(local_platform.describe(), ok=True)
         if parts == ["preferences"] and verb == "GET":
             return 200, dict(console_prefs.load(console_dir()), ok=True)
         if parts == ["preferences"] and verb == "PUT":
@@ -3451,6 +3543,10 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 return 200, dict(c.storage(profile), ok=True)
             if rest == ["storage", "scan"] and verb == "POST":
                 return 202, dict(c.start_storage_scan(profile), ok=True)
+            if rest == ["quota"] and verb == "GET":
+                return 200, dict(c.quota(profile, self.query.get("kind", ["all"])[-1]), ok=True)
+            if rest == ["quota", "settings"] and verb == "PUT":
+                return 200, dict(c.set_quota_checks(profile, self.json_body()), ok=True)
             if rest == ["ports"] and verb == "GET":
                 return 200, {"ok": True, "ports": c.login_ports(profile)}
             if rest == ["ports", "clear"] and verb == "POST":
@@ -3772,8 +3868,14 @@ def main(argv=None):
     if opts.static:
         print(f"  front end: {url}/#key={key}")
         if opts.open:
-            import webbrowser
-            webbrowser.open(f"{url}/#key={key}")
+            if local_platform.platform() == "wsl":       # the browser is Windows'
+                try:
+                    local_platform.open_target(f"{url}/#key={key}")
+                except OSError as e:
+                    print(f"  couldn't open your browser ({e}); open the front end link above")
+            else:
+                import webbrowser
+                webbrowser.open(f"{url}/#key={key}")
     sys.stdout.flush()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:

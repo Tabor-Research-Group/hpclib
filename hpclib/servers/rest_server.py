@@ -84,6 +84,10 @@ Endpoints (all responses are JSON unless noted)    scope
   GET    /actions[?refresh=1]   tunnel actions (rest_actions.py): the owner sees all, with   read
                                  which are on; an agent the ones it may run; with availability
   POST   /actions/run  {"tunnel", "action", "params"}   the action's own scope; off until the owner turns it on
+  GET    /quota[?kind=storage|project|all][&refresh=1]   your storage quota and project balance,    read
+                                 with the cluster's own commands (lib/quota.sh: showquota and
+                                 myproject by default; HPCLIB_*_QUOTA_CHECK or the cluster's
+                                 settings change them); cached for a minute
   POST   /slurm/{sbatch,squeue,sacct,scontrol,scancel}
            body: {"args": [...], "cwd": "...", "input": "..."}   slurm
   GET    /slurm/{squeue,sacct}?arg=...&arg=...&cwd=...          slurm
@@ -161,6 +165,7 @@ __all__ = [
     "TokenAuth",
     "AuditLog",
     "RESTServer",
+    "QuotaChecks",
     "RESTHandler",
     "HPCRESTHandler",
     "setup_parent_terminated_listener",
@@ -536,6 +541,58 @@ class AuditLog:
                 f.write(line)
 
 
+class QuotaChecks:
+    """
+    GET /quota: lib/quota.sh's checks, run as this user (the commands are the owner's: the environment the server
+    started with, or $HPCTUNNELS_DATA_DIR/settings/quota.sh, which the API can't reach). The site's commands can be
+    slow and agents ask often, so an answer is kept for TTL seconds and one check of a kind runs at a time.
+    """
+    KINDS = ("all", "storage", "project")
+    TTL = 60
+    TIMEOUT = 150
+    SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib", "quota.sh")
+
+    def __init__(self, script=None, env=None):
+        self.script = script or self.SCRIPT
+        self.env = env
+        self._lock = threading.Lock()
+        self._kind_locks = {k: threading.Lock() for k in self.KINDS}
+        self._cache = {}
+
+    def check(self, kind="all", refresh=False):
+        with self._kind_locks[kind]:
+            with self._lock:
+                hit = self._cache.get(kind)
+            if hit and not refresh and time.time() - hit[0] < self.TTL:
+                return dict(hit[1], cached=True, age=round(time.time() - hit[0]))
+            out = self._run(kind)
+            with self._lock:
+                self._cache[kind] = (time.time(), out)
+            return dict(out, cached=False, age=0)
+
+    def _run(self, kind):
+        env = self.env if self.env is not None else rest_sandbox.child_env()
+        proc = subprocess.Popen(["bash", self.script, kind, "--json"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                                start_new_session=True)
+        try:
+            stdout, stderr = proc.communicate(timeout=self.TIMEOUT)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.communicate()
+            raise RESTError(504, f"the quota checks took over {self.TIMEOUT} s")
+        for line in stdout.splitlines():
+            if line.startswith("HPCLIB_QUOTA "):
+                try:
+                    return json.loads(line[len("HPCLIB_QUOTA "):])
+                except ValueError:
+                    break
+        raise RESTError(500, "lib/quota.sh gave no answer: " + (stderr.strip()[-2000:] or f"exit {proc.returncode}"))
+
+
 class RESTServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -556,6 +613,7 @@ class RESTServer(http.server.ThreadingHTTPServer):
         self.audit = audit
         self.ssh_keys = ssh_keys.SSHKeyStore()
         self.tunnel_installs = rest_installs.TunnelInstalls()
+        self.quota = QuotaChecks()
         self.sandbox_prober = None
         if jobs is not None:
             probe_dir = os.path.join(jobs.sandbox.data_dir or tempfile.gettempdir(), "sandbox", "probe")
@@ -799,6 +857,7 @@ class HPCRESTHandler(RESTHandler):
             # each action needs its own scope too (rest_actions.py)
             ("GET", "/actions"): "read",
             ("POST", "/actions/run"): "read",
+            ("GET", "/quota"): "read",
         },
         **{("POST", f"/slurm/{c}"): "slurm" for c in SLURM_COMMANDS},
         **{("GET", f"/slurm/{c}"): "slurm" for c in READ_ONLY_COMMANDS},
@@ -834,6 +893,7 @@ class HPCRESTHandler(RESTHandler):
             ("GET", "/envs/sync"): self.do_sync_status,
             ("GET", "/actions"): self.do_actions,
             ("POST", "/actions/run"): self.do_run_action,
+            ("GET", "/quota"): self.do_quota,
             # owner only: not in ROUTE_SCOPES, so they need the `*` scope
             ("GET", "/admin/proposals"): self.do_admin_proposals,
             ("GET", "/admin/proposals/diff"): self.do_admin_proposal_diff,
@@ -989,6 +1049,14 @@ class HPCRESTHandler(RESTHandler):
                                            not self.server.disable_file_changes, jobs=self.server.jobs, audit=detail)
         finally:
             self.audit_detail = detail or {"tunnel": tunnel, "action": action}
+
+    def do_quota(self):
+        kind = self.query_value("kind", "all")
+        if kind not in QuotaChecks.KINDS:
+            raise RESTError(422, f"kind: one of {list(QuotaChecks.KINDS)}")
+        out = self.server.quota.check(kind, refresh=self.query_flag("refresh"))
+        self.audit_detail = {"quota": kind}
+        return 200, out
 
     def do_health(self):
         wl = self.whitelist

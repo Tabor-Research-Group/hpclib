@@ -975,16 +975,28 @@ function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROF
     "$_c_alert" "$_c_reset"
   printf '   %suntil you do, the agent has no tools for this cluster (or an old entry'"'"'s port and token).%s\n' \
     "$_c_alert" "$_c_reset"
-  printf '   Claude Desktop: merge into "mcpServers" in ~/Library/Application Support/Claude/claude_desktop_config.json\n'
-  printf '   (also saved as %s/mcp.json):\n\n' "$pdir"
+  # this machine's platform (lib/local_platform.py): under WSL, Claude Desktop is a Windows program that starts the
+  # server in WSL through wsl.exe
+  local client_platform desktop_config quit_hint='Cmd-Q, not just closing the window'
+  client_platform=$(python3 "$HPCLIB_DIR/lib/local_platform.py" platform 2>/dev/null) || client_platform=linux
+  desktop_config=$(python3 "$HPCLIB_DIR/lib/local_platform.py" desktop-config 2>/dev/null)
+  [ "$client_platform" = macos ] || quit_hint='quit it from its tray icon or menu, not just closing the window'
+  printf '   Claude Desktop: merge into "mcpServers" in %s\n' "${desktop_config:-claude_desktop_config.json}"
+  if [ "$client_platform" = wsl ]; then
+    printf '   (it runs on Windows, so the entry starts the server in WSL with wsl.exe; the console'"'"'s Console Settings\n'
+    printf '   -> LLM clients can write it for you. The plain entry is saved as %s/mcp.json):\n\n' "$pdir"
+  else
+    printf '   (also saved as %s/mcp.json):\n\n' "$pdir"
+  fi
   while IFS= read -r line; do
     printf '%s%s%s\n' "$_c_json" "$line" "$_c_reset"
-  done < <(_hpclib_agent_profiles mcp "$name" "$mcp_python" "$local_hpclib/servers/rest_mcp.py")
+  done < <(_hpclib_agent_profiles mcp "$name" "$mcp_python" "$local_hpclib/servers/rest_mcp.py" |
+           python3 "$HPCLIB_DIR/lib/local_platform.py" client-config)
   printf '\n   Claude Code (remove an older entry first with `claude mcp remove %s`):\n' "$mcp_name"
   printf '   %sclaude mcp add-json %s '"'"'%s'"'"'%s\n' "$_c_alert" "$mcp_name" \
     "$(_hpclib_agent_profiles mcp-entry "$name" "$mcp_python" "$local_hpclib/servers/rest_mcp.py")" "$_c_reset"
-  printf '   %sThen quit the client completely (Claude Desktop: Cmd-Q, not just closing the window) and reopen it.%s\n' \
-    "$_c_alert" "$_c_reset"
+  printf '   %sThen quit the client completely (Claude Desktop: %s) and reopen it.%s\n' \
+    "$_c_alert" "$quit_hint" "$_c_reset"
   if [ "$mcp_ok" = no ]; then
     printf '   %s%s has no MCP SDK: run `%s -m pip install mcp`, or set HPCLIB_MCP_PYTHON and rerun%s\n' \
       "$_c_warn" "$mcp_python" "$mcp_python" "$_c_reset"

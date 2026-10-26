@@ -26,6 +26,7 @@ from test_rest_jobs import OWNER, JobServerTestCase  # noqa: E402
 import agent_console  # noqa: E402
 import console_packages  # noqa: E402
 import agent_profiles  # noqa: E402
+import local_platform  # noqa: E402
 
 KEY = "console-key"
 SPEC = {"description": "Run xtb on an xyz file", "parameters": {"xyz": {"type": "path", "kind": "file"}},
@@ -150,8 +151,10 @@ class ConsoleTestCase(JobServerTestCase):
         super().setUp()
         self.agents = self.tmp / "agents"
         self.console = self.tmp / "console"
+        # HPCLIB_PLATFORM: tests see Linux paths for the LLM clients, even run under WSL (test_local_platform
+        # covers WSL)
         env = mock.patch.dict(os.environ, {"HPCLIB_AGENTS_DIR": str(self.agents),
-                                           "HPCLIB_CONSOLE_DIR": str(self.console)})
+                                           "HPCLIB_CONSOLE_DIR": str(self.console), "HPCLIB_PLATFORM": "linux"})
         env.start()
         self.addCleanup(env.stop)
         self.live = self.make_profile("me@live.example.edu", self.server.server_address[1],
@@ -381,6 +384,17 @@ class TestStylesheets(ConsoleTestCase):
 
 class TestDefaultApplication(unittest.TestCase):
 
+    def setUp(self):   # the platform from sys.platform alone (not WSL, whatever runs the tests)
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for var in ("HPCLIB_PLATFORM", "WSL_DISTRO_NAME", "WSL_INTEROP"):
+            os.environ.pop(var, None)
+        for patch in (mock.patch.object(local_platform, "settings", lambda: {}),
+                      mock.patch.object(local_platform, "OSRELEASE", "/nonexistent")):
+            patch.start()
+            self.addCleanup(patch.stop)
+
     def test_delegates_to_os_without_selecting_an_editor(self):
         path = "/tmp/styles with spaces/user.css"
         for platform, command in (("darwin", "/usr/bin/open"), ("linux", "xdg-open")):
@@ -600,7 +614,11 @@ class TestClusterJobsAndStorage(ConsoleTestCase):
                 return 0, "", ""
             return 0, ("D|ok|/scratch/me/llm\nS|2048|/scratch/me/llm/models\nS|512|/scratch/me/llm/runs\n"
                        "S|2600|/scratch/me/llm\nI|1234|/scratch/me/llm\nM|/home/me/.local/tunnels\n"
-                       "Q|showquota\nq|Disk  Usage  Limit\nq|/scratch  612G  1T\n"), ""
+                       'HPCLIB_QUOTA {"host": "login1", "settings_file": "/home/me/.local/tunnels/settings/quota.sh", '
+                       '"storage": {"command": "showquota", "source": "default", "exit_code": 0, '
+                       '"output": ["Disk  Usage  Limit", "/scratch  612G  1T"], "saved": null}, '
+                       '"project": {"command": "myproject", "source": "default", "exit_code": 0, '
+                       '"output": ["Project 122800 5000 SU"], "saved": null}}\n'), ""
         self.clusters.script_runner = runner
 
     def test_jobs_grouped_and_labelled(self):
@@ -636,12 +654,81 @@ class TestClusterJobsAndStorage(ConsoleTestCase):
         self.assertEqual([c["kb"] for c in llm["children"]], [2048, 512])
         self.assertTrue(tunnels["missing"])
         self.assertEqual(out["quota"], {"command": "showquota", "lines": ["Disk  Usage  Limit", "/scratch  612G  1T"]})
+        self.assertEqual(out["quotas"]["project"]["output"], ["Project 122800 5000 SU"])
+        self.assertIn("hpclib_quota all --json", self.ran[-1][0])         # lib/quota.sh goes along
         self.assertEqual(self.ran[-1][1][1:], ("/scratch/me/llm", "~/.local/tunnels"))
         self.assertEqual(stat.S_IMODE(os.stat(self.clusters.storage_path(self.dead)).st_mode), 0o600)
 
     def test_scripts_parse(self):
         for script in (agent_console.CLUSTER_JOBS_SCRIPT, agent_console.CLUSTER_STORAGE_SCRIPT):
             self.assertEqual(subprocess.run(["bash", "-n"], input=script, text=True).returncode, 0)
+
+
+class TestQuota(ConsoleTestCase):
+    """The quota routes, with lib/quota.sh run here (standing in for the login node) against fake site commands."""
+
+    def setUp(self):
+        super().setUp()
+        self.clusters.logins.alive = lambda profile: True
+        self.remote_data = Path(self.tmp) / "remote-data"
+        bin_dir = Path(self.tmp) / "site-bin"
+        bin_dir.mkdir()
+        (bin_dir / "myproject").write_text("#!/bin/sh\necho 'Project 122800 balance 5000 SU'\n")
+        (bin_dir / "myproject").chmod(0o755)
+        self.ran = []
+
+        def runner(profile, script, args=(), wait=60):
+            self.ran.append(tuple(args))
+            env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(self.tmp),
+                   "HPCTUNNELS_DATA_DIR": str(self.remote_data)}
+            res = subprocess.run(["bash", "-s", "--", *args], input=script, capture_output=True, text=True,
+                                 env=env, timeout=wait)
+            return res.returncode, res.stdout, res.stderr
+        self.clusters.script_runner = runner
+        for var in agent_console.QUOTA_ENV:
+            patch = mock.patch.dict(os.environ)
+            patch.start()
+            self.addCleanup(patch.stop)
+            os.environ.pop(var, None)
+
+    def test_check_and_configure(self):
+        status, out = self.call("GET", f"/api/clusters/{self.dead}/quota")
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["quotas"]["project"]["output"], ["Project 122800 balance 5000 SU"])
+        self.assertEqual(out["quotas"]["project"]["source"], "default")
+        # a cluster without showquota: set the storage check, and turn the project one off
+        status, out = self.call("PUT", f"/api/clusters/{self.dead}/quota/settings",
+                                {"storage": "echo 'scratch 10%'", "project": "none"})
+        self.assertEqual(status, 200, out)
+        self.assertEqual((out["quotas"]["storage"]["source"], out["quotas"]["storage"]["output"]),
+                         ("settings", ["scratch 10%"]))
+        self.assertEqual(out["quotas"]["project"]["source"], "none")
+        saved = (self.remote_data / "settings" / "quota.sh").read_text()
+        self.assertIn("HPCLIB_PROJECT_QUOTA_CHECK=none", saved)
+        # kept with the storage scan, for the Storage tab
+        storage = self.call("GET", f"/api/clusters/{self.dead}/storage")[1]
+        self.assertEqual(storage["quota"], {"command": "echo 'scratch 10%'", "lines": ["scratch 10%"]})
+        # "" goes back to the default; a check of one kind keeps the other
+        self.call("PUT", f"/api/clusters/{self.dead}/quota/settings", {"project": ""})
+        status, out = self.call("GET", f"/api/clusters/{self.dead}/quota?kind=project")
+        self.assertEqual(out["quotas"]["project"]["command"], "myproject")
+        self.assertEqual(out["quotas"]["storage"]["source"], "settings")
+        self.assertEqual(self.ran[-1], ("project", "--json"))
+
+    def test_console_environment_wins(self):
+        os.environ["HPCLIB_PROJECT_QUOTA_CHECK"] = "echo from-console"
+        out = self.call("GET", f"/api/clusters/{self.dead}/quota")[1]
+        self.assertEqual((out["quotas"]["project"]["source"], out["quotas"]["project"]["output"]),
+                         ("env", ["from-console"]))
+        self.assertEqual(out["quotas"]["environment"], ["HPCLIB_PROJECT_QUOTA_CHECK"])
+
+    def test_refused(self):
+        for body in ({}, {"disk": "x"}, {"storage": "a\nb"}, {"storage": 3}, {"project": "x" * 1001}):
+            self.assertEqual(self.call("PUT", f"/api/clusters/{self.dead}/quota/settings", body)[0], 400, body)
+        self.assertEqual(self.call("GET", f"/api/clusters/{self.dead}/quota?kind=disk")[0], 400)
+        self.assertEqual(self.ran, [])
+        self.clusters.logins.alive = lambda profile: False
+        self.assertEqual(self.call("GET", f"/api/clusters/{self.dead}/quota")[0], 409)
 
 
 class TestSettings(ConsoleTestCase):

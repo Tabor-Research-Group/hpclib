@@ -10,6 +10,9 @@ The console's own preferences (this machine, not a cluster), kept in preferences
   widgets         which packaged widgets are hidden, and their order (keys PACKAGE/ID)
   interface       values for the page's CSS variables (default-styles.css): "common" ones, and colours for the
                   light and dark themes; served as /interface.css, before the user's own user.css
+  system          this machine (local_platform.py): platform, "auto" or one of linux, macos, wsl, for when detection
+                  gets it wrong ($HPCLIB_PLATFORM wins); windows_home, under WSL your Windows profile folder as WSL
+                  sees it (/mnt/c/Users/NAME), when Windows can't be asked ("" asks)
 
 The local port range tunnels are given ports from is agent_profiles' (it picks them, from bash too).
 Standard library only.
@@ -30,7 +33,9 @@ DEFAULTS = {
     "llm_clients": {k: False for k in LLM_CLIENTS},
     "interface": {"common": {}, "light": {}, "dark": {}},
     "widgets": {"hidden": [], "order": []},
+    "system": {"platform": "auto", "windows_home": ""},
 }
+PLATFORM_CHOICES = ("auto", "linux", "macos", "wsl")      # local_platform.CHOICES
 CSS_VAR_RE = re.compile(r"--[a-z][a-z0-9-]{0,47}")
 # a CSS value with nothing that ends a declaration or rule, escapes, comments or fetches anything
 CSS_VALUE_RE = re.compile(r"(?!.*(?:/\*|\*/|url\s*\(|@import|expression\s*\())[^;{}<>\\\n\r\0]{1,200}", re.I)
@@ -133,12 +138,26 @@ def _widgets(values):
     return values
 
 
+def _system(values):
+    if not isinstance(values, dict) or set(values) - set(DEFAULTS["system"]):
+        raise PrefsError("system has platform and windows_home")
+    if "platform" in values and values["platform"] not in PLATFORM_CHOICES:
+        raise PrefsError(f"platform is one of {', '.join(PLATFORM_CHOICES)}")
+    home = values.get("windows_home")
+    if "windows_home" in values and home != "" and (
+            not isinstance(home, str) or len(home) > 512 or not home.startswith("/") or re.search(r"[\0\n\r]", home)):
+        raise PrefsError("windows_home is your Windows profile folder as WSL sees it, such as /mnt/c/Users/NAME "
+                         "(empty: ask Windows)")
+    return values
+
+
 CHECKS = {
     "notifications": lambda v: _bool_map(v, NOTIFICATIONS, "notifications"),
     "new_cluster": _new_cluster,
     "llm_clients": lambda v: _bool_map(v, LLM_CLIENTS, "llm_clients"),
     "interface": _interface,
     "widgets": _widgets,
+    "system": _system,
 }
 
 

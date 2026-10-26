@@ -1,7 +1,7 @@
 // The cluster-first pages: #/c lists the clusters with what each needs, and #/c/NAME/TAB[/SUB] is one cluster's
 // page (Overview, Jobs, Apps, Installed, Storage, Files, Agents, Settings); #/c/NAME/apps/APP is one app there, with
 // its controls, tools and settings, and a package's tabs for it. They use the console's existing API, plus
-// GET clusters/NAME/jobs and GET/POST clusters/NAME/storage[/scan]. app.js passes what they share with it (init).
+// GET clusters/NAME/jobs, GET/POST clusters/NAME/storage[/scan] and GET clusters/NAME/quota. app.js passes what they share with it (init).
 import { el, action, confirmDialog } from "./components.js";
 import * as widgets from "./widgets.js";
 
@@ -482,9 +482,35 @@ async function storageTab(c) {
       el("span", {}, st.scanned ? `Scanned ${ago(st.scanned)}` : "Not scanned yet", (st.scan || {}).state === "failed"
         ? el("span", { class: "error-box" }, ` · the last scan failed: ${st.scan.error}`) : null),
       scan, el("span", { class: "muted small" }, "du over your login, at low priority, up to 5 minutes per directory")),
-    st.quota ? el("section", { class: "card" }, el("h3", {}, "Quota ", el("span", { class: "muted" }, `· ${st.quota.command}`)),
-      el("pre", { class: "quota" }, st.quota.lines.join("\n"))) : null,
+    quotaCard(c, st),
     cards.length ? cards : el("p", { class: "muted" }, `Work directories: ${(st.work_dirs || []).join(", ") || "none set"}.`));
+}
+
+// the quota checks (lib/quota.sh on the cluster): the storage quota and the project's balance, each the site's own
+// text; which commands run is the cluster's Settings → Quota checks
+function quotaCard(c, st) {
+  const q = st.quotas || (st.quota ? { storage: { command: st.quota.command, source: "default", output: st.quota.lines } } : null);
+  const check = action(q ? "Check again" : "Check quotas", async () => {
+    await ctx.api(path(c.name, "quota"));
+    ctx.render();
+  }, { disabled: !login(c) });
+  const one = (kind, label) => {
+    const r = (q || {})[kind];
+    if (!r) return null;
+    const meta = r.command ? `${r.command} · ${{ env: "from the environment", settings: "set for this cluster",
+      default: "default" }[r.source] || r.source}${r.exit_code ? ` · exit ${r.exit_code}` : ""}` : null;
+    return el("div", { class: `quota-check quota-${kind}` },
+      el("h4", {}, label, meta ? el("span", { class: "muted" }, ` · ${meta}`) : null),
+      r.command ? el("pre", { class: "quota" }, (r.output || []).join("\n") || "(no output)")
+        : el("p", { class: "muted" }, r.source === "none" ? "Turned off." :
+          "No check found on this cluster: set one in Settings → Quota checks."));
+  };
+  return el("section", { class: "card" },
+    el("div", { class: "toolbar" }, el("h3", {}, "Quotas"),
+      q && q.checked ? el("span", { class: "muted small" }, `checked ${ago(q.checked)}`) : null, check,
+      el("a", { href: href(c.name, "settings"), class: "small" }, "Change the checks")),
+    q ? [one("storage", "Storage"), one("project", "Project")]
+      : el("p", { class: "muted" }, "Not checked yet: Check quotas (or Scan now) runs the cluster's commands over your login."));
 }
 
 // ---------------------------------------------------------------- Settings

@@ -288,6 +288,18 @@ def build_server(client: RESTClient, enable_file_writes=False, local_roots=None)
         return await call(client.run_action, tunnel, action, params or {})
 
     @server.tool(annotations=read_only, description=(
+        "Your storage quota and your project's (allocation's) balance on this cluster, from the cluster's own "
+        "commands (by default showquota, or myquota or `quota -s`, and TAMU HPRC's myproject; the owner can set "
+        "others). Each check gives its command, where that came from (env, settings, default or none: turned "
+        "off), the exit code and the command's output as lines, unparsed. Answers are cached for a minute; "
+        "refresh=true runs the checks again. Check before submitting large jobs or writing a lot of data."))
+    async def check_quota(
+        kind: Annotated[str, Field(pattern=r"^(all|storage|project)$", description="all, storage or project")] = "all",
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        return await call(client.quota, kind, refresh)
+
+    @server.tool(annotations=read_only, description=(
         "Template proposals waiting for the cluster owner's review."))
     async def list_template_proposals() -> dict[str, Any]:
         return await call(client.proposals)

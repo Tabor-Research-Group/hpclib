@@ -345,6 +345,8 @@ table.bars td.bar-cell { width: 46%; }
 table.bars .bar { height: 10px; border-radius: 3px; background: var(--accent); opacity: 0.75; }
 table.bars td.num { text-align: right; }
 pre.quota { max-height: 220px; }
+.quota-check h4 { margin: var(--space-md, 8px) 0 var(--space-xs, 4px); font-size: 0.95em; }
+.quota-check pre.quota { margin: 0; }
 @media (max-width: 720px) {
   .overview-table thead { display: none; }
   .overview-table tr { display: grid; grid-template-columns: 1fr 1fr; padding: var(--space-sm) 0; border-bottom: 1px solid var(--line); }

@@ -24,10 +24,10 @@ Its address is `#/c/NAME/TAB`, so a tab can be bookmarked.
 | Jobs | every job of yours on the cluster, read with `squeue` and `sacct` over your login: queued (with Slurm's reason in plain words and the expected start), running, and finished in the last 24 hours (result, time taken, peak memory against what was asked for). Each job is labelled with what started it: an agent's template, the agent tunnel, an app, or something else |
 | Apps | each app's row (Start, Open, Stop, Log), showing only the buttons that apply; a package's apps too. Click an app's name for its page |
 | Installed | hpclib, the agent setup and each app: whether it is installed, what the cluster reported, and Check / Install / Update; **Check all** checks every app |
-| Storage | the work directories' sizes and file counts, their largest folders, and the site's quota report. **Scan now** runs `du` over your login at low priority, at most 5 minutes per directory (a longer scan is marked partial); the result is kept on this machine |
+| Storage | the work directories' sizes and file counts, their largest folders, and your storage quota and project balance (**Check quotas**). **Scan now** runs `du` over your login at low priority, at most 5 minutes per directory (a longer scan is marked partial); the result is kept on this machine |
 | Files | the cluster's files through its REST server (needs the agent tunnel), as the Files page was |
 | Agents | **Tunnel and setup**: the agent profile's row (start and stop the agent tunnel, its log, Update hpclib, Setup…, Set up SSH), the MCP server's name, and **Tunnel actions** (what tunnels may do for agents with your access: on or off per tunnel and per action, and whether each can run now); **Activity**: what agents did here; **SSH keys** |
-| Settings | the cluster's settings: its agent tunnel's job, ports (with **Clear leftover ports…**) and the REST server's limits and sandbox |
+| Settings | the cluster's settings: its agent tunnel's job, ports (with **Clear leftover ports…**), **Quota checks**, and the REST server's limits and sandbox |
 
 ## An app's page
 
@@ -44,4 +44,8 @@ Overview.
 Jobs are labelled from what hpclib puts on them: `hpcrest-TEMPLATE` names and the `hpclib-rest:TOKEN:TEMPLATE`
 comment for agents' jobs, `TUNNEL-ID` names for tunnels. A job `job-queue` or you submitted yourself is "other".
 
-The quota report is the output of the first of `showquota`, `myquota` or `quota -s` the login node has.
+The quotas are two checks run over your login with the cluster's own commands: storage, the first of
+`showquota`, `myquota` or `quota -s`; project, `myproject` (TAMU HPRC). **Settings → Quota checks** changes
+them for a cluster that has other commands (empty: the default; `none`: off). They are saved on the cluster, so
+`hpclib_quota` there, the REST server and agents' `check_quota` use them too; `HPCLIB_STORAGE_QUOTA_CHECK` and
+`HPCLIB_PROJECT_QUOTA_CHECK` in the console's environment win. See [Quotas](../cli/README.md#quotas).

@@ -5,7 +5,7 @@ fi
 
 # Bump on every release: install_hpclib only replaces a remote copy
 # whose HPCLIB_VERSION is older than this one. setup.py reads it too.
-HPCLIB_VERSION="1.1.1"
+HPCLIB_VERSION="1.3.0"
 
 MAIN_USER=$(whoami)
 MAIN_PARTITION=""
@@ -28,6 +28,7 @@ export HPCTUNNELS_DIR HPCLIB_TUNNEL_INSTALL_LOCATION HPCLIB_TUNNEL_PATH
 . $HPCLIB_DIR/lib/tunnels.sh
 . $HPCLIB_DIR/lib/applications.sh
 . $HPCLIB_DIR/lib/job_queue.sh
+. $HPCLIB_DIR/lib/quota.sh
 
 HPCLIB_ROOT=$(dirname "$HPCLIB_DIR")
 export PYTHONPATH="${PYTHONPATH:-}:${HPCLIB_ROOT:-}"
