@@ -11,7 +11,8 @@ done from the page.
 
 1. [Getting started](getting-started.md): start the console, add a cluster, log in, connect an LLM client.
 2. [Agents](agents.md): the Clusters, Proposals, Activity, Files and Settings pages.
-3. [Apps](apps.md): JupyterLab, VS Code, PAI, Data transfer, and apps added from packages.
+3. [Apps](apps.md): JupyterLab, VS Code, PAI, Data transfer, the Workspace (files, an editor, terminals and job
+   submission), and apps added from packages.
 4. [Clusters](clusters.md): one page per cluster, with its apps, jobs, what is installed, storage, files and agents.
 5. [The console menu](console-settings.md): dark mode, Interface Settings, Console Settings (notifications, ports,
    LLM clients, defaults for new clusters) and About.

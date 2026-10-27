@@ -120,12 +120,71 @@ sign in, which **GUI** Start opens, and where the image is kept. GUI is `rclone`
 a settings package provides, or a program on the cluster (see `smbshell --help`, and the README's Data transfer
 section, for what such a program gets and must print).
 
+## Workspace (a package)
+
+Your files on a cluster in the browser: a file list, an editor, viewers, terminals and job submission. It comes
+with hpclib as a package (`packages/workspace`): **Packages → Come with hpclib → Workspace → Install…**, then
+**Install**. It then has a row on each cluster's Apps tab. It needs Python 3.6 or newer on the login node and
+nothing else (**Check** says which Python it will use).
+
+- **Start** runs its server on the cluster's **login node** (no job), as you, with your full permissions; it is
+  not the agents' sandbox. It listens on the login node's 127.0.0.1 only and answers only with the token it
+  prints at start, which **Open** adds (a login node is shared: anyone on it could reach the port).
+- **Files**: browse (**Places** has your home and scratch directories), **New file**, **New folder**,
+  **Upload** (or drop files on the list), and from each entry's **⋯** menu: Rename, Delete (a file or an empty
+  folder), Download, Copy path, Terminal here, and **Submit job…** for a Python or bash script.
+- **Editor**: text files open in CodeMirror, with syntax highlighting for Python, shell, YAML, TOML, JSON,
+  Markdown, C/C++, Fortran, R, Julia and more. **Save** (or Ctrl/⌘-S) refuses to overwrite a file someone
+  changed on the cluster since you opened it, and asks first. Files up to **Editor limit** (800 MB by default)
+  open; above **Ask above** (20 MB) it asks first.
+- **Viewers**: images and SVG, HTML pages (their scripts run, sandboxed, and relative links to their images
+  work), PDFs and movies (they seek). **Edit source** opens an HTML or SVG file in the editor.
+- **Terminals**: **Terminal here** opens your login shell in the current folder (xterm.js), as many as you like,
+  below the files. They end with the Workspace (Stop) or when you close their tab.
+- **My jobs**: your queued and running jobs (`squeue`), with Cancel; a job's name opens its folder.
+
+![The Workspace: files, an editor, a terminal and your jobs](../images/workspace.png)
+
+**Submit job…** builds a job script from a **script template** and submits it with `sbatch` in the file's folder.
+The templates that come with it run a Python script with **uv** (`uv run` in the project with the
+`pyproject.toml`, or with the script's inline dependencies), with **pixi** (`pixi run` in a pixi project), with
+**modules, a venv or conda**, or run a **bash** script. Each has a form (time limit, nodes, tasks, CPUs, memory,
+GPUs, partition, account, modules, and its own fields). The job script beside it follows the form as you type,
+and you can edit it by hand before **Submit**. The values you used last on a cluster are filled in next time.
+Every template sources your `~/.bashrc` (jobs start with `--export=NONE`) and hpclib, and uses
+`slurm_job_info` and `slurm_job_footer`; output goes to `JOBNAME-JOBID.out` beside the script.
+
+![Submit job: a template's form and the job script it makes](../images/workspace-submit.png)
+
+**Edit (your copy)** copies a template to `~/.local/tunnels/script_templates/` on the cluster and opens it; yours
+replace the Workspace's of the same name, and **New template from this…** starts another. A template is the job
+script with a header that declares its form, `{{name}}` for a field's value (or the file's: `input`, `input_stem`,
+`dir`, `hpclib`, `user`, `home`), and lines starting `{{?name}}` that are kept only when that field isn't empty:
+
+```bash
+#!/bin/bash
+#@ title: Python on a GPU
+#@ for: .py
+#@ field time: Time limit | 6:00:00
+#@ field gres: GPUs | gpu:a100:1
+#SBATCH --time={{time}}
+{{?gres}}#SBATCH --gres={{gres}}
+python -u "{{input}}"
+```
+
+The page loads CodeMirror and xterm.js from jsDelivr: your browser needs to reach it (the cluster doesn't). For a
+site without it, set **CDN** in the Workspace's settings to a mirror of npm packages; without them the editor is a
+plain text box and terminals don't open.
+
+![A picture in the Workspace's viewer](../images/workspace-viewer.png)
+
 ## Adding apps and settings from packages
 
 Apps that don't belong in hpclib itself (a group's file server, a project's test instance) come as **package**
 zip files. Click **Packages** at the top right:
 
-1. Choose the zip. The console checks it and shows what it adds: apps, tunnels, and default settings with their
+1. Choose the zip, or one of the packages that **come with hpclib** (its clone's `packages/` folder, such as the
+   Workspace). The console checks it and shows what it adds: apps, tunnels, and default settings with their
    values.
 2. **Install** it. Its apps join each cluster's Apps tab.
 3. The packaged tunnel and settings files go to a cluster the next time you Check, Install or Start the app

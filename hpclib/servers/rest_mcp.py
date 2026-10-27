@@ -66,7 +66,10 @@ tasks with tasks_from.select.
 For Python work, keep a uv or pixi project in your directory (push
 pyproject.toml/uv.lock or pixi.toml/pixi.lock), sync_environment it, then
 submit the python_project template (or a template with an `environment`);
-prefer pixi when you need conda packages (xtb, openmm, ...).
+prefer pixi when you need conda packages (xtb, openmm, ...). A large
+environment can be packed into one file (squash=true, or
+squash_environment), and others built on it as a core (core=DIR) so they
+install only what they add.
 If no template fits, search_modules shows what software the cluster has
 and propose_template drafts a new template. cluster_info's
 template_proposals says whether proposals are approved automatically
@@ -246,15 +249,61 @@ def build_server(client: RESTClient, enable_file_writes=False, local_roots=None)
         "first; with a lockfile exactly that is installed, and update=true re-resolves and rewrites the lock. "
         "Waits up to wait_seconds, then returns the sync's state (running, succeeded, failed, timed_out) and "
         "the end of its log; check again with sync_status. Jobs from templates with an `environment` (e.g. "
-        "python_project) then run in it; jobs never install packages themselves."))
+        "python_project) then run in it; jobs never install packages themselves. "
+        "squash=true packs the environment into one SquashFS file that jobs mount read-only (one file instead of "
+        "thousands on the cluster's filesystem; needs a Singularity or Apptainer sandbox), squash=false unpacks it, "
+        "and leaving it out keeps it as it is. core=DIR builds this environment on another (a core, ideally "
+        "squashed): its packages aren't installed again but used from the core, and the manifest gets the core's "
+        "versions as constraints and [tool.hpclib] core, so later syncs keep it (core=\"\" stops). "
+        "force=true goes ahead though queued or running jobs use the environment."))
     async def sync_environment(
         project: Project,
         manager: Annotated[str, Field(pattern="^(auto|uv|pixi)$")] = "auto",
         environment: Annotated[str, Field(description="pixi environment name")] = "default",
         update: bool = False,
+        squash: Annotated[Optional[bool], Field(description="true: pack into one SquashFS image; false: unpack; "
+                                                            "omit: keep as it is")] = None,
+        core: Annotated[Optional[str], Field(description="the core project to build on; \"\" for none; omit: "
+                                                         "the one the manifest declares")] = None,
+        core_environment: Annotated[Optional[str], Field(description="pixi: the core's environment")] = None,
+        force: bool = False,
         wait_seconds: Annotated[int, Field(ge=0, le=300)] = 120,
     ) -> dict[str, Any]:
-        started = await call(client.sync_environment, project, manager, environment, update)
+        started = await call(client.sync_environment, project, manager, environment, update, squash,
+                             client.KEEP if core is None else (core or None), core_environment, force)
+        if wait_seconds == 0 or started.get("state") != "running":
+            return started
+        return await call(client.sync_status, started["id"], wait_seconds)
+
+    @server.tool(annotations=changes, description=(
+        "Pack a synced Python environment into one SquashFS file (no sync): jobs then mount it read-only, so a "
+        "large environment is one file on the cluster's filesystem (for file quotas, and fast starts). A squashed "
+        "environment makes a good core for others (sync_environment core=...). Refused while queued or running "
+        "jobs use it unless force=true. Waits up to wait_seconds; then sync_status."))
+    async def squash_environment(
+        project: Project,
+        manager: Annotated[str, Field(pattern="^(auto|uv|pixi)$")] = "auto",
+        environment: Annotated[str, Field(description="pixi environment name")] = "default",
+        force: bool = False,
+        wait_seconds: Annotated[int, Field(ge=0, le=300)] = 120,
+    ) -> dict[str, Any]:
+        started = await call(client.squash_environment, project, manager, environment, force)
+        if wait_seconds == 0 or started.get("state") != "running":
+            return started
+        return await call(client.sync_status, started["id"], wait_seconds)
+
+    @server.tool(annotations=changes, description=(
+        "Unpack a squashed Python environment into its directory again (and remove the image), e.g. to look "
+        "inside it. Layers built on it keep working. Refused while queued or running jobs use it unless "
+        "force=true. Waits up to wait_seconds; then sync_status."))
+    async def unsquash_environment(
+        project: Project,
+        manager: Annotated[str, Field(pattern="^(auto|uv|pixi)$")] = "auto",
+        environment: Annotated[str, Field(description="pixi environment name")] = "default",
+        force: bool = False,
+        wait_seconds: Annotated[int, Field(ge=0, le=300)] = 120,
+    ) -> dict[str, Any]:
+        started = await call(client.unsquash_environment, project, manager, environment, force)
         if wait_seconds == 0 or started.get("state") != "running":
             return started
         return await call(client.sync_status, started["id"], wait_seconds)

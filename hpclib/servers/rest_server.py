@@ -822,6 +822,8 @@ class HPCRESTHandler(RESTHandler):
         ("PUT", "/admin/ssh/hosts"),
         ("DELETE", "/admin/ssh/hosts"),
         ("POST", "/envs/sync"),
+        ("POST", "/envs/squash"),
+        ("POST", "/envs/unsquash"),
         ("POST", "/admin/tunnel-tokens"),
         ("POST", "/admin/tunnel-install"),
         ("PUT", "/files/content"),
@@ -853,6 +855,8 @@ class HPCRESTHandler(RESTHandler):
             ("DELETE", "/files"): "files:write",
             ("GET", "/envs"): "read",
             ("POST", "/envs/sync"): "envs",
+            ("POST", "/envs/squash"): "envs",
+            ("POST", "/envs/unsquash"): "envs",
             ("GET", "/envs/sync"): "read",
             # each action needs its own scope too (rest_actions.py)
             ("GET", "/actions"): "read",
@@ -890,6 +894,8 @@ class HPCRESTHandler(RESTHandler):
             ("POST", "/files/mkdir"): self.do_mkdir,
             ("GET", "/envs"): self.do_environment_info,
             ("POST", "/envs/sync"): self.do_sync_environment,
+            ("POST", "/envs/squash"): self.do_squash_environment,
+            ("POST", "/envs/unsquash"): self.do_unsquash_environment,
             ("GET", "/envs/sync"): self.do_sync_status,
             ("GET", "/actions"): self.do_actions,
             ("POST", "/actions/run"): self.do_run_action,
@@ -1149,6 +1155,16 @@ class HPCRESTHandler(RESTHandler):
     def do_sync_environment(self):
         out = self.jobs.sync_environment(self.identity.name, self.read_json(), self.whitelist)
         self.audit_detail = {"sync": out.get("id"), "project": out.get("project"), "manager": out.get("manager")}
+        return 202, out
+
+    def do_squash_environment(self):
+        out = self.jobs.squash_environment(self.identity.name, self.read_json(), self.whitelist)
+        self.audit_detail = {"squash": out.get("id"), "project": out.get("project")}
+        return 202, out
+
+    def do_unsquash_environment(self):
+        out = self.jobs.unsquash_environment(self.identity.name, self.read_json(), self.whitelist)
+        self.audit_detail = {"unsquash": out.get("id"), "project": out.get("project")}
         return 202, out
 
     def do_sync_status(self):

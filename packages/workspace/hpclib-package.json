@@ -1,0 +1,24 @@
+{
+  "format": 1,
+  "name": "workspace",
+  "version": "1.0.0",
+  "description": "The Workspace: your files on a cluster in the browser, with an editor, viewers for images, HTML, PDFs and movies, terminals, and job scripts built from templates (uv, pixi, a venv or conda) and submitted with sbatch. Runs on the login node as you.",
+  "apps": {
+    "workspace": {
+      "title": "Workspace",
+      "tunnel": "workspace",
+      "description": "Your files on the cluster with an editor and viewers, terminals, and job submission from script templates. It runs on the login node as you, with your full permissions (not the agents' sandbox); only the console's Open (which carries its token) gets in.",
+      "open_path": "/",
+      "health_path": "/health",
+      "token_regex": "[?&]token=([A-Za-z0-9_-]{20,})",
+      "settings": [
+        {"name": "WORKSPACE_ROOT", "label": "Start in", "hint": "the directory it opens in; empty: your home directory"},
+        {"name": "WORKSPACE_PYTHON", "label": "Python", "hint": "Python 3.6 or newer on the login node; default python3"},
+        {"name": "WORKSPACE_EDIT_LIMIT_MB", "label": "Editor limit (MB)", "hint": "the largest file the editor opens; default 800"},
+        {"name": "WORKSPACE_CONFIRM_MB", "label": "Ask above (MB)", "hint": "it asks before opening a file larger than this; default 20"},
+        {"name": "WORKSPACE_CDN", "label": "CDN", "hint": "where CodeMirror and xterm.js load from (an npm mirror); default https://cdn.jsdelivr.net/npm"}
+      ]
+    }
+  },
+  "tunnels": {"workspace": "tunnels/workspace"}
+}

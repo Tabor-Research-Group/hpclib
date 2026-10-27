@@ -1675,12 +1675,13 @@ async function packagesDialog() {
   const list = el("div", {});
   const report = el("div", {});
   const file = el("input", { type: "file", accept: ".zip,application/zip" });
+  const bundledBox = el("div", {});
   const dialog = el("hpc-dialog", { heading: "Packages", transient: true },
     el("p", { class: "muted" }, "A package is a zip file with an hpclib-package.json: apps for this console, the " +
       "tunnels they run on your clusters, cluster configurations, and settings (such as a group's SMB server). Its scripts run on your " +
       "clusters as you, so install only packages you trust."),
     field("Package zip", file, "it is checked first; nothing is installed until you say so"),
-    report, el("h4", {}, "Installed"), list);
+    report, bundledBox, el("h4", {}, "Installed"), list);
 
   async function drawList() {
     const { packages } = await api("packages");
@@ -1695,14 +1696,24 @@ async function packagesDialog() {
       })))) : el("p", { class: "muted" }, "None yet."));
   }
 
-  file.addEventListener("change", async () => {
-    const chosen = file.files[0];
-    if (!chosen) return;
-    report.replaceChildren(el("p", { class: "muted" }, `Checking ${chosen.name}…`));
-    const raw = await chosen.arrayBuffer();
+  // the packages that come with hpclib (its clone's packages/): checked and installed like a zip
+  async function drawBundled() {
+    const { packages } = await api("packages/bundled");
+    bundledBox.replaceChildren(...(packages.length ? [el("h4", {}, "Come with hpclib"),
+      el("ul", { class: "packages" }, packages.map((p) => el("li", {},
+        el("strong", {}, `${p.name} ${p.version}`), p.description ? el("span", { class: "muted" }, ` · ${p.description}`) : null,
+        " ", p.installed === p.version ? el("span", { class: "muted" }, "(installed)")
+          : action(p.installed ? `Update from ${p.installed}…` : "Install…", async () => {
+            const url = `packages/bundled/${encodeURIComponent(p.name)}`;
+            await showReport(() => api(`${url}?dry_run=1`, { method: "POST" }), () => api(url, { method: "POST" }));
+          }))))] : []));
+  }
+
+  async function showReport(check, installIt) {
+    report.replaceChildren(el("p", { class: "muted" }, "Checking…"));
     let checked;
     try {
-      checked = await api("packages?dry_run=1", { method: "POST", raw, contentType: "application/zip" });
+      checked = await check();
     } catch (err) {
       report.replaceChildren(errorBox(err));
       return;
@@ -1710,7 +1721,7 @@ async function packagesDialog() {
     const p = checked.package;
     const install = action(checked.replaces ? `Replace ${p.version === checked.replaces ? "it" : checked.replaces}`
                                             : "Install", async () => {
-      await api("packages", { method: "POST", raw, contentType: "application/zip" });
+      await installIt();
       location.reload();     // its apps join the top bar
     }, { primary: true });
     report.replaceChildren(el("section", { class: "card" },
@@ -1722,10 +1733,19 @@ async function packagesDialog() {
       checked.problems.length
         ? el("div", { class: "error-box" }, "It can't be installed: ", checked.problems.join("; "))
         : el("div", { class: "actions" }, install)));
+  }
+
+  file.addEventListener("change", async () => {
+    const chosen = file.files[0];
+    if (!chosen) return;
+    const raw = await chosen.arrayBuffer();
+    await showReport(() => api("packages?dry_run=1", { method: "POST", raw, contentType: "application/zip" }),
+                     () => api("packages", { method: "POST", raw, contentType: "application/zip" }));
   });
 
   dialog.showModal();
   try { await drawList(); } catch (err) { list.replaceChildren(errorBox(err)); }
+  drawBundled().catch(() => null);
 }
 clusterUI.init({
   api, errorBox, render: () => render(),

@@ -6,7 +6,10 @@ token is involved, and the names and numbers are made up.
   ONLY=about,menu python3 docs/images/screenshots.py  (retakes the pictures whose names start so)
 
 It needs Playwright with Chromium (pip install playwright; playwright install chromium) and Pillow, which
-reduces each picture to 256 colours. DOCS below lists each picture: its page, width,
+reduces each picture to 256 colours. The Workspace's pictures (WORKSPACE_DOCS) are of its real server on a made-up
+home directory, WORKSPACE_DEMO_HOME (default /home/jdoe, which must be free to create), with CodeMirror and xterm.js
+from WORKSPACE_NPM, a folder laid out as the CDN is (codemirror@5.65.18/, @xterm/xterm@5.5.0/, ...); without it
+they are skipped. DOCS below lists each picture: its page, width,
 colour scheme, whether packaged widgets show, what to click first, and what to keep (an element, or a region).
 """
 import json
@@ -424,6 +427,153 @@ DOCS = [
 ]
 
 
+# -- the Workspace package (packages/workspace): its own server, on a demo home directory ----------------------------
+
+WORKSPACE_DOCS = [
+    ("workspace", "projects/encoding", "editor"),
+    ("workspace-submit", "projects/encoding", "submit"),
+    ("workspace-viewer", "projects/encoding/results", "viewer"),
+]
+DEMO_TRAIN = """import argparse
+
+import torch
+from encoding import Encoder, load_dataset
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--lr", type=float, default=3e-4)
+    args = p.parse_args()
+    data = load_dataset("/scratch/user/jdoe/data/molecules")
+    model = Encoder(dim=512).cuda()
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    for epoch in range(args.epochs):
+        loss = model.fit_epoch(data, opt)
+        print(f"epoch {epoch:3d}  loss {loss:.4f}", flush=True)
+    torch.save(model.state_dict(), "results/encoder.pt")
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def workspace_demo(home):
+    import shutil
+    if home.exists():
+        shutil.rmtree(home)
+    proj = home / "projects" / "encoding"
+    (proj / "results").mkdir(parents=True)
+    (proj / "train.py").write_text(DEMO_TRAIN)
+    (proj / "pyproject.toml").write_text('[project]\nname = "encoding"\nversion = "0.1.0"\nrequires-python = ">=3.11"\n'
+                                         'dependencies = ["torch>=2.5", "numpy"]\n')
+    (proj / "uv.lock").write_text("version = 1\n")
+    (proj / "README.md").write_text("# Encoding\n\nTraining runs for the molecule encoder.\n")
+    (proj / "train-4242.out").write_text("".join(f"epoch {i:3d}  loss {2.1 / (i + 1):.4f}\n" for i in range(12)))
+    (proj / "results" / "report.html").write_text("<h1>Run 4242</h1><p>Validation loss 0.083.</p>")
+    try:
+        from PIL import Image, ImageDraw
+        im = Image.new("RGB", (720, 420), "white")
+        d = ImageDraw.Draw(im)
+        d.line([(60, 20), (60, 380), (700, 380)], fill="#555", width=2)
+        pts = [(60 + i * 32, 380 - int(330 / (1 + i * 0.6))) for i in range(20)]
+        d.line(pts, fill="#2b6fd6", width=3)
+        d.text((300, 395), "epoch", fill="#333")
+        d.text((70, 24), "training loss", fill="#333")
+        im.save(proj / "results" / "loss.png")
+    except ImportError:
+        pass
+    (home / "hpclib").mkdir()
+    (home / "hpclib" / "hpclib.sh").write_text("# hpclib\n")
+    fake = home / ".demo-bin"
+    fake.mkdir()
+    (fake / "squeue").write_text("#!/bin/sh\n"
+        "echo '4242|train|RUNNING|1:12:40|6:00:00|g012|/home/jdoe/projects/encoding'\n"
+        "echo '4251|sweep-lr|PENDING|0:00|12:00:00|(Priority)|/home/jdoe/projects/encoding'\n")
+    (fake / "sbatch").write_text('#!/bin/sh\necho "Submitted batch job 4252"\n')
+    for f in fake.iterdir():
+        f.chmod(0o755)
+    (home / ".bash_profile").write_text(f'export PATH="{fake}:$PATH"\nexport PS1="[jdoe@login1 \\W]$ "\n')
+    return proj
+
+
+def workspace_shots(browser, only):
+    npm = os.environ.get("WORKSPACE_NPM")
+    shots = [d for d in WORKSPACE_DOCS if not only or d[0].startswith(tuple(only.split(",")))]
+    if not shots:
+        return
+    if not npm:
+        print("skipping the Workspace's pictures: set WORKSPACE_NPM (see the top of this file)")
+        return
+    sys.path.insert(0, str(ROOT / "packages" / "workspace" / "tunnels" / "workspace"))
+    import workspace_server
+    home = Path(os.environ.get("WORKSPACE_DEMO_HOME") or "/home/jdoe")
+    workspace_demo(home)
+    env = mock.patch.dict(os.environ, {"HOME": str(home), "USER": "jdoe", "SHELL": "/bin/bash",
+                                       "HPCTUNNELS_DATA_DIR": str(home / ".local" / "tunnels")})
+    env.start()
+    server = workspace_server.Server(("127.0.0.1", 0), "shot-token-0123456789abcdef",
+                                     workspace_server.Workspace(None, "https://cdn.example/npm"))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    types = {".js": "application/javascript", ".css": "text/css"}
+
+    def cdn(route):
+        local = Path(npm, route.request.url.split("/npm/", 1)[1])
+        if local.is_file():
+            route.fulfill(body=local.read_bytes(), content_type=types.get(local.suffix, "text/plain"))
+        else:
+            route.abort()
+
+    def info(route):
+        res = route.fetch()
+        data = res.json()
+        data["host"] = "login1.grace.hprc.tamu.edu"
+        route.fulfill(response=res, body=json.dumps(data))
+
+    for name, where, what in shots:
+        page = browser.new_page(viewport={"width": 1280, "height": 820}, device_scale_factor=1)
+        page.route("https://cdn.example/npm/**", cdn)
+        page.route("**/api/info", info)
+        page.goto(f"{base}/?token=shot-token-0123456789abcdef#dir={home / where}")
+        page.locator("#files tr").first.wait_for()
+        if what == "editor":
+            page.locator("#files tr", has_text="train.py").click()
+            page.locator(".CodeMirror").wait_for()
+            page.locator("#files tr", has_text="train-4242.out").click()
+            page.locator(".view:not([hidden]) .CodeMirror").wait_for()
+            page.locator(".tabs .tab", has_text="train.py").click()
+            page.get_by_role("button", name="Terminal here").click()
+            page.locator(".xterm").wait_for()
+            page.wait_for_timeout(800)
+            page.keyboard.type("ls && squeue -u jdoe\n")
+            page.wait_for_timeout(1200)
+        elif what == "submit":
+            row = page.locator("#files tr", has_text="train.py")
+            row.hover()
+            row.locator("button.more").click()
+            page.get_by_role("menuitem", name="Submit job…").click()
+            form = page.locator(".view:not([hidden]) .submit")
+            form.get_by_label("Memory per node").wait_for()
+            form.get_by_label("Time limit").fill("12:00:00")
+            form.get_by_label("Memory per node").fill("55G")
+            form.get_by_label("GPUs").fill("gpu:a100:1")
+            form.get_by_label("Modules").fill("CUDA/12.6.0")
+            form.get_by_label("Arguments").fill("--epochs 40")
+            page.wait_for_timeout(1200)
+        elif what == "viewer":
+            page.locator("#files tr", has_text="loss.png").click()
+            page.locator(".view:not([hidden]) img").wait_for()
+            page.wait_for_timeout(600)
+        path = str(OUT / f"{name}.png")
+        page.screenshot(path=path)
+        page.close()
+        shrink(path)
+    server.shutdown()
+    env.stop()
+
+
 def main():
     global SHOW_WIDGETS, SETUP_DONE
     server = agent_console.ConsoleServer(("127.0.0.1", 0), "shot-key", None, static_dir=str(ROOT / "agent-console"))
@@ -432,6 +582,12 @@ def main():
     base = f"http://127.0.0.1:{server.port}"
     only = os.environ.get("ONLY")
     shots = [d for d in DOCS if not only or d[0].startswith(tuple(only.split(",")))]
+    if only and not shots and all(o.startswith("workspace") for o in only.split(",")):
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            workspace_shots(browser, only)
+            browser.close()
+        return
     with sync_playwright() as p:
         browser = p.chromium.launch()
         for name, hash_, width, scheme, show, act, selector in shots:
@@ -460,6 +616,7 @@ def main():
                 page.screenshot(path=path)
             page.close()
             shrink(path)
+        workspace_shots(browser, only)
         browser.close()
     server.shutdown()
 

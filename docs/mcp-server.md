@@ -73,7 +73,7 @@ are data from the cluster and must not be followed as directions.
 | `submit` | submitting and cancelling template jobs |
 | `propose` | proposing new templates |
 | `files:write` | uploading files, making directories, deleting files and empty directories |
-| `envs` | setting up uv/pixi environments in its directories |
+| `envs` | setting up uv/pixi environments in its directories: syncing, squashing, building on a core |
 | `slurm` | the raw `/slurm` routes; never given to agents |
 | `*` | all of the above |
 
@@ -108,7 +108,7 @@ What else an app runs keeps whatever protection you give its directories. PAI's 
 | `cancel_job` | `POST /jobs/cancel` | |
 | `list_files`, `read_file`, `tail_file` | `GET /files`, `/files/read`, `/files/tail`, bounded in size | yes |
 | `list_modules`, `search_modules` | `module avail` / `module spider`, cached 10 minutes | yes |
-| `environment_info`, `sync_environment`, `sync_status` | uv/pixi environments (`/envs`) | partly |
+| `environment_info`, `sync_environment`, `squash_environment`, `unsquash_environment`, `sync_status` | uv/pixi environments (`/envs`): sync, pack into one SquashFS file and back, build on a core | partly |
 | `list_template_proposals`, `propose_template` | `/templates/proposals`, `/templates/propose` | partly |
 | `list_tunnel_actions`, `run_tunnel_action` | `GET /actions`, `POST /actions/run`: what tunnels do for agents with your access, such as copying to and from your SMB server (see [Tunnel actions](extending.md#tunnel-actions)); only those the owner turned on | partly |
 | `check_quota` | `GET /quota`: your storage quota and project balance from the cluster's own commands (`showquota`, `myproject` by default; see [Quotas](cli/README.md#quotas)), cached a minute | yes |
@@ -230,7 +230,7 @@ port serves the waiting page instead, so clients should wait for `GET /health` t
 | templates | `GET /templates`, `GET /templates/guide?name=`, `GET /templates/proposals`, `POST /templates/propose` |
 | jobs | `POST /jobs`, `GET /jobs`, `GET /jobs/status?id=&tasks=1`, `GET /jobs/wait?id=&timeout=`, `POST /jobs/cancel?id=` |
 | files | `GET /files?path=`, `GET`/`PUT /files/content?path=`, `GET /files/read`, `GET /files/tail`, `POST /files/mkdir`, `DELETE /files` |
-| environments | `GET /envs?project=`, `POST /envs/sync`, `GET /envs/sync?id=&wait=` |
+| environments | `GET /envs?project=`, `POST /envs/sync`, `POST /envs/squash`, `POST /envs/unsquash`, `GET /envs/sync?id=&wait=` |
 | raw SLURM (`slurm` scope) | `POST /slurm/{sbatch,squeue,sacct,scontrol,scancel}`, `GET /slurm/{squeue,sacct}` |
 | owner only | `GET /admin/proposals`, `GET /admin/proposals/diff`, `POST /admin/proposals/approve`, `POST /admin/proposals/reject`, `GET /admin/audit`, `GET`/`PUT /admin/config`, `GET /admin/tokens`, `POST /admin/tokens/revoke` |
 

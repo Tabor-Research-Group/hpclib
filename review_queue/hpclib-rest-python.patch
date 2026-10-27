@@ -1,0 +1,196 @@
+diff --git a/README.md b/README.md
+index 20af4cd..2b130ca 100644
+--- a/README.md
++++ b/README.md
+@@ -178,7 +178,7 @@ instead: `agent_console --static agent-console --open` serves the minimal front
+ | `GET /api/health` | the console is up |
+ | `GET /api/clusters`, `GET /api/clusters/NAME` | profiles and tunnel state (`down`, `starting`, `up`, `error`); never token values |
+ | `GET /api/clusters/NAME/mcp` | the MCP client entry |
+-| `GET`/`PUT /api/clusters/NAME/settings` | this machine's tunnel settings for the cluster: `auto_approve_templates` (`all`, `new`, `review`) and `tunnel_args` (sbatch options for the tunnel job, e.g. `--time=12:00:00`), `connection_hours` (how long the ssh login is kept, default 12), and `rest_on` (`job`, the default: the REST server runs in a SLURM job; `login`: on the login node, for sites that ask for that; template jobs still go to SLURM, and `tunnel_args` don't apply); `agent_tunnel` reads them, and its own options win |
++| `GET`/`PUT /api/clusters/NAME/settings` | this machine's tunnel settings for the cluster: `auto_approve_templates` (`all`, `new`, `review`) and `tunnel_args` (sbatch options for the tunnel job, e.g. `--time=12:00:00`), `connection_hours` (how long the ssh login is kept, default 12), and `rest_on` (`job`, the default: the REST server runs in a SLURM job; `login`: on the login node, for sites that ask for that; template jobs still go to SLURM, and `tunnel_args` don't apply), and `rest_python` (an absolute path on the cluster of the Python that runs the REST server, for when the compute nodes lack the one `setup_agents` found; `agent_tunnel` passes it to the launcher as `--env=HPC_REST_PYTHON=PATH`); `agent_tunnel` reads them, and its own options win |
+ | `POST /api/clusters/NAME/tunnel/start` (`{"auto_approve_templates": "all"\|"new"\|"review"}`, default `all`), `.../tunnel/stop`, `GET .../tunnel/log` | `agent_tunnel` and `agent_stop`, logged to `~/.config/hpclib/console/logs/` |
+ | `ANY /api/clusters/NAME/rest/ROUTE` | the cluster's REST route, with the owner token (`?as=agent`: the agent token); downloads (`files/content`) are streamed through |
+ | `GET /api/jobs`, `GET /api/proposals` | jobs and pending proposals from every live cluster, with each cluster's `ok`/`error` |
+diff --git a/agent-console/app.js b/agent-console/app.js
+index ff0d36a..f654920 100644
+--- a/agent-console/app.js
++++ b/agent-console/app.js
+@@ -903,6 +903,8 @@ async function tunnelSettings(c) {
+   const restOn = el("select", {}, (s.rest_on_choices || ["job", "login"]).map((m) => el("option",
+     { value: m, selected: m === (s.rest_on || "job") },
+     { job: "In a SLURM job on a compute node", login: "On the login node (no job)" }[m] || m)));
++  const restPython = el("input", { value: s.rest_python || "", size: 40, placeholder: "default: the one setup_agents found",
++    "aria-label": "Python for the REST server" });
+   const jobFields = el("div", { class: "row" },
+     TUNNEL_FIELDS.map(([k, label, hint]) => field(`Tunnel job: ${label}`, inputs[k], hint)));
+   const showJob = () => { jobFields.hidden = restOn.value === "login"; };
+@@ -913,7 +915,7 @@ async function tunnelSettings(c) {
+       .concat(other);
+     await api(cluster(c.name) + "/settings", { method: "PUT", body: {
+       auto_approve_templates: mode.value, tunnel_args: args, connection_hours: Number(hours.value),
+-      rest_on: restOn.value } });
++      rest_on: restOn.value, rest_python: restPython.value.trim() } });
+     return "Saved. Applies the next time the tunnel starts (the login hours: the next time you log in).";
+   });
+   return el("section", { class: "card" },
+@@ -923,6 +925,8 @@ async function tunnelSettings(c) {
+     field("Run the REST server", restOn, "on the login node where a site asks for it, or on a machine without SLURM "
+       + "(its server config then runs jobs there too); setup_agents picks this for a machine without sbatch"),
+     jobFields,
++    field("Python for the REST server", restPython, "an absolute path on the cluster, for when the compute nodes " +
++      "lack the one found at setup (the job then fails with \"No such file or directory\"); empty: the default"),
+     other.length ? el("p", { class: "muted" }, `Also: ${other.join(" ")}`) : null,
+     el("div", { class: "actions" }, save));
+ }
+diff --git a/hpclib/lib/agent_profiles.py b/hpclib/lib/agent_profiles.py
+index d735832..4bb5561 100644
+--- a/hpclib/lib/agent_profiles.py
++++ b/hpclib/lib/agent_profiles.py
+@@ -38,8 +38,13 @@ LIST_KEYS = ("login", "work_dirs", "binds", "local_roots", "tunnel_args", "mcp_a
+ #   connection_hours        how long an ssh login is kept for reuse once idle (default 12)
+ #   rest_on                 where the REST server runs: job (default; a SLURM job on a compute node) or login (on
+ #                           the login node, for sites that would rather it didn't hold a share of a compute node)
++#   rest_python             an absolute path on the cluster of the Python that runs the REST server, for a cluster
++#                           whose compute nodes lack the one setup_agents found on the login node; agent_tunnel
++#                           hands it to the tunnel launcher as --env=HPC_REST_PYTHON=PATH (empty: the launcher
++#                           setup_agents wrote)
+ APPROVE_MODES = ("all", "new", "review")
+ REST_ON = ("job", "login")
++REST_PYTHON_RE = re.compile(r"/[A-Za-z0-9._+/-]{1,255}")      # no commas or spaces: it rides in --env=NAME=value,...
+ TUNNEL_ARG_RE = re.compile(r"--(?:(time|mem|partition|account|qos|cpus-per-task|constraint)=[A-Za-z0-9:._,+-]{1,64}|nodelist=[A-Za-z0-9._,+\[\]-]{1,256})")
+ 
+ 
+@@ -356,6 +361,10 @@ def cmd_set(name, *pairs):
+         if key == "rest_on" and value not in REST_ON:
+             print(f"agent_profiles: rest_on is one of {', '.join(REST_ON)}", file=sys.stderr)
+             return 2
++        if key == "rest_python" and value and not REST_PYTHON_RE.fullmatch(value):
++            print(f"agent_profiles: rest_python is an absolute path on the cluster (letters, digits and . _ + - /), "
++                  f"not {value!r}", file=sys.stderr)
++            return 2
+         if key == "auto_approve_templates" and value not in APPROVE_MODES:
+             print(f"agent_profiles: auto_approve_templates is one of {', '.join(APPROVE_MODES)}", file=sys.stderr)
+             return 2
+diff --git a/hpclib/lib/tunnels.sh b/hpclib/lib/tunnels.sh
+index 2cdb834..83266ed 100644
+--- a/hpclib/lib/tunnels.sh
++++ b/hpclib/lib/tunnels.sh
+@@ -1415,7 +1415,7 @@ except ValueError as e:
+ # --review-templates holds every proposal. Other options (e.g. --time=2:00:00)
+ # go to launch_tunnel.
+ function agent_tunnel {
+-  local name host port process_port d allow=() launch=() approve
++  local name host port process_port d allow=() launch=() approve rest_python env_list=''
+   if [ "$#" -lt 1 ]; then
+     echo "usage: agent_tunnel NAME|[user@]host [--review-templates|--auto-approve-templates=new] [launch_tunnel options]" >&2
+     _hpclib_agent_profiles list >&2
+@@ -1438,6 +1438,8 @@ function agent_tunnel {
+   if [ "$(_hpclib_agent_profiles get "$name" rest_on 2>/dev/null)" = login ]; then
+     launch=(--login-node)   # no job, so no sbatch options
+   fi
++  # the profile's rest_python, for a cluster whose compute nodes lack the Python setup_agents found
++  rest_python=$(_hpclib_agent_profiles get "$name" rest_python 2>/dev/null) || rest_python=''
+   while [ "$#" -gt 0 ]; do
+     case "$1" in
+       --auto-approve-templates|--auto-approve-templates=new) approve=new ;;
+@@ -1446,10 +1448,15 @@ function agent_tunnel {
+       --auto-approve-templates=*)
+         echo "agent_tunnel: --auto-approve-templates takes new or all" >&2
+         return 2 ;;
++      # launch_tunnel reads only the first --env, so the profile's variable and this one are joined below
++      --env=*) env_list="${env_list:+$env_list,}${1#--env=}" ;;
+       *) launch+=("$1") ;;
+     esac
+     shift
+   done
++  case ",$env_list," in *,HPC_REST_PYTHON=*) rest_python='' ;; esac     # an option given here wins
++  [ -n "$rest_python" ] && env_list="HPC_REST_PYTHON=$rest_python${env_list:+,$env_list}"
++  [ -n "$env_list" ] && launch+=("--env=$env_list")
+   # an option for the REST server, not launch_tunnel; it applies only while jobs are sandboxed
+   [ -n "$approve" ] && allow+=("--auto-approve-templates=$approve")
+   # if this ssh is the one that logs in, keep the login as long as the profile says (default 12h)
+diff --git a/hpclib/servers/agent_console.py b/hpclib/servers/agent_console.py
+index 59449c1..6188e90 100644
+--- a/hpclib/servers/agent_console.py
++++ b/hpclib/servers/agent_console.py
+@@ -149,7 +149,8 @@ The front end depends only on the routes below; nothing here depends on it.
+   GET  /api/clusters/NAME/settings            this machine's tunnel settings for the cluster
+   PUT  /api/clusters/NAME/settings            {"auto_approve_templates": all|new|review,
+                                                "tunnel_args": ["--time=12:00:00", ...],
+-                                               "connection_hours": 12, "rest_on": job|login}
++                                               "connection_hours": 12, "rest_on": job|login,
++                                               "rest_python": "/path/to/python3" ("" for the default)}
+   POST /api/clusters/NAME/tunnel/start        runs agent_tunnel NAME ({"auto_approve_templates": all|new|review})
+   POST /api/clusters/NAME/ssh/setup           initialize shared-home compute SSH via the active login;
+                                               tracked ssh_setup operation, body {}
+@@ -4173,12 +4174,13 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
+                 "connection_hours": profile.get("connection_hours") or Logins.DEFAULT_HOURS,
+                 "rest_on": profile.get("rest_on") or "job",
+                 "rest_on_choices": list(agent_profiles.REST_ON),
++                "rest_python": profile.get("rest_python") or "",
+                 "modes": list(agent_profiles.APPROVE_MODES),
+                 "tunnel_arg_pattern": agent_profiles.TUNNEL_ARG_RE.pattern,
+                 "applies": "the next time the tunnel starts"}
+ 
+     def save_tunnel_settings(self, profile, body):
+-        unknown = set(body) - {"auto_approve_templates", "tunnel_args", "connection_hours", "rest_on"}
++        unknown = set(body) - {"auto_approve_templates", "tunnel_args", "connection_hours", "rest_on", "rest_python"}
+         if unknown:
+             raise ConsoleError(400, f"unknown settings {sorted(unknown)}")
+         mode = body.get("auto_approve_templates", profile.get("auto_approve_templates") or "all")
+@@ -4195,8 +4197,14 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
+         rest_on = body.get("rest_on", profile.get("rest_on") or "job")
+         if rest_on not in agent_profiles.REST_ON:
+             raise ConsoleError(422, f"rest_on must be one of {list(agent_profiles.REST_ON)}")
++        rest_python = body.get("rest_python", profile.get("rest_python") or "")
++        if not isinstance(rest_python, str) or (rest_python.strip() and
++                                                not agent_profiles.REST_PYTHON_RE.fullmatch(rest_python.strip())):
++            raise ConsoleError(422, "rest_python must be an absolute path on the cluster, such as "
++                                    "/sw/eb/sw/Python/3.11.5/bin/python3, or empty for the default")
+         fresh = agent_profiles.load(profile["name"]) or profile
+-        fresh.update(auto_approve_templates=mode, tunnel_args=args, connection_hours=hours, rest_on=rest_on)
++        fresh.update(auto_approve_templates=mode, tunnel_args=args, connection_hours=hours, rest_on=rest_on,
++                     rest_python=rest_python.strip())
+         agent_profiles.save(fresh)
+         return self.tunnel_settings(fresh)
+ 
+diff --git a/tests/test_agent_console.py b/tests/test_agent_console.py
+index b2fc888..9fe971c 100644
+--- a/tests/test_agent_console.py
++++ b/tests/test_agent_console.py
+@@ -866,6 +866,35 @@ class TestSettings(ConsoleTestCase):
+         self.assertNotIn("--time=12:00:00", res.stdout)                            # no job, no sbatch options
+         self.assertEqual(agent_profiles.cmd_set(self.live, "rest_on=elsewhere"), 2)
+ 
++    def test_rest_python(self):
++        url = f"/api/clusters/{self.live}/settings"
++        self.assertEqual(self.call("GET", url)[1]["rest_python"], "")
++        status, out = self.call("PUT", url, {"rest_python": " /sw/eb/sw/Python/3.11.5/bin/python3 "})
++        self.assertEqual((status, out["rest_python"]), (200, "/sw/eb/sw/Python/3.11.5/bin/python3"), out)
++        self.assertEqual(self.call("PUT", url, {"rest_on": "login"})[1]["rest_python"],
++                         "/sw/eb/sw/Python/3.11.5/bin/python3")                         # kept when not sent
++        for bad in ("python3", "/a b/python3", "/a,HPC_X=1/python3", "/py;rm", 3):
++            self.assertEqual(self.call("PUT", url, {"rest_python": bad})[0], 422, bad)
++        self.assertEqual(agent_profiles.cmd_set(self.live, "rest_python=python3"), 2)
++        self.assertEqual(self.call("PUT", url, {"rest_python": ""})[1]["rest_python"], "")
++        self.assertEqual(agent_profiles.load(self.live)["rest_python"], "")
++
++    def test_agent_tunnel_passes_rest_python(self):
++        repo = Path(__file__).resolve().parents[1]
++        agent_profiles.cmd_set(self.live, "rest_python=/sw/py/bin/python3")
++        script = (f'source {repo / "hpclib" / "hpclib.sh"}; launch_tunnel() {{ printf "%s\\n" "$*"; }}; '
++                  f'agent_tunnel {self.live}; agent_tunnel {self.live} --env=A=1,B=2; '
++                  f'agent_tunnel {self.live} --env=HPC_REST_PYTHON=/mine/python3; '
++                  f'_hpclib_agent_profiles set {self.live} rest_python=; agent_tunnel {self.live}')
++        res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
++                             env=dict(os.environ, HPCLIB_AGENTS_DIR=str(self.agents)))
++        plain, merged, theirs, unset = res.stdout.splitlines()
++        self.assertIn(" --env=HPC_REST_PYTHON=/sw/py/bin/python3 -- ", plain)           # before the server's options
++        self.assertIn(" --env=HPC_REST_PYTHON=/sw/py/bin/python3,A=1,B=2 -- ", merged)  # one --env: launch_tunnel reads one
++        self.assertEqual(theirs.count("--env="), 1)
++        self.assertIn("--env=HPC_REST_PYTHON=/mine/python3 ", theirs)
++        self.assertNotIn("--env", unset)
++
+     def test_server_config_through_the_proxy(self):
+         path = self.data / "rest" / "config.json"
+         path.write_text("{}")

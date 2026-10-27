@@ -347,6 +347,12 @@ A package can't replace hpclib's apps or tunnels or what another package provide
 reach a cluster with the app's next Check, Install or Start (`tunnel_setup --push`). Raise `version` with each
 change; installing a newer version replaces the old one.
 
+Packages in hpclib's own `packages/` folder **come with hpclib**: the Packages dialog lists them (from the clone
+the console runs from) and builds and installs one when asked, so they stay optional. `packages/workspace` (the
+[Workspace](interface/apps.md#workspace-a-package)) is a complete example of an app on the login node: a
+standard-library Python server (`workspace_server.py`) started by `sbatch_script.sh` with `RUN_ON_LOGIN_NODE=true`,
+which prints a URL with a token that the app's `token_regex` finds for Open, and serves its own page.
+
 ### Installation files
 
 Every file inside a packaged tunnel, including its `install.sh`, already travels through the console's SSH

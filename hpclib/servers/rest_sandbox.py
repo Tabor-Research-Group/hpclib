@@ -434,12 +434,16 @@ class Sandbox:
         rebind = [(d, "ro" if d in ro else "rw") for d in binds if self._within(d, hidden)]
         return masks, protected, rebind
 
-    def plan(self, writable, extra_ro=()):
+    def plan(self, writable, extra_ro=(), images=()):
         """
         What a job would see: the method and the read-only and read-write
         binds. `extra_ro` adds read-only binds for this job (e.g. a Python
-        environment's interpreter). `hidden` and `protected` (see protect)
-        are covered after them, and `rebind` binds again over those.
+        environment's interpreter). `images` are (image, mount point)
+        pairs: SquashFS (or ext3, SIF) images mounted read-only over a
+        directory, e.g. a squashed Python environment on its .venv; they
+        come after the binds, so their mount points may be inside them.
+        `hidden` and `protected` (see protect) are covered after them, and
+        `rebind` binds again over those.
         """
         method, detail = self.resolve()
         if method == "none":
@@ -455,8 +459,21 @@ class Sandbox:
             if d in rw:
                 continue
             (rw if os.path.exists(d) else missing).append(d)
+        mounted = []
+        for image, target in images:
+            image, target = os.path.normpath(image), os.path.normpath(target)
+            if ":" in image + target or "," in image + target:
+                raise SandboxError(f"can't mount {image!r} on {target!r} (':' or ',' in a path)")
+            if not os.path.isfile(image):
+                # without it the job would run on an empty mount point and fail on its first import
+                raise SandboxError(f"the environment image {image} isn't there (sync the environment again)")
+            if not os.path.isdir(target):
+                raise SandboxError(f"{target}, where {image} is mounted, isn't a directory")
+            mounted.append([image, target])
         plan = {"method": method, "runtime": detail, "image": self.image or self.host_image_for(method),
                 "host_image": self.image is None, "read_only": ro, "read_write": rw}
+        if mounted:
+            plan["images"] = mounted
         masks, protected, rebind = self._protection(ro, rw)
         if masks or protected:
             plan.update(hidden=[h for _, h in masks], protected=protected, masks=masks, rebind=rebind)
@@ -520,7 +537,7 @@ class Sandbox:
             return []
         return ["--nv"] if self.gpus == "always" or (self.gpus == "auto" and gpus > 0) else []
 
-    def launch(self, shebang, body, writable, prelude=None, extra_ro=(), network=False, gpus=0):
+    def launch(self, shebang, body, writable, prelude=None, extra_ro=(), network=False, gpus=0, images=()):
         """
         Lines for the end of the job script: start `body` in the
         sandbox and exit with its status. Returns (lines, plan).
@@ -532,10 +549,14 @@ class Sandbox:
         shares the host's network as Apptainer does (podman --network=host),
         for a service that talks to others on the node's loopback.
         `gpus`: how many GPUs the job asked SLURM for (see `gpus` in the config).
+        `images`: (image, mount point) pairs to mount read-only (see plan).
         """
-        plan = self.plan(writable, extra_ro)
+        plan = self.plan(writable, extra_ro, images)
         if plan["method"] == "none":
             return None, plan
+        if images and plan["method"] == "podman":
+            raise SandboxError("mounting an image (a squashed Python environment) needs Singularity or Apptainer; "
+                               "podman can't. Sync the environment without `squash`")
         runtime, image = plan["runtime"], plan["image"]
         if plan["host_image"]:
             build_host_image(image, plan["read_only"] + plan["read_write"] + plan.get("hidden", []) +
@@ -702,6 +723,9 @@ class Sandbox:
         for path in plan["read_write"]:
             if path not in rebind:
                 args += [flag, f"{path}:{path}"]
+        for image, path in plan.get("images", []):
+            # mounted from the host (setuid: the kernel's squashfs; unprivileged: squashfuse), read-only
+            args += [flag, f"{image}:{path}:image-src=/"]
         for source, path in plan.get("masks", []):
             args += [flag, f"{source}:{path}:ro"]
         for path in plan.get("protected", []):

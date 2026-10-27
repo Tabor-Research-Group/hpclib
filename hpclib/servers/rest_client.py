@@ -204,9 +204,35 @@ class RESTClient:
         query = {"project": project, "manager": manager, "environment": environment} if project else None
         return self.request("GET", "/envs", query)
 
-    def sync_environment(self, project, manager="auto", environment="default", update=False):
-        return self.request("POST", "/envs/sync", body={"project": project, "manager": manager,
-                                                        "environment": environment, "update": update})
+    KEEP = object()        # sync_environment's core: the one the manifest declares ([tool.hpclib] core)
+
+    def sync_environment(self, project, manager="auto", environment="default", update=False, squash=None,
+                         core=KEEP, core_environment=None, force=False):
+        """squash: True packs, False unpacks, None keeps it as it is. core: the core project to build on, None for
+        none, KEEP for the one the manifest declares. Fields are sent only when used: older servers refuse ones
+        they don't know."""
+        body = {"project": project, "manager": manager, "environment": environment, "update": update}
+        if squash is not None:
+            body["squash"] = bool(squash)
+        if core is not self.KEEP:
+            body["core"] = core or None
+            if core_environment:
+                body["core_environment"] = core_environment
+        if force:
+            body["force"] = True
+        return self.request("POST", "/envs/sync", body=body)
+
+    def squash_environment(self, project, manager="auto", environment="default", force=False):
+        body = {"project": project, "manager": manager, "environment": environment}
+        if force:
+            body["force"] = True
+        return self.request("POST", "/envs/squash", body=body)
+
+    def unsquash_environment(self, project, manager="auto", environment="default", force=False):
+        body = {"project": project, "manager": manager, "environment": environment}
+        if force:
+            body["force"] = True
+        return self.request("POST", "/envs/unsquash", body=body)
 
     def sync_status(self, sync_id, wait=0):
         return self.request("GET", "/envs/sync", {"id": sync_id, "wait": wait},

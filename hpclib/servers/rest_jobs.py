@@ -688,13 +688,15 @@ class JobTemplate:
     )
 
     def render(self, values, tasks=None, sandbox: 'rest_sandbox.Sandbox' = None, writable=(), prelude=None,
-               extra_ro=(), env=None, gpus=0):
+               extra_ro=(), env=None, gpus=0, images=()):
         """
         The full job script: shebang, exports, module loads, per-task
         values, then the body - which runs in `sandbox`, with `writable`
         directories, when one is configured. `prelude` (bash lines, e.g.
         activating a Python environment) runs just before the body, inside
-        the sandbox. Returns (script, sandbox plan).
+        the sandbox. `images` ((image, mount point) pairs, e.g. a squashed
+        Python environment) can only be mounted by the sandbox. Returns
+        (script, sandbox plan).
         """
         body = self.script
         shebang = "#!/bin/bash"
@@ -735,11 +737,15 @@ class JobTemplate:
             ]
         plan = {"method": "none", "reason": "not sandboxed"}
         if sandbox is not None:
-            launch, plan = sandbox.launch(shebang, body, writable, prelude=prelude, extra_ro=extra_ro, gpus=gpus)
+            launch, plan = sandbox.launch(shebang, body, writable, prelude=prelude, extra_ro=extra_ro, gpus=gpus,
+                                          images=images)
             if launch is not None:
                 if lines[0].strip() == shebang.strip() and not lines[0].startswith("#!/bin/bash"):
                     lines[0] = "#!/bin/bash"   # the launcher is bash, whatever the body is
                 return "\n".join(lines) + "\n\n" + "\n".join(launch) + "\n", plan
+        if images:
+            raise RESTError(422, f"the Python environment for template {self.name} is squashed into an image, which "
+                                 f"only a Singularity or Apptainer sandbox can mount; sync it without `squash`")
         if prelude:
             if not re.match(r"#!\s*(/bin/bash|/usr/bin/env\s+bash)\b", lines[0]):
                 raise RESTError(422, f"template {self.name} uses a Python environment, which needs a bash "
@@ -1019,8 +1025,9 @@ class JobRegistry:
         "task_states": "TEXT",
         "label": "TEXT",
         "status_details": "TEXT",
+        "environments": "TEXT",      # the Python environment directories the job uses (it and its core)
     }
-    JSON_COLUMNS = ("params", "resources", "tasks", "task_states", "status_details")
+    JSON_COLUMNS = ("params", "resources", "tasks", "task_states", "status_details", "environments")
 
     def __init__(self, path):
         self.path = os.path.expanduser(path)
@@ -1501,19 +1508,69 @@ class JobManager:
         info = self._env_call(envs.detect, self._project(project, whitelist), manager or "auto", name or "default")
         return dict(info, tools=envs.describe()["managers"])
 
-    def sync_environment(self, token_name, request, whitelist):
+    def _env_request(self, request, whitelist, fields):
         if not isinstance(request, dict):
             raise RESTError(400, "request body must be an object")
-        unknown = set(request) - {"project", "manager", "environment", "update"}
+        unknown = set(request) - {"project", "manager", "environment", "force"} - set(fields)
         if unknown:
             raise RESTError(400, f"unknown fields {sorted(unknown)}")
-        update = request.get("update", False)
-        if not isinstance(update, bool):
-            raise RESTError(400, "`update` must be true or false")
-        envs = self._envs
-        info = self._env_call(envs.detect, self._project(request.get("project"), whitelist),
+        if not isinstance(request.get("force", False), bool):
+            raise RESTError(400, "`force` must be true or false")
+        return self._env_call(self._envs.detect, self._project(request.get("project"), whitelist),
                               request.get("manager") or "auto", request.get("environment") or "default")
-        return self._env_call(envs.sync, token_name, info, update=update)
+
+    def _env_busy(self, info, force):
+        """Refuse (409) changing an environment that queued or running API jobs use (they would lose it or find it
+        changed), unless `force`."""
+        if force:
+            return
+        active = [j for j in self.registry.list(limit=1000, active_only=True)
+                  if info["path"] in (j.get("environments") or [])]
+        if active:
+            active = [j for j in self.refresh(active) if not j["terminal"]]
+        if active:
+            raise RESTError(409, f"{len(active)} queued or running job(s) use {info['path']}; wait for them, cancel "
+                                 "them, or pass force=true (they may fail)", jobs=[j["job_id"] for j in active])
+
+    def sync_environment(self, token_name, request, whitelist):
+        info = self._env_request(request, whitelist, {"update", "squash", "core", "core_environment"})
+        update, squash = request.get("update", False), request.get("squash")
+        if not isinstance(update, bool) or squash not in (None, True, False):
+            raise RESTError(400, "`update` is true or false; `squash` true, false, or null (keep it as it is)")
+        envs = self._envs
+        # the core: given (a path; null for none), else the one the manifest declares ([tool.hpclib] core)
+        if "core" in request:
+            wanted = request["core"]
+            name = request.get("core_environment") or "default"
+        else:
+            declared = info.get("core_declared") or {}
+            wanted = declared.get("core")
+            if wanted and not os.path.isabs(wanted):
+                wanted = os.path.normpath(os.path.join(info["project"], wanted))
+            name = declared.get("core-environment") or "default"
+        core = None
+        if wanted not in (None, ""):
+            if not isinstance(wanted, str):
+                raise RESTError(400, "`core` is the core project's directory, or null for none")
+            try:
+                core_dir = self._project(wanted, whitelist)
+            except RESTError as e:
+                raise RESTError(e.status, f"core: {e}")
+            core = self._env_call(envs.detect, core_dir, info.get("manager") or "auto", name)
+        packing = squash is not None and bool(squash) != bool(info.get("squashed"))
+        if packing or info.get("squashed"):
+            self._env_busy(info, request.get("force", False))
+        return self._env_call(envs.sync, token_name, info, update=update, squash=squash, core=core)
+
+    def squash_environment(self, token_name, request, whitelist):
+        info = self._env_request(request, whitelist, set())
+        self._env_busy(info, request.get("force", False))
+        return self._env_call(self._envs.squash, token_name, info)
+
+    def unsquash_environment(self, token_name, request, whitelist):
+        info = self._env_request(request, whitelist, set())
+        self._env_busy(info, request.get("force", False))
+        return self._env_call(self._envs.unsquash, token_name, info)
 
     def sync_status(self, sync_id, token_name, see_all, wait=0):
         return self._env_call(self._envs.status, sync_id, token_name, see_all, wait=wait)
@@ -1737,13 +1794,15 @@ class JobManager:
         # by the server's --allow list), or just the workdir if neither restricts it.
         writable = list(whitelist.roots) if whitelist.restricted else [workdir]
         environment = self._job_environment(template, values, whitelist)
-        prelude = extra_ro = None
+        prelude = extra_ro = images = None
         if environment is not None:
             prelude, extra_ro = self.environments.prelude(environment), self.environments.job_binds(environment)
+            images = self.environments.job_images(environment)
         try:
             # a job that asks SLURM for GPUs gets them in its sandbox too (--nv; the sandbox's `gpus` setting)
             script, sandbox_plan = template.render(values, tasks, sandbox=self.sandbox, writable=writable,
-                                                   prelude=prelude, extra_ro=extra_ro or (), env=self.job_env,
+                                                   prelude=prelude, extra_ro=extra_ro or (), images=images or (),
+                                                   env=self.job_env,
                                                    gpus=parse_gres_gpus(resources.get("gres")))
         except rest_sandbox.SandboxError as e:
             raise RESTError(503, str(e), see="GET /sandbox describes what this node supports")
@@ -1763,6 +1822,10 @@ class JobManager:
                 "sbatch_args": args[1:], "script": script, "sandbox": sandbox_plan}
         if environment is not None:
             plan["environment"] = {k: environment.get(k) for k in ("manager", "project", "environment", "path")}
+            if environment.get("squashed"):
+                plan["environment"]["image"] = environment["image"]   # mounted on `path`
+            if environment.get("core"):
+                plan["environment"]["core"] = {k: environment["core"].get(k) for k in ("project", "path", "image")}
         if tasks is not None:
             plan.update(array_size=len(tasks), throttle=throttle, tasks=tasks, task_source=task_source)
         if dry_run:
@@ -1804,6 +1867,8 @@ class JobManager:
                            tasks=[{"params": t, "source_index": (task_source["indices"][i] if task_source else None)}
                                   for i, t in enumerate(tasks)])
             job["output"] = self._output_path(job)
+            if environment is not None:
+                job["environments"] = self.environments.job_envs(environment)
             self.registry.record(job)
         return 201, dict(self.job_view(self.registry.get(job_id)), duplicate=False, sandbox=sandbox_plan)
 

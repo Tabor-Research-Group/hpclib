@@ -596,6 +596,53 @@ on your machine as MCP tools.
   {"template": "python_project", "params": {"project": "projects/analysis", "script": "projects/analysis/analyze.py"}}
   ```
 
+  **Squashed environments.** An environment is thousands of small files, slow to start from on a parallel
+  filesystem and heavy on file quotas. `POST /envs/squash {"project": DIR}` (MCP `squash_environment`) packs a
+  synced environment into one SquashFS file beside its project's environment (`.venv.sqfs`; pixi:
+  `.pixi-NAME.sqfs`), with bytecode compiled, and empties the environment's directory; jobs mount the image
+  read-only on it (Singularity/Apptainer `--bind IMAGE:DIR:image-src=/`), so every path in it is the one uv or
+  pixi wrote and the job sees an ordinary environment. `POST /envs/unsquash` (`unsquash_environment`) unpacks it
+  again. A sync takes `"squash"` too: `true` packs after syncing, `false` unpacks, and leaving it out keeps the
+  environment as it was. It needs `mksquashfs`/`unsquashfs` (squashfs-tools) where the server runs (asked for
+  before a sync starts) and a Singularity or Apptainer sandbox; a setuid installation mounts the image with the
+  kernel, an unprivileged one needs `squashfuse`. Packing or unpacking an environment that queued or running API
+  jobs use is refused (409, listing them) unless `"force": true`, and while an operation works on an environment
+  jobs aren't submitted into it.
+
+  **A core and layers.** Freeze a large, shared set of packages once, then build small environments on it:
+  `POST /envs/sync {"project": DIR, "core": CORE_DIR}` (MCP `sync_environment(core=...)`) installs only what DIR
+  adds and uses the core's packages from the core (squashed, ideally). hpclib writes the core's exact versions
+  into DIR's manifest, between `# hpclib core` marker comments, so resolution can't pick others, and records the
+  core in `[tool.hpclib]`, so later syncs keep building on it (`"core": null`, MCP `core=""`, takes both out):
+
+  ```toml
+  [tool.uv]
+  constraint-dependencies = [
+      "scipy<2",                       # yours, kept
+      # hpclib core: ../core (hpclib replaces these lines at each sync)
+      "numpy==2.5.4",
+      # hpclib core end
+  ]
+
+  [tool.hpclib]
+  core = "../core"
+  ```
+
+  | | uv | pixi |
+  | --- | --- | --- |
+  | the core's versions | `[tool.uv] constraint-dependencies` | `[constraints]` (`[tool.pixi.constraints]`), version and build of each conda package |
+  | not installed again | `uv sync --no-install-package ...` | `pixi install --skip ...` |
+  | the interpreter | the core's (`--python`) | the core's: a layer has none of its own |
+  | the core's packages, in a job | `_hpclib_core.pth` in the layer's site-packages, after its own | the layer is the user site (`PYTHONUSERBASE`); `PATH` and `LD_LIBRARY_PATH` put the layer's `bin`/`lib` before the core's; both run their activation scripts |
+
+  A layer is usable while its core is the one it was built on; once the core is synced again, `GET /envs` says
+  so and jobs are refused until the layer is synced too. A core has to be synced (or squashed) by this hpclib
+  first, which records its interpreter and packages in `.venv.hpclib.json` (pixi `.pixi-NAME.hpclib.json`) beside
+  it; a core can't itself be a layer. Inside the core, sync only through hpclib: `uv run` or `pixi run` there
+  would install its packages again into its directory (`GET /envs` notes files that turn up beside an image; jobs
+  keep using the image). In a pixi layer, a native library the core provides is found through
+  `LD_LIBRARY_PATH`; a core package that looks for data through `sys.prefix` finds the core's.
+
   Jobs only activate an environment, inside their sandbox (pixi's activation scripts included); they never
   install, so compute nodes need no network. The sync itself runs where the REST server runs, also in the
   sandbox, with only the project, the tool's cache and uv's Python directory writable, and the tool binary

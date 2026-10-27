@@ -247,6 +247,21 @@ class TestProtectedPaths(unittest.TestCase):
         self.assertNotIn("masks", plan)
         self.assertEqual(self.sandbox._bind_args(plan, "-v"), ["-v", f"{self.home}/proj:{self.home}/proj"])
 
+    def test_images_mount_after_the_binds(self):
+        """An image (a squashed Python environment) is mounted on a directory inside a bind, so after the binds."""
+        proj = self.home / "proj"
+        (proj / ".venv").mkdir()
+        (proj / ".venv.sqfs").write_text("sqfs")
+        plan = self.sandbox.plan([str(proj)], images=[(proj / ".venv.sqfs", proj / ".venv")])
+        self.assertEqual(plan["images"], [[f"{proj}/.venv.sqfs", f"{proj}/.venv"]])
+        self.assertEqual(self.sandbox._bind_args(plan, "--bind")[1::2],
+                         [f"{proj}:{proj}", f"{proj}/.venv.sqfs:{proj}/.venv:image-src=/"])
+        # an image that isn't there: refused (the job would start on an empty mount point)
+        with self.assertRaisesRegex(rest_sandbox.SandboxError, "isn't there"):
+            self.sandbox.plan([str(proj)], images=[(proj / "gone.sqfs", proj / ".venv")])
+        with self.assertRaises(rest_sandbox.SandboxError):
+            self.sandbox.plan([str(proj)], images=[(proj / ".venv.sqfs", self.tmp / "a:b")])
+
     def test_read_only_bind_hides_secrets_too(self):
         """Hidden paths are hidden under read-only binds as well; protected ones need no cover there."""
         plan = self.sandbox.plan([], extra_ro=[str(self.home)])
@@ -554,6 +569,13 @@ class TestPodmanSandbox(SandboxServerTestCase):
 
     def args(self):
         return json.loads(self.runtime_log.read_text().splitlines()[-1])
+
+    def test_podman_mounts_no_images(self):
+        sandbox = self.use_podman({"method": "podman"})
+        image = self.llm_root / "env.sqfs"
+        image.write_text("sqfs")
+        with self.assertRaisesRegex(rest_sandbox.SandboxError, "Singularity or Apptainer"):
+            sandbox.launch("#!/bin/bash", "true", [str(self.llm_root)], images=[(image, self.llm_root)])
 
     def test_config(self):
         self.assertEqual(rest_sandbox.Sandbox({"method": "podman", "image": "docker.io/library/ubuntu:24.04"}).image,

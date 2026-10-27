@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Workspace</title>
+  <link rel="stylesheet" href="ui/workspace.css">
+</head>
+<body>
+  <header class="top">
+    <strong class="brand">Workspace</strong>
+    <span class="host muted" id="host"></span>
+    <select id="places" aria-label="Places"></select>
+    <form id="go" class="path-form">
+      <input id="path" aria-label="Directory" spellcheck="false" autocomplete="off">
+    </form>
+    <div class="actions">
+      <button type="button" id="up" title="The directory above">Up</button>
+      <button type="button" id="refresh" title="List it again">Refresh</button>
+      <button type="button" id="new-file">New file</button>
+      <button type="button" id="new-folder">New folder</button>
+      <button type="button" id="upload">Upload</button>
+      <label class="check"><input type="checkbox" id="hidden"> Hidden files</label>
+      <button type="button" id="terminal-here" class="primary">Terminal here</button>
+    </div>
+    <input type="file" id="upload-input" multiple hidden>
+  </header>
+  <div class="main" id="main">
+    <aside class="side" id="side">
+      <div class="files" id="files" tabindex="-1"></div>
+      <section class="jobs" id="jobs">
+        <div class="jobs-head"><strong>My jobs</strong> <span class="muted small" id="jobs-at"></span>
+          <button type="button" id="jobs-refresh" class="small-button">Refresh</button></div>
+        <div id="jobs-list" class="muted small">…</div>
+      </section>
+    </aside>
+    <div class="splitter" id="splitter" role="separator" aria-orientation="vertical" title="Drag to resize"></div>
+    <section class="work">
+      <nav class="tabs" id="tabs" role="tablist"></nav>
+      <div class="views" id="views">
+        <div class="empty muted" id="empty">Open a file from the list, or <strong>Submit job…</strong> from a Python
+          or bash script's menu (⋯). Drop files on the list to upload them.</div>
+      </div>
+    </section>
+  </div>
+  <section class="term-panel" id="term-panel" hidden>
+    <div class="term-splitter" id="term-splitter" role="separator" aria-orientation="horizontal"></div>
+    <nav class="tabs term-tabs" id="term-tabs">
+      <button type="button" id="term-new" class="small-button">+ Terminal</button>
+      <button type="button" id="term-hide" class="small-button push-right">Hide</button>
+    </nav>
+    <div class="term-views" id="term-views"></div>
+  </section>
+  <dialog id="ask">
+    <form method="dialog">
+      <p id="ask-text"></p>
+      <input id="ask-input" spellcheck="false" autocomplete="off">
+      <div class="actions"><button value="cancel" type="submit">Cancel</button>
+        <button value="ok" type="submit" class="primary" id="ask-ok">OK</button></div>
+    </form>
+  </dialog>
+  <div class="menu" id="menu" hidden role="menu"></div>
+  <div class="toast" id="toast" hidden role="status"></div>
+  <script src="ui/workspace.js"></script>
+</body>
+</html>

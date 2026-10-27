@@ -111,6 +111,9 @@ The front end depends only on the routes below; nothing here depends on it.
                                               the package each came from (null: hpclib's own)
   GET  /api/packages                          apps and settings installed from packages (console_packages.py)
   POST /api/packages[?dry_run=1]              body: a package zip; checks it (dry_run) or installs it
+  GET  /api/packages/bundled                  the packages that come with this hpclib (its clone's packages/:
+                                              the Workspace), with the version installed
+  POST /api/packages/bundled/NAME[?dry_run=1]  build that one and check it (dry_run) or install it
   DELETE /api/packages/NAME                   removes one (its apps go; what it sent to clusters stays)
   GET  /api/apps/APP                          that app's session on every cluster: state (down, starting,
                                               queued, up), the job's queue status, and the URL to open
@@ -2340,6 +2343,39 @@ class Clusters:
                  "installed": m.get("installed"), "sha256": m.get("sha256"), "apps": sorted(m["apps"]),
                  "summary": console_packages.summary(m)} for m, _ in self.packages.installed()]
 
+    # packages that come with hpclib's clone (packages/NAME: the Workspace), installed like any other
+    BUNDLED_DIR = os.path.join(os.path.dirname(HPCLIB_DIR), "packages")
+
+    def bundled_packages(self):
+        installed = {m["name"]: m["version"] for m, _ in self.packages.installed()}
+        out = []
+        try:
+            names = sorted(os.listdir(self.BUNDLED_DIR))
+        except OSError:
+            names = []
+        for n in names:
+            try:
+                with open(os.path.join(self.BUNDLED_DIR, n, console_packages.MANIFEST)) as f:
+                    m = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if isinstance(m, dict) and m.get("name") == n:
+                out.append({"name": n, "version": m.get("version"), "description": m.get("description"),
+                            "installed": installed.get(n)})
+        return out
+
+    def bundled_add(self, name, dry_run):
+        if name not in {p["name"] for p in self.bundled_packages()}:
+            raise ConsoleError(404, f"no package {name!r} comes with this hpclib")
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                out, _ = console_packages.build(os.path.join(self.BUNDLED_DIR, name), os.path.join(tmp, "p.zip"))
+            except console_packages.PackageError as e:
+                raise ConsoleError(422, str(e)) from e
+            with open(out, "rb") as f:
+                data = f.read()
+        return self.package_add(data, dry_run)
+
     def widgets(self):
         try:
             return self.packages.widgets()
@@ -3893,6 +3929,10 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         if parts == ["packages"] and verb == "POST":
             data = self.body(console_packages.MAX_ZIP)
             return (200 if self.flag("dry_run") else 201), dict(c.package_add(data, self.flag("dry_run")), ok=True)
+        if parts == ["packages", "bundled"] and verb == "GET":
+            return 200, {"ok": True, "packages": c.bundled_packages()}
+        if len(parts) == 3 and parts[:2] == ["packages", "bundled"] and verb == "POST":
+            return (200 if self.flag("dry_run") else 201), dict(c.bundled_add(parts[2], self.flag("dry_run")), ok=True)
         if len(parts) == 2 and parts[0] == "packages" and verb == "DELETE":
             return 200, dict(c.package_remove(parts[1]), ok=True)
         if parts == ["apps"] and verb == "GET":
