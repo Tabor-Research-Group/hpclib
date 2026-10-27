@@ -263,6 +263,9 @@ def answer(path, method):
         return {"clients": CLIENTS}
     if path == "update":
         return UPDATE
+    if path == "styles":
+        return {"path": "/Users/jdoe/.config/hpclib/console/user.css", "exists": True,
+                "values": {"common": {}, "light": {"--accent": "#7b3fbf"}, "dark": {}}}
     if path == "about":
         return ABOUT
     if path == "platform":

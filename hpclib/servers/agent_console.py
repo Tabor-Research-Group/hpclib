@@ -25,13 +25,18 @@ The front end depends only on the routes below; nothing here depends on it.
                                               are in the way); the console runs the new code after a restart
   POST /api/restart                           start this console again (same port and session key), running the
                                               hpclib now on disk; refused while a login or an operation runs
+  GET  /api/styles                            Interface Settings: what user.css sets default-styles.css's variables
+                                              to ({"values": {"common", "light", "dark"}})
+  PUT  /api/styles                            {"common", "light", "dark"}: write them into user.css (changed in
+                                              place, defaults taken out, new ones in a block at the end;
+                                              console_styles.py); the rest of user.css is left as it is
   GET  /api/diagnostics                      about, preferences and every cluster's state, for a bug report
                                               (token-like strings redacted)
   GET  /api/preferences                      this machine's preferences (console_prefs.py)
   GET  /api/platform                         this machine's platform (local_platform.py: linux, macos, wsl), where
                                               it came from, and under WSL the Windows profile folder the LLM
                                               clients' configuration is in
-  PUT  /api/preferences                      {section: {...}}: notifications, new_cluster, llm_clients, interface
+  PUT  /api/preferences                      {section: {...}}: notifications, new_cluster, llm_clients, widgets, system, ...
   GET  /api/ports                            every local port the profiles hold, free / its tunnel's / taken
   PUT  /api/ports/range                      {"low", "high"} (or {"reset": true}): where new ports are picked
   POST /api/clusters/NAME/new-ports          {"app": APP or null}: new local ports while it is stopped
@@ -185,6 +190,7 @@ import local_platform  # noqa: E402
 sys.path.insert(0, HERE)
 import console_packages  # noqa: E402
 import console_prefs  # noqa: E402
+import console_styles  # noqa: E402
 import console_update  # noqa: E402
 import mcp_clients  # noqa: E402
 
@@ -3348,7 +3354,6 @@ class Clusters:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(profiles)))) as pool:
             clusters = list(pool.map(one, profiles))
         prefs = console_prefs.load(console_dir())
-        prefs.pop("interface", None)
         clients = [{"id": c["id"], "available": c["available"], "enabled": c["enabled"], "error": c["error"],
                     "entries": {e["name"]: e["state"] for e in c["entries"]}, "stale": c["stale"]}
                    for c in self.llm_clients()]
@@ -3557,6 +3562,10 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
     def route(self, verb, path):
         parts = [urllib.parse.unquote(p) for p in path.strip("/").split("/")[1:]]  # without "api"
         c = self.server.clusters
+        if parts == ["styles"] and verb == "GET":
+            return 200, dict(self.styles(), ok=True)
+        if parts == ["styles"] and verb == "PUT":
+            return 200, dict(self.styles(self.json_body()), ok=True)
         if parts == ["styles", "open"] and verb == "POST":
             return 200, self.open_stylesheet()
         if parts == ["health"] and verb == "GET":
@@ -3901,12 +3910,40 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             raise ConsoleError(503, f"could not open user.css with the OS default application: {e}", path=path) from e
         return {"ok": True, "path": path, "created": created}
 
+    def default_css(self):
+        """The bundled default-styles.css (None without --static)."""
+        if not self.server.static_dir:
+            return None
+        try:
+            with open(os.path.join(self.server.static_dir, "default-styles.css")) as f:
+                return f.read()
+        except OSError:
+            return None
+
+    def styles(self, values=None):
+        """GET /api/styles: what user.css sets each of default-styles.css's variables to (Interface Settings' form);
+        PUT (values): write them into user.css (console_styles.py)."""
+        defaults = self.default_css()
+        if defaults is None:
+            raise ConsoleError(503, "Interface Settings needs the bundled default-styles.css: run the console with --static")
+        path = os.path.join(console_dir(), "user.css")
+        console_styles.migrate(console_dir(), defaults)
+        if values is not None:
+            try:
+                current = console_styles.save(path, defaults, values)
+            except console_styles.StyleError as e:
+                raise ConsoleError(422, str(e)) from e
+        else:
+            try:
+                with open(path) as f:
+                    current = console_styles.read(f.read(), defaults)
+            except OSError:
+                current = console_styles.read("", defaults)
+        return {"path": path, "exists": os.path.isfile(path), "values": current}
+
     def serve_static(self, path):
         # One optional user file outside --static; never expose the console's other files.
         # Handle it before the SPA fallback, which would otherwise return HTML when it is absent.
-        if path == "/interface.css":      # the Interface Settings page's values (preferences.json)
-            css = console_prefs.interface_css(console_prefs.load(console_dir()))
-            return self.send_bytes(200, "text/css; charset=utf-8", css.encode(), cache=False)
         if path == "/user.css":
             try:
                 with open(os.path.join(console_dir(), "user.css"), "rb") as f:
@@ -3965,6 +4002,12 @@ def main(argv=None):
     except OSError as e:
         sys.exit(f"agent_console: can't listen on 127.0.0.1:{opts.port} ({e}); is it already running? "
                  f"pick another with --port")
+    if opts.static:      # Interface Settings' values from an earlier console's preferences.json, into user.css
+        try:
+            with open(os.path.join(opts.static, "default-styles.css")) as f:
+                console_styles.migrate(console_dir(), f.read())
+        except OSError:
+            pass
     write_private(session_file, json.dumps({"url": f"http://127.0.0.1:{server.port}", "key": key,
                                             "pid": os.getpid()}) + "\n")
     # a restart (Console Settings) runs this again: same port, the key through the environment, no new browser tab

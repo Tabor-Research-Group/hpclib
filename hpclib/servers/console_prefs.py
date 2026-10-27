@@ -12,8 +12,7 @@ The console's own preferences (this machine, not a cluster), kept in preferences
   llm_client_paths  where each client's configuration file is, when finding it isn't right ("" finds it), and
                   claude_command, the claude program Claude Code's entries are added with
   widgets         which packaged widgets are hidden, and their order (keys PACKAGE/ID)
-  interface       values for the page's CSS variables (default-styles.css): "common" ones, and colours for the
-                  light and dark themes; served as /interface.css, before the user's own user.css
+(Interface Settings' values live in user.css itself: console_styles.py.)
   system          this machine (local_platform.py): platform, "auto" or one of linux, macos, wsl, for when detection
                   gets it wrong ($HPCLIB_PLATFORM wins); windows_home, under WSL your Windows profile folder as WSL
                   sees it (/mnt/c/Users/NAME), when Windows can't be asked ("" asks)
@@ -35,18 +34,13 @@ DEFAULTS = {
     "new_cluster": {"connection_hours": 12, "work_dir_pattern": "", "sandbox_gpus": "auto", "max_gpus": None,
                     "mcp_name_pattern": "hpclib-{cluster}", "local_root_pattern": "", "mcp_python": ""},
     "llm_clients": {k: False for k in LLM_CLIENTS},
-    "interface": {"common": {}, "light": {}, "dark": {}},
     "widgets": {"hidden": [], "order": []},
     "system": {"platform": "auto", "windows_home": ""},
     "llm_client_paths": {k: "" for k in LLM_CLIENTS + ("claude_command",)},
 }
 PLATFORM_CHOICES = ("auto", "linux", "macos", "wsl")      # local_platform.CHOICES
-CSS_VAR_RE = re.compile(r"--[a-z][a-z0-9-]{0,47}")
-# a CSS value with nothing that ends a declaration or rule, escapes, comments or fetches anything
-CSS_VALUE_RE = re.compile(r"(?!.*(?:/\*|\*/|url\s*\(|@import|expression\s*\())[^;{}<>\\\n\r\0]{1,200}", re.I)
 WORK_PATTERN_RE = re.compile(r"(/[A-Za-z0-9_.@{}+-]+)+/?")
 MCP_PATTERN_RE = re.compile(r"(?:[A-Za-z0-9_-]|\{(?:cluster|user|host)\}){1,64}")      # agent_profiles' too
-MAX_VARS = 200
 WIDGET_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}/[a-z][a-z0-9_-]{0,31}")
 
 
@@ -125,24 +119,6 @@ def _new_cluster(values):
     return values
 
 
-def _interface(values):
-    if not isinstance(values, dict) or set(values) - {"common", "light", "dark"}:
-        raise PrefsError("interface has common, light and dark variable maps")
-    count = 0
-    for part, given in values.items():
-        if not isinstance(given, dict):
-            raise PrefsError(f"interface.{part} must map CSS variables to values")
-        for name, value in given.items():
-            count += 1
-            if not CSS_VAR_RE.fullmatch(name):
-                raise PrefsError(f"{name!r} is not a CSS variable name like --bg")
-            if not isinstance(value, str) or not CSS_VALUE_RE.fullmatch(value.strip()):
-                raise PrefsError(f"{name}: a value without ; {{ }} < > \\, comments or url()")
-    if count > MAX_VARS:
-        raise PrefsError(f"at most {MAX_VARS} interface values")
-    return {part: {k: v.strip() for k, v in given.items()} for part, given in values.items()}
-
-
 def _widgets(values):
     if not isinstance(values, dict) or set(values) - {"hidden", "order"}:
         raise PrefsError("widgets has hidden and order: lists of PACKAGE/ID")
@@ -182,7 +158,6 @@ CHECKS = {
     "notifications": lambda v: _bool_map(v, NOTIFICATIONS, "notifications"),
     "new_cluster": _new_cluster,
     "llm_clients": lambda v: _bool_map(v, LLM_CLIENTS, "llm_clients"),
-    "interface": _interface,
     "widgets": _widgets,
     "system": _system,
     "llm_client_paths": _client_paths,
@@ -190,39 +165,16 @@ CHECKS = {
 
 
 def update(console_dir, body):
-    """Merge {section: {...}} into the saved preferences (interface replaces its maps whole); returns them all."""
+    """Merge {section: {...}} into the saved preferences returns them all."""
     if not isinstance(body, dict) or not body or set(body) - set(CHECKS):
         raise PrefsError(f"preferences has the sections {', '.join(CHECKS)}")
     checked = {section: CHECKS[section](values) for section, values in body.items()}
     with _lock:
         prefs = load(console_dir)
         for section, values in checked.items():
-            if section == "interface":
-                prefs[section] = dict(DEFAULTS["interface"], **values)
-            else:
-                prefs[section].update(values)
+            prefs[section].update(values)
         _write(console_dir, prefs)
     return prefs
-
-
-def interface_css(prefs):
-    """/interface.css: the saved variables, laid over default-styles.css with the same theme selectors."""
-    ui = prefs.get("interface") or {}
-
-    def block(selector, values):
-        if not values:
-            return ""
-        body = "".join(f"  {k}: {v};\n" for k, v in sorted(values.items())
-                       if CSS_VAR_RE.fullmatch(k) and CSS_VALUE_RE.fullmatch(v))
-        return f"{selector} {{\n{body}}}\n" if body else ""
-
-    light = dict(ui.get("common") or {}, **(ui.get("light") or {}))
-    dark = ui.get("dark") or {}
-    return ("/* Saved on the console's Interface Settings page; user.css, loaded after this, wins. */\n" +
-            block(":root", light) +
-            ("@media (prefers-color-scheme: dark) {\n" + block(':root:not([data-theme="light"])', dark) + "}\n"
-             if dark else "") +
-            block(':root[data-theme="dark"]', dark))
 
 
 def cluster_config(prefs, config=None):

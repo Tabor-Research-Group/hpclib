@@ -182,7 +182,7 @@ const redraw = () => {
 };
 document.addEventListener("hpc-theme", () => { delete cache.theme; redraw(); });
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { delete cache.theme; redraw(); });
-document.getElementById("interface-css")?.addEventListener("load", () => { if (cache.theme) refresh("theme"); });
+document.getElementById("user-css")?.addEventListener("load", () => { if (cache.theme) refresh("theme"); });
 
 const NAV_RE = /^#\/[A-Za-z0-9_\-./%?=&@:~]*$/;
 

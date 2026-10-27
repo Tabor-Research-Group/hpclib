@@ -1,5 +1,5 @@
-// This machine's settings, from the console menu: the theme switch, Interface Settings (#/interface: the CSS
-// variables of default-styles.css), Console Settings (#/console: notifications, local ports, LLM clients,
+// This machine's settings, from the console menu: the theme switch, Interface Settings (#/interface: a form over
+// user.css for the variables of default-styles.css; GET/PUT /api/styles, console_styles.py), Console Settings (#/console: notifications, local ports, LLM clients,
 // defaults for new clusters), About (#/about: versions, the console's link, diagnostics), and the notifications
 // themselves. They use GET/PUT /api/preferences and the routes beside it (agent_console.py).
 import { el, action, confirmDialog } from "./components.js";
@@ -70,7 +70,7 @@ async function styleVariables() {
   return groups;
 }
 
-// the same CSS as /interface.css (console_prefs.interface_css), for the preview while editing
+// the form's values as CSS, laid over user.css while editing (Save writes them into user.css itself)
 function interfaceCss(ui) {
   const block = (sel, vals) => Object.keys(vals).length
     ? `${sel} {\n${Object.entries(vals).map(([k, v]) => `  ${k}: ${v};`).join("\n")}\n}\n` : "";
@@ -84,22 +84,25 @@ function previewStyle() {
   let s = document.getElementById("interface-preview");
   if (!s) {
     s = el("style", { id: "interface-preview" });
-    document.getElementById("user-css").before(s);     // user.css still wins, as it will once saved
+    document.getElementById("user-css").after(s);      // over user.css, as the saved values will be
   }
   return s;
 }
-function reloadInterfaceCss() {
-  const link = document.getElementById("interface-css");
-  link.href = `/interface.css?t=${Date.now()}`;
-  document.getElementById("interface-preview")?.remove();
+function reloadUserCss() {
+  const link = document.getElementById("user-css");
+  const done = () => document.getElementById("interface-preview")?.remove();   // no flash of the old values
+  link.addEventListener("load", done, { once: true });
+  link.addEventListener("error", done, { once: true });
+  link.href = `/user.css?t=${Date.now()}`;
 }
 
 const isHex = (v) => /^#[0-9a-f]{3}([0-9a-f]{3})?$/i.test(v || "");
 const fullHex = (v) => v.length === 4 ? "#" + [...v.slice(1)].map((c) => c + c).join("") : v;
 
 export async function interfacePage() {
-  const [groups, p] = await Promise.all([styleVariables(), loadPreferences()]);
-  const saved = (p && p.interface) || { common: {}, light: {}, dark: {} };
+  // the form shows what user.css sets (GET /api/styles), and Save writes it back there: one source of truth
+  const [groups, styles] = await Promise.all([styleVariables(), ctx.api("styles"), loadPreferences()]);
+  const saved = styles.values || { common: {}, light: {}, dark: {} };     // (a console too old for /api/styles)
   const ui = { common: { ...saved.common }, light: { ...saved.light }, dark: { ...saved.dark } };
   const changed = el("span", { class: "muted small", role: "status" });
   const preview = () => { previewStyle().textContent = interfaceCss(ui); changed.textContent = "Previewing: Save keeps it."; };
@@ -129,16 +132,15 @@ export async function interfacePage() {
                          el("span", { class: "muted small" }, "Dark"), input("dark", v, v.dark)))
         : el("td", {}, input("common", v, v.value))))))));
   const save = saveButton("Save", async () => {
-    prefs = await ctx.api("preferences", { method: "PUT", body: { interface: ui } });
-    reloadInterfaceCss();
+    const out = await ctx.api("styles", { method: "PUT", body: ui });
+    reloadUserCss();
     changed.textContent = "";
-    return "Saved for this console.";
+    return `Saved in ${out.path}.`;
   });
   const resetAll = action("Reset all", async () => {
-    if (!await confirmDialog("Reset the interface?", "Every value here goes back to its default " +
-                             "(user.css, if you have one, is not changed).", "Reset")) return;
-    prefs = await ctx.api("preferences", { method: "PUT", body: { interface: { common: {}, light: {}, dark: {} } } });
-    reloadInterfaceCss();
+    if (!await confirmDialog("Reset the interface?", "Every value here goes back to its default: user.css " +
+                             "loses the lines that set these variables. The rest of user.css stays.", "Reset")) return;
+    await ctx.api("styles", { method: "PUT", body: { common: {}, light: {}, dark: {} } });
     location.reload();
   });
   const openSheet = action("Open user.css", async () => {
@@ -148,8 +150,9 @@ export async function interfacePage() {
   return [
     el("h2", {}, "Interface Settings"),
     el("p", { class: "muted" }, "The page's look: colours (with their dark-theme values), type, corners, spacing " +
-      "and sizes. Empty fields use the default shown in them. Changes preview as you type; Save keeps them for " +
-      "this console, in every browser that opens it."),
+      "and sizes. This is a form over your user.css: it shows what user.css sets, and Save writes your changes " +
+      "into it, so editing user.css by hand and using this form are the same thing. Empty fields use the default " +
+      "shown in them. Changes preview as you type."),
     el("section", { class: "card" },
       el("h3", {}, "Theme"),
       themeChoice()),
@@ -158,8 +161,10 @@ export async function interfacePage() {
     rows,
     el("section", { class: "card" },
       el("h3", {}, "The complete stylesheet"),
-      el("p", { class: "muted" }, "For anything these fields don't cover, the console loads user.css after them: " +
-        "a copy of the defaults that you edit in your own editor, with any CSS. Where both set a variable, user.css wins."),
+      el("p", { class: "muted" }, `user.css (${styles.path}${styles.exists ? "" : ", not created yet"}) is ` +
+        "loaded after the defaults, and can hold any CSS. Save changes a variable where user.css sets it, takes " +
+        "out the ones set back to their default, and puts new ones in a marked block at its end; nothing else in " +
+        "it is touched. Reload this page after editing it by hand."),
       el("div", { class: "actions" },
         el("a", { class: "button", href: "default-styles.css", target: "_blank", rel: "noopener" }, "View the default stylesheet"),
         el("a", { class: "button", href: "/user.css", target: "_blank", rel: "noopener" }, "View user.css"),

@@ -15,8 +15,9 @@ your system's setting; **Match system** goes back to that. The choice is kept in
 
 Every variable of the page's stylesheet, grouped (colours, typography, corners, spacing, sizes) with what each one
 changes. The colours that differ between themes have a light and a dark value. Empty fields use the default shown
-in them. Changes preview as you type; **Save** keeps them for this console, in any browser that opens it, and
-**Reset all** returns to the defaults.
+in them. It is a form over your `user.css` (below): it shows what `user.css` sets, changes preview as you type,
+and **Save** writes them into `user.css`, so a browser that opens this console gets them, and editing the file by
+hand is the same thing. **Reset all** takes the lines that set these variables out of `user.css`.
 
 ![Interface Settings](../images/interface-settings.png)
 
@@ -25,9 +26,14 @@ tab of their own): show or hide each, and move it up or down within its place. W
 only the data their package lists, can't use the console's key or change anything, and have no network access.
 See [Console widgets](../extending.md#console-widgets).
 
-For anything else, the page loads your own stylesheet, `user.css` (in `~/.config/hpclib/console/`), last:
-**Open user.css** creates it from the defaults the first time and opens it in your editor. Where both set a
-variable, `user.css` wins. **View the default stylesheet** shows the full set of defaults.
+`user.css` (in `~/.config/hpclib/console/`) is your stylesheet, loaded after the defaults, and it can hold any
+CSS. **Open user.css** creates it from the defaults the first time and opens it in your editor. When you save on
+Interface Settings, a variable `user.css` already sets is changed where it is (your layout and comments stay),
+one set back to its default is taken out, and a new one goes in a block marked "Interface Settings" at the end of
+the file; nothing else in it is touched, and the file as it was before the first change is kept as
+`user.css.before-hpclib`. Reload the page after editing it by hand. **View the default stylesheet** shows the full
+set of defaults. (Earlier versions kept these values in `preferences.json`; the console moves them into
+`user.css` once.)
 
 ## Console Settings
 

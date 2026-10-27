@@ -34,7 +34,7 @@ class TestConsoleSettingsUI(unittest.TestCase):
 
     def handler(self, route, path):
         self.calls.append((route.request.method, path, route.request.post_data_json if route.request.post_data else None))
-        if path in ("preferences", "styles/open"):
+        if path in ("preferences", "styles/open", "styles"):
             route.continue_()            # the real console: preferences.json in a temporary directory
             return True
         answers = {
@@ -100,6 +100,25 @@ class TestConsoleSettingsUI(unittest.TestCase):
         self.assertEqual(self.page.locator("#app-title").inner_text(), "Interface Settings")
         self.assertEqual(self.errors, [])
 
+    def test_interface_settings_edit_a_copied_user_css_in_place(self):
+        defaults = (console_ui.ROOT / "agent-console" / "default-styles.css").read_text()
+        (self.console / "user.css").write_text(defaults.replace("--muted: #6e6e73;", "--muted: #555555;"))
+        self.open("#/interface")
+        muted = self.page.get_by_label("--muted (light)", exact=True)
+        muted.wait_for()
+        self.assertEqual(muted.input_value(), "#555555")                        # what user.css sets
+        self.assertEqual(self.page.get_by_label("--bg (light)", exact=True).input_value(), "")   # a copied default
+        self.page.get_by_label("--bg (light)", exact=True).fill("#ff4435")
+        with self.page.expect_response(lambda r: r.url.endswith("/api/styles") and r.request.method == "PUT"):
+            self.page.get_by_role("button", name="Save", exact=True).click()
+        text = (self.console / "user.css").read_text()
+        self.assertIn("  --bg: #ff4435;", text.split(":root {", 1)[1].split("}", 1)[0])   # changed in place
+        self.assertNotIn("Interface Settings <<<", text)                              # nothing new to add
+        var = "name => getComputedStyle(document.documentElement).getPropertyValue(name).trim()"
+        self.page.wait_for_function("getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() === '#ff4435'")
+        self.assertEqual(self.page.evaluate(var, "--muted"), "#555555")
+        self.assertEqual(self.errors, [])
+
     def test_interface_settings_preview_save_and_reset(self):
         self.open("#/interface")
         light = self.page.get_by_label("--accent (light)", exact=True)
@@ -110,13 +129,14 @@ class TestConsoleSettingsUI(unittest.TestCase):
         accent = "getComputedStyle(document.documentElement).getPropertyValue('--accent').trim()"
         self.assertEqual(self.page.evaluate(accent), "#7b3fbf")                    # previewed
         self.page.get_by_label("--radius-control", exact=True).fill("2px")
-        with self.page.expect_response(lambda r: r.url.endswith("/api/preferences") and r.request.method == "PUT"):
+        with self.page.expect_response(lambda r: r.url.endswith("/api/styles") and r.request.method == "PUT"):
             self.page.get_by_role("button", name="Save", exact=True).click()
-        saved = json.loads((self.console / "preferences.json").read_text())["interface"]
-        self.assertEqual(saved, {"common": {"--radius-control": "2px"}, "light": {"--accent": "#7b3fbf"}, "dark": {}})
+        block = (self.console / "user.css").read_text().split("Interface Settings")[1]   # a new user.css: the block
+        self.assertIn("--accent: #7b3fbf;", block)
+        self.assertIn("--radius-control: 2px;", block)
         self.page.reload()
         self.page.get_by_label("--accent (light)", exact=True).wait_for()
-        self.assertEqual(self.page.evaluate(accent), "#7b3fbf")                    # from /interface.css
+        self.assertEqual(self.page.evaluate(accent), "#7b3fbf")                    # from user.css
         self.assertEqual(self.page.get_by_label("--accent (light)", exact=True).input_value(), "#7b3fbf")
         self.page.evaluate("document.documentElement.dataset.theme = 'dark'")
         self.assertEqual(self.page.evaluate(accent), "#6ea0ff")                    # the dark default still applies

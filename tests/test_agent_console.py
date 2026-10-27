@@ -329,6 +329,8 @@ class TestStylesheets(ConsoleTestCase):
             self.assertEqual(destination.read_bytes(), (ui / "default-styles.css").read_bytes())
             opener.assert_called_once_with(str(destination))
             self.assertEqual(self.call("GET", "/user.css", key=None, raw=True)[1], destination.read_bytes())
+            # a copy of the defaults sets nothing of its own: Interface Settings' fields are empty
+            self.assertEqual(self.call("GET", "/api/styles")[1]["values"], {"common": {}, "light": {}, "dark": {}})
             for existing in (b":root { --accent: purple; }", b""):
                 destination.write_bytes(existing)
                 status, out = self.call("POST", "/api/styles/open", {"path": "elsewhere.css"})
@@ -337,6 +339,34 @@ class TestStylesheets(ConsoleTestCase):
                 self.assertEqual(destination.read_bytes(), existing)
                 self.assertFalse((self.console / "elsewhere.css").exists())
             self.assertEqual(opener.call_count, 3)
+
+    def test_interface_settings_read_and_write_user_css(self):
+        ui = Path(__file__).resolve().parents[1] / "agent-console"
+        self.console_server.static_dir = str(ui)
+        self.console.mkdir(parents=True, exist_ok=True)
+        css = self.console / "user.css"
+        css.write_text("/* mine */\n:root {\n  --accent: purple; /* my accent */\n}\nmain { padding: 0; }\n")
+        self.assertEqual(self.call("GET", "/api/styles")[1]["values"]["light"], {"--accent": "purple"})
+        status, out = self.call("PUT", "/api/styles", {"common": {"--radius-control": "2px"},
+                                                       "light": {"--accent": "#7b3fbf"}, "dark": {"--accent": "#c79bff"}})
+        self.assertEqual(status, 200, out)
+        text = css.read_text()
+        self.assertIn("  --accent: #7b3fbf; /* my accent */", text)             # changed where it was
+        self.assertIn("/* mine */", text)
+        self.assertIn("main { padding: 0; }", text)
+        self.assertIn("--radius-control: 2px;", text.split("Interface Settings")[1])   # new ones in the block
+        self.assertEqual(out["values"], {"common": {"--radius-control": "2px"}, "light": {"--accent": "#7b3fbf"},
+                                         "dark": {"--accent": "#c79bff"}})
+        self.assertEqual(self.call("GET", "/user.css", key=None, raw=True)[1].decode(), text)   # served as it is
+        self.assertIn("purple", (self.console / "user.css.before-hpclib").read_text())
+        # back to the defaults: the lines go, the rest stays
+        self.call("PUT", "/api/styles", {"common": {}, "light": {}, "dark": {}})
+        self.assertEqual(css.read_text(), "/* mine */\n:root {\n}\nmain { padding: 0; }\n")
+        for bad in ({"light": {"--nope": "1"}}, {"common": {"--accent": "red"}}, {"light": {"--bg": "red; } x {"}},
+                    {"light": {"--bg": "url(http://x)"}}, {"theme": {}}, ["x"]):
+            self.assertIn(self.call("PUT", "/api/styles", bad)[0], (400, 422), bad)
+        self.console_server.static_dir = None
+        self.assertEqual(self.call("GET", "/api/styles")[0], 503)
 
     def test_open_requires_key_and_post(self):
         with mock.patch.object(agent_console, "open_with_default_application") as opener:

@@ -38,22 +38,22 @@ class TestPreferences(ConsoleTestCase):
             with self.subTest(bad=bad):
                 self.assertEqual(self.call("PUT", "/api/preferences", bad)[0], 422)
 
-    def test_interface_css_lays_values_over_both_themes(self):
-        ui = {"common": {"--radius-control": "2px", "--font-ui": '"Segoe UI", sans-serif'},
-              "light": {"--accent": "#7b3fbf"}, "dark": {"--accent": "#c79bff"}}
-        self.assertEqual(self.call("PUT", "/api/preferences", {"interface": ui})[0], 200)
-        status, body, headers = self.call("GET", "/interface.css", key=None, raw=True)
-        self.assertEqual(status, 200)
-        self.assertTrue(headers["Content-Type"].startswith("text/css"))
-        css = body.decode()
-        root = css.split(":root {", 1)[1].split("}", 1)[0]
-        self.assertIn("--accent: #7b3fbf;", root)
-        self.assertIn('--font-ui: "Segoe UI", sans-serif;', root)
-        self.assertIn(':root:not([data-theme="light"]) {\n  --accent: #c79bff;', css)
-        self.assertIn(':root[data-theme="dark"] {\n  --accent: #c79bff;', css)
-        # the interface map is replaced whole: what's left out returns to the default
-        self.call("PUT", "/api/preferences", {"interface": {"common": {}, "light": {}, "dark": {}}})
-        self.assertNotIn("--", self.call("GET", "/interface.css", key=None, raw=True)[1].decode().split("*/", 1)[1])
+    def test_interface_values_move_from_preferences_into_user_css(self):
+        # an earlier console kept them in preferences.json; user.css's own value still wins where it has one
+        self.console_server.static_dir = str(Path(__file__).resolve().parents[1] / "agent-console")
+        self.console.mkdir(parents=True, exist_ok=True)
+        (self.console / "preferences.json").write_text(json.dumps({"notifications": {"job": True}, "interface": {
+            "common": {"--radius-control": "2px"}, "light": {"--accent": "#7b3fbf", "--bg": "#ff4435"},
+            "dark": {"--accent": "#c79bff"}}}))
+        (self.console / "user.css").write_text(":root {\n  --bg: #fafafa;\n}\n")
+        out = self.call("GET", "/api/styles")[1]["values"]
+        self.assertEqual(out, {"common": {"--radius-control": "2px"}, "light": {"--accent": "#7b3fbf", "--bg": "#fafafa"},
+                               "dark": {"--accent": "#c79bff"}})
+        prefs = json.loads((self.console / "preferences.json").read_text())
+        self.assertNotIn("interface", prefs)
+        self.assertTrue(prefs["notifications"]["job"])
+        self.assertEqual(self.call("GET", "/interface.css", key=None, raw=True)[0], 200)   # the SPA page, not CSS
+        self.assertEqual(self.call("PUT", "/api/preferences", {"interface": {"common": {}}})[0], 422)
 
     def test_new_cluster_defaults_apply_to_added_clusters(self):
         self.call("PUT", "/api/preferences", {"new_cluster": {"connection_hours": 48, "sandbox_gpus": "always",

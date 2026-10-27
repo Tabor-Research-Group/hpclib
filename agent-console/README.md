@@ -127,8 +127,9 @@ The top-left hamburger menu holds what belongs to this machine rather than a clu
 - a **dark-mode switch** (sun and moon). It is kept in this browser (`localStorage`, read by `theme.js` before
   the page draws) and sets `data-theme` on `<html>`; **Match system** removes the choice.
 - **Interface Settings** (`#/interface`): every variable in `default-styles.css`, grouped and described, with
-  light and dark values for the themed colours. Changes preview as you type; **Save** keeps them in
-  `preferences.json`, served as `/interface.css`. Links to the default stylesheet and `user.css`.
+  light and dark values for the themed colours: a form over `user.css`. It shows what `user.css` sets, previews
+  changes as you type, and **Save** writes them into `user.css` (console_styles.py). Links to the default
+  stylesheet and `user.css`.
 - **Console Settings** (`#/console`): browser notifications (a tunnel dropping, a password or host-key prompt, an
   agent's job finishing, a new proposal), the local port range and each tunnel's ports (**New ports** while it is
   stopped), the LLM clients that get each cluster's MCP entry (Claude Desktop, Claude Code, Cursor, and ChatGPT
@@ -152,8 +153,8 @@ An existing `user.css` is always preserved, including an empty one. The console 
 detect an editor. Saving changes and reloading the browser applies them.
 
 With `launch-tunnel-manager` or `agent_console --static ...`, the page loads `default-styles.css`
-(the complete default variable inventory), then `style.css` (the UI rules), then `/interface.css` (the values saved
-on Interface Settings), then the optional `user.css`, which wins over all of them.
+(the complete default variable inventory), then `style.css` (the UI rules), then the optional `user.css`, which
+wins over both. Interface Settings reads and writes `user.css` itself, so there is one place for your styling.
 Keep personal styling in `user.css` so it survives updates to hpclib. You can also create it yourself:
 
 ```bash

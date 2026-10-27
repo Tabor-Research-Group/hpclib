@@ -1,5 +1,6 @@
 /* Default console UI variables. Open Stylesheet copies this file to user.css once.
-   Keep the theme blocks when editing; changes apply after a browser reload.
+   Keep the theme blocks when editing; changes apply after a browser reload. Interface Settings is a form over
+   user.css: its Save changes these lines in place (and adds a marked block at the end for the rest).
    The theme follows the system unless the menu's dark-mode switch picks one (data-theme on <html>);
    colours set on Interface Settings (interface.css) are laid over these, and user.css over both. */
 :root {
@@ -117,7 +118,7 @@
 
   /* Sizes and behaviour */
   /* Main content width, including page padding */
-  --content-max-width: 1200px;
+  --content-max-width: 1600px;
   /* Dialog width before the viewport clamp */
   --dialog-max-width: 440px;
   /* Total horizontal clearance around dialogs */
