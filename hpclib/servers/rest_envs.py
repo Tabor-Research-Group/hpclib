@@ -13,6 +13,11 @@ in the token's directories.
     activation lines run inside its sandbox (so packages' activation
     scripts are sandboxed too) and read-only binds (uv's managed Pythons).
 
+uv's Python and cache directories and pixi's cache come from the
+environment (UV_PYTHON_INSTALL_DIR, UV_CACHE_DIR, PIXI_CACHE_DIR), else
+what lib/pytools.sh saved for the cluster ($HPCTUNNELS_DATA_DIR/settings/
+pytools.sh, the console's Settings -> uv and pixi), else the tools' own.
+
 Jobs only activate environments; they never resolve or download, so
 compute nodes don't need the network. The sync runs where the REST server
 runs (the tunnel's node). Config, the `environments` key of the server's
@@ -54,6 +59,33 @@ SEARCH = {
 LOG_TAIL = 60
 
 
+TOOL_DIR_VARS = ("UV_PYTHON_INSTALL_DIR", "UV_CACHE_DIR", "PIXI_CACHE_DIR")
+
+
+def saved_tool_dirs(environ=None):
+    """{VAR: DIR} from $HPCTUNNELS_DATA_DIR/settings/pytools.sh (written by lib/pytools.sh's hpclib_pytools set)."""
+    environ = os.environ if environ is None else environ
+    path = os.path.join(os.path.expanduser(environ.get("HPCTUNNELS_DATA_DIR") or "~/.local/tunnels"),
+                        "settings", "pytools.sh")
+    out = {}
+    try:
+        with open(path) as f:
+            lines = f.read(1 << 16).splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        name, sep, value = line.partition("=")
+        if not sep or name not in TOOL_DIR_VARS:
+            continue
+        try:
+            words = shlex.split(value)
+        except ValueError:
+            continue
+        if len(words) == 1 and words[0].startswith("/"):
+            out[name] = words[0]
+    return out
+
+
 class EnvironmentError_(Exception):
     """A request about environments that can't be done; `status` is the HTTP status."""
     def __init__(self, status, message, **extra):
@@ -71,6 +103,7 @@ def _has_pixi_table(pyproject):
 
 
 class EnvironmentManager:
+    RECHECK = 60     # seconds before a missing uv or pixi is looked for again
 
     def __init__(self, config=None, sandbox: 'rest_sandbox.Sandbox' = None, data_dir=None, which=None,
                  environ=None, sync_env=None):
@@ -98,13 +131,20 @@ class EnvironmentManager:
         self._which = which
         self._environ = environ
         self._tools = None
+        self._tools_at = 0
         self._lock = threading.Lock()
         self.syncs = {}
 
     # -- the tools -----------------------------------------------------------
 
     def env(self):
-        return dict(self._environ) if self._environ is not None else rest_sandbox.child_env()
+        """The syncs' environment: the server's, with the uv and pixi directories saved for this cluster (lib/pytools.sh,
+        the console's cluster Settings) where the environment doesn't set them."""
+        env = dict(self._environ) if self._environ is not None else rest_sandbox.child_env()
+        for k, v in saved_tool_dirs(env).items():
+            if not env.get(k):
+                env[k] = v
+        return env
 
     def _find(self, manager):
         wanted = self.wanted[manager]
@@ -136,7 +176,10 @@ class EnvironmentManager:
     def tools(self, refresh=False):
         """{manager: {"path", "version", "dirs": {...}}} for the tools found (cached)."""
         with self._lock:
-            if self._tools is not None and not refresh:
+            # cached; looked for again after a minute while one is missing (it may have been installed since)
+            fresh = self._tools is not None and (len(self._tools) == len(MANAGERS)
+                                                 or time.time() - self._tools_at < self.RECHECK)
+            if fresh and not refresh:
                 return self._tools
         home = os.path.expanduser("~")
         found = {}
@@ -168,7 +211,7 @@ class EnvironmentManager:
                 "dirs": {"cache": cache or os.path.join(home, ".cache", "rattler", "cache")},
             }
         with self._lock:
-            self._tools = found
+            self._tools, self._tools_at = found, time.time()
         return found
 
     def describe(self):

@@ -245,6 +245,91 @@ export class HpcLog extends HTMLElement {
   stop() { this.removeAttribute("every"); }
 }
 
+// ------------------------------------------------------------------ after setup: the LLM clients
+
+// arguments as one line, quoted where a shell would need it (the console splits them back the same way)
+export const shellJoin = (args) => (args || []).map((a) => /^[A-Za-z0-9_@%+=:,./-]+$/.test(a) ? a
+  : `'${a.replaceAll("'", "'\\''")}'`).join(" ");
+
+// The cluster's MCP entry in each LLM client on this machine (GET clusters/NAME/llm-clients), with Write entry
+// (POST llm-clients/ID/write {names}) for each: what Console Settings → LLM clients does, for this one cluster.
+// local: also what runs the server here (launch command and arguments) and the agent's local folders, saved at
+// once (PUT clusters/NAME/local: nothing to do on the cluster), as on the cluster's Settings tab.
+export function connectClients(name, { heading = null, local = false } = {}) {
+  const box = el("div", { class: "connect-clients" });
+  const draw = async () => {
+    let info;
+    try { info = await fetcher(`clusters/${enc(name)}/llm-clients`); }
+    catch (err) { box.replaceChildren(el("p", { class: "error-box" }, err.message)); return; }
+    const rows = (info.clients || []).filter((c) => c.available || c.state === "current").map((c) => {
+      const own = c.state === "current" && c.launcher === "own";
+      const state = own ? "has it, with its own launcher"
+        : { current: "has it", different: "has an older entry", missing: "doesn't have it" }[c.state] || "—";
+      const write = action(own ? "Use the console's launcher" : c.state === "current" ? "Write again" : "Write entry", async () => {
+        await fetcher(`llm-clients/${c.id}/write`, { method: "POST", body: { names: [info.mcp_name], force: true } });
+        await draw();
+      }, { primary: c.state !== "current", disabled: !!c.error });
+      return el("tr", {},
+        el("td", {}, el("strong", {}, c.title), c.windows ? el("span", { class: "muted small" }, " · Windows") : null,
+          el("div", { class: "muted small" }, c.path || "")),
+        el("td", { class: c.state === "current" ? "ok-text" : "muted" }, c.error || state,
+          c.state === "current" && c.after ? el("div", { class: "muted small" }, c.after) : null),
+        el("td", { class: "next" }, write));
+    });
+    // a client's own launcher can become the console's (e.g. /usr/bin/arch -arm64 PYTHON)
+    const theirs = (info.clients || []).filter((c) => c.launcher_argv && c.launcher_argv.length);
+    const sdk = info.python_has_mcp === false ? el("p", { class: "warning small" }, `${info.python} can't import ` +
+      "the MCP SDK, so a client can't start this server with the console's entry. " +
+      (theirs.length ? `${theirs.map((c) => c.title).join(" and ")} start${theirs.length === 1 ? "s" : ""} it their own way, ` +
+        "which you can use below. " : "") +
+      (local ? "Install the SDK for it (pip install mcp), or set another launch command here."
+        : "Change the launch command on the cluster's Settings tab.")) : null;
+    box.replaceChildren(...[
+      heading === "" ? null : el("h4", {}, heading || `Connect your LLM clients to ${info.mcp_name}`),
+      local ? localForm(name, info, theirs, draw) : sdk,
+      local ? sdk : null,
+      rows.length ? el("table", { class: "compact" }, el("tbody", {}, rows))
+        : el("p", { class: "muted" }, "No LLM client was found on this machine: copy the entry from the log above, " +
+          "or set where a client's configuration is on Console Settings → LLM clients."),
+      el("p", { class: "muted small" }, "Console Settings → LLM clients can keep every cluster's entries up to date " +
+        "after each setup, new ports and rename."),
+    ].filter(Boolean));
+  };
+  draw();
+  return box;
+}
+
+function localForm(name, info, theirs, redraw) {
+  const l = info.local || { command: "", args: [], local_roots: [] };
+  const command = el("input", { size: 30, value: l.command, "aria-label": "MCP launch command",
+    placeholder: "found: the installer's Python, else python3 with mcp" });
+  const args = el("input", { size: 44, value: shellJoin(l.args), "aria-label": "Launch arguments",
+    placeholder: "optional, e.g. -arm64 /path/to/python" });
+  const roots = el("textarea", { rows: 2, "aria-label": "Local folders for the agent's files",
+    placeholder: "~/Documents/hpclib-agents" }, (l.local_roots || []).join("\n"));
+  const put = (body) => fetcher(`clusters/${enc(name)}/local`, { method: "PUT", body });
+  const saveBtn = action("Save", async () => {
+    await put({ command: command.value.trim(), args: args.value.trim(),
+                local_roots: roots.value.split("\n").map((x) => x.trim()).filter(Boolean) });
+    await redraw();
+    return "";
+  }, { primary: true });
+  const adopt = theirs.map((c) => action(`Use ${c.title}'s launcher`, async () => {
+    await put({ command: c.launcher_argv[0], args: shellJoin(c.launcher_argv.slice(1)) });
+    await redraw();
+  }));
+  return el("div", { class: "local-mcp" },
+    el("p", { class: "muted small" }, "On this machine, nothing to set up on the cluster: what your LLM clients run " +
+      "for this server, and the folders the agent's push_files and pull_files may use. Saving writes mcp.json " +
+      "and the clients kept up to date. ", info.python ? ["Runs: ", el("code", {}, info.python)] : null),
+    el("div", { class: "row" },
+      el("hpc-field", { label: "MCP launch command", hint: "a Python with the mcp package, or a launcher such as /usr/bin/arch; empty: find a Python" }, command),
+      el("hpc-field", { label: "Launch arguments", hint: "before rest_mcp.py, space-separated (quote one with spaces)" }, args)),
+    el("div", { class: "row" },
+      el("hpc-field", { label: "Local folders for the agent's files", hint: "one per line, created if missing; empty: none" }, roots)),
+    el("div", { class: "actions" }, saveBtn, ...adopt));
+}
+
 // ------------------------------------------------------------------ <hpc-dialog>
 
 const DIALOG_CSS = css(`
@@ -688,6 +773,10 @@ class TunnelRow extends HTMLElement {
                                      failed: `failed (exit ${op.exit_code})` }[op.state] || op.state);
       panel.setAttribute("tone", { succeeded: "ok", failed: "error" }[op.state] || "");
       if (op.state !== "running") { log.stop(); this.refresh(); }
+      // setup done: write the cluster's MCP entry into the LLM clients from here, as Console Settings does
+      if (op.kind === "setup" && op.state === "succeeded" && !panel.querySelector(".connect-clients")) {
+        panel.append(connectClients(this.name));
+      }
     });
     panel.addEventListener("dismiss", () => TunnelRow.dismissOp(id));
     this.showDetail("operation", panel);

@@ -35,7 +35,7 @@ Common options:
 | `--local-root DIR` | a folder on your machine the agent may push from and pull into (repeatable; created if missing). Without it, the first run asks in a terminal (empty: none) or uses `$HPCLIB_AGENT_LOCAL_ROOT` |
 | `--no-local-root` | no local file access for the agent |
 | `--python-module MOD` / `--remote-python PATH` | choose the cluster's Python explicitly (`--remote-python auto` finds one again) |
-| `--mcp-python PATH` | the Python on this machine your LLM client runs the MCP server with (it needs the `mcp` package); kept in the profile. `auto` (the default) uses `$HPCLIB_MCP_PYTHON`, then the installer's environment (`~/.local/share/hpclib/mcp`), then a `python3` that has `mcp` |
+| `--mcp-command CMD`, `--mcp-args 'ARGS'` | what your LLM client runs for the MCP server: a Python with the `mcp` package, or a launcher, with the arguments before `rest_mcp.py` (split like a shell's), e.g. `--mcp-command /usr/bin/arch --mcp-args '-arm64 /path/to/venv/bin/python'`; kept in the profile. `--mcp-command auto` (the default) uses `$HPCLIB_MCP_PYTHON`, then the installer's environment (`~/.local/share/hpclib/mcp`), then a `python3` that has `mcp`. `--mcp-python PATH` is `--mcp-command PATH` with no arguments |
 | `--mcp-name NAME` | the MCP server's name: letters, digits, `-` and `_` (default `hpclib-` and the first part of the host name, e.g. `hpclib-grace`). A later rename keeps the old name in the profile, so the console can remove it from LLM clients |
 | `--port N`, `--process-port N`, `--new-ports` | the tunnel's ports (picked at random, then kept) |
 | `--no-sandbox` | leave jobs unsandboxed (not recommended) |
@@ -74,6 +74,7 @@ cat ~/.config/hpclib/agents/USER@HOST/mcp.json
 agent_tunnel user@login.example        # or the profile name; leave it running
 agent_stop user@login.example          # from another terminal, or Ctrl-C
 agent_list                             # every cluster set up on this machine
+agent_remove user@login.example        # forget it here: stops its tunnel, moves the profile to agents/.removed/
 ```
 
 `agent_tunnel` starts the `rest` tunnel with the profile's ports and directories, without a browser. Options:

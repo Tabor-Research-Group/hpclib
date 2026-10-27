@@ -31,7 +31,27 @@ Its address is `#/c/NAME/TAB`, so a tab can be bookmarked.
 | Storage | the work directories' sizes and file counts, their largest folders, and your storage quota and project balance (**Check quotas**). **Scan now** runs `du` over your login at low priority, at most 5 minutes per directory (a longer scan is marked partial); the result is kept on this machine |
 | Files | the cluster's files through its REST server (needs the agent tunnel), as the Files page was |
 | Agents | **Tunnel and setup**: the agent profile's row (start and stop the agent tunnel, its log, Update hpclib, Setup…, Set up SSH), the MCP server's name, and **Tunnel actions** (what tunnels may do for agents with your access: on or off per tunnel and per action, and whether each can run now); **Activity**: what agents did here; **SSH keys** |
-| Settings | the cluster's settings: its agent tunnel's job, ports (with **Clear leftover ports…**), **Quota checks**, and the REST server's limits and sandbox |
+| Settings | the cluster's settings, in this order: its agent **Tunnel** (the tunnel's job), the REST **Server** (its limits and sandbox), **uv and pixi** (install them, and their Python and cache directories), ports (with **Clear leftover ports…**), **Quota checks**, **LLM clients** (its MCP entry in each client on this machine, with **Write entry**), and **Remove this cluster** |
+
+### LLM clients
+
+After the tunnel, server, port and quota settings, the Settings tab shows the cluster's MCP entry in each LLM
+client installed here: whether the client has
+it, an older one or none, and **Write entry** to add or update it (only this cluster's; Console Settings → LLM
+clients writes every cluster's). An entry that starts the same server (the same URL, token and folders) with a
+launcher of its own, such as `/usr/bin/arch -arm64 PYTHON`, counts as having it and is never rewritten by
+**Write entries** or **Keep up to date**; **Use the console's launcher** replaces it. The card also says when the
+launcher the console writes can't import the MCP SDK. The same list opens in setup's panel when setup finishes.
+
+Above the list, what runs the server on this machine, changed without running setup again (nothing on the
+cluster depends on it): **MCP launch command** (a Python with the `mcp` package, or a launcher such as
+`/usr/bin/arch`), **Launch arguments**, the arguments before `rest_mcp.py`, separated by spaces (quote one that
+contains spaces), e.g. `-arm64 /path/to/venv/bin/python`, and the agent's **local folders** (for `push_files` and
+`pull_files`). **Save** writes `mcp.json` and the clients kept up to date. When a client already starts the
+server its own way, **Use … 's launcher** makes that the console's too. Console Settings → Defaults for new
+clusters suggests a launcher for new clusters. (Setup… holds only what the cluster needs.)
+
+![Settings, LLM clients](../images/cluster-llm-clients.png)
 
 ### Jobs
 
@@ -69,6 +89,28 @@ Overview.
 
 Jobs are labelled from what hpclib puts on them: `hpcrest-TEMPLATE` names and the `hpclib-rest:TOKEN:TEMPLATE`
 comment for agents' jobs, `TUNNEL-ID` names for tunnels. A job `job-queue` or you submitted yourself is "other".
+
+### uv and pixi
+
+**Settings → uv and pixi** shows whether uv and pixi are installed on the cluster (checked over your login) and
+installs or updates either with its official installer (the login node needs the internet; your shell startup
+files aren't changed). Below, where uv keeps the Pythons it downloads and where uv and pixi keep their package
+caches: home directories are small, so a scratch directory is the usual place. Empty is the tool's default; the
+directories are created when saved. When your `~/.bashrc` exports one, the card says so (it wins wherever
+`~/.bashrc` is sourced), and **Fill in what ~/.bashrc sets** copies those values in. See
+[uv and pixi](../cli/README.md#uv-and-pixi).
+
+![Settings, uv and pixi](../images/cluster-python-tools.png)
+
+## Removing a cluster
+
+**Remove this cluster**, at the end of its Settings tab, makes the console forget it: its profile (login, ports,
+tokens, `mcp.json`) moves to `~/.config/hpclib/agents/.removed/`, from where moving the folder back restores it.
+Before that it can revoke the cluster's agent token (with the agent tunnel up), stop its agent tunnel and apps, log
+out, and take its MCP entry out of your LLM clients. hpclib, your files and the REST server's settings on the
+cluster stay. On the command line: `agent_remove NAME` (it stops the agent tunnel and moves the profile).
+
+![Remove this cluster](../images/cluster-remove.png)
 
 ## Quotas
 

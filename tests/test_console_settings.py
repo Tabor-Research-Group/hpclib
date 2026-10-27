@@ -156,6 +156,83 @@ class TestLlmClients(ConsoleTestCase):
         self.assertNotIn("hpclib-gone", json.loads(self.cursor.read_text())["mcpServers"])
         self.assertIn("github", json.loads(self.cursor.read_text())["mcpServers"])
 
+    def test_one_clusters_entry_after_its_setup(self):
+        self.cursor.parent.mkdir(parents=True)
+        mine = agent_profiles.load(self.dead)["mcp_name"]
+        other = agent_profiles.load(self.live)["mcp_name"]
+        status, out = self.call("GET", f"/api/clusters/{self.dead}/llm-clients")
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["mcp_name"], mine)
+        cursor = next(c for c in out["clients"] if c["id"] == "cursor")
+        self.assertEqual((cursor["available"], cursor["state"]), (True, "missing"))
+        self.assertFalse(out["python_has_mcp"])                         # /py isn't a program here
+        status, out = self.call("POST", "/api/llm-clients/cursor/write", {"names": [mine]})
+        self.assertEqual((status, out["changed"]), (200, [mine]))
+        self.assertEqual(list(json.loads(self.cursor.read_text())["mcpServers"]), [mine])   # only this one
+        self.assertNotIn(other, self.cursor.read_text())
+        self.assertEqual(next(c for c in self.call("GET", f"/api/clusters/{self.dead}/llm-clients")[1]["clients"]
+                              if c["id"] == "cursor")["state"], "current")
+        self.assertEqual(self.call("POST", "/api/llm-clients/cursor/write", {"names": ["nobody"]})[0], 404)
+        self.assertEqual(self.call("POST", "/api/llm-clients/cursor/write", {"names": "x"})[0], 400)
+
+    def test_an_entry_with_its_own_launcher_counts_and_is_kept(self):
+        # e.g. /usr/bin/arch -arm64 PYTHON rest_mcp.py ...: the same server, started another way
+        self.cursor.parent.mkdir(parents=True)
+        mine = agent_profiles.load(self.dead)["mcp_name"]
+        entry = self.entries[mine]
+        own = {"command": "/usr/bin/arch", "args": ["-arm64", "/venv/bin/python", "/elsewhere/hpclib/servers/rest_mcp.py",
+                                                     *entry["args"][1:]]}
+        self.cursor.write_text(json.dumps({"mcpServers": {mine: own}}))
+        cursor = next(c for c in self.call("GET", f"/api/clusters/{self.dead}/llm-clients")[1]["clients"]
+                      if c["id"] == "cursor")
+        self.assertEqual((cursor["state"], cursor["launcher"]), ("current", "own"))
+        self.assertEqual(self.call("POST", "/api/llm-clients/cursor/write")[1]["changed"],
+                         [n for n in self.entries if n != mine])                     # kept: not rewritten
+        self.assertEqual(json.loads(self.cursor.read_text())["mcpServers"][mine], own)
+        # a stale one (another port) is: out of date
+        stale = dict(own, args=[a.replace(entry["args"][2], "http://127.0.0.1:1") for a in own["args"]])
+        self.cursor.write_text(json.dumps({"mcpServers": {mine: stale}}))
+        self.assertEqual(next(c for c in self.call("GET", f"/api/clusters/{self.dead}/llm-clients")[1]["clients"]
+                              if c["id"] == "cursor")["state"], "different")
+        # force: the console's launcher replaces it
+        self.cursor.write_text(json.dumps({"mcpServers": {mine: own}}))
+        self.call("POST", "/api/llm-clients/cursor/write", {"names": [mine], "force": True})
+        self.assertEqual(json.loads(self.cursor.read_text())["mcpServers"][mine], entry)
+
+    def test_the_launcher_here_changes_without_setup(self):
+        self.cursor.parent.mkdir(parents=True)
+        self.call("PUT", "/api/preferences", {"llm_clients": {"cursor": True}})
+        mine = agent_profiles.load(self.dead)["mcp_name"]
+        entry = self.entries[mine]
+        own = {"command": "/usr/bin/arch", "args": ["-arm64", "/venv/bin/python", "/x/rest_mcp.py", *entry["args"][1:]]}
+        self.cursor.write_text(json.dumps({"mcpServers": {mine: own}}))
+        info = self.call("GET", f"/api/clusters/{self.dead}/llm-clients")[1]
+        cursor = next(c for c in info["clients"] if c["id"] == "cursor")
+        self.assertEqual(cursor["launcher_argv"], ["/usr/bin/arch", "-arm64", "/venv/bin/python"])   # to adopt
+        folder = self.tmp / "agent files"
+        status, out = self.call("PUT", f"/api/clusters/{self.dead}/local",
+                                {"command": "/usr/bin/env", "args": "-i '/venv/my python'", "local_roots": [str(folder)]})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["entry"]["command"], "/usr/bin/env")
+        self.assertEqual(out["entry"]["args"][:3], ["-i", "/venv/my python", "/rest_mcp.py"])    # setup's rest_mcp.py
+        self.assertEqual(out["entry"]["args"][-2:], ["--local-root", str(folder.resolve())])
+        self.assertTrue(folder.is_dir())
+        saved = json.loads((Path(agent_profiles.profile_dir(self.dead)) / "mcp.json").read_text())
+        self.assertEqual(saved["mcpServers"][mine], out["entry"])
+        profile = agent_profiles.load(self.dead)
+        self.assertEqual((profile["mcp_command"], profile["mcp_args"]), ("/usr/bin/env", ["-i", "/venv/my python"]))
+        # the kept-up-to-date client: its own launcher served the old folders, so it is out of date and rewritten
+        self.assertEqual(json.loads(self.cursor.read_text())["mcpServers"][mine], out["entry"])
+        info = self.call("GET", f"/api/clusters/{self.dead}/llm-clients")[1]
+        self.assertEqual(info["local"], {"command": "/usr/bin/env", "args": ["-i", "/venv/my python"],
+                                         "local_roots": [str(folder.resolve())]})
+        # empty: a Python is found again, without arguments
+        out = self.call("PUT", f"/api/clusters/{self.dead}/local", {"command": ""})[1]
+        self.assertNotEqual(out["entry"]["command"], "/usr/bin/env")
+        self.assertTrue(out["entry"]["args"][0].endswith("rest_mcp.py"))
+        for bad in ({}, {"command": "/no/such"}, {"args": "'open"}, {"local_roots": ["relative"]}, {"other": 1}):
+            self.assertIn(self.call("PUT", f"/api/clusters/{self.dead}/local", bad)[0], (400, 422), bad)
+
     def test_unreadable_configuration_is_left_alone(self):
         self.cursor.parent.mkdir(parents=True)
         self.cursor.write_text("{ not json")

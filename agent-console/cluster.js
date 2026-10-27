@@ -2,7 +2,7 @@
 // page (Overview, Jobs, Apps, Installed, Storage, Files, Agents, Settings); #/c/NAME/apps/APP is one app there, with
 // its controls, tools and settings, and a package's tabs for it. They use the console's existing API, plus
 // GET clusters/NAME/jobs, GET/POST clusters/NAME/storage[/scan] and GET clusters/NAME/quota. app.js passes what they share with it (init).
-import { el, action, confirmDialog } from "./components.js";
+import { el, action, confirmDialog, connectClients } from "./components.js";
 import * as widgets from "./widgets.js";
 
 // { api, errorBox, render, settingsCards: (c) => [cards], addCluster: () => [button, area], files: (name) => page,
@@ -37,7 +37,7 @@ function subTabs(items, active) {
 
 // ---------------------------------------------------------------- small pieces
 
-function chip(label, tone = "down", title = null) {
+export function chip(label, tone = "down", title = null) {
   return el("span", { class: `chip ${tone}`, title }, label);
 }
 
@@ -517,8 +517,62 @@ function quotaCard(c, st) {
 
 // ---------------------------------------------------------------- Settings
 
-async function settings(c) {
-  return el("div", {}, await ctx.settingsCards(c));
+async function settings(c, local, sub) {
+  // tunnel, server, port clearing, quota checks; then the MCP entry in the LLM clients; removal last
+  const page = el("div", {}, await ctx.settingsCards(c), llmClientsCard(c), removeCard(c));
+  if (sub === "llm-clients") requestAnimationFrame(() => page.querySelector("#cluster-llm-clients")?.scrollIntoView());
+  return page;
+}
+
+// The cluster's MCP entry in the LLM clients on this machine, always here (and in setup's panel right after it)
+function llmClientsCard(c) {
+  return el("section", { class: "card", id: "cluster-llm-clients" },
+    el("h3", {}, "LLM clients ", el("span", { class: "muted" }, `· ${c.mcp_name || "its MCP entry"}`)),
+    c.set_up ? connectClients(c.name, { heading: "", local: true })
+      : el("p", { class: "muted" }, "Set the cluster up first (Agents → Setup…): setup writes the MCP entry the " +
+        "clients run."));
+}
+
+// Remove this cluster (DELETE clusters/NAME): forget it on this machine. Its profile and tokens move to
+// agents/.removed/ (so it can be put back); nothing on the cluster changes except, if asked, the agent token.
+function removeCard(c) {
+  const canRevoke = tunnelUp(c) && c.has_owner_token && c.set_up;
+  const box = (label, checked, disabled = false, title = null) => {
+    const input = el("input", { type: "checkbox", checked, disabled });
+    return [input, el("label", { class: "check", title }, input, " ", label)];
+  };
+  const [revoke, revokeLabel] = box("Revoke its agent token on the cluster first", canRevoke, !canRevoke,
+    canRevoke ? null : "needs the agent tunnel up and the owner token");
+  const [stop, stopLabel] = box("Stop its agent tunnel and apps", true);
+  const [logout, logoutLabel] = box("Log out", true);
+  const [clients, clientsLabel] = box(`Take ${c.mcp_name || "its MCP entry"} out of your LLM clients`, true);
+  const remove = action("Remove cluster…", async () => {
+    if (!await confirmDialog(`Remove ${c.name}?`, `The console forgets ${c.name}: its login, ports, tokens and ` +
+        "settings here. They are kept in a folder of removed profiles, from where they can be moved back. Files, " +
+        "jobs and hpclib on the cluster stay as they are.", "Remove")) return null;
+    const out = await ctx.api(path(c.name), { method: "DELETE", body: {
+      revoke_token: revoke.checked, stop_tunnels: stop.checked, log_out: logout.checked, llm_clients: clients.checked } });
+    const done = [out.token_revoked ? "its agent token was revoked" : null, out.tunnel_stopped ? "its tunnel was stopped" : null,
+      Object.keys(out.llm_clients || {}).length ? `its MCP entry was taken out of ${Object.keys(out.llm_clients).join(", ")}` : null]
+      .filter(Boolean);
+    card.replaceChildren(...[
+      el("h3", {}, `${c.name} was removed`),
+      el("p", {}, done.length ? `${done.join("; ")}. ` : "", "Its profile and tokens are in ", el("code", {}, out.kept_in),
+        " (move that folder back into ~/.config/hpclib/agents/ to restore it)."),
+      out.warnings && out.warnings.length ? el("ul", { class: "error-box" }, out.warnings.map((w) => el("li", {}, w))) : null,
+      el("div", { class: "actions" }, el("a", { class: "button primary", href: "#/c" }, "Back to Clusters")),
+    ].filter(Boolean));
+    return null;
+  }, { primary: true });
+  remove.classList.add("danger");
+  const card = el("section", { class: "card danger-zone", id: "remove-cluster" },
+    el("h3", {}, "Remove this cluster"),
+    el("p", { class: "muted" }, "For a cluster you no longer use, or one to set up again from scratch. The profile " +
+      "(login, ports, tokens, mcp.json) moves to ~/.config/hpclib/agents/.removed/; on the cluster, hpclib, your " +
+      "files and the REST server's settings stay. On the command line: agent_remove NAME."),
+    el("div", { class: "checks" }, revokeLabel, stopLabel, logoutLabel, clientsLabel),
+    el("div", { class: "actions" }, remove));
+  return card;
 }
 
 // ---------------------------------------------------------------- a packaged widget's tab

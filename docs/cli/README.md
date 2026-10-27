@@ -30,6 +30,7 @@ Run on **your machine**:
 | `setup_cluster_ssh HOST` | initialize shared-home login-to-compute key authentication; [SSH key guide](../ssh-keys.md) |
 | `agent_tunnel HOST`, `agent_stop HOST` | start or stop the agents' REST tunnel |
 | `agent_list`, `agent_env HOST` | the clusters set up on this machine; environment variables for scripts |
+| `agent_remove HOST` | forget a cluster here: stop its agent tunnel, move its profile to `~/.config/hpclib/agents/.removed/` |
 | `agent_console`, `launch-tunnel-manager` | the web interface's backend (see [Using the interface](../interface/README.md)) |
 
 Run on **a cluster**:
@@ -43,6 +44,27 @@ Run on **a cluster**:
 | `python3 hpclib/servers/rest_server.py --list-tokens` etc. | manage the REST server's tokens and proposals |
 
 Most functions print their usage with `-h` or when given no arguments.
+
+## uv and pixi
+
+`hpclib_pytools` (on a cluster) installs [uv](https://docs.astral.sh/uv/) and [pixi](https://pixi.sh) and
+remembers where they keep what they download. Template jobs, app environments and the agents' environment syncs
+prefer uv and pixi projects.
+
+```bash
+hpclib_pytools                                   # where each is, its version, and the directories in use
+hpclib_pytools install uv                        # the official installer, into ~/.local/bin (pixi: ~/.pixi/bin);
+hpclib_pytools install pixi                      #   your ~/.bashrc is left alone
+hpclib_pytools set UV_PYTHON_INSTALL_DIR /scratch/user/$USER/.uv/python
+hpclib_pytools set UV_CACHE_DIR /scratch/user/$USER/.uv/cache
+hpclib_pytools set PIXI_CACHE_DIR /scratch/user/$USER/.pixi/cache
+hpclib_pytools set UV_CACHE_DIR default          # forget one
+```
+
+The directories are saved in `$HPCTUNNELS_DATA_DIR/settings/pytools.sh`. Sourcing `hpclib.sh` exports the ones
+your environment doesn't already set, so a variable your `~/.bashrc` exports wins; the REST server's syncs use
+them the same way. The console's cluster **Settings → uv and pixi** does the same over your login, and fills in
+what your `~/.bashrc` sets on request.
 
 ## Quotas
 

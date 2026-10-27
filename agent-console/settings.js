@@ -482,7 +482,8 @@ function defaultsCard(p) {
   const pattern = el("input", { value: d.work_dir_pattern || "", placeholder: "/scratch/user/{user}/llm", size: 34 });
   const mcpName = el("input", { value: d.mcp_name_pattern || "hpclib-{cluster}", placeholder: "hpclib-{cluster}", size: 22 });
   const localRoot = el("input", { value: d.local_root_pattern || "", placeholder: "~/Documents/hpclib-agents/{cluster}", size: 34 });
-  const mcpPython = el("input", { value: d.mcp_python || "", placeholder: "found: the installer's environment, else python3", size: 34 });
+  const mcpCommand = el("input", { value: d.mcp_command || "", placeholder: "found: the installer's Python, else python3", size: 30 });
+  const mcpArgs = el("input", { value: d.mcp_args || "", placeholder: "optional, e.g. -arm64 /path/to/python", size: 34 });
   const gpus = el("select", {}, [["auto", "when the job asks for GPUs"], ["always", "always"], ["never", "never"]]
     .map(([v, t]) => el("option", { value: v, selected: d.sandbox_gpus === v }, t)));
   const maxGpus = el("input", { type: "number", min: 0, max: 64, value: d.max_gpus ?? "", placeholder: "server default (0)", size: 10 });
@@ -491,7 +492,7 @@ function defaultsCard(p) {
       connection_hours: Number(hours.value), work_dir_pattern: pattern.value.trim(), sandbox_gpus: gpus.value,
       max_gpus: maxGpus.value === "" ? null : Number(maxGpus.value),
       mcp_name_pattern: mcpName.value.trim() || "hpclib-{cluster}", local_root_pattern: localRoot.value.trim(),
-      mcp_python: mcpPython.value.trim() } } });
+      mcp_command: mcpCommand.value.trim(), mcp_args: mcpArgs.value.trim() } } });
     return "Saved. Clusters added from now on start with these; each can change them on its own Settings tab.";
   });
   return el("section", { class: "card", id: "new-cluster" },
@@ -501,7 +502,8 @@ function defaultsCard(p) {
       field("Work directory", pattern, "suggested by Add cluster; {user} is the login's user"),
       field("MCP server name", mcpName, "what LLM clients call it; {cluster}, {host}, {user}"),
       field("Local folder for agents' files", localRoot, "on this machine, suggested by Add cluster and Set up; {cluster}, {user}; empty: none"),
-      field("Python for MCP servers", mcpPython, "on this machine, with the mcp package; empty: find one. Each cluster's Set up can change it"),
+      field("MCP launch command", mcpCommand, "what LLM clients run for a cluster's MCP server: a Python with mcp, or a launcher such as /usr/bin/arch; empty: find a Python"),
+      field("Launch arguments", mcpArgs, "before rest_mcp.py, space-separated; each cluster's Set up can change both"),
       field("NVIDIA GPUs in sandboxed jobs", gpus, "the REST server's --nv"),
       field("GPUs per job, at most", maxGpus, "empty: the server's default")),
     el("p", { class: "muted small" }, "A cluster configuration from a package keeps its own login time; the GPU " +

@@ -910,16 +910,24 @@ function _hpclib_agent_lines {  # _hpclib_agent_lines NAME KEY: a list-valued pr
 # The Python that will run rest_mcp.py: $HPCLIB_MCP_PYTHON, or the first
 # python3 that has the MCP SDK. Prints the path; returns 1 (printing plain
 # python3's path) if none has it.
-# The Python this machine runs the MCP server with: the cluster profile's own (setup_agents --mcp-python),
-# $HPCLIB_MCP_PYTHON, install.sh's environment, or a python3 that has the MCP SDK. The profile's and the
-# variable's are used as given (a warning follows if they lack the SDK); the others only if they have it.
+# What this machine runs the MCP server with: the cluster profile's launch command (setup_agents --mcp-command,
+# with --mcp-args before rest_mcp.py), $HPCLIB_MCP_PYTHON, install.sh's environment, or a python3 that has the
+# MCP SDK. The profile's and the variable's are used as given (a warning follows if `COMMAND ARGS -c 'import mcp'`
+# fails); the others only if they have it. Prints the command.
 function _hpclib_mcp_python {  # _hpclib_mcp_python [PROFILE]
-  local candidate chosen=''
-  [ -n "${1:-}" ] && chosen=$(_hpclib_agent_profiles get "$1" mcp_python 2>/dev/null)
+  local candidate chosen='' launch_args=() a
+  if [ -n "${1:-}" ]; then
+    chosen=$(_hpclib_agent_profiles get "$1" mcp_command 2>/dev/null)
+    if [ -n "$chosen" ]; then
+      while IFS= read -r a; do [ -n "$a" ] && launch_args+=("$a"); done < <(_hpclib_agent_lines "$1" mcp_args)
+    else
+      chosen=$(_hpclib_agent_profiles get "$1" mcp_python 2>/dev/null)     # hpclib 1.4 to 1.8
+    fi
+  fi
   chosen="${chosen:-${HPCLIB_MCP_PYTHON:-}}"
   if [ -n "$chosen" ]; then
     printf '%s\n' "$chosen"
-    "$chosen" -c 'import mcp' > /dev/null 2>&1
+    "$chosen" "${launch_args[@]}" -c 'import mcp' > /dev/null 2>&1
     return
   fi
   for candidate in "${HPCLIB_MCP_VENV:-$HOME/.local/share/hpclib/mcp}/bin/python" \
@@ -1009,8 +1017,8 @@ function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROF
   printf '   %sThen quit the client completely (Claude Desktop: %s) and reopen it.%s\n' \
     "$_c_alert" "$quit_hint" "$_c_reset"
   if [ "$mcp_ok" = no ]; then
-    printf '   %s%s has no MCP SDK: run `%s -m pip install mcp`, or choose another with --mcp-python and rerun%s\n' \
-      "$_c_warn" "$mcp_python" "$mcp_python" "$_c_reset"
+    printf '   %s%s has no MCP SDK: install it (pip install mcp) for it, or choose another launcher with --mcp-command\n   (and --mcp-args) and rerun%s\n' \
+      "$_c_warn" "$mcp_python" "$_c_reset"
   fi
   printf '\n%s3. Check it%s (with the tunnel up)\n' "$_c_head" "$_c_reset"
   printf '   %scurl -s -H "Authorization: Bearer $(cat %s)" http://127.0.0.1:%s/health%s\n' \
@@ -1058,18 +1066,18 @@ function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROF
 function setup_agents {
   local usage='usage: setup_agents [--work-dir DIR ...] [--bind DIR ...] [--local-root DIR ...] [--templates LIST|all]
        [--config FILE] [--no-sandbox] [--rebuild] [--no-install] [--target DIR] [--name NAME]
-       [--no-local-root] [--python-module MODULE ...] [--remote-python PATH|auto] [--mcp-python PATH|auto] [--port N] [--process-port N] [--new-ports] [--token-name NAME] [--token-file FILE]
+       [--no-local-root] [--python-module MODULE ...] [--remote-python PATH|auto] [--mcp-command PATH|auto] [--mcp-args 'ARGS'] [--port N] [--process-port N] [--new-ports] [--token-name NAME] [--token-file FILE]
        [--owner-token-file FILE] [--mcp-name NAME] [--scopes LIST] [ssh options] [user@]host'
   local work_dirs=() binds=() local_roots=() login_args=() hosts=()
   local name='' token_name='' token_file='' owner_file='' port='' process_port='' mcp_name='' new_ports=no
-  local no_local_root=no python_modules=() remote_python='' mcp_python=''
+  local no_local_root=no python_modules=() remote_python='' mcp_python='' mcp_args_given=no mcp_args=''
   local scopes="read,submit,propose,files:write,envs"
   local templates="hello,orca,python_project,writing_templates" base_config='' sandbox=yes rebuild=no install=yes
   local target="$HPCLIB_REMOTE_INSTALL_LOCATION"
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --work-dir|--token-name|--token-file|--owner-token-file|--scopes|--templates|--config|--bind|--target|\
---name|--port|--process-port|--mcp-name|--local-root|--python-module|--remote-python|--mcp-python)
+--name|--port|--process-port|--mcp-name|--local-root|--python-module|--remote-python|--mcp-python|--mcp-command)
         if [ "$#" -lt 2 ] || [ -z "$2" ]; then
           echo "setup_agents: $1 needs a value" >&2
           return 2
@@ -1091,7 +1099,7 @@ function setup_agents {
           --local-root) local_roots+=("$2") ;;
           --python-module) python_modules+=("$2") ;;
           --remote-python) remote_python="$2" ;;
-          --mcp-python) mcp_python="$2" ;;
+          --mcp-python|--mcp-command) mcp_python="$2" ;;
         esac
         shift 2 ;;
       --no-sandbox) sandbox=no; shift ;;
@@ -1099,6 +1107,8 @@ function setup_agents {
       --no-install) install=no; shift ;;
       --new-ports) new_ports=yes; shift ;;
       --no-local-root) no_local_root=yes; shift ;;
+      --mcp-args) [ "$#" -ge 2 ] || { echo "setup_agents: --mcp-args needs a value ('' for none)" >&2; return 2; }
+                  mcp_args="$2" mcp_args_given=yes; shift 2 ;;
       -h|--help) echo "$usage"; return 0 ;;
       *) login_args+=("$1"); shift ;;
     esac
@@ -1132,14 +1142,26 @@ function setup_agents {
   for d in "${local_roots[@]}"; do
     [ -d "$d" ] || { echo "setup_agents: --local-root $d is not a directory on this machine" >&2; return 2; }
   done
+  # the MCP server's launcher: a command (a Python, or e.g. /usr/bin/arch) and the arguments before rest_mcp.py
+  local mcp_arg_list=() a
+  if [ "$mcp_args_given" = yes ] && [ -n "$mcp_args" ]; then
+    local split
+    split=$(python3 -c '
+import shlex, sys
+try:
+    print("\n".join(shlex.split(sys.argv[1])))
+except ValueError as e:
+    sys.exit(f"setup_agents: --mcp-args: {e}")' "$mcp_args") || return 2
+    while IFS= read -r a; do [ -n "$a" ] && mcp_arg_list+=("$a"); done <<< "$split"
+  fi
   if [ -n "$mcp_python" ] && [ "$mcp_python" != auto ]; then
     case "$mcp_python" in "~/"*) mcp_python="$HOME/${mcp_python#\~/}" ;; esac
     if [ ! -x "$mcp_python" ] || [ -d "$mcp_python" ]; then
-      echo "setup_agents: --mcp-python $mcp_python is not a program on this machine" >&2
+      echo "setup_agents: --mcp-command $mcp_python is not a program on this machine" >&2
       return 2
     fi
-    "$mcp_python" -c 'import mcp' > /dev/null 2>&1 ||
-      echo "setup_agents: note: $mcp_python has no MCP SDK yet ($mcp_python -m pip install mcp)" >&2
+    "$mcp_python" "${mcp_arg_list[@]}" -c 'import mcp' > /dev/null 2>&1 ||
+      echo "setup_agents: note: $mcp_python ${mcp_arg_list[*]} can't import the MCP SDK (pip install mcp for it)" >&2
   fi
   case "$remote_python" in
     auto|/*|'') ;;
@@ -1199,9 +1221,14 @@ function setup_agents {
   [ -n "$process_port" ] && updates+=("process_port=$process_port")
   [ -n "$mcp_name" ] && updates+=("mcp_name=$mcp_name")
   if [ "$mcp_python" = auto ]; then
-    updates+=("mcp_python=")
+    updates+=("mcp_command=" "mcp_python=" "mcp_args=")
   elif [ -n "$mcp_python" ]; then
-    updates+=("mcp_python=$mcp_python")
+    updates+=("mcp_command=$mcp_python" "mcp_python=")
+    [ "$mcp_args_given" = yes ] || updates+=("mcp_args=")      # a new command doesn't keep another's arguments
+  fi
+  if [ "$mcp_args_given" = yes ]; then
+    updates+=("mcp_args=")
+    for a in "${mcp_arg_list[@]}"; do updates+=("mcp_args+=$a"); done
   fi
   if [ "${#python_modules[@]}" -gt 0 ]; then
     updates+=("python_spec=modules:${python_modules[*]}")
@@ -1450,6 +1477,26 @@ function agent_env {
     return 1
   }
   _hpclib_agent_profiles env "$name"
+}
+
+# Forget a cluster set up with setup_agents: its agent tunnel is stopped (unless --keep-running), and its profile
+# (login, ports, tokens, mcp.json) moves to ~/.config/hpclib/agents/.removed/, from where it can be moved back.
+# Nothing on the cluster changes; the console's Settings tab (Remove this cluster) also revokes the agent token
+# and takes the MCP entry out of your LLM clients.
+#   agent_remove [--keep-running] NAME|[user@]host
+function agent_remove {
+  local keep=no name dest
+  [ "${1:-}" = --keep-running ] && { keep=yes; shift; }
+  name=$(_hpclib_agent_profiles find "${1:-}") || {
+    echo "agent_remove: no agent profile for '${1:-}' (agent_list shows the profiles)" >&2
+    return 1
+  }
+  if [ "$keep" = no ]; then
+    agent_stop "$name" > /dev/null 2>&1 || true
+  fi
+  dest=$(_hpclib_agent_profiles remove "$name") || return 1
+  echo "removed $name; its profile and tokens are in $dest"
+  echo "its MCP entry ($(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mcp_name"])' "$dest/profile.json" 2>/dev/null || echo "?")) may still be in your LLM clients"
 }
 
 # The clusters set up with setup_agents on this machine.

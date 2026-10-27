@@ -438,6 +438,29 @@ def _same(a, b):
     return isinstance(a, dict) and a.get("command") == b["command"] and a.get("args") == b["args"]
 
 
+def _split(entry):
+    """(launcher, server): the argv that starts Python (the command and any arguments before rest_mcp.py, such as
+    /usr/bin/arch -arm64 PYTHON, or wsl.exe ... PYTHON) and rest_mcp.py's own arguments (None: no rest_mcp.py)."""
+    args = list(entry.get("args") or []) if isinstance(entry, dict) else []
+    for i, a in enumerate(args):
+        if isinstance(a, str) and os.path.basename(a.replace("\\", "/")) == "rest_mcp.py":
+            return [entry.get("command"), *args[:i]], args[i + 1:]
+    return [entry.get("command") if isinstance(entry, dict) else None, *args], None
+
+
+def launcher(entry):
+    """The argv before rest_mcp.py ([] for no entry)."""
+    argv = _split(entry)[0]
+    return [a for a in argv if a] if argv and argv[0] else []
+
+
+def _serves(have, want):
+    """The client's entry starts the same server as ours (the same URL, token and folders), whatever launches it:
+    a launcher of your own (e.g. /usr/bin/arch -arm64 PYTHON) counts as having it."""
+    mine, theirs = _split(want)[1], _split(have)[1]
+    return mine is not None and theirs is not None and mine == theirs
+
+
 def status(cid, wanted, owned):
     """
     What the client has: each wanted entry current / different (an older port or path) / missing, and `stale`:
@@ -461,8 +484,10 @@ def status(cid, wanted, owned):
     wanted = {name: entry_for(cid, entry) for name, entry in wanted.items()}
     for name, entry in sorted(wanted.items()):
         have = servers.get(name)
-        out["entries"].append({"name": name, "state": "missing" if have is None else
-                               ("current" if _same(have, entry) else "different")})
+        state = "missing" if have is None else "current" if _same(have, entry) or _serves(have, entry) else "different"
+        own = state == "current" and not _same(have, entry)
+        out["entries"].append({"name": name, "state": state, "launcher": "own" if own else None,
+                               "launcher_argv": launcher(have) if own and not windows_client(cid) else None})
     out["stale"] = sorted(n for n in servers if n not in wanted and owned(n))
     return out
 
@@ -526,8 +551,9 @@ def _claude(args, timeout=60):
         raise ClientError(f"claude mcp {args[0]}: {e}") from e
 
 
-def write(cid, wanted):
-    """Add or update every wanted entry; returns the names changed."""
+def write(cid, wanted, force=False):
+    """Add or update every wanted entry; returns the names changed. An entry that starts the same server with a
+    launcher of its own is left as it is, unless force."""
     spec = CLIENTS[cid]
     if spec["path"]() is None:
         raise ClientError(NO_WINDOWS_HOME)
@@ -539,21 +565,22 @@ def write(cid, wanted):
 
         def change(servers):
             for name, entry in wanted.items():
-                if not _same(servers.get(name), entry):
+                if not _same(servers.get(name), entry) and (force or not _serves(servers.get(name), entry)):
                     servers[name] = dict(servers.get(name) or {}, **entry)
                     changed.append(name)
         _write_file(spec["path"](), change)
         return changed
     if spec["kind"] == "toml":
         servers, _ = _read_servers(spec["path"]())
-        changed = [n for n, e in wanted.items() if not _same(servers.get(n), e)]
+        changed = [n for n, e in wanted.items()
+                   if not _same(servers.get(n), e) and (force or not _serves(servers.get(n), e))]
         if changed:
             _write_toml(spec["path"](), put={n: wanted[n] for n in changed})
         return changed
     servers, _ = _read_servers(spec["path"]())
     changed = []
     for name, entry in wanted.items():
-        if _same(servers.get(name), entry):
+        if _same(servers.get(name), entry) or (not force and _serves(servers.get(name), entry)):
             continue
         if name in servers:
             _claude(["remove", "--scope", "user", name])
@@ -587,4 +614,5 @@ def has_other(cid, name, entry):
         servers, _ = _read_servers(CLIENTS[cid]["path"]())
     except ClientError:
         return False
-    return name in servers and not _same(servers[name], entry_for(cid, entry))
+    mine = entry_for(cid, entry)
+    return name in servers and not _same(servers[name], mine) and not _serves(servers[name], mine)

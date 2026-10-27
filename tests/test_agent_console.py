@@ -412,6 +412,60 @@ class TestStylesheets(ConsoleTestCase):
             opener.assert_not_called()
 
 
+class TestRemoveCluster(ConsoleTestCase):
+    def setUp(self):
+        super().setUp()
+        self.home = Path(self.tmp) / "client-home"
+        env = mock.patch.dict(os.environ, {"HPCLIB_MCP_CLIENT_HOME": str(self.home), "HPCLIB_CLAUDE_BIN": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        self.disconnected = []
+        patch = mock.patch.object(self.clusters.logins, "disconnect",
+                                  side_effect=lambda p: self.disconnected.append(p["name"]) or {"logged_out": True})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_forgotten_here_and_kept_aside(self):
+        mcp = agent_profiles.load(self.dead)["mcp_name"]
+        cursor = self.home / ".cursor" / "mcp.json"
+        cursor.parent.mkdir(parents=True)
+        cursor.write_text(json.dumps({"mcpServers": {mcp: {"command": "x"}, "github": {"command": "gh"}}}))
+        for bad in ({"revoke_token": "yes"}, {"nuke": True}):
+            self.assertEqual(self.call("DELETE", f"/api/clusters/{self.dead}", bad)[0], 400, bad)
+        self.clusters.ops[self.dead] = {"state": "running", "kind": "setup"}
+        self.assertEqual(self.call("DELETE", f"/api/clusters/{self.dead}")[0], 409)
+        del self.clusters.ops[self.dead]
+        status, out = self.call("DELETE", f"/api/clusters/{self.dead}")
+        self.assertEqual(status, 200, out)
+        kept = Path(out["kept_in"])
+        self.assertEqual(kept.parent, Path(agent_profiles.root()) / ".removed")
+        self.assertTrue((kept / "profile.json").is_file())
+        self.assertEqual(stat.S_IMODE(kept.parent.stat().st_mode), 0o700)
+        self.assertIsNone(agent_profiles.load(self.dead))
+        self.assertEqual(self.call("GET", f"/api/clusters/{self.dead}")[0], 404)
+        self.assertNotIn(self.dead, [c["name"] for c in self.call("GET", "/api/clusters")[1]["clusters"]])
+        self.assertEqual(self.disconnected, [self.dead])
+        self.assertEqual(out["llm_clients"], {"cursor": [mcp]})
+        self.assertEqual(list(json.loads(cursor.read_text())["mcpServers"]), ["github"])
+        self.assertNotIn(["agent_stop", self.dead], self.shell.calls)            # its tunnel wasn't running
+
+    def test_revoking_the_agent_token_first(self):
+        agent_profiles.cmd_set(self.live, "token_name=llm")
+        self.assertIsNotNone(self.server.auth.identify(f"Bearer {self.llm_token}"))
+        status, out = self.call("DELETE", f"/api/clusters/{self.live}", {"revoke_token": True, "log_out": False})
+        self.assertEqual(status, 200, out)
+        self.assertTrue(out["token_revoked"])
+        self.assertIsNone(self.server.auth.identify(f"Bearer {self.llm_token}"))
+        self.assertIn(["agent_stop", self.live], self.shell.calls)                 # its tunnel answered: stopped
+        self.assertEqual(self.disconnected, [])
+
+    def test_a_failed_revoke_removes_nothing(self):
+        status, out = self.call("DELETE", f"/api/clusters/{self.dead}", {"revoke_token": True})
+        self.assertEqual(status, 502, out)
+        self.assertIn("nothing was removed", out["error"])
+        self.assertIsNotNone(agent_profiles.load(self.dead))
+
+
 class TestDefaultApplication(unittest.TestCase):
 
     def setUp(self):   # the platform from sys.platform alone (not WSL, whatever runs the tests)
@@ -1074,19 +1128,24 @@ class TestManage(TestLogin):
         status, out = self.call("POST", "/api/clusters", {"host": "me@new.example.edu"})
         name = out["name"]
         with mock.patch.object(self.clusters.logins, "alive", return_value=True):
-            for bad in ({"mcp_python": "/no/such/python"}, {"mcp_python": 3}, {"remote_python": "python3"},
-                        {"python_modules": ["Python 3"]}):
+            for bad in ({"mcp_command": "/no/such/python"}, {"mcp_python": 3}, {"remote_python": "python3"},
+                        {"python_modules": ["Python 3"]}, {"mcp_args": "'unclosed"}, {"mcp_args": ["a\nb"]}):
                 self.assertEqual(self.call("POST", f"/api/clusters/{name}/setup", dict(bad, work_dirs=["/w"]))[0],
                                  422, bad)
             status, out = self.call("POST", f"/api/clusters/{name}/setup",
-                                    {"work_dirs": ["/w"], "mcp_python": sys.executable, "remote_python": "/sw/py/bin/python3"})
+                                    {"work_dirs": ["/w"], "mcp_command": "/usr/bin/env",
+                                     "mcp_args": "-i '/opt/my python/bin/python3'", "remote_python": "/sw/py/bin/python3"})
             self.assertEqual(status, 202, out)
-            self.assertEqual(self.shell.calls[-1], ["setup_agents", "--mcp-python", os.path.abspath(sys.executable),
+            self.assertEqual(self.shell.calls[-1], ["setup_agents", "--mcp-command", "/usr/bin/env", "--mcp-args",
+                                                    "-i '/opt/my python/bin/python3'",
                                                     "--remote-python", "/sw/py/bin/python3", "--work-dir", "/w", name])
+            self.wait_op(name)
+            self.call("POST", f"/api/clusters/{name}/setup", {"work_dirs": ["/w"], "mcp_python": sys.executable})
+            self.assertEqual(self.shell.calls[-1][:3], ["setup_agents", "--mcp-command", os.path.abspath(sys.executable)])
             self.wait_op(name)
             self.call("POST", f"/api/clusters/{name}/setup", {"work_dirs": ["/w"], "mcp_python": "", "remote_python": "",
                                                               "python_modules": ["GCCcore/13.2.0", "Python/3.11.5"]})
-            self.assertEqual(self.shell.calls[-1], ["setup_agents", "--mcp-python", "auto", "--python-module",
+            self.assertEqual(self.shell.calls[-1], ["setup_agents", "--mcp-command", "auto", "--python-module",
                                                     "GCCcore/13.2.0", "--python-module", "Python/3.11.5",
                                                     "--work-dir", "/w", name])
             self.wait_op(name)

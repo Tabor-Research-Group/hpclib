@@ -30,6 +30,7 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 NOW = time.time()
 LOCAL = "1.4.0"
 SHOW_WIDGETS = False
+SETUP_DONE = False         # hpclib-grace has just been set up (the setup panel, with Connect your LLM clients)
 
 
 def cluster(name, host, login, tunnel, version=None, set_up=True, work=None):
@@ -291,7 +292,27 @@ def answer(path, method):
         name = parts[1]
         rest = parts[2:]
         if not rest:
+            if SETUP_DONE and name == "hpclib-grace":
+                return dict(CLUSTERS[name], operation={"kind": "setup", "state": "succeeded", "started": NOW - 90,
+                                                       "title": "setup_agents"})
             return CLUSTERS[name]
+        if rest == ["operation"]:
+            return {"kind": "setup", "state": "succeeded", "title": "setup_agents", "log": [
+                "== profile jdoe@grace.hprc.tamu.edu (existing)", "== templates and server config", "...",
+                "hpclib agents: grace.hprc.tamu.edu is ready", "Not done yet: add the MCP entry from step 2 to your LLM client and restart it."]}
+        if rest == ["llm-clients"]:
+            return {"mcp_name": "hpclib-grace", "set_up": True, "python": "/Users/jdoe/.local/share/hpclib/mcp/bin/python",
+                    "python_has_mcp": True, "local": {"command": "", "args": [],
+                                                      "local_roots": ["/Users/jdoe/Documents/hpclib-agents/grace"]},
+                    "clients": [
+                        {"id": "claude_desktop", "title": "Claude Desktop", "available": True, "enabled": False, "windows": False,
+                         "path": "/Users/jdoe/Library/Application Support/Claude/claude_desktop_config.json", "error": None,
+                         "after": "Quit and reopen Claude Desktop to load changed entries.", "state": "current",
+                         "launcher": "own", "launcher_argv": ["/usr/bin/arch", "-arm64", "/Users/jdoe/venvs/mcp/bin/python"]},
+                        {"id": "claude_code", "title": "Claude Code", "available": True, "enabled": False, "windows": False,
+                         "path": "/Users/jdoe/.claude.json", "error": None, "after": "", "state": "missing"},
+                        {"id": "chatgpt", "title": "ChatGPT", "available": True, "enabled": False, "windows": False,
+                         "path": "/Users/jdoe/.codex/config.toml", "error": None, "after": "", "state": "different"}]}
         if rest == ["jobs"]:
             return JOBS.get(name, {"queued": [], "running": [], "finished": [], "at": NOW,
                                    "counts": {"queued": 0, "running": 0, "finished": 0, "failed": 0}})
@@ -300,6 +321,17 @@ def answer(path, method):
         if rest == ["settings"]:
             return {"modes": ["all", "new", "review"], "auto_approve_templates": "new",
                     "tunnel_args": ["--time=8:00:00", "--mem=2gb"], "connection_hours": 12, "rest_on": "job"}
+        if rest == ["python-tools"]:
+            return {"host": "grace1", "settings_file": "/home/jdoe/.local/tunnels/settings/pytools.sh",
+                    "tools": {"uv": {"path": "/home/jdoe/.local/bin/uv", "version": "0.9.2"},
+                              "pixi": {"path": None, "version": None}},
+                    "dirs": {"UV_PYTHON_INSTALL_DIR": {"value": "/scratch/user/jdoe/.uv/python", "source": "settings",
+                                                       "saved": "/scratch/user/jdoe/.uv/python"},
+                             "UV_CACHE_DIR": {"value": "/scratch/user/jdoe/.uv/cache", "source": "settings",
+                                              "saved": "/scratch/user/jdoe/.uv/cache"},
+                             "PIXI_CACHE_DIR": {"value": "/home/jdoe/.cache/rattler/cache", "source": "default", "saved": None}},
+                    "shell": {"UV_PYTHON_INSTALL_DIR": None, "UV_CACHE_DIR": None,
+                              "PIXI_CACHE_DIR": "/scratch/user/jdoe/.pixi/cache"}}
         if rest == ["ports"]:
             return {"ports": [{"port": 20735, "what": "agent tunnel", "app": None, "running": True},
                               {"port": 31003, "what": "PAI", "app": "pai", "running": True},
@@ -371,6 +403,10 @@ DOCS = [
     ("cluster-agents", "#/c/hpclib-grace/agents", 1280, None, False, None, "main"),
     ("cluster-setup", "#/c/hpclib-grace/agents", 1280, None, False, setup_panel, "hpc-panel"),
     ("cluster-files", "#/c/hpclib-grace/files", 1280, None, False, None, None),
+    ("cluster-setup-done", "#/c/hpclib-grace/agents", 1280, None, False, None, "hpc-panel.log-panel"),
+    ("cluster-remove", "#/c/hpclib-grace/settings", 1280, None, False, None, "#remove-cluster"),
+    ("cluster-llm-clients", "#/c/hpclib-grace/settings", 1280, None, False, None, "#cluster-llm-clients"),
+    ("cluster-python-tools", "#/c/hpclib-grace/settings", 1280, None, False, None, "#python-tools"),
     ("app-pai", "#/c/hpclib-grace/apps/pai", 1280, None, False, None, "main"),
     ("app-package-tab", "#/c/hpclib-grace/apps/cmccdb_preview", 1280, None, False, None, None),
     ("proposals", "#/proposals", 1280, None, False, None, None),
@@ -389,7 +425,7 @@ DOCS = [
 
 
 def main():
-    global SHOW_WIDGETS
+    global SHOW_WIDGETS, SETUP_DONE
     server = agent_console.ConsoleServer(("127.0.0.1", 0), "shot-key", None, static_dir=str(ROOT / "agent-console"))
     server.RequestHandlerClass.log_message = lambda *a: None
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -400,6 +436,7 @@ def main():
         browser = p.chromium.launch()
         for name, hash_, width, scheme, show, act, selector in shots:
             SHOW_WIDGETS = show
+            SETUP_DONE = name == "cluster-setup-done"
             page = browser.new_page(viewport={"width": width, "height": 860 if width > 500 else 780},
                                     color_scheme=scheme or "light", device_scale_factor=1)
             page.route("**/api/**", lambda route: route.fulfill(

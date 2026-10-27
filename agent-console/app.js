@@ -235,15 +235,19 @@ function setupForm(c, row) {
   const spec = c.python_spec || "";
   const savedPath = spec.startsWith("path:") ? spec.slice(5) : "";
   const savedModules = spec.startsWith("modules:") ? spec.slice(8) : "";
-  const mcpPython = el("input", { size: 34, value: c.mcp_python || (c.set_up ? "" : defaultMcpPython()),
-    placeholder: "found: the installer's environment, else python3 with mcp" });
   const remotePython = el("input", { size: 30, value: savedPath,
     placeholder: c.remote_python ? `found: ${c.remote_python}` : "found: Python 3.9+ on PATH or a module" });
   const modules = el("input", { size: 30, value: savedModules, placeholder: "optional: Python/3.11.5" });
   const rebuild = el("input", { type: "checkbox" });
   const run = action(c.set_up ? "Run setup_agents again" : "Set up", async () => {
-    const body = { work_dirs: lines(workDirs.value), binds: lines(binds.value), local_roots: lines(localRoots.value),
-                   mcp_python: mcpPython.value.trim(), rebuild: rebuild.checked };
+    const body = { work_dirs: lines(workDirs.value), binds: lines(binds.value), rebuild: rebuild.checked };
+    // what only this machine needs (the MCP launcher, the agent's local folders) is on the Settings tab; a first
+    // setup takes the local folders from here, and Console Settings' launcher for new clusters
+    if (!c.set_up) {
+      body.local_roots = lines(localRoots.value);
+      if (defaultLauncher().command && !c.mcp_command) Object.assign(body, { mcp_command: defaultLauncher().command,
+                                                                          mcp_args: defaultLauncher().args });
+    }
     // the cluster's Python: only when changed (finding it again takes a moment)
     if (modules.value.trim() !== savedModules) {
       if (modules.value.trim()) body.python_modules = words(modules.value);
@@ -258,9 +262,10 @@ function setupForm(c, row) {
     el("div", { class: "row" },
       field("Work directories (agents may write here)", workDirs, "absolute paths on the cluster, one per line"),
       field("Extra read-only directories for jobs", binds, "e.g. a software tree, one per line")),
-    el("div", { class: "row" }, field("Local folders for the agent's files", localRoots, LOCAL_ROOT_HINT)),
+    c.set_up ? el("p", { class: "muted small" }, "What runs the MCP server on this machine and the agent's local " +
+      "folders are on the cluster's Settings tab (LLM clients): they change without running setup again.")
+      : el("div", { class: "row" }, field("Local folders for the agent's files", localRoots, LOCAL_ROOT_HINT)),
     el("div", { class: "row" },
-      field("Python for the MCP server (this machine)", mcpPython, "the program your LLM client starts; it needs the mcp package. Empty: find one"),
       field("Python on the cluster", remotePython, "an absolute path, 3.9 or newer; empty: find one"),
       field("…or modules that provide it", modules, "space-separated, loaded in order")),
     el("label", {}, rebuild, " Rebuild: regenerate templates and config and replace the agent token (old copies are kept)"),
@@ -277,7 +282,11 @@ function localRootSuggestion(name, host) {
   return pattern.replaceAll("{cluster}", clusterName).replaceAll("{user}", user);
 }
 
-const defaultMcpPython = () => (settingsUI.preferences()?.new_cluster || {}).mcp_python || "";
+// Console Settings' launcher for new clusters' MCP servers
+const defaultLauncher = () => {
+  const nc = settingsUI.preferences()?.new_cluster || {};
+  return { command: nc.mcp_command || nc.mcp_python || "", args: nc.mcp_args || "" };
+};
 
 function addClusterForm(onAdded) {
   const host = el("input", { placeholder: "user@login.cluster.edu", size: 32 });
@@ -302,7 +311,7 @@ function addClusterForm(onAdded) {
       port: port.value ? Number(port.value) : null, jump: jump.value.trim() || null } });
     const setup = { work_dirs: [work.value.trim()], binds: words(binds.value),
                     local_roots: local.value.trim() ? [local.value.trim()] : [] };
-    if (defaultMcpPython()) setup.mcp_python = defaultMcpPython();
+    if (defaultLauncher().command) Object.assign(setup, { mcp_command: defaultLauncher().command, mcp_args: defaultLauncher().args });
     loginDialog(c, { onConnected: () => api(cluster(c.name) + "/setup", { method: "POST", body: setup }) });
     onAdded();
     return `Added ${c.name}.`;
@@ -1056,7 +1065,10 @@ async function serverSettings(c) {
   const found = Object.entries(managers).map(([m, i]) => `${m} ${i.available ? i.version || "" : "not found"}`).join(" · ");
   return el("section", { class: "card" }, head,
     el("p", { class: "muted" }, conf.path),
-    el("h4", {}, "Python environments ", el("span", { class: "muted" }, found)),
+    el("h4", {}, "Python environments ", el("span", { class: "muted" }, found), " ",
+      el("a", { href: "#python-tools", class: "small", onclick: (e) => {
+        e.preventDefault(); document.getElementById("python-tools")?.scrollIntoView({ behavior: "smooth" }); } },
+        "Install or configure uv and pixi")),
     field("Modules to load before a sync", syncModules, "space-separated, e.g. a web proxy module the node needs for PyPI"),
     el("div", { class: "row" },
       field("uv", uvPath, "auto, a path, or off"),
@@ -1082,6 +1094,80 @@ async function serverSettings(c) {
     el("div", { class: "actions" }, save),
     el("details", {}, el("summary", {}, "Edit the editable sections as JSON"), jsonBox,
       el("div", { class: "actions" }, saveJson)));
+}
+
+// uv and pixi on the cluster (lib/pytools.sh, over the login): install them, and where they keep the Pythons they
+// download and their package caches (home directories are small; scratch is the usual place). Saved on the cluster
+// ($HPCTUNNELS_DATA_DIR/settings/pytools.sh): sourcing hpclib.sh exports them, the REST server's environment syncs
+// use them, and a variable your ~/.bashrc exports wins.
+const PYTOOLS_DIRS = [
+  ["UV_PYTHON_INSTALL_DIR", "uv: Python install directory", "the Pythons uv downloads"],
+  ["UV_CACHE_DIR", "uv: cache directory", "downloaded and built packages"],
+  ["PIXI_CACHE_DIR", "pixi: cache directory", "downloaded conda and PyPI packages"]];
+function pythonToolsSettings(c) {
+  const head = el("h3", {}, "uv and pixi ", el("span", { class: "muted" }, "· for your Python environments on the cluster"));
+  const card = el("section", { class: "card", id: "python-tools" }, head);
+  const needLogin = (c.login || {}).state !== "connected";
+  if (needLogin) {
+    card.append(el("p", { class: "muted" }, "Log in to check and install them: it runs over the console's login."));
+    return card;
+  }
+  const body = el("div", {}, el("p", { class: "muted" }, "Checking the cluster…"));
+  card.append(body);
+  const url = cluster(c.name) + "/python-tools";
+  const draw = (info, note) => {
+    const tools = info.tools || {}, dirs = info.dirs || {}, shell = info.shell || {};
+    const rows = ["uv", "pixi"].map((t) => {
+      const it = tools[t] || {};
+      const install = action(it.path ? "Update" : "Install", async () => {
+        const out = await api(url + "/install", { method: "POST", body: { tool: t } });
+        const r = out.install || {};
+        draw(out, r.ok ? `${t} ${(out.tools[t] || {}).version || ""} is installed.`
+          : el("div", { class: "error-box" }, `Installing ${t} failed: ${r.error}`,
+            r.log && r.log.length ? el("pre", { class: "quota" }, r.log.join("\n")) : null));
+      }, { primary: !it.path });
+      return el("tr", {}, el("td", {}, el("strong", {}, t)),
+        el("td", {}, it.path ? clusterUI.chip(it.version || "installed", "up") : clusterUI.chip("not installed", "starting")),
+        el("td", { class: "muted" }, it.path || (t === "uv" ? "installs to ~/.local/bin/uv" : "installs to ~/.pixi/bin/pixi")),
+        el("td", { class: "next" }, install));
+    });
+    const inputs = Object.fromEntries(PYTOOLS_DIRS.map(([k]) => {
+      const d = dirs[k] || {};
+      return [k, el("input", { value: d.saved || "", size: 40, "aria-label": k,
+                               placeholder: d.source === "default" && d.value ? `default: ${d.value}` : "the tool's default" })];
+    }));
+    const hint = (k, text) => {
+      const d = dirs[k] || {};
+      const fromShell = shell[k];
+      return [text, fromShell ? ` · your ~/.bashrc sets ${fromShell}${fromShell !== d.saved ? " (it wins where ~/.bashrc is sourced)" : ""}` : ""].join("");
+    };
+    const differs = PYTOOLS_DIRS.filter(([k]) => shell[k] && shell[k] !== (dirs[k] || {}).saved);
+    const adopt = differs.length ? el("button", { type: "button", onclick: () => {
+      for (const [k] of differs) inputs[k].value = shell[k];
+    } }, "Fill in what ~/.bashrc sets") : null;
+    const save = saveButton("Save directories", async () => {
+      const sent = Object.fromEntries(PYTOOLS_DIRS.map(([k]) => [k, inputs[k].value.trim()])
+        .filter(([k, v]) => v !== ((dirs[k] || {}).saved || "")));
+      if (!Object.keys(sent).length) return "Nothing changed.";
+      const out = await api(url, { method: "PUT", body: sent });
+      draw(out, "Saved on the cluster (the directories are created). New shells, jobs that source hpclib.sh and " +
+        "the REST server's next sync use them.");
+      return "Saved.";
+    });
+    body.replaceChildren(...[
+      el("p", { class: "muted" }, "Template jobs and the agents' environments prefer uv and pixi projects. Installing " +
+        "runs the tool's official installer over your login (the login node needs the internet) and leaves your shell " +
+        "startup files alone; hpclib finds them where they install."),
+      typeof note === "string" ? el("p", { class: "muted" }, note) : note || null,
+      el("table", { class: "rows" }, el("tbody", {}, rows)),
+      el("h4", {}, "Directories ", el("span", { class: "muted" }, `· ${info.settings_file || "saved on the cluster"}`)),
+      el("div", { class: "row" }, PYTOOLS_DIRS.map(([k, label, text]) => field(label, inputs[k], hint(k, text)))),
+      el("p", { class: "muted small" }, "Absolute paths on the cluster; empty for the tool's default. Sourcing " +
+        "hpclib.sh exports them; one your ~/.bashrc exports wins."),
+      el("div", { class: "actions" }, save, adopt)].filter(Boolean));   // replaceChildren would print a null
+  };
+  api(url).then((info) => draw(info)).catch((err) => body.replaceChildren(errorBox(err)));
+  return card;
 }
 
 // Each tunnel records its port on the login node it started on. A login that lands on another node leaves the
@@ -1643,8 +1729,10 @@ async function packagesDialog() {
 }
 clusterUI.init({
   api, errorBox, render: () => render(),
-  settingsCards: (c) => Promise.all([tunnelSettings(c), portSettings(c).catch(errorBox), quotaSettings(c).catch(errorBox),
-                                     serverSettings(c).catch(errorBox)]),
+  // the cluster's Settings tab: the tunnel and its server first, then port clearing and quota checks
+  settingsCards: (c) => Promise.all([tunnelSettings(c), serverSettings(c).catch(errorBox), pythonToolsSettings(c),
+                                     portSettings(c).catch(errorBox),
+                                     quotaSettings(c).catch(errorBox)]),
   addCluster: addClusterControls,
   files: (name) => filesPage(name),
   activity: (name) => activityPage(name),

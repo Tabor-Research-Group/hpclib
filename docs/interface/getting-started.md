@@ -74,8 +74,17 @@ client runs the MCP server with, and the cluster's Python (a path or modules), w
 
 ## 5. Connect your LLM client
 
-The easiest way: on **Console Settings → LLM clients** (☰ menu), click **Write entries** for your client, and
-tick **Keep up to date** so later setups, new ports and renames reach it too. If a client's configuration file
+When setup finishes, its panel lists the LLM clients on this machine with whether each has this cluster's entry:
+**Write entry** adds it (or updates an older one). The same list is always on the cluster's Settings tab. If
+the launcher the entry runs can't import the MCP SDK, the panel says so. An entry you wrote yourself with
+another launcher (e.g. `/usr/bin/arch -arm64 PYTHON`) counts as there; to have the console write yours, set
+**MCP launch command** and **Launch arguments** on the Settings tab (or **Use … 's launcher** there), with no
+need to run setup again.
+
+![The finished setup panel: Connect your LLM clients, with Write entry for each](../images/cluster-setup-done.png)
+
+For every cluster at once: on **Console Settings → LLM clients** (☰ menu), click **Write entries** for your client,
+and tick **Keep up to date** so later setups, new ports and renames reach it too. If a client's configuration file
 isn't where the console looked, **Change** sets it.
 
 ![Console Settings, LLM clients: each client's entries, its configuration file, and Change](../images/console-llm-clients.png)

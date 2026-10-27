@@ -205,6 +205,200 @@ class TestConsoleSettingsUI(unittest.TestCase):
         self.assertEqual(renamed, [{"name": "grace-gpu"}])
         self.assertEqual(self.errors, [])
 
+    def test_remove_a_cluster_from_its_settings_tab(self):
+        demo = {"name": "demo", "host": "me@demo.example", "mcp_name": "hpclib-demo", "set_up": True, "port": 20735,
+                "has_owner_token": True, "login": {"state": "connected"}, "tunnel": {"state": "down"}}
+        removed = []
+
+        def handler(route, path):
+            if path == "clusters/demo" and route.request.method == "DELETE":
+                removed.append(route.request.post_data_json)
+                route.fulfill(body=json.dumps({"removed": "demo", "kept_in": "/home/me/.config/hpclib/agents/.removed/demo-1",
+                                               "warnings": [], "tunnel_stopped": False,
+                                               "llm_clients": {"claude_desktop": ["hpclib-demo"]}}),
+                              content_type="application/json")
+                return True
+            if path in ("clusters", "clusters/demo"):
+                route.fulfill(body=json.dumps({"clusters": [demo]} if path == "clusters" else demo),
+                              content_type="application/json")
+                return True
+            if path == "clusters/demo/settings":
+                route.fulfill(body=json.dumps({"modes": ["all", "new", "review"], "auto_approve_templates": "all",
+                                               "tunnel_args": [], "connection_hours": 12, "rest_on": "job"}),
+                              content_type="application/json")
+                return True
+            return self.handler(route, path)
+        console_ui.TestConsoleUI.load_console(self, handler)
+        self.page.goto(self.base + "/#/c/demo/settings")
+        card = self.page.locator("#remove-cluster")
+        card.wait_for()
+        revoke = card.get_by_label("Revoke its agent token on the cluster first")
+        self.assertTrue(revoke.is_disabled())                                    # the tunnel is down
+        card.get_by_label("Log out").uncheck()
+        card.get_by_role("button", name="Remove cluster…", exact=True).click()
+        self.page.locator("hpc-dialog").get_by_role("button", name="Remove", exact=True).click()
+        card.get_by_text("demo was removed", exact=False).wait_for()
+        self.assertEqual(removed, [{"revoke_token": False, "stop_tunnels": True, "log_out": False, "llm_clients": True}])
+        self.assertIn(".removed/demo-1", card.inner_text())
+        self.assertIn("claude_desktop", card.inner_text())
+        self.assertEqual(self.errors, [])
+
+    def test_setup_panel_writes_the_mcp_entry(self):
+        demo = {"name": "demo", "host": "me@demo.example", "mcp_name": "hpclib-demo", "set_up": True, "port": 20735,
+                "has_owner_token": True, "login": {"state": "connected"}, "tunnel": {"state": "down"},
+                "operation": {"kind": "setup", "state": "succeeded", "started": 1, "title": "setup_agents"}}
+        state = {"cursor": "missing"}
+        writes = []
+
+        def handler(route, path):
+            if path in ("clusters", "clusters/demo"):
+                route.fulfill(body=json.dumps({"clusters": [demo]} if path == "clusters" else demo),
+                              content_type="application/json")
+                return True
+            if path == "clusters/demo/operation":
+                route.fulfill(body=json.dumps({"kind": "setup", "state": "succeeded", "title": "setup_agents",
+                                               "log": ["Not done yet: add the MCP entry"]}), content_type="application/json")
+                return True
+            if path == "clusters/demo/llm-clients":
+                route.fulfill(body=json.dumps({"mcp_name": "hpclib-demo", "set_up": True, "python": "/usr/bin/python3",
+                                               "python_has_mcp": False, "clients": [
+                    {"id": "cursor", "title": "Cursor", "available": True, "path": "/home/me/.cursor/mcp.json",
+                     "error": None, "windows": False, "after": "Cursor reloads.", "enabled": False, "state": state["cursor"]},
+                    {"id": "chatgpt", "title": "ChatGPT", "available": False, "path": "/x", "error": None,
+                     "windows": False, "after": "", "enabled": False, "state": "missing"}]}),
+                              content_type="application/json")
+                return True
+            if path == "llm-clients/cursor/write":
+                writes.append(route.request.post_data_json)
+                state["cursor"] = "current"
+                route.fulfill(body=json.dumps({"changed": ["hpclib-demo"], "client": {}}), content_type="application/json")
+                return True
+            return self.handler(route, path)
+        console_ui.TestConsoleUI.load_console(self, handler)
+        self.page.goto(self.base + "/#/c/demo/agents")
+        box = self.page.locator(".connect-clients")
+        box.get_by_text("Connect your LLM clients to hpclib-demo").wait_for()
+        self.assertIn("/usr/bin/python3 can't import the MCP SDK", box.inner_text())
+        self.assertNotIn("ChatGPT", box.inner_text())                               # not installed here
+        box.get_by_role("button", name="Write entry", exact=True).click()
+        box.get_by_role("button", name="Write again", exact=True).wait_for()
+        self.assertIn("has it", box.inner_text())
+        self.assertEqual(writes, [{"names": ["hpclib-demo"], "force": True}])
+        self.assertEqual(self.errors, [])
+
+    def test_settings_tab_has_the_llm_clients_and_the_launcher_here(self):
+        demo = {"name": "demo", "host": "me@demo.example", "mcp_name": "hpclib-demo", "set_up": True, "port": 20735,
+                "has_owner_token": True, "login": {"state": "connected"}, "tunnel": {"state": "down"}}
+        puts = []
+
+        def handler(route, path):
+            if path in ("clusters", "clusters/demo"):
+                route.fulfill(body=json.dumps({"clusters": [demo]} if path == "clusters" else demo),
+                              content_type="application/json")
+                return True
+            if path == "clusters/demo/settings":
+                route.fulfill(body=json.dumps({"modes": ["all"], "auto_approve_templates": "all", "tunnel_args": [],
+                                               "connection_hours": 12, "rest_on": "job"}), content_type="application/json")
+                return True
+            if path == "clusters/demo/local":
+                puts.append(route.request.post_data_json)
+                route.fulfill(body=json.dumps({"entry": {}, "llm_clients": {}, "local_roots": []}),
+                              content_type="application/json")
+                return True
+            if path == "clusters/demo/llm-clients":
+                route.fulfill(body=json.dumps({"mcp_name": "hpclib-demo", "set_up": True,
+                    "python": "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3", "python_has_mcp": False,
+                    "local": {"command": "", "args": [], "local_roots": ["/Users/me/Documents/Claude"]},
+                    "clients": [{"id": "claude_desktop", "title": "Claude Desktop", "available": True, "path": "/x.json",
+                                 "error": None, "windows": False, "after": "", "enabled": True, "state": "current",
+                                 "launcher": "own", "launcher_argv": ["/usr/bin/arch", "-arm64", "/venv/my python/bin/python"]}]}),
+                              content_type="application/json")
+                return True
+            return self.handler(route, path)
+        console_ui.TestConsoleUI.load_console(self, handler)
+        self.page.goto(self.base + "/#/c/demo/overview")
+        self.page.locator(".cluster-head").first.wait_for()
+        self.assertEqual(self.page.get_by_role("button", name="Connect LLM clients").count(), 0)   # not a next step
+        self.page.goto(self.base + "/#/c/demo/settings")
+        card = self.page.locator("#cluster-llm-clients")
+        card.get_by_text("has it, with its own launcher").wait_for()
+        self.assertIn("Claude Desktop starts it their own way", card.inner_text())
+        # the tunnel and its server first; then ports and quotas; the LLM clients; removal last
+        heads = self.page.eval_on_selector_all("main section.card > h3, main section.card > .toolbar > h3",
+                                               "hs => hs.map(h => h.textContent.split(' ')[0])")
+        order = [h for h in heads if h in ("Tunnel", "Server", "Login-node", "Quota", "LLM", "Remove")]
+        self.assertEqual(order[0], "Tunnel", heads)
+        self.assertEqual(order[-2:], ["LLM", "Remove"], heads)
+        self.assertEqual(order, sorted(order, key=["Tunnel", "Server", "Login-node", "Quota", "LLM", "Remove"].index), heads)
+        card.get_by_role("button", name="Use Claude Desktop's launcher", exact=True).click()
+        self.page.wait_for_function("document.querySelector('#cluster-llm-clients') !== null")
+        for _ in range(50):
+            if puts:
+                break
+            self.page.wait_for_timeout(100)
+        self.assertEqual(puts[0], {"command": "/usr/bin/arch", "args": "-arm64 '/venv/my python/bin/python'"})
+        self.page.wait_for_load_state("networkidle")              # the card draws again after saving
+        self.page.wait_for_timeout(300)
+        card.get_by_label("MCP launch command").fill("/opt/py/bin/python")
+        card.get_by_label("Launch arguments").fill("")
+        card.get_by_role("button", name="Save", exact=True).click()
+        for _ in range(50):
+            if len(puts) > 1:
+                break
+            self.page.wait_for_timeout(100)
+        self.assertEqual(puts[1], {"command": "/opt/py/bin/python", "args": "", "local_roots": ["/Users/me/Documents/Claude"]})
+        self.assertEqual(self.errors, [])
+
+    def test_uv_and_pixi_install_and_directories(self):
+        demo = {"name": "demo", "host": "me@demo.example", "mcp_name": "hpclib-demo", "set_up": True, "port": 20735,
+                "has_owner_token": True, "login": {"state": "connected"}, "tunnel": {"state": "down"}}
+        calls = []
+        state = {"uv": None}
+
+        def info():
+            return {"settings_file": "/home/me/.local/tunnels/settings/pytools.sh",
+                    "tools": {"uv": {"path": state["uv"], "version": "0.9.9" if state["uv"] else None},
+                              "pixi": {"path": None, "version": None}},
+                    "dirs": {"UV_PYTHON_INSTALL_DIR": {"value": "/home/me/.local/share/uv/python", "source": "default", "saved": None},
+                             "UV_CACHE_DIR": {"value": "/home/me/.cache/uv", "source": "default", "saved": None},
+                             "PIXI_CACHE_DIR": {"value": "/home/me/.cache/rattler/cache", "source": "default", "saved": None}},
+                    "shell": {"UV_CACHE_DIR": "/scratch/me/.uv/cache"}}
+
+        def handler(route, path):
+            if path in ("clusters", "clusters/demo"):
+                route.fulfill(body=json.dumps({"clusters": [demo]} if path == "clusters" else demo),
+                              content_type="application/json")
+                return True
+            if path == "clusters/demo/settings":
+                route.fulfill(body=json.dumps({"modes": ["all"], "auto_approve_templates": "all", "tunnel_args": [],
+                                               "connection_hours": 12, "rest_on": "job"}), content_type="application/json")
+                return True
+            if path.startswith("clusters/demo/python-tools"):
+                calls.append((route.request.method, path, route.request.post_data_json if route.request.method != "GET" else None))
+                out = info()
+                if path.endswith("/install"):
+                    state["uv"] = "/home/me/.local/bin/uv"
+                    out = dict(info(), install={"tool": "uv", "ok": True, "exit_code": 0, "log": []})
+                route.fulfill(body=json.dumps(out), content_type="application/json")
+                return True
+            return self.handler(route, path)
+        console_ui.TestConsoleUI.load_console(self, handler)
+        self.page.goto(self.base + "/#/c/demo/settings")
+        card = self.page.locator("#python-tools")
+        card.get_by_text("installs to ~/.local/bin/uv").wait_for()
+        self.assertIn("your ~/.bashrc sets /scratch/me/.uv/cache", card.inner_text())
+        card.get_by_role("button", name="Install", exact=True).first.click()
+        card.get_by_text("uv 0.9.9 is installed.").wait_for()
+        self.assertEqual(calls[-1][1:], ("clusters/demo/python-tools/install", {"tool": "uv"}))
+        card.get_by_role("button", name="Fill in what ~/.bashrc sets").click()
+        card.get_by_label("UV_PYTHON_INSTALL_DIR").fill("/scratch/me/.uv/python")
+        card.get_by_role("button", name="Save directories").click()
+        card.get_by_text("Saved on the cluster").wait_for()
+        self.assertEqual(calls[-1], ("PUT", "clusters/demo/python-tools",
+                                     {"UV_PYTHON_INSTALL_DIR": "/scratch/me/.uv/python", "UV_CACHE_DIR": "/scratch/me/.uv/cache"}))
+        self.assertNotIn("null", card.inner_text())
+        self.assertEqual(self.errors, [])
+
     def test_tunnel_actions_are_turned_on_and_put_needs_its_own_yes(self):
         demo = {"name": "demo", "host": "me@demo.example", "mcp_name": "hpclib-demo", "set_up": True, "port": 20735,
                 "has_owner_token": True, "login": {"state": "connected"}, "tunnel": {"state": "up"}}

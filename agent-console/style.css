@@ -412,3 +412,9 @@ iframe.widget-frame { display: block; width: 100%; border: none; background: tra
 .widget.bare iframe.widget-frame { min-height: 300px; }
 .widgets-table th { padding-top: var(--space-lg); color: var(--fg); }
 .action-tunnel + .action-tunnel { margin-top: var(--space-xl); border-top: 1px solid var(--line); padding-top: var(--space-lg); }
+.danger-zone { border-color: color-mix(in srgb, var(--bad) 45%, var(--line)); }
+.danger-zone .checks { display: flex; flex-direction: column; gap: var(--space-xs, 4px); margin: var(--space-md, 8px) 0; }
+hpc-action-button.danger { --accent: var(--bad); }
+.connect-clients { margin-top: var(--space-lg, 12px); }
+.connect-clients h4 { margin: 0 0 var(--space-sm, 6px); }
+.ok-text { color: var(--good); }

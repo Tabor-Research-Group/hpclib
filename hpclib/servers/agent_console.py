@@ -43,7 +43,14 @@ The front end depends only on the routes below; nothing here depends on it.
                                               (the agent tunnel's also rewrites mcp.json and the LLM clients')
   PUT  /api/clusters/NAME/mcp-name           {"name"}: the cluster's MCP server name (mcp.json, kept-up-to-date clients)
   GET  /api/llm-clients                      Claude Desktop, Claude Code, Cursor, ChatGPT: which entries each has
-  POST /api/llm-clients/ID/write             add or update every cluster's entry (mcp_clients.py)
+  POST /api/llm-clients/ID/write             add or update every cluster's entry (mcp_clients.py); {"names": [...]}:
+                                              only those MCP names
+  PUT  /api/clusters/NAME/local               {"command", "args", "local_roots"} (any): what runs its MCP server here
+                                              (a launch command, "" finds a Python, and the arguments before
+                                              rest_mcp.py) and the agent's local folders; rewrites mcp.json and the
+                                              LLM clients kept up to date, with nothing to run on the cluster
+  GET  /api/clusters/NAME/llm-clients         this cluster's entry in each client (current, different, missing),
+                                              and whether its Python has the MCP SDK
   POST /api/llm-clients/ID/remove            {"name"}: remove an hpclib entry no cluster has any more
   GET  /api/watch                            each tunnel's port open or not, and Stops asked for here
   GET  /api/widgets                          the installed packages' widgets (slot, topics they read, height)
@@ -64,11 +71,15 @@ The front end depends only on the routes below; nothing here depends on it.
                                               account?, tunnel_args?, jump?; no remote action
   POST /api/clusters/NAME/login/answer        {"code", "challenge"}: answer the current MFA code prompt;
                                               codes are used once and never saved
+  DELETE /api/clusters/NAME                   forget the cluster here: {"revoke_token"?: false (its agent token, on
+                                              the cluster, first), "stop_tunnels"?, "log_out"?, "llm_clients"?:
+                                              true}; the profile moves to agents/.removed/ (kept_in)
   POST /api/clusters/NAME/install             install_hpclib over the login ({"force": true} reinstalls)
   POST /api/clusters/NAME/setup               setup_agents ({"work_dirs": [...], "binds": [...], "local_roots": [...]
                                               (folders here for push_files/pull_files; [] none; created),
-                                              "mcp_python" (this machine's Python for the MCP server; "" finds
-                                              one), "remote_python" (the cluster's: a path, "" finds one) or
+                                              "mcp_command" and "mcp_args" (what starts the MCP server here: a
+                                              program, "" finds a Python, and the arguments before rest_mcp.py,
+                                              space-separated), "remote_python" (the cluster's: a path, "" finds one) or
                                               "python_modules" (modules that provide it),
                                               "templates": "...", "rebuild": false})
   GET  /api/clusters/NAME/operation           the running or last install/setup/SSH setup, with its log
@@ -82,6 +93,14 @@ The front end depends only on the routes below; nothing here depends on it.
   PUT  /api/clusters/NAME/quota/settings      {"storage"?, "project"?}: the cluster's checks (a command; "" for
                                               the default, "none" to turn one off), saved on the cluster
                                               ($HPCTUNNELS_DATA_DIR/settings/quota.sh), then checked
+  GET  /api/clusters/NAME/python-tools        uv and pixi on the cluster over the login (lib/pytools.sh): where each
+                                              is and its version, and their directories (Pythons, caches) with where
+                                              each value comes from (your ~/.bashrc, hpclib's settings, the default)
+  PUT  /api/clusters/NAME/python-tools        {"UV_PYTHON_INSTALL_DIR"?, "UV_CACHE_DIR"?, "PIXI_CACHE_DIR"?}: save
+                                              directories on the cluster ($HPCTUNNELS_DATA_DIR/settings/pytools.sh;
+                                              "" for the tool's default); hpclib.sh exports them, ~/.bashrc wins
+  POST /api/clusters/NAME/python-tools/install  {"tool": "uv"|"pixi"}: run its official installer over the login
+                                              (~/.local/bin/uv, ~/.pixi/bin/pixi; shell startup files untouched)
   GET  /api/clusters/NAME/ports               the login-node ports this console's tunnels use, and which run now
   POST /api/clusters/NAME/ports/clear         {"fresh_logins": false, "password"?, "max_logins"?}: clear what earlier
                                               tunnels left on those ports on every login node (clear_tunnel_ports,
@@ -426,7 +445,8 @@ def redact(value):
 
 REST_ROUTE_RE = re.compile(r"[A-Za-z0-9_./-]{1,256}")
 PROFILE_KEYS = ("name", "host", "port", "process_port", "work_dirs", "binds", "local_roots", "token_name", "preset",
-                "mcp_name", "created", "updated", "setup_config", "mcp_python", "python_spec", "remote_python")
+                "mcp_name", "created", "updated", "setup_config", "mcp_python", "mcp_command", "mcp_args", "python_spec",
+                "remote_python")
 
 
 class ConsoleError(Exception):
@@ -1038,6 +1058,15 @@ def storage_quota(quotas):
 QUOTA_SH = os.path.join(HPCLIB_DIR, "lib", "quota.sh")
 QUOTA_ENV = ("HPCLIB_STORAGE_QUOTA_CHECK", "HPCLIB_PROJECT_QUOTA_CHECK")
 QUOTA_KINDS = ("all", "storage", "project")
+PYTOOLS_SH = os.path.join(HPCLIB_DIR, "lib", "pytools.sh")
+PYTOOLS_VARS = ("UV_PYTHON_INSTALL_DIR", "UV_CACHE_DIR", "PIXI_CACHE_DIR")
+
+
+def pytools_script(call):
+    """lib/pytools.sh's functions and then `call`, for bash -s on a cluster (works before hpclib is installed there)."""
+    with open(PYTOOLS_SH) as f:
+        text = f.read()
+    return f"{text}\n{call}\n"
 
 
 def quota_script(call):
@@ -1694,6 +1723,65 @@ class Clusters:
             write_private(self.storage_path(name), json.dumps(stored))
         return {"quotas": merged}
 
+    # -- uv and pixi on the cluster (lib/pytools.sh): installed?, install, and their directories ----------------
+
+    PYTOOLS_TIMEOUT = 60
+    PYTOOLS_INSTALL_TIMEOUT = 400
+
+    def python_tools(self, profile):
+        """uv and pixi on the cluster over the login: {tools: {uv|pixi: {path, version}}, dirs: {VAR: {value,
+        source, saved}}, shell: {VAR: what ~/.bashrc sets}, settings_file, host}."""
+        return self._pytools_call(profile, 'hpclib_pytools --json', ())
+
+    def set_python_tools(self, profile, body):
+        """{VAR: DIR or "" (the tool's default)} for VAR in PYTOOLS_VARS: saved on the cluster
+        ($HPCTUNNELS_DATA_DIR/settings/pytools.sh; the directories are created), then reported again."""
+        if not isinstance(body, dict) or not body or set(body) - set(PYTOOLS_VARS):
+            raise ConsoleError(400, f"send {{VAR: DIR}} for any of {list(PYTOOLS_VARS)} (\"\" for the tool's default)")
+        args = []
+        for var in PYTOOLS_VARS:
+            if var not in body:
+                continue
+            value = body[var]
+            if not isinstance(value, str) or re.search(r"[\0\n\r]", value) or len(value) > 1000:
+                raise ConsoleError(400, f"{var}: one line, at most 1000 characters")
+            value = value.strip()
+            if value and not (value.startswith("/") or value == "~" or value.startswith("~/")):
+                raise ConsoleError(400, f"{var}: an absolute path on the cluster (or empty for the default)")
+            args.append(f"{var}={value or 'default'}")
+        call = ('for kv in "$@"; do _hpclib_pytools_set "${kv%%=*}" "${kv#*=}" || exit 3; done; '
+                'hpclib_pytools --json')
+        return self._pytools_call(profile, call, args)
+
+    def install_python_tool(self, profile, body):
+        """{"tool": "uv"|"pixi"}: its official installer, over the login (the login node needs the internet)."""
+        tool = (body or {}).get("tool") if isinstance(body, dict) else None
+        if tool not in ("uv", "pixi"):
+            raise ConsoleError(400, 'send {"tool": "uv"} or {"tool": "pixi"}')
+        call = ('out=$(_hpclib_pytools_install "$1" 2>&1); code=$?; printf "%s\\n" "$out" | tail -n 40 | '
+                'sed "s/^/HPCLIB_PYTOOLS_LOG /"; hpclib_pytools --json; exit $code')
+        return self._pytools_call(profile, call, (tool,), timeout=self.PYTOOLS_INSTALL_TIMEOUT, install=tool)
+
+    def _pytools_call(self, profile, call, args, timeout=None, install=None):
+        name = profile["name"]
+        if not self.logins.alive(profile):
+            raise ConsoleError(409, f"log in to {name} first: uv and pixi are checked over the console's login")
+        code, out, err = self.script_runner(profile, pytools_script(call), tuple(args), timeout or self.PYTOOLS_TIMEOUT)
+        found = re.search(r"^HPCLIB_PYTOOLS (\{.*\})\s*$", out or "", re.M)
+        try:
+            result = json.loads(found.group(1)) if found else None
+        except ValueError:
+            result = None
+        log = [self._one_line(m) for m in re.findall(r"^HPCLIB_PYTOOLS_LOG (.*)$", out or "", re.M)]
+        if result is None or (code and not install):
+            detail = self._one_line((err or out or "").strip()[-300:]) if (err or out or "").strip() else f"exit {code}"
+            raise ConsoleError(400 if code == 3 or result is not None else 502, f"uv and pixi on {name}: {detail}")
+        if install:
+            result["install"] = {"tool": install, "ok": code == 0, "exit_code": code, "log": log}
+            if code:
+                result["install"]["error"] = (log[-1] if log else self._one_line(err or "")) or f"exit {code}"
+        return result
+
     # -- leftover tunnel ports on the cluster's login nodes ---------------------
 
     PORT_LINE_RE = re.compile(r"^HPCLIB_PORT_(HERE|CLEARED|BUSY|PENDING) ([A-Za-z0-9][A-Za-z0-9._-]{0,62})(?: ([0-9]{1,5}))?\s*$", re.M)
@@ -1864,12 +1952,16 @@ class Clusters:
 
     def setup(self, profile, body):
         unknown = set(body) - {"work_dirs", "binds", "local_roots", "templates", "rebuild", "mcp_python",
-                               "remote_python", "python_modules"}
+                               "mcp_command", "mcp_args", "remote_python", "python_modules"}
         if unknown:
             raise ConsoleError(400, f"unknown setup options {sorted(unknown)}")
         args = ["setup_agents"]
-        if "mcp_python" in body:
-            args += ["--mcp-python", self._mcp_python(body["mcp_python"])]
+        # the MCP server's launcher: a command and the arguments before rest_mcp.py (mcp_python: the older name)
+        command = body.get("mcp_command", body.get("mcp_python"))
+        if command is not None:
+            args += ["--mcp-command", self._mcp_python(command)]
+        if "mcp_args" in body:
+            args += ["--mcp-args", shlex.join(self._mcp_args(body["mcp_args"]))]
         modules = body.get("python_modules") or []
         if not isinstance(modules, list) or len(modules) > 8 or not all(
                 isinstance(m, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+/-]{0,127}", m) for m in modules):
@@ -1914,10 +2006,24 @@ class Clusters:
         return self.run_operation(profile, "setup", args + [profile["name"]])
 
     @staticmethod
+    def _mcp_args(value):
+        """The launch arguments before rest_mcp.py: a list, or one string split like a shell's (quotes allowed)."""
+        if isinstance(value, str):
+            try:
+                value = shlex.split(value)
+            except ValueError as e:
+                raise ConsoleError(422, f"mcp_args: {e}") from e
+        if not isinstance(value, list) or len(value) > 32 or not all(
+                isinstance(a, str) and a and len(a) <= 1024 and not re.search(r"[\0\n\r]", a) for a in value):
+            raise ConsoleError(422, "mcp_args: the arguments before rest_mcp.py, separated by spaces")
+        return value
+
+    @staticmethod
     def _mcp_python(value):
-        """This machine's Python for the cluster's MCP server: a program here ("" finds one: "auto")."""
+        """The command that starts the cluster's MCP server here (a Python, or a launcher such as /usr/bin/arch):
+        a program on this machine ("" finds a Python: "auto")."""
         if not isinstance(value, str) or len(value) > 1024 or re.search(r"[\0\n\r]", value):
-            raise ConsoleError(422, "mcp_python: the path of a Python on this machine, or empty to find one")
+            raise ConsoleError(422, "mcp_command: a program on this machine, or empty to find a Python")
         value = value.strip()
         if not value:
             return "auto"
@@ -1925,7 +2031,7 @@ class Clusters:
             value = local_platform.to_linux(value) or value
         path = os.path.expanduser(value) if os.sep in value or value.startswith("~") else shutil.which(value)
         if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
-            raise ConsoleError(422, f"mcp_python: {value} isn't a program on this machine")
+            raise ConsoleError(422, f"mcp_command: {value} isn't a program on this machine")
         return os.path.abspath(path)
 
     @staticmethod
@@ -3181,6 +3287,137 @@ class Clusters:
         agent_profiles.write_private(path, json.dumps(data, indent=2) + "\n")
         return True
 
+    def set_local_mcp(self, profile, body):
+        """
+        PUT /api/clusters/NAME/local: what runs the cluster's MCP server on this machine, with nothing on the
+        cluster to change: the launch command ("" finds a Python) and the arguments before rest_mcp.py, and the
+        folders push_files/pull_files may use. Saved in the profile; mcp.json is written again, and so are the
+        LLM clients kept up to date (an entry with a launcher of its own stays as it is).
+        """
+        if not isinstance(body, dict) or not body or set(body) - {"command", "args", "local_roots"}:
+            raise ConsoleError(400, 'send {"command", "args", "local_roots"} (any of them)')
+        name = profile["name"]
+        fresh = agent_profiles.load(name) or profile
+        if "command" in body:
+            command = self._mcp_python(body["command"])
+            fresh["mcp_command"] = "" if command == "auto" else command
+            fresh.pop("mcp_python", None)
+            if "args" not in body:
+                fresh["mcp_args"] = []            # a new command doesn't keep another's arguments
+        if "args" in body:
+            fresh["mcp_args"] = self._mcp_args(body["args"])
+        if "local_roots" in body:
+            fresh["local_roots"] = self._local_roots(body["local_roots"])
+            fresh["local_roots_off"] = "no" if fresh["local_roots"] else "yes"
+        path = os.path.join(agent_profiles.profile_dir(name), "mcp.json")
+        rest_mcp = os.path.join(HPCLIB_DIR, "servers", "rest_mcp.py")
+        try:
+            with open(path) as f:
+                old = json.load(f)["mcpServers"][profile["mcp_name"]]
+            rest_mcp = next(a for a in old["args"] if os.path.basename(a) == "rest_mcp.py")   # setup's clone
+        except (OSError, ValueError, KeyError, TypeError, StopIteration):
+            pass
+        python = fresh.get("mcp_command") or agent_profiles.find_mcp_python()
+        agent_profiles.save(fresh)
+        data = agent_profiles.mcp_entry(fresh, python, rest_mcp)
+        agent_profiles.write_private(path, json.dumps(data, indent=2) + "\n")
+        return {"entry": data["mcpServers"][fresh["mcp_name"]], "llm_clients": self.sync_llm_clients(),
+                "local_roots": fresh.get("local_roots") or []}
+
+    def remove_cluster(self, profile, body):
+        """
+        DELETE /api/clusters/NAME: forget a cluster here. Optionally revoke its agent token on the cluster first
+        (needs the agent tunnel up and the owner token), then stop its tunnels (agent and apps), log out, take its
+        MCP entries out of the LLM clients, and move its profile (login, ports, tokens, mcp.json) to
+        agents/.removed/, from where it can be moved back. Nothing else on the cluster changes.
+        """
+        body = body or {}
+        options = {"revoke_token": False, "stop_tunnels": True, "log_out": True, "llm_clients": True}
+        if set(body) - set(options) or not all(isinstance(v, bool) for v in body.values()):
+            raise ConsoleError(400, f"options are true or false: {', '.join(options)}")
+        options.update(body)
+        name = profile["name"]
+        with self.lock:
+            busy = [(self.ops.get(name) or {}).get("kind")] if (self.ops.get(name) or {}).get("state") == "running" else []
+            if (self.storage_scans.get(name) or {}).get("state") == "running":
+                busy.append("storage scan")
+        attempt = self.logins.attempts.get(name) or {}
+        if attempt.get("state") in ("starting", "password_sent", "push_sent", "code_required"):
+            busy.append("login")
+        if busy:
+            raise ConsoleError(409, f"wait for {name}'s {' and '.join(busy)} to finish first")
+        out = {"removed": name, "warnings": []}
+        if options["revoke_token"]:
+            # first, and stopping if it fails: once the profile is gone, nothing here can reach the server to do it
+            try:
+                status, _, content = self.call(profile, "POST", "/admin/tokens/revoke",
+                                               body=json.dumps({"name": profile.get("token_name")}).encode(),
+                                               headers={"Content-Type": "application/json"}, timeout=30)
+            except ConsoleError as e:
+                raise ConsoleError(502, f"couldn't revoke the agent token ({e}); nothing was removed. Start the "
+                                        f"agent tunnel, or uncheck Revoke to remove it anyway") from e
+            if status not in (200, 404):
+                detail = content.decode(errors="replace")[:300]
+                raise ConsoleError(502, f"{name} didn't revoke the agent token (HTTP {status}: {detail}); nothing "
+                                        f"was removed. Uncheck Revoke to remove it anyway")
+            out["token_revoked"] = status == 200
+        if options["stop_tunnels"]:
+            fresh = agent_profiles.load(name) or profile
+            for app, conf in sorted((fresh.get("apps") or {}).items()):
+                with self.lock:
+                    proc = self.app_procs.get((name, app))
+                running = (proc is not None and proc.poll() is None) or (
+                    isinstance(conf, dict) and conf.get("port") and self.port_open(conf["port"]))
+                if running and app in APPS:
+                    try:
+                        self.app_stop(fresh, app)
+                    except ConsoleError as e:
+                        out["warnings"].append(f"{APPS[app]['title']}: {e}")
+            with self.lock:
+                proc = self.procs.get(name)
+            if (proc is not None and proc.poll() is None) or (profile.get("port") and self.port_open(profile["port"])):
+                try:
+                    self.stop_tunnel(profile)
+                    out["tunnel_stopped"] = True
+                except ConsoleError as e:
+                    out["warnings"].append(f"agent tunnel: {e}")
+        if options["log_out"]:
+            try:
+                out["logged_out"] = self.logins.disconnect(profile).get("logged_out", False)
+            except ConsoleError as e:
+                out["warnings"].append(f"log out: {e}")
+        if options["llm_clients"]:
+            names = [n for n in [profile.get("mcp_name"), *(profile.get("previous_mcp_names") or [])] if n]
+            cleaned = {}
+            for cid in mcp_clients.CLIENTS:
+                try:
+                    if not mcp_clients.available(cid):
+                        continue
+                    servers, _ = mcp_clients._read_servers(mcp_clients.CLIENTS[cid]["path"]())
+                    for n in names:
+                        if n in servers:
+                            mcp_clients.remove(cid, n)
+                            cleaned.setdefault(cid, []).append(n)
+                except (mcp_clients.ClientError, OSError) as e:
+                    out["warnings"].append(f"{mcp_clients.CLIENTS[cid]['title']}: {e}")
+            out["llm_clients"] = cleaned
+        dest = agent_profiles.remove(name)
+        if dest is None:
+            raise ConsoleError(404, f"no agent profile {name!r}")
+        out["kept_in"] = dest
+        with self.lock:
+            self.procs.pop(name, None)
+            self.ops.pop(name, None)
+            self.storage_scans.pop(name, None)
+            for key in [k for k in self.app_procs if k[0] == name]:
+                self.app_procs.pop(key, None)
+        for path in (self.storage_path(name),):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return out
+
     def rename_mcp(self, profile, body):
         """A new MCP name for the cluster: its mcp.json, and the LLM clients kept up to date (the old name goes)."""
         name = body.get("name")
@@ -3254,13 +3491,52 @@ class Clusters:
             raise ConsoleError(404, f"no LLM client {cid!r}; the console knows {sorted(mcp_clients.CLIENTS)}")
         return cid
 
-    def llm_client_write(self, cid):
+    def llm_client_write(self, cid, names=None, force=False):
+        """Write the clusters' entries to one client (names: only these MCP names, e.g. the cluster just set up)."""
         self._client(cid)
+        if names is not None and (not isinstance(names, list) or not all(isinstance(n, str) for n in names)):
+            raise ConsoleError(400, "names: a list of MCP names")
+        wanted = self._mcp_wanted()
+        if names is not None:
+            wanted = {n: e for n, e in wanted.items() if n in names}
+            if not wanted:
+                raise ConsoleError(404, f"no cluster has the MCP name{'s' if len(names) != 1 else ''} {', '.join(names)}")
         try:
-            changed = mcp_clients.write(cid, self._mcp_wanted())
+            changed = mcp_clients.write(cid, wanted, force=bool(force))
         except (mcp_clients.ClientError, OSError) as e:
             raise ConsoleError(422, str(e)) from e
         return {"changed": changed, "client": mcp_clients.status(cid, self._mcp_wanted(), self._owned_mcp_name)}
+
+    def cluster_llm_clients(self, profile):
+        """One cluster's MCP entry in each LLM client (for the setup panel's Write entry), and whether the Python
+        the entry runs has the MCP SDK."""
+        name = profile.get("mcp_name")
+        wanted = {n: e for n, e in self._mcp_wanted().items() if n == name}
+        enabled = console_prefs.load(console_dir())["llm_clients"]
+        clients = []
+        for cid in mcp_clients.CLIENTS:
+            st = mcp_clients.status(cid, wanted, self._owned_mcp_name)
+            entry = next((e for e in st["entries"] if e["name"] == name), None)
+            clients.append({"id": cid, "title": st["title"], "available": st["available"], "path": st["path"],
+                            "error": st["error"], "windows": st.get("windows"), "after": st["after"],
+                            "enabled": enabled.get(cid, False), "state": entry["state"] if entry else None,
+                            "launcher": entry.get("launcher") if entry else None,
+                            "launcher_argv": entry.get("launcher_argv") if entry else None})
+        # the launcher (command and the arguments before rest_mcp.py), asked whether it can import the SDK
+        launch = mcp_clients.launcher(wanted.get(name) or {})
+        has_mcp = None
+        if launch:
+            try:
+                has_mcp = subprocess.run([*launch, "-c", "import mcp"], stdin=subprocess.DEVNULL,
+                                         capture_output=True, timeout=20).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                has_mcp = False
+        fresh = agent_profiles.load(profile["name"]) or profile
+        return {"mcp_name": name, "set_up": bool(wanted), "python": shlex.join(launch) if launch else None,
+                "python_has_mcp": has_mcp, "clients": clients,
+                "local": {"command": fresh.get("mcp_command") or fresh.get("mcp_python") or "",
+                          "args": list(fresh.get("mcp_args") or []) if fresh.get("mcp_command") else [],
+                          "local_roots": list(fresh.get("local_roots") or [])}}
 
     def llm_client_remove(self, cid, body):
         self._client(cid)
@@ -3588,7 +3864,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         if parts == ["llm-clients"] and verb == "GET":
             return 200, {"ok": True, "clients": c.llm_clients()}
         if len(parts) == 3 and parts[0] == "llm-clients" and parts[2] == "write" and verb == "POST":
-            return 200, dict(c.llm_client_write(parts[1]), ok=True)
+            body = self.json_body()
+            return 200, dict(c.llm_client_write(parts[1], body.get("names"), body.get("force")), ok=True)
         if len(parts) == 3 and parts[0] == "llm-clients" and parts[2] == "remove" and verb == "POST":
             return 200, dict(c.llm_client_remove(parts[1], self.json_body()), ok=True)
         if parts == ["watch"] and verb == "GET":
@@ -3648,6 +3925,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             rest = parts[2:]
             if not rest and verb == "GET":
                 return 200, dict(c.describe(profile), ok=True)
+            if not rest and verb == "DELETE":
+                return 200, dict(c.remove_cluster(profile, self.json_body()), ok=True)
             if rest == ["install"] and verb == "POST":
                 return 202, dict(c.install(profile, self.json_body()), ok=True)
             if rest == ["setup"] and verb == "POST":
@@ -3664,6 +3943,12 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 return 200, dict(c.quota(profile, self.query.get("kind", ["all"])[-1]), ok=True)
             if rest == ["quota", "settings"] and verb == "PUT":
                 return 200, dict(c.set_quota_checks(profile, self.json_body()), ok=True)
+            if rest == ["python-tools"] and verb == "GET":
+                return 200, dict(c.python_tools(profile), ok=True)
+            if rest == ["python-tools"] and verb == "PUT":
+                return 200, dict(c.set_python_tools(profile, self.json_body()), ok=True)
+            if rest == ["python-tools", "install"] and verb == "POST":
+                return 200, dict(c.install_python_tool(profile, self.json_body()), ok=True)
             if rest == ["ports"] and verb == "GET":
                 return 200, {"ok": True, "ports": c.login_ports(profile)}
             if rest == ["ports", "clear"] and verb == "POST":
@@ -3688,6 +3973,10 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 return 200, dict(self.tunnel_settings(profile), ok=True)
             if rest == ["settings"] and verb == "PUT":
                 return 200, dict(self.save_tunnel_settings(profile, self.json_body()), ok=True)
+            if rest == ["local"] and verb == "PUT":
+                return 200, dict(c.set_local_mcp(profile, self.json_body()), ok=True)
+            if rest == ["llm-clients"] and verb == "GET":
+                return 200, dict(c.cluster_llm_clients(profile), ok=True)
             if rest == ["mcp"] and verb == "GET":
                 return 200, self.mcp_entry(profile)
             if rest == ["tunnel", "start"] and verb == "POST":

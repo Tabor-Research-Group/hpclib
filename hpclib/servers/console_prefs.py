@@ -5,8 +5,8 @@ The console's own preferences (this machine, not a cluster), kept in preferences
                   an agent's job finishing, a new template proposal
   new_cluster     defaults a cluster added from now on starts with: how long its login is kept, the work
                   directory the Add cluster form suggests ({user} is the login's user), the local folder it
-                  suggests for the agent's files ({cluster}, {user}; "" suggests none), the Python here it suggests
-                  for the MCP server ("" finds one), its MCP server's name
+                  suggests for the agent's files ({cluster}, {user}; "" suggests none), the launcher it suggests
+                  for MCP servers here (mcp_command, and mcp_args before rest_mcp.py; "" finds a Python), its MCP server's name
                   (hpclib-{cluster} unless changed), and the REST server's GPU mode and per-job GPU limit
   llm_clients     the LLM clients whose MCP configuration the console keeps up to date (see mcp_clients.py)
   llm_client_paths  where each client's configuration file is, when finding it isn't right ("" finds it), and
@@ -32,7 +32,8 @@ LLM_CLIENTS = ("claude_desktop", "claude_code", "cursor", "chatgpt")
 DEFAULTS = {
     "notifications": {k: False for k in NOTIFICATIONS},
     "new_cluster": {"connection_hours": 12, "work_dir_pattern": "", "sandbox_gpus": "auto", "max_gpus": None,
-                    "mcp_name_pattern": "hpclib-{cluster}", "local_root_pattern": "", "mcp_python": ""},
+                    "mcp_name_pattern": "hpclib-{cluster}", "local_root_pattern": "", "mcp_command": "",
+                    "mcp_args": ""},
     "llm_clients": {k: False for k in LLM_CLIENTS},
     "widgets": {"hidden": [], "order": []},
     "system": {"platform": "auto", "windows_home": ""},
@@ -66,6 +67,10 @@ def load(console_dir):
     for section, values in (saved if isinstance(saved, dict) else {}).items():
         if section in out and isinstance(values, dict):
             out[section].update(values)
+    nc = out["new_cluster"]
+    if nc.get("mcp_python") and not nc.get("mcp_command"):     # its name in hpclib 1.4 to 1.8
+        nc["mcp_command"] = nc["mcp_python"]
+    nc.pop("mcp_python", None)
     return out
 
 
@@ -107,10 +112,11 @@ def _new_cluster(values):
             not isinstance(local, str) or len(local) > 512 or re.search(r"[\0\n\r]", local)
             or not re.match(r"(/|~/|~$|[A-Za-z]:[\\/])", local) or re.search(r"\{(?!(?:cluster|user)\})", local)):
         raise PrefsError("the local folder is a full path on this machine; {cluster} and {user} are filled in")
-    py = values.get("mcp_python")
-    if "mcp_python" in values and py != "" and (not isinstance(py, str) or len(py) > 1024
-                                                 or re.search(r"[\0\n\r]", py)):
-        raise PrefsError("mcp_python is the path of a Python on this machine, or empty to find one")
+    for key in ("mcp_command", "mcp_args"):
+        v = values.get(key)
+        if key in values and v != "" and (not isinstance(v, str) or len(v) > 2048 or re.search(r"[\0\n\r]", v)):
+            raise PrefsError(f"{key} is one line: the program that starts MCP servers here, and the arguments "
+                             "before rest_mcp.py (empty: find a Python)")
     if "sandbox_gpus" in values and values["sandbox_gpus"] not in GPU_MODES:
         raise PrefsError(f"sandbox_gpus is one of {', '.join(GPU_MODES)}")
     gpus = values.get("max_gpus")

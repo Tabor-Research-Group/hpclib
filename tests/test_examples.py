@@ -421,25 +421,48 @@ class TestSetupAgents(unittest.TestCase):
                   "--token-name", "second", "me@login.example", env=env)
         self.assertEqual(self.profile("two")["local_roots"], [str(self.tmp / "elsewhere")])
 
-    def test_mcp_python(self):
+    def test_agent_remove(self):
+        self.setup_agents("--work-dir", str(self.work[0]), "--templates", "hello", "me@login.example")
+        out = self.bash('stop_tunnel() { echo "stopped $*"; }; agent_remove "$@"', "me@login.example")
+        self.assertIn("removed ", out)
+        removed = list((self.profile_dir.parent / ".removed").iterdir())
+        self.assertEqual(len(removed), 1)
+        self.assertTrue((removed[0] / "agent_token").is_file())
+        self.assertFalse(self.profile_dir.exists())
+        self.assertIn("hpclib-login", out)                                   # its MCP entry is named
+        self.bash("agent_remove me@login.example", expect=1)
+
+    def test_mcp_launcher(self):
         py = self.tmp / "py" / "python"
         py.parent.mkdir()
         py.write_text("#!/bin/sh\nexit 1\n")          # no MCP SDK: used anyway, with a note
         py.chmod(0o755)
         out = self.setup_agents("--work-dir", str(self.work[0]), "--templates", "hello", "--mcp-python", str(py),
                                 "me@login.example")
-        self.assertEqual(self.profile()["mcp_python"], str(py))
+        self.assertEqual(self.profile()["mcp_command"], str(py))
         mcp = json.loads((self.profile_dir / "mcp.json").read_text())["mcpServers"]["hpclib-login"]
         self.assertEqual(mcp["command"], str(py))
-        self.assertIn("has no MCP SDK", out)
+        self.assertIn("can't import the MCP SDK", out)
+        # a launcher, with arguments before rest_mcp.py (quoted ones too): /usr/bin/arch -arm64 PYTHON, say
+        self.setup_agents("--no-install", "--mcp-command", "/usr/bin/env", "--mcp-args", f"-i '{py}' -X dev -X dev",
+                          "me@login.example")
+        mcp = json.loads((self.profile_dir / "mcp.json").read_text())["mcpServers"]["hpclib-login"]
+        self.assertEqual(mcp["command"], "/usr/bin/env")
+        self.assertEqual(mcp["args"][:5], ["-i", str(py), "-X", "dev", "-X"])
+        self.assertTrue(mcp["args"][6].endswith("rest_mcp.py"))
+        self.setup_agents("--no-install", "--mcp-args", "", "me@login.example")         # no arguments
+        self.assertEqual(json.loads((self.profile_dir / "mcp.json").read_text())["mcpServers"]["hpclib-login"]
+                         ["args"][0][-11:], "rest_mcp.py")
+        self.setup_agents("--no-install", "--mcp-command", str(py), "me@login.example")
         self.setup_agents("--no-install", "me@login.example")                    # kept on a rerun
         self.assertEqual(json.loads((self.profile_dir / "mcp.json").read_text())["mcpServers"]["hpclib-login"]
                          ["command"], str(py))
         self.setup_agents("--no-install", "--mcp-python", "auto", "me@login.example")
-        self.assertEqual(self.profile()["mcp_python"], "")
+        self.assertEqual(self.profile()["mcp_command"], "")
         self.assertNotEqual(json.loads((self.profile_dir / "mcp.json").read_text())["mcpServers"]["hpclib-login"]
                             ["command"], str(py))
         self.bash('setup_agents "$@"', "--mcp-python", str(self.tmp / "nope"), "me@login.example", expect=2)
+        self.bash('setup_agents "$@"', "--mcp-args", "'open", "me@login.example", expect=2)
 
     def test_colours_on_request(self):
         env = dict(self.env, HPCLIB_COLOR="always")

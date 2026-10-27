@@ -31,7 +31,7 @@ import time
 PORT_RANGE = (20000, 32000)
 MIN_PORT_SPAN = 50
 NAME_RE = re.compile(r"[^A-Za-z0-9._@-]+")
-LIST_KEYS = ("login", "work_dirs", "binds", "local_roots", "tunnel_args")
+LIST_KEYS = ("login", "work_dirs", "binds", "local_roots", "tunnel_args", "mcp_args")
 # Tunnel settings agent_tunnel reads (the console's settings page writes them):
 #   auto_approve_templates  all (default) | new | review
 #   tunnel_args             sbatch options for the tunnel's own job, e.g. --time=12:00:00
@@ -95,6 +95,26 @@ def write_private(path, text):
 def save(profile):
     profile["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     write_private(profile_path(profile["name"]), json.dumps(profile, indent=2) + "\n")
+
+
+def removed_root():
+    return os.path.join(root(), ".removed")
+
+
+def remove(name):
+    """Take a profile out of use: its folder (profile, tokens, mcp.json) moves to .removed/NAME-WHEN, private like
+    the rest, so it can be put back by moving it again. Returns where it went (None: no such profile)."""
+    if load(name) is None:
+        return None
+    os.makedirs(removed_root(), mode=0o700, exist_ok=True)
+    os.chmod(removed_root(), 0o700)
+    base = os.path.join(removed_root(), f"{name}-{time.strftime('%Y%m%d-%H%M%S')}")
+    dest, n = base, 1
+    while os.path.exists(dest):
+        n += 1
+        dest = f"{base}-{n}"
+    os.rename(profile_dir(name), dest)
+    return dest
 
 
 def port_free(port):
@@ -173,11 +193,40 @@ def random_port(taken=()):
     raise SystemExit("agent_profiles: could not find a free port")
 
 
+def launcher(profile, python):
+    """(command, args) that start rest_mcp.py: the profile's launch command and arguments (setup_agents
+    --mcp-command/--mcp-args, e.g. /usr/bin/arch with -arm64 /path/to/python), else `python`."""
+    command = profile.get("mcp_command") or profile.get("mcp_python")      # (mcp_python: hpclib 1.4 to 1.8)
+    if command:
+        return command, list(profile.get("mcp_args") or []) if profile.get("mcp_command") else []
+    return python, []
+
+
+def find_mcp_python():
+    """A Python here with the MCP SDK, as setup_agents finds one (_hpclib_mcp_python): $HPCLIB_MCP_PYTHON,
+    install.sh's environment, then a python3 that has it (else plain python3)."""
+    import shutil
+    import subprocess
+    if os.environ.get("HPCLIB_MCP_PYTHON"):
+        return os.environ["HPCLIB_MCP_PYTHON"]
+    venv = os.path.expanduser(os.environ.get("HPCLIB_MCP_VENV") or "~/.local/share/hpclib/mcp")
+    for candidate in (os.path.join(venv, "bin", "python"), shutil.which("python3"), "/usr/local/bin/python3",
+                      "/opt/homebrew/bin/python3"):
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            try:
+                if subprocess.run([candidate, "-c", "import mcp"], capture_output=True, timeout=20).returncode == 0:
+                    return candidate
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+    return shutil.which("python3") or "python3"
+
+
 def mcp_entry(profile, python, rest_mcp):
-    args = [rest_mcp, "--url", f"http://127.0.0.1:{profile['port']}", "--token-file", profile["token_file"]]
+    command, before = launcher(profile, python)
+    args = [*before, rest_mcp, "--url", f"http://127.0.0.1:{profile['port']}", "--token-file", profile["token_file"]]
     for d in profile.get("local_roots") or []:
         args += ["--local-root", d]
-    return {"mcpServers": {profile["mcp_name"]: {"command": python, "args": args}}}
+    return {"mcpServers": {profile["mcp_name"]: {"command": command, "args": args}}}
 
 
 # An MCP server's name: what LLM clients call the cluster (a key in their configuration, a TOML bare key)
@@ -312,7 +361,7 @@ def cmd_set(name, *pairs):
             return 2
         if key in LIST_KEYS:
             items = profile.get(key) or [] if append else []
-            if value and value not in items:
+            if value and (key == "mcp_args" or value not in items):     # (arguments may repeat)
                 items.append(value)
             profile[key] = items
         elif key in ("port", "process_port"):
@@ -403,10 +452,21 @@ def cmd_port_free(port):
     return 0 if port_free(int(port)) else 1
 
 
+def cmd_remove(name):
+    """Move the profile to .removed/ and print where it went."""
+    dest = remove(name)
+    if dest is None:
+        print(f"agent_profiles: no profile {name!r}", file=sys.stderr)
+        return 1
+    print(dest)
+    return 0
+
+
 COMMANDS = {
     "name": cmd_name, "get": cmd_get, "init": cmd_init, "set": cmd_set, "new-ports": cmd_new_ports,
     "mcp": cmd_mcp, "mcp-entry": cmd_mcp_entry, "find": cmd_find, "env": cmd_env, "list": cmd_list, "port-free": cmd_port_free,
     "dir": lambda name: print(profile_dir(name)) or 0, "root": lambda: print(root()) or 0,
+    "remove": cmd_remove,
 }
 
 
