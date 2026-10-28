@@ -199,8 +199,8 @@ class TestSetupCluster(unittest.TestCase):
                              env=env, capture_output=True, text=True, timeout=120)
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertIn("plaintext owner token", res.stdout)
-        self.assertIn("--hash-token-file", res.stdout)
-        self.assertIn("rerun with --rebuild", res.stdout)
+        self.assertIn("--repair-owner-token", res.stdout)
+        self.assertIn("--repair-owner-token", res.stdout)
         self.assertEqual(plaintext.read_text(), "server-made-token\n")      # left for you to copy first
         self.assertFalse((local_home / ".config" / "hpclib" / "agents" / "me@login.example" / "owner_token").exists())
 
@@ -305,11 +305,11 @@ class TestSetupAgents(unittest.TestCase):
         self.assertEqual(mcp["args"][1:], ["--url", f"http://127.0.0.1:{profile['port']}",
                                            "--token-file", str(self.token_file)])
         self.assertIn("no local folder for the agent", out)
-        self.assertIn("2. REQUIRED: add the MCP server", out)
-        self.assertIn("Not done yet: add the MCP entry", out)
+        self.assertIn("2. Check your MCP client entry", out)
+        self.assertIn("Client registration and job execution readiness were not verified", out)
         self.assertIn('"hpclib-login": {', out)                        # the JSON is in the output
         self.assertIn("claude mcp add-json hpclib-login", out)
-        self.assertNotIn("\033[", out[out.index("hpclib agents:"):])     # no colours when not a terminal
+        self.assertNotIn("\033[", out[out.index("hpclib:"):])     # no colours when not a terminal
 
         # a rerun with just the address uses the profile: same directories, ports and tokens ...
         (self.rest / "templates" / "orca" / "template.json").write_text('{"edited": true}')
@@ -469,7 +469,7 @@ class TestSetupAgents(unittest.TestCase):
         out = self.bash('setup_agents "$@"', "--work-dir", str(self.work[0]), "--templates", "hello",
                         "me@login.example", env=env)
         self.assertIn("\033[1;97;44m", out)
-        self.assertIn("\033[1;31m2. REQUIRED", out)                    # the MCP step is in red
+        self.assertIn("2. Check your MCP client entry", out)
         self.assertIn("\033[1;31mclaude mcp add-json", out)
         self.assertIn("\033[33m{", out)                                # the JSON block is coloured
         json_lines = [line[len("\033[33m"):-len("\033[0m")] for line in out.splitlines()

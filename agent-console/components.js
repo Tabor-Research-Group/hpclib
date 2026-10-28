@@ -918,10 +918,25 @@ export class HpcClusterRow extends TunnelRow {
       this.loginCells(lg, c),
       c.port,
       !c.set_up ? el("span", { class: "muted" }, "not set up") :
-        (c.has_owner_token ? "owner" : el("span", { class: "muted" }, "agent only")),
+        (c.tunnel?.owner_access === "rejected" ? el("span", { class: "muted" }, "agent only · owner rejected")
+          : c.has_owner_token ? "owner" : el("span", { class: "muted" }, "agent only · owner missing")),
       [el("div", { class: "actions" }, b.start, b.stop, b.log), el("div", { class: "actions second" }, b.install, b.setup, b.ssh)],
     ];
   }
+}
+
+// Owner recovery is separate from setup/rebuild; it preserves the agent token and server settings.
+export function ownerRecovery(cluster, started = async () => {}) {
+  return action("Recover owner access", async () => {
+    if (!await confirmDialog("Recover owner access?",
+      "A matching owner credential will be reused. Otherwise a replacement is created for this console. " +
+      "Other consoles using the previous owner credential will need the replacement. Agent credentials, " +
+      "templates, server settings and databases are preserved. Restart the agent tunnel after recovery.",
+      "Recover owner access")) return;
+    await fetcher(`clusters/${encodeURIComponent(cluster.name)}/setup`,
+      { method: "POST", body: { repair_owner_token: true } });
+    await started();
+  });
 }
 
 /** 19.5 GB: a size in bytes for people (decimal units, as Ollama and Hugging Face give them). */

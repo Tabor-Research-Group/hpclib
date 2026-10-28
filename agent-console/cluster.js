@@ -2,7 +2,7 @@
 // page (Overview, Jobs, Apps, Installed, Storage, Files, Agents, Settings); #/c/NAME/apps/APP is one app there, with
 // its controls, tools and settings, and a package's tabs for it. They use the console's existing API, plus
 // GET clusters/NAME/jobs, GET/POST clusters/NAME/storage[/scan] and GET clusters/NAME/quota. app.js passes what they share with it (init).
-import { el, action, confirmDialog, connectClients } from "./components.js";
+import { el, action, confirmDialog, connectClients, ownerRecovery } from "./components.js";
 import * as widgets from "./widgets.js";
 
 // { api, errorBox, render, settingsCards: (c) => [cards], addCluster: () => [button, area], files: (name) => page,
@@ -148,7 +148,11 @@ async function runStep(c, what) {
   }
   if (what === "update") await api(path(c.name, "install"), { method: "POST", body: {} });
   if (what === "setup") { location.hash = href(c.name, "agents"); return; }
-  if (what === "start") await api(path(c.name, "tunnel/start"), { method: "POST", body: {} });
+  if (what === "start") {
+    // Reuse the Agents page's Stop action and wait for it before starting again.
+    await api(path(c.name, "tunnel/stop"), { method: "POST" });
+    await api(path(c.name, "tunnel/start"), { method: "POST", body: {} });
+  }
   if (what === "stop") await api(path(c.name, "tunnel/stop"), { method: "POST" });
   ctx.render();
 }
@@ -737,12 +741,22 @@ async function agents(c, local, sub) {
   // Clusters page; its panels open under it
   const row = el("hpc-cluster-row", { cluster: c.name, local });
   row.data = c;
+  let actionsCard = tunnelActionsCard(c);
+  let actionsState = JSON.stringify([c.tunnel?.state, c.tunnel?.owner_access, c.has_owner_token]);
+  row.addEventListener("update", ({ detail: current }) => {
+    const next = JSON.stringify([current.tunnel?.state, current.tunnel?.owner_access, current.has_owner_token]);
+    if (next === actionsState) return;
+    actionsState = next;
+    const replacement = tunnelActionsCard(current);
+    actionsCard.replaceWith(replacement);
+    actionsCard = replacement;
+  });
   return el("div", {}, tabs,
     el("p", { class: "muted" }, "Agents reach this cluster through its REST server, which runs in a job behind the " +
       "agent tunnel. Setup installs the job templates, the sandboxed server's config and the agent's token."),
     el("table", { class: "rows" },
       el("thead", {}, el("tr", {}, ["Cluster", "Tunnel", "Login", "Port", "Token", ""].map((h) => el("th", {}, h)))), row),
-    mcpNameCard(c), tunnelActionsCard(c));
+    mcpNameCard(c), actionsCard);
 }
 
 // Tunnel actions (rest_actions.py on the cluster): what each tunnel offers agents, which are on, and whether each
@@ -754,8 +768,19 @@ function tunnelActionsCard(c) {
   const intro = el("p", { class: "muted" }, "Operations a tunnel runs for agents with your access, such as copying " +
     "files to and from your group's SMB server with your sign-in. They run as you, outside the agents' sandbox, " +
     "with typed, checked parameters, and each call is in the audit log (Activity). Agents see only what is on.");
-  if (!tunnelUp(c) || !c.has_owner_token) {
-    box.append(head, intro, el("p", { class: "muted" }, "Start the agent tunnel to see and change them."));
+  if (!tunnelUp(c)) {
+    const state = c.tunnel?.state || "down";
+    const message = state === "starting" ? "The agent tunnel is connecting. Its actions will appear when it is ready."
+      : state === "error" ? "The agent tunnel check failed: " + (c.tunnel?.error || "see the tunnel log for details.")
+      : "Start the agent tunnel to see and change them.";
+    box.append(head, intro, el("p", { class: "muted", role: "status" }, message));
+    return box;
+  }
+  if (!c.has_owner_token || c.tunnel?.owner_access === "rejected") {
+    box.append(head, intro, el("p", { class: "notice", role: "status" },
+      "The tunnel is connected for agents. This console has no verified owner credential (missing, unusable or rejected). " +
+      "Enabled actions can still run; recovering owner access allows their settings to be changed."),
+      ownerRecovery(c, () => ctx.render()));
     return box;
   }
   const notice = el("p", { class: "notice", role: "status" });

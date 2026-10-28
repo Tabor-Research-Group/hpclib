@@ -867,8 +867,17 @@ function _hpclib_remote_owner_token {
       mkdir -p "$(dirname "$f")" &&
         (umask 077; set -o noclobber; printf 'sha256:%s\n' "$2" > "$f") && echo installed ;;
     replace)
-      mkdir -p "$(dirname "$f")" &&
-        (umask 077; printf 'sha256:%s\n' "$2" > "$f.new" && mv "$f.new" "$f") && echo replaced ;;
+      [[ "$2" =~ ^[0-9a-f]{64}$ ]] || return 1
+      [ ! -L "$f" ] || return 1
+      [ ! -e "$f" ] || [ -f "$f" ] || return 1
+      local tmp
+      mkdir -p "$(dirname "$f")" || return 1
+      tmp=$(umask 077; mktemp "$f.XXXXXX") || return 1
+      if printf 'sha256:%s\n' "$2" > "$tmp" && mv -f "$tmp" "$f"; then
+        echo replaced
+      else
+        rm -f "$tmp"; return 1
+      fi ;;
     matches)  # is the owner token the one with hash $2?
       if [ -e "$f" ] && [ "$(head -n 1 "$f" | tr -d '[:space:]')" = "sha256:$2" ]; then echo match; else echo differs; fi ;;
   esac
@@ -897,6 +906,94 @@ function _hpclib_agents_remote {  # _hpclib_agents_remote FUNCTION INPUT_FILE AR
 
 function _hpclib_sha256 {  # the sha256 of a token file's contents, without trailing whitespace
   python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.read().strip().encode()).hexdigest())' < "$1"
+}
+
+
+# Local credentials are private regular files, containing the token itself, never its hash.
+function _hpclib_owner_token_hash {
+  python3 -c 'import hashlib, os, stat, sys
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd) as f:
+        s = os.fstat(f.fileno())
+        if not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid() or s.st_mode & 0o077:
+            sys.exit(1)
+        token = f.read(4097).strip()
+    if not token or len(token) > 4096 or token.startswith("sha256:") or any(c.isspace() for c in token):
+        sys.exit(1)
+    print(hashlib.sha256(token.encode()).hexdigest())
+except (OSError, ValueError, UnicodeError):
+    sys.exit(1)' "$1"
+}
+
+function _hpclib_owner_token_create {
+  # Write completely before making the credential visible; never truncate an existing file.
+  python3 -c 'import os, secrets, sys, tempfile
+dest = sys.argv[1]
+os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=".owner-", dir=os.path.dirname(dest))
+try:
+    with os.fdopen(fd, "w") as f:
+        f.write(secrets.token_urlsafe(32) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.link(tmp, dest)
+finally:
+    os.unlink(tmp)' "$1"
+}
+
+# An explicit, owner-only recovery. It uses the existing login and profile; no install,
+# config/template regeneration, agent-token replacement, or profile update takes place.
+function _hpclib_agents_repair_owner {
+  (
+    local name owner_file pending hash result d lock
+    name=$(_hpclib_agent_profiles find "$1") || {
+      echo "owner recovery: no existing profile for $1; run ordinary setup first" >&2; return 1;
+    }
+    owner_file=$(_hpclib_agent_profiles get "$name" owner_token_file) || return 1
+    owner_file="${owner_file/#\~/$HOME}"
+    [ -n "$owner_file" ] || { echo 'owner recovery: this profile has no owner token path' >&2; return 1; }
+    if [ -L "$owner_file" ] || { [ -e "$owner_file" ] && [ ! -f "$owner_file" ]; }; then
+      echo 'owner recovery: the owner token path must be a regular file, not a link or directory' >&2
+      return 1
+    fi
+    local _hpclib_agents_login=()
+    while IFS= read -r d; do _hpclib_agents_login+=("$d"); done < <(_hpclib_agent_lines "$name" login)
+    [ "${#_hpclib_agents_login[@]}" -gt 0 ] || { echo 'owner recovery: this profile has no login' >&2; return 1; }
+    mkdir -p "$(dirname "$owner_file")" || return 1
+    lock="$owner_file.recovery-lock"
+    mkdir "$lock" 2>/dev/null || { echo 'owner recovery: another recovery is running (or left a recovery-lock)' >&2; return 1; }
+    trap 'rmdir "$lock"' EXIT
+    hash=$(_hpclib_owner_token_hash "$owner_file" 2>/dev/null) || hash=''
+    if [ -n "$hash" ] &&
+        [ "$(_hpclib_agents_remote _hpclib_remote_owner_token '' matches "$hash" | tail -n 1)" = match ]; then
+      echo "Owner credential verified for $name; no credential changed."
+      echo 'If the running server still rejects it, restart the agent tunnel to reload its stored credential.'
+      return 0
+    fi
+    # Keep this private pending file if the connection fails after the remote update.
+    # A retry uses the same credential and can finish without losing the only copy.
+    pending="$owner_file.recovery"
+    if [ ! -e "$pending" ] && [ ! -L "$pending" ]; then
+      _hpclib_owner_token_create "$pending" || return 1
+    fi
+    hash=$(_hpclib_owner_token_hash "$pending") || {
+      echo "owner recovery: pending credential is empty, unsafe or unreadable: $pending" >&2; return 1;
+    }
+    result=$(_hpclib_agents_remote _hpclib_remote_owner_token '' matches "$hash" | tail -n 1)
+    if [ "$result" != match ]; then
+      result=$(_hpclib_agents_remote _hpclib_remote_owner_token '' replace "$hash" | tail -n 1)
+      if [ "$result" != replaced ]; then
+        echo "Owner update could not be confirmed. Private recovery credential kept at $pending; rerun the same recovery command." >&2
+        return 1
+      fi
+    fi
+    mv -f "$pending" "$owner_file" || return 1
+    echo "Owner credential recovered for $name."
+    echo 'Agent tokens, templates, configuration and deployments were preserved.'
+    echo 'Restart the agent tunnel to load the new owner credential, then refresh the console.'
+    echo 'Other consoles using the previous owner credential must obtain the replacement securely.'
+  )
 }
 
 function _hpclib_agent_profiles {  # the profile store: lib/agent_profiles.py
@@ -955,7 +1052,7 @@ function _hpclib_colors {
   fi
 }
 
-function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROFILE_NAME
+function _hpclib_agents_getting_started {  # PROFILE_NAME OWNER_STATE
   local name="$1" host port process_port mcp_name token_file pdir mcp_python mcp_ok=yes local_hpclib
   local _c_reset _c_banner _c_head _c_cmd _c_json _c_dim _c_warn _c_alert line d allow='' roots=''
   _hpclib_colors
@@ -974,7 +1071,12 @@ function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROF
     [ -n "$d" ] && roots="$roots${roots:+, }$d"
   done < <(_hpclib_agent_lines "$name" local_roots)
 
-  printf '\n%s  hpclib agents: %s is ready  %s\n\n' "$_c_banner" "$host" "$_c_reset"
+  if [ "${2:-unverified}" = ready ]; then
+    printf '\n%s  hpclib: agent setup complete; owner credential verified for %s  %s\n\n' "$_c_banner" "$host" "$_c_reset"
+  else
+    printf '\n%s  hpclib: agent setup complete; owner access incomplete (%s) for %s  %s\n\n' "$_c_warn" "${2:-unverified}" "$host" "$_c_reset"
+    printf '   Recover owner access without rebuilding: setup_agents --repair-owner-token %s\n\n' "$name"
+  fi
   printf '%sProfile%s  %s\n' "$_c_head" "$_c_reset" "$pdir"
   printf '%s         ports %s (your machine and the login node) and %s (the compute node), picked at random%s\n' \
     "$_c_dim" "$port" "$process_port" "$_c_reset"
@@ -990,10 +1092,9 @@ function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROF
   printf '%s   = launch_tunnel -A none -P %s %s rest --process-port=%s%s --%s%s\n\n' \
     "$_c_dim" "$port" "$host" "$process_port" "$login_node" "$allow" "$_c_reset"
 
-  printf '%s2. REQUIRED: add the MCP server to your LLM client.%s setup_agents does not change the client'"'"'s config, and\n' \
-    "$_c_alert" "$_c_reset"
-  printf '   %suntil you do, the agent has no tools for this cluster (or an old entry'"'"'s port and token).%s\n' \
-    "$_c_alert" "$_c_reset"
+  printf '%s2. Check your MCP client entry.%s Client registration was not checked by setup.\n' "$_c_head" "$_c_reset"
+  printf '   Add the entry for a new client, or update it if its launcher, port or token path changed.\n'
+  printf '   An existing working client needs no duplicate entry.\n'
   # this machine's platform (lib/local_platform.py): under WSL, Claude Desktop is a Windows program that starts the
   # server in WSL through wsl.exe
   local client_platform desktop_config quit_hint='Cmd-Q, not just closing the window'
@@ -1031,7 +1132,7 @@ function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROF
   printf '   rerun, keeping everything: %ssetup_agents %s%s   (--rebuild replaces it all)\n' \
     "$_c_cmd" "$name" "$_c_reset"
   printf '   describe the cluster for agents: cluster_notes in ~/.local/tunnels/rest/config.json on the cluster\n\n'
-  printf '%sNot done yet: add the MCP entry from step 2 to your LLM client and restart it.%s\n\n' "$_c_alert" "$_c_reset"
+  printf 'Client registration and job execution readiness were not verified by this setup summary.\n\n'
 }
 
 # Prepare a cluster for agents (LLM clients) using the REST server's job
@@ -1064,10 +1165,12 @@ function _hpclib_agents_getting_started {  # _hpclib_agents_getting_started PROF
 # sandbox's host image, the owner token's hash, and the scoped token (the old
 # one is revoked).
 function setup_agents {
+  local original_argc="$#" repair_owner=no
   local usage='usage: setup_agents [--work-dir DIR ...] [--bind DIR ...] [--local-root DIR ...] [--templates LIST|all]
        [--config FILE] [--no-sandbox] [--rebuild] [--no-install] [--target DIR] [--name NAME]
        [--no-local-root] [--python-module MODULE ...] [--remote-python PATH|auto] [--mcp-command PATH|auto] [--mcp-args 'ARGS'] [--port N] [--process-port N] [--new-ports] [--token-name NAME] [--token-file FILE]
-       [--owner-token-file FILE] [--mcp-name NAME] [--scopes LIST] [ssh options] [user@]host'
+       [--owner-token-file FILE] [--mcp-name NAME] [--scopes LIST] [ssh options] [user@]host
+       setup_agents --repair-owner-token PROFILE   (owner credential only)'
   local work_dirs=() binds=() local_roots=() login_args=() hosts=()
   local name='' token_name='' token_file='' owner_file='' port='' process_port='' mcp_name='' new_ports=no
   local no_local_root=no python_modules=() remote_python='' mcp_python='' mcp_args_given=no mcp_args=''
@@ -1104,6 +1207,7 @@ function setup_agents {
         shift 2 ;;
       --no-sandbox) sandbox=no; shift ;;
       --rebuild) rebuild=yes; shift ;;
+      --repair-owner-token) repair_owner=yes; shift ;;
       --no-install) install=no; shift ;;
       --new-ports) new_ports=yes; shift ;;
       --no-local-root) no_local_root=yes; shift ;;
@@ -1113,6 +1217,14 @@ function setup_agents {
       *) login_args+=("$1"); shift ;;
     esac
   done
+  if [ "$repair_owner" = yes ]; then
+    if [ "$original_argc" -ne 2 ] || [ "${#login_args[@]}" -ne 1 ]; then
+      echo 'usage: setup_agents --repair-owner-token PROFILE (no other setup options)' >&2
+      return 2
+    fi
+    _hpclib_agents_repair_owner "${login_args[0]}"
+    return $?
+  fi
   if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 6))' 2> /dev/null; then
     echo "setup_agents: needs python3 (3.6 or newer) on this machine" >&2
     return 1
@@ -1302,7 +1414,7 @@ except ValueError as e:
   fi
 
   echo "== owner token"
-  local state hash result legacy="$HOME/.config/hpclib/rest_token"
+  local state hash result owner_state=unverified legacy="$HOME/.config/hpclib/rest_token"
   state=$(_hpclib_agents_remote _hpclib_remote_owner_token "" check | tail -n 1)
   case "$state" in
     missing|hashed|plaintext) ;;
@@ -1315,12 +1427,14 @@ except ValueError as e:
     (umask 077; cp "$legacy" "$owner_file") && echo "copied this cluster's owner token from $legacy into the profile"
   fi
   if [ "$state" = missing ] || [ "$rebuild" = yes ]; then
-    if [ ! -e "$owner_file" ]; then
-      mkdir -p "$(dirname "$owner_file")"
-      (umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > "$owner_file") || return 1
+    if [ ! -e "$owner_file" ] && [ ! -L "$owner_file" ]; then
+      _hpclib_owner_token_create "$owner_file" || return 1
       echo "created $owner_file"
     fi
-    hash=$(_hpclib_sha256 "$owner_file") || return 1
+    hash=$(_hpclib_owner_token_hash "$owner_file") || {
+      echo 'setup_agents: owner credential is empty, unsafe or unreadable; use --repair-owner-token PROFILE' >&2
+      return 1
+    }
     if [ "$state" = missing ]; then
       result=$(_hpclib_agents_remote _hpclib_remote_owner_token "" install "$hash" | tail -n 1)
     else
@@ -1333,13 +1447,22 @@ except ValueError as e:
     echo "the cluster has the hash of $owner_file; keep that file, it is the only copy of the token"
     [ "$state" = plaintext ] && echo "  (the plaintext owner token that was on the cluster no longer works)"
   elif [ "$state" = hashed ]; then
-    echo "the cluster already has a hashed owner token"
-    [ -e "$owner_file" ] || echo "  ($owner_file doesn't exist; if you have lost the token, rerun with --rebuild)"
+    echo 'the cluster already has a hashed owner token'
   else
-    echo "the cluster has a plaintext owner token, made when the REST server first started; rerun with --rebuild"
-    echo "to replace it with one kept on this machine, or hash it in place:"
-    echo "  (umask 077; ssh ${login_args[*]} cat .local/tunnels/rest_token > $owner_file)"
-    echo "  ssh ${login_args[*]} python3 $(case "$rest_server" in /*) printf %s "$rest_server" ;; *) printf '~/%s' "$rest_server" ;; esac) --hash-token-file"
+    echo 'the cluster has a plaintext owner token; owner access has not been verified'
+  fi
+  hash=$(_hpclib_owner_token_hash "$owner_file" 2>/dev/null) || hash=''
+  if [ -z "$hash" ]; then
+    owner_state=missing-or-unusable
+  elif [ "$(_hpclib_agents_remote _hpclib_remote_owner_token '' matches "$hash" | tail -n 1)" = match ]; then
+    owner_state=ready
+  else
+    owner_state=mismatched-or-unverified
+  fi
+  if [ "$owner_state" != ready ]; then
+    echo "Owner access incomplete ($owner_state): this machine has no verified matching owner credential."
+    echo "Recover only owner access: setup_agents --repair-owner-token $name"
+    echo 'An ordinary setup rerun preserves the existing server hash; it cannot recover a missing secret from it.'
   fi
 
   echo "== agent token '$token_name' for ${work_dirs[*]}"
@@ -1403,7 +1526,7 @@ except ValueError as e:
     echo "saved to $token_file"
   fi
 
-  _hpclib_agents_getting_started "$name"
+  _hpclib_agents_getting_started "$name" "$owner_state"
 }
 
 # Start the REST tunnel for a cluster set up with setup_agents, with the

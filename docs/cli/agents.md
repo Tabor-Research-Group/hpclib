@@ -39,10 +39,39 @@ Common options:
 | `--mcp-name NAME` | the MCP server's name: letters, digits, `-` and `_` (default `hpclib-` and the first part of the host name, e.g. `hpclib-grace`). A later rename keeps the old name in the profile, so the console can remove it from LLM clients |
 | `--port N`, `--process-port N`, `--new-ports` | the tunnel's ports (picked at random, then kept) |
 | `--no-sandbox` | leave jobs unsandboxed (not recommended) |
+| `--repair-owner-token PROFILE` | recover only this existing profile’s owner access; preserves agent tokens, templates, configuration, ports and deployment state |
 | `--rebuild` | regenerate templates, config, the sandbox image and the agent token; old copies are kept on the cluster |
 
 Rerunning is safe: it keeps your templates, configuration and tokens and adds what a newer hpclib brings. A later
 run needs only the address: `setup_agents user@login.example`.
+
+### Missing or mismatched owner credential
+
+The server stores only the owner token’s hash. The original credential stays on the machine that created it.
+Creating a profile on another machine, losing its credential file, or using a different profile for the same
+server can leave agent access working while console administration is unavailable. A hash cannot reconstruct
+the original credential. Ordinary setup preserves that hash and now reports owner access as incomplete.
+It verifies a local credential against the server rather than relying on file existence.
+
+If the original credential is available, restore it privately to the profile’s owner token path with mode 600.
+Otherwise run on your own machine:
+
+```bash
+setup_agents --repair-owner-token user@login.example
+```
+
+Or choose **Recover owner access** in the console’s Setup panel or Tunnel actions card. This is an explicit
+credential recovery: it reuses a matching credential, or creates a replacement, without running installation
+or changing templates, server configuration, the agent token, ports, work directories, or databases. Restart
+the agent tunnel after replacement; other consoles using the previous owner credential must obtain the new
+credential securely. No credential contents are printed in setup logs.
+
+If the connection fails during replacement, the private `owner_token.recovery` file is retained. Rerun the
+same recovery command to finish; keep that file until recovery succeeds. Concurrent recovery on the same
+profile is refused with a recovery-lock message.
+
+The setup summary does not verify MCP client registration or job execution. A working existing client does
+not need a duplicate MCP entry. A successful container probe does not establish CPU/memory-limit readiness.
 
 ## 2. Add the MCP entry to your client
 

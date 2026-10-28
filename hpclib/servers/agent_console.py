@@ -1279,6 +1279,15 @@ class Clusters:
                 # node's ssh to the compute node waits (perhaps for a password)
                 return dict(out, state="starting", error="connecting: nothing answers behind the port yet")
             return dict(out, state="error", error=e.payload["error"])
+        if status == 401 and read_private(profile.get("owner_token_file") or "") and \
+                read_private(profile.get("token_file") or ""):
+            # A stale owner credential must not hide a working agent connection.
+            try:
+                status, ctype, content = self.call(profile, "GET", "/health", as_agent=True, timeout=5)
+            except ConsoleError as e:
+                return dict(out, state="error", error=e.payload["error"])
+            if status < 400:
+                out["owner_access"] = "rejected"
         if "text/html" in ctype:
             return dict(out, state="starting")
         try:
@@ -1436,7 +1445,8 @@ class Clusters:
                 self._record_setup(profile, record["app"], self._operation_text(profile, record))
             except Exception:    # the log or the profile is gone: the next Check says
                 pass
-        if record["kind"] == "setup" and code == 0 and profile is not None:
+        if (record["kind"] == "setup" and code == 0 and profile is not None and
+                "--repair-owner-token" not in record.get("command", ())):
             # its MCP entry may be new or changed: give it to the LLM clients the console keeps up to date
             try:
                 synced = self.sync_llm_clients()
@@ -1472,7 +1482,7 @@ class Clusters:
         if self.tunnel_state(profile)["state"] != "up":
             raise ConsoleError(409, f"{needs}: start the agent tunnel first (Agents → Clusters → Start)")
         if not read_private(profile.get("owner_token_file") or ""):
-            raise ConsoleError(409, f"{needs}: this console needs its owner token; rerun setup_agents")
+            raise ConsoleError(409, f"{needs}: this console needs its owner credential; use Setup → Recover owner access")
 
         def request(verb, body=None, query=None):
             status, ctype, content = self.call(profile, verb, "/admin/tunnel-install", query=query,
@@ -1986,10 +1996,20 @@ class Clusters:
                                   title="Set up cluster SSH")
 
     def setup(self, profile, body):
-        unknown = set(body) - {"work_dirs", "binds", "local_roots", "templates", "rebuild", "mcp_python",
+        unknown = set(body) - {"work_dirs", "binds", "local_roots", "templates", "rebuild", "repair_owner_token", "mcp_python",
                                "mcp_command", "mcp_args", "remote_python", "python_modules"}
         if unknown:
             raise ConsoleError(400, f"unknown setup options {sorted(unknown)}")
+        repair = body.get("repair_owner_token", False)
+        if not isinstance(repair, bool):
+            raise ConsoleError(400, "repair_owner_token must be true or false")
+        if repair:
+            if set(body) != {"repair_owner_token"}:
+                raise ConsoleError(400, "owner recovery cannot be combined with other setup options")
+            if not profile.get("work_dirs"):
+                raise ConsoleError(422, "set this cluster up before recovering owner access")
+            return self.run_operation(profile, "setup", ["setup_agents", "--repair-owner-token", profile["name"]],
+                                      title="Recover owner access")
         args = ["setup_agents"]
         # the MCP server's launcher: a command and the arguments before rest_mcp.py (mcp_python: the older name)
         command = body.get("mcp_command", body.get("mcp_python"))
@@ -2507,8 +2527,8 @@ class Clusters:
         if self.tunnel_state(profile)["state"] != "up":
             raise ConsoleError(409, f"{needs}: start the agent tunnel first (Agents → Clusters → Start)")
         if not read_private(profile.get("owner_token_file") or ""):
-            raise ConsoleError(409, f"{needs}, with the owner token, which this console doesn't have for it: rerun "
-                                    f"setup_agents")
+            raise ConsoleError(409, f"{needs}, with the owner token, which this console doesn't have for it: "
+                                    f"use Setup → Recover owner access")
         status, ctype, content = self.call(profile, "POST", "/admin/tunnel-tokens", body=json.dumps(
             {"tunnel": spec["tunnel"], "action": args[0], "args": args[1:]}).encode(),
             headers={"Content-Type": "application/json"}, timeout=240)
@@ -4217,8 +4237,12 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             raise ConsoleError(503, f"the tunnel to {profile['name']} is up but its REST server job is still "
                                     f"queued or starting")
         if status == 401:  # keep 401 for the console's own key, so a front end can tell them apart
-            raise ConsoleError(502, f"{profile['name']} refused the stored token (HTTP 401); it may have been "
-                                    f"revoked: rerun setup_agents --rebuild", cluster_status=401)
+            _, credential = self.server.clusters.token(profile, as_agent=as_agent)
+            recovery = ("use Setup → Recover owner access; if already recovered, restart the agent tunnel"
+                        if credential == "owner" else
+                        "restore a valid agent token, or use Rebuild (also replaces configuration and templates)")
+            raise ConsoleError(502, f"{profile['name']} refused the stored {credential} credential (HTTP 401); "
+                                    f"{recovery}", cluster_status=401)
         self.send_bytes(status, ctype or "application/octet-stream", content)
         return status, None
 

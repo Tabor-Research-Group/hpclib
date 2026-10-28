@@ -6,7 +6,7 @@
 // and open   http://127.0.0.1:8000/?api=http://127.0.0.1:27180
 
 // The page's building blocks are custom elements, in components.js (see its header).
-import { configure, el, action, confirmDialog, LOGIN_BUSY, LOGIN_LABEL, HpcClusterPicker } from "./components.js";
+import { configure, el, action, confirmDialog, LOGIN_BUSY, LOGIN_LABEL, HpcClusterPicker, ownerRecovery } from "./components.js";
 import { activityPage as buildActivity } from "./activity.js";
 import * as clusterUI from "./cluster.js";
 import * as settingsUI from "./settings.js";
@@ -269,7 +269,9 @@ function setupForm(c, row) {
       field("Python on the cluster", remotePython, "an absolute path, 3.9 or newer; empty: find one"),
       field("…or modules that provide it", modules, "space-separated, loaded in order")),
     el("label", {}, rebuild, " Rebuild: regenerate templates and config and replace the agent token (old copies are kept)"),
-    el("div", { class: "actions" }, run)));
+    c.set_up ? el("p", { class: "muted" }, "An ordinary rerun preserves the owner credential. If it is missing " +
+      "or rejected, use Recover owner access; a full Rebuild is not required.") : null,
+    el("div", { class: "actions" }, run, c.set_up ? ownerRecovery(c, () => row.refresh()) : null)));
 }
 
 // the folder on this machine for an agent's push_files/pull_files: Console Settings' suggestion, filled in

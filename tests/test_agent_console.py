@@ -1438,7 +1438,7 @@ class TestTunnelInstall(ConsoleTestCase):
     def test_install_rest_prerequisites_and_failures(self):
         self.shell.install_elsewhere = "no runtime on login"
         cases = [("down", "owner", None, "start the agent tunnel"),
-                 ("up", None, None, "owner token"),
+                 ("up", None, None, "owner credential"),
                  ("up", "owner", (404, "application/json", b'{"error":"unknown route"}'), "0.2.71"),
                  ("up", "owner", (200, "text/html", b'<html>queued</html>'), "queued or starting")]
         for state, owner, response, message in cases:
