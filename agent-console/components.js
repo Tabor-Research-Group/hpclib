@@ -1164,10 +1164,11 @@ export class HpcAppSession extends TunnelRow {
   drawControls(controls) {
     this._controls = this._controls || {};
     const made = (controls || []).map((c) => {
-      let wrap = this._controls[c.id];
+      const key = c.key || c.id;
+      let wrap = this._controls[key];
       if (!wrap) {
-        const button = action(c.label, () => this.runControl(this._controls[c.id].spec), { result: true });
-        wrap = this._controls[c.id] = el("hpclib-control", {}, button);
+        const button = action(c.label, () => this.runControl(this._controls[key].spec), { result: true });
+        wrap = this._controls[key] = el("hpclib-control", {}, button);
         wrap.button = button;
       }
       wrap.spec = c;

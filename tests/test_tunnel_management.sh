@@ -438,6 +438,7 @@ printf 'JOB_INITIALIZATION_PAUSE=0\nJOB_CONNECT_RETRY_WAIT_TIME=0\n' > "$test_di
 cat > "$test_dir/share-bin/squeue" <<'SCRIPT'
 #!/usr/bin/env bash
 # jobs in $TEST_RUNNING run (on node9); others have ended
+[ -z "${TEST_SQUEUE_ERROR:-}" ] || { echo 'slurm_load_jobs error: Socket timed out' >&2; exit 1; }
 job=''; fmt=''
 while [ "$#" -gt 0 ]; do case "$1" in -j) job="$2"; shift ;; -o|--format) fmt="$2"; shift ;; --format=*) fmt="${1#*=}" ;; esac; shift; done
 case " $TEST_RUNNING " in
@@ -576,6 +577,12 @@ fi
   stop() { bash "$HPCLIB_DIR/tunnels/setup_tunnel.sh" shared-demo "$@"; }
   SLURM_JOB_ID=7100 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance shared-demo 3101"
   SLURM_JOB_ID=7200 bash -c "source '$HPCLIB_DIR/tunnels/instances.sh'; tunnel_register_instance shared-demo 3102"
+  if TEST_SQUEUE_ERROR=1 stop --instances > /dev/null 2>&1; then fail 'reported a failed query as no instances'; fi
+  [ -e "$test_dir/share-data/instances/shared-demo/7100" ] || fail 'lost a running instance on a failed query'
+  [ -e "$test_dir/share-data/instances/shared-demo/7200" ] || fail 'removed an unverified instance on a failed query'
+  if TEST_SQUEUE_ERROR=1 stop --stop-instance 7100 > /dev/null 2>&1; then fail 'reported a failed stop query as ended'; fi
+  [ -e "$test_dir/share-data/instances/shared-demo/7100" ] || fail 'lost the instance after a failed ownership query'
+  grep -q 'scancel' "$TEST_SHARE_LOG" 2>/dev/null && fail 'cancelled a job after a failed ownership query'
   out=$(TEST_RUNNING=7100 stop --instances)
   assert_equal "$out" "HPCLIB_TUNNEL_INSTANCE 7100 $(hostname -s) 3101 RUNNING $(id -un)"
   [ ! -e "$test_dir/share-data/instances/shared-demo/7200" ] || fail 'listed (kept) an ended instance'

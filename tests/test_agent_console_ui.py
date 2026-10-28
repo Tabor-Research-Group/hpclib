@@ -124,6 +124,50 @@ class TestConsoleUI(unittest.TestCase):
           document.getElementById('sessions').append(row);
         }""")
 
+    def test_shared_instance_controls_work_without_tunnel_metadata_and_target_the_selected_job(self):
+        self.load()
+        self.page.evaluate("""async () => {
+          const {configure, el} = await import('/components.js');
+          window.instanceRequests = [];
+          const controls = ['11', '22'].map(job => ({
+            id: 'stop_instance', key: `stop_instance:${job}`, label: `End database job ${job}`,
+            args: {job}, confirm: `End registered job ${job}? Every connected tunnel loses it.`
+          }));
+          const state = {cluster: 'demo', host: 'demo', port: 1234, state: 'down', shared: true,
+                         token_known: true, login: {state: 'connected'}, install: {state: 'nothing'},
+                         tools: [{id: 'instance', kind: 'info', label: 'Database',
+                                  text: 'job 11 on node1, port 3104; registered on the cluster (RUNNING)'}],
+                         controls: [...controls, {id: 'refresh_instances', label: 'Refresh instances'}]};
+          configure({api: async (path, options) => {
+            if (path.includes('/control/')) {
+              instanceRequests.push({path, method: options.method, body: options.body});
+              return {message: 'Done.'};
+            }
+            return state;
+          }});
+          row.remove();
+          window.row = el('hpc-app-session', {app: 'pai', 'app-title': 'PAI', cluster: 'demo', 'by-app': true, 'app-page': true});
+          row.data = state;
+          document.getElementById('sessions').append(row);
+        }""")
+        self.page.get_by_text("registered on the cluster", exact=False).wait_for()
+        self.assertTrue(self.page.get_by_role("button", name="End database job 11", exact=True).is_visible())
+        self.assertTrue(self.page.get_by_role("button", name="End database job 22", exact=True).is_visible())
+        self.page.get_by_role("button", name="End database job 11", exact=True).click()
+        self.page.get_by_role("button", name="Cancel", exact=True).click()
+        self.assertEqual(self.page.evaluate("window.instanceRequests"), [])
+        self.page.get_by_role("button", name="End database job 22", exact=True).click()
+        dialog = self.page.locator('hpc-dialog[heading="End database job 22"]')
+        dialog.get_by_role("button", name="End database job 22", exact=True).click()
+        self.page.wait_for_function("window.instanceRequests.length === 1")
+        self.assertEqual(self.page.evaluate("window.instanceRequests"),
+                         [{"path": "apps/pai/demo/control/stop_instance", "method": "POST", "body": {"job": "22"}}])
+        self.page.get_by_role("button", name="Refresh instances", exact=True).click()
+        self.page.wait_for_function("window.instanceRequests.length === 2")
+        self.assertEqual(self.page.evaluate("window.instanceRequests[1]"),
+                         {"path": "apps/pai/demo/control/refresh_instances", "method": "POST", "body": {}})
+        self.assertFalse(self.errors)
+
     def test_transfer_open_waits_for_cache_preparation_before_navigating(self):
         self.transfer_row()
         self.page.context.route("**/opened-transfer.html", lambda route:

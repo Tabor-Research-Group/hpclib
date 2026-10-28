@@ -1159,6 +1159,7 @@ class Clusters:
         self.ops = {}
         self.app_procs = {}
         self.control_procs = {}      # (name, app): a row's control that asks for a password (kinit), beside its GUI
+        self.instance_queries = {}   # (name, app): recent registry recovery when launch metadata is unavailable
         self._clear_requests = {}    # name -> clear_ports' options (its password too), until its operation ends
         self.script_runner = self._login_script
         self.storage_scans = {}      # name -> {"state": "running", "started": ...} while a storage scan runs
@@ -2800,20 +2801,31 @@ class Clusters:
         inst = state.get("instance")
         if spec.get("shared"):
             what = spec.get("instance_label", "instance")
-            if inst:
-                tools.append({"id": "instance", "kind": "info", "label": what.capitalize(),
-                              "text": f"job {inst['job']} on {inst['node']}, port {inst['port']}; " +
-                                      ("this tunnel started it, and it keeps running after Stop"
-                                       if inst["how"] == "started" else
-                                       "another tunnel started it; Stop only disconnects")})
-                controls.append({"id": "stop_instance", "label": f"End {what} job",
-                                 "title": f"scancel {inst['job']}: ends the {what} for every tunnel using it",
-                                 "confirm": f"End job {inst['job']}, the {what} on {inst['node']}? Every tunnel "
+            instances = state.get("registered_instances") or ([inst] if inst else [])
+            for item in instances:
+                job = item["job"]
+                how = item.get("how", "registered")
+                detail = ("this tunnel started it, and it keeps running after Stop" if how == "started" else
+                          "another tunnel started it; Stop only disconnects" if how == "attached" else
+                          f"registered on the cluster ({item['state']}); Stop only disconnects")
+                tools.append({"id": "instance" if len(instances) == 1 else f"instance-{job}",
+                              "kind": "info", "label": what.capitalize(),
+                              "text": f"job {job} on {item['node']}, port {item['port']}; " + detail})
+                controls.append({"id": "stop_instance", "key": f"stop_instance:{job}",
+                                 "label": f"End {what} job" + (f" {job}" if len(instances) > 1 else ""),
+                                 "title": f"scancel {job}: ends the {what} for every tunnel using it",
+                                 "confirm": f"End job {job}, the {what} on {item['node']}? Every tunnel "
                                             f"connected to it loses it, and this tunnel stops too.",
-                                 "args": {"job": inst["job"]}})
-            else:
+                                 "args": {"job": job}})
+            if not instances:
+                text = (f"instance discovery failed: {state['instance_error']}" if state.get("instance_error") else
+                        f"no registered {what} jobs on the cluster" if "registered_instances" in state else
+                        "checking the cluster's instance registry" if state.get("instance_checking") else
+                        f"none seen yet: Start connects to a running {what} job, or starts one")
                 tools.append({"id": "instance", "kind": "info", "label": what.capitalize(),
-                              "text": f"none seen yet: Start connects to a running {what} job, or starts one"})
+                              "text": text})
+            controls.append({"id": "refresh_instances", "label": "Refresh instances",
+                             "disabled": bool(state.get("instance_checking"))})
         return tools, controls
 
     # -- Data transfer (smbshell): signing in to the SMB server, beside its GUI ----------------------
@@ -2944,11 +2956,31 @@ class Clusters:
         """The shared app's registered running instances on the cluster, with their owners."""
         spec = self.app_spec(app)
         text = self._run_setup(profile, ["tunnel_setup"] + ssh_options(profile) +
-                               [profile["host"], spec["tunnel"], "--instances"], wait)
+                               [profile["host"], spec["tunnel"], "--instances"], wait, check=True)
         return [{"job": j, "node": n, "port": int(p), "state": st, "owner": u}
                 for j, n, p, st, u in INSTANCE_LINE_RE.findall(text)]
 
-    def _run_setup(self, profile, args, wait):
+    def recover_app_instances(self, profile, app):
+        """Recover shared jobs from the cluster registry, independently of a local tunnel/log tail."""
+        if not self.logins.alive(profile):
+            return {"error": "log in to the cluster to discover running instances"}
+        key = (profile["name"], app)
+        now = time.monotonic()
+        with self.lock:
+            cached = self.instance_queries.get(key)
+            if cached and now - cached["checked"] < 30:
+                return cached
+            self.instance_queries[key] = {"checked": now, "pending": True}
+        try:
+            instances = self.app_instances(profile, app, wait=5)
+            out = {"checked": time.monotonic(), "instances": instances}
+        except ConsoleError as error:
+            out = {"checked": time.monotonic(), "error": str(error)}
+        with self.lock:
+            self.instance_queries[key] = out
+        return out
+
+    def _run_setup(self, profile, args, wait, check=False):
         if not self.logins.alive(profile):
             raise ConsoleError(409, f"log in to {profile['name']} first: this runs over the console's ssh login")
         with tempfile.TemporaryFile() as out:
@@ -2960,6 +2992,8 @@ class Clusters:
                 raise ConsoleError(504, f"no answer from {profile['name']} within {wait} s")
             out.seek(0)
             text = out.read().decode(errors="replace")
+        if check and code != 0:
+            raise ConsoleError(502, f"could not query {profile['name']} (exit {code}); check its login and hpclib installation")
         return text if code == 0 else text + f"\n(exit {code})"
 
     def app_control(self, profile, app, control, body):
@@ -2967,6 +3001,13 @@ class Clusters:
         spec = self.app_spec(app)
         if spec.get("smb"):
             return self.transfer_control(profile, app, control)
+        if control == "refresh_instances" and spec.get("shared"):
+            if body:
+                raise ConsoleError(400, "refresh_instances takes an empty object")
+            instances = self.app_instances(profile, app, wait=5)
+            with self.lock:
+                self.instance_queries[(profile["name"], app)] = {"checked": time.monotonic(), "instances": instances}
+            return {"instances": instances, "message": "Checked the cluster's running instances."}
         if control != "stop_instance" or not spec.get("shared"):
             raise ConsoleError(404, f"{spec['title']} has no control {control!r}")
         job = str(body.get("job") or "")
@@ -2982,6 +3023,8 @@ class Clusters:
             reason = next((l.split(": ", 1)[1] for l in text.splitlines() if l.startswith("setup_tunnel: ")),
                           " ".join(text.strip().splitlines()[-2:]))
             raise ConsoleError(409, f"job {job} was not ended: {reason}")
+        with self.lock:
+            self.instance_queries.pop((profile["name"], app), None)
         with open(self.app_log_path(profile["name"], app), "a") as log:
             log.write(f"hpclib console: ended job {job} ({result})\n")
         # the tunnel to it has nothing left to reach
@@ -2994,6 +3037,21 @@ class Clusters:
 
     def app_state(self, profile, app):
         state = self._app_state(profile, app)
+        with self.lock:
+            queried_instances = (profile["name"], app) in self.instance_queries
+        if APPS[app].get("shared") and (not state.get("instance") or queried_instances):
+            recovered = self.recover_app_instances(profile, app)
+            if "instances" in recovered:
+                hint = state.get("instance") or {}
+                instances = [dict(item, how=hint.get("how", "registered") if item["job"] == hint.get("job")
+                                  else "registered") for item in recovered["instances"]]
+                state["registered_instances"] = instances
+                state["instance"] = next((item for item in instances if item["job"] == hint.get("job")),
+                                         instances[0] if len(instances) == 1 else None)
+            if recovered.get("error"):
+                state["instance_error"] = recovered["error"]
+            if recovered.get("pending"):
+                state["instance_checking"] = True
         state["tools"], state["controls"] = self.app_extras(APPS[app], state)
         if APPS[app].get("reinstall"):     # what Install does once installed (PAI: Update), if not Reinstall
             state["reinstall"] = APPS[app]["reinstall"]

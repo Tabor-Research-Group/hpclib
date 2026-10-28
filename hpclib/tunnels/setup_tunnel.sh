@@ -406,7 +406,12 @@ if [ "$instances" = true ]; then
   dir=$(_tunnel_instances_dir "$TUNNEL_NAME")
   for file in $(ls -t "$dir" 2>/dev/null); do
     case "$file" in ''|*[!0-9]*) continue ;; esac
-    line=$(squeue -h -j "$file" -o "%T %u" 2>/dev/null | head -n 1)
+    if ! line=$(squeue -h -j "$file" -o "%T %u" 2>&1); then
+      if printf '%s' "$line" | grep -qi 'invalid job id'; then rm -f "$dir/$file"; continue; fi
+      echo "setup_tunnel: cannot query job $file; keeping its instance record" >&2
+      exit 1
+    fi
+    line=$(printf '%s\n' "$line" | head -n 1)
     if [ -z "$line" ]; then rm -f "$dir/$file"; continue; fi
     read -r node port < "$dir/$file"
     printf 'HPCLIB_TUNNEL_INSTANCE %s %s %s %s\n' "$file" "$node" "$port" "$line"
@@ -420,7 +425,15 @@ if [ -n "$stop_job" ]; then
     echo "setup_tunnel: job $stop_job is not a registered $TUNNEL_NAME instance; not cancelling it" >&2
     exit 1
   fi
-  owner=$(squeue -h -j "$stop_job" -o %u 2>/dev/null | head -n 1)
+  if ! owner=$(squeue -h -j "$stop_job" -o %u 2>&1); then
+    if printf '%s' "$owner" | grep -qi 'invalid job id'; then
+      owner=''
+    else
+      echo "setup_tunnel: cannot query job $stop_job; keeping its instance record and not cancelling it" >&2
+      exit 1
+    fi
+  fi
+  owner=$(printf '%s\n' "$owner" | head -n 1)
   if [ -z "$owner" ]; then
     rm -f "$dir/$stop_job"
     echo "HPCLIB_TUNNEL_INSTANCE_GONE $stop_job"

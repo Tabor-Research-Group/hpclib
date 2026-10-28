@@ -227,6 +227,12 @@ whether this tunnel started it or only connected), and **End database job** canc
 only if it is yours and registered as a PAI database, and stops this tunnel. Stop itself still only
 disconnects.
 
+When launch metadata is unavailable (including after a verbose log has exceeded the console's log
+tail), shared apps recover their jobs from the cluster's instance registry over the existing SSH login.
+Registered jobs remain manageable while the local tunnel is stopped. Recovery results are cached for
+30 seconds; **Refresh instances** checks immediately. Each registered job has its own **End database
+job** control. Registry-query failures are shown explicitly rather than being reported as no jobs.
+
 The two row elements fetch their own state, every 3 s while something is in motion (a login, a starting tunnel
 or session, an install) and every 30 s otherwise. They redraw only themselves, so pages aren't reloaded to follow
 a tunnel. For what only the page does (the login dialog, the setup and app settings forms, the password dialog)

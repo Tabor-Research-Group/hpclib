@@ -71,6 +71,8 @@ class FakeShell:
         self.calls = []
         self.setup_status = "missing not installed: no image at /x/vscode.sif"   # what tunnel_setup --check says
         self.stop_answer = None                                                  # what --stop-instance says
+        self.instances = [("152400", "chem-entr-c04", 3104, "RUNNING", "maboyer")]
+        self.instances_exit = 0
         self.install_elsewhere = None
         self.tokens = []                                                         # the app's tokens, for --tokens
         self.tokens_error = None                                                 # what tunnel_setup --tokens says instead
@@ -93,10 +95,15 @@ class FakeShell:
             if "--check" in args:
                 log.write(f"HPCLIB_TUNNEL_STATUS {self.setup_status}\n".encode())
             if "--instances" in args:
-                log.write(b"HPCLIB_TUNNEL_INSTANCE 152400 chem-entr-c04 3104 RUNNING maboyer\n")
+                for row in self.instances:
+                    log.write(("HPCLIB_TUNNEL_INSTANCE " + " ".join(map(str, row)) + "\n").encode())
+                if self.instances_exit:
+                    return subprocess.Popen(["bash", "-c", f"exit {self.instances_exit}"], start_new_session=True)
             if "--stop-instance" in args:
                 job = args[args.index("--stop-instance") + 1]
                 log.write((self.stop_answer or f"HPCLIB_TUNNEL_INSTANCE_STOPPED {job}").encode() + b"\n")
+                if self.stop_answer is None:
+                    self.instances = [row for row in self.instances if row[0] != job]
         if args[0] == "tunnel_setup" and "--tokens" in args:   # like setup_tunnel.sh --tokens over tokens.sh --json
             rest = args[args.index("--tokens") + 1:]
             if self.tokens_error:
@@ -1634,9 +1641,73 @@ class TestTunnelInstall(ConsoleTestCase):
             self.assertEqual((status, out["result"]), (200, "stopped"), out)
         self.assertIn(["tunnel_setup", host, "pai", "--stop-instance", "152400"], self.shell.calls)
         self.assertEqual(self.shell.calls[-1][0], "stop_tunnel")                 # and this tunnel stops
-        pai = self.call("GET", base)[1]
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            pai = self.call("GET", base)[1]
         self.assertNotIn("stop_instance", [c["id"] for c in pai["controls"]])
-        self.assertIn("none seen yet", pai["tools"][0]["text"])
+        self.assertIn("no registered database jobs", pai["tools"][0]["text"])
+
+    def test_recovers_shared_instance_beyond_log_tail_and_after_local_stop(self):
+        base = f"/api/apps/pai/{self.dead}"
+        self.call("GET", base)
+        port = agent_profiles.load(self.dead)["apps"]["pai"]["port"]
+        log = self.console / "logs" / f"{self.dead}.pai.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("\n=== launch ===\nhpclib: attaching to the running pai instance: "
+                       "job 152400 on chem-entr-c04, port 3104\n" + "request completed\n" * 70000)
+        server = self.serve(port)
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            state = self.call("GET", base)[1]
+            self.assertEqual(state["state"], "up")
+            self.assertEqual(state["instance"]["job"], "152400")
+            self.assertEqual(state["instance"]["how"], "registered")
+            self.assertEqual(state["controls"][0]["args"], {"job": "152400"})
+            self.assertIn("registered on the cluster", state["tools"][0]["text"])
+            self.assertEqual(sum("--instances" in args for args in self.shell.calls), 1)
+            self.call("GET", base)
+            self.assertEqual(sum("--instances" in args for args in self.shell.calls), 1)  # cached recovery
+            server.shutdown()
+            server.server_close()
+            log.write_text(log.read_text() + "\n=== stop_tunnel ===\nStopped\n")
+            state = self.call("GET", base)[1]
+            self.assertEqual(state["state"], "down")
+            self.assertEqual(state["controls"][0]["args"], {"job": "152400"})
+
+    def test_registry_refresh_distinguishes_failure_empty_and_multiple_jobs(self):
+        base = f"/api/apps/pai/{self.dead}"
+        self.call("GET", base)
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.shell.instances_exit = 1
+            state = self.call("GET", base)[1]
+            self.assertIn("instance discovery failed", state["tools"][0]["text"])
+            self.assertNotIn("registered_instances", state)
+            self.assertEqual(self.call("GET", base + "/instances")[0], 502)
+            self.assertEqual(self.call("POST", base + "/control/refresh_instances", {})[0], 502)
+            self.shell.instances_exit = 0
+            self.shell.instances = []
+            self.assertEqual(self.call("POST", base + "/control/refresh_instances", {})[0], 200)
+            state = self.call("GET", base)[1]
+            self.assertEqual(state["registered_instances"], [])
+            self.assertIn("no registered database jobs", state["tools"][0]["text"])
+            self.shell.instances = [("11", "node1", 3104, "RUNNING", "me"),
+                                    ("22", "node2", 3105, "RUNNING", "me")]
+            self.call("POST", base + "/control/refresh_instances", {})
+            state = self.call("GET", base)[1]
+            controls = [c for c in state["controls"] if c["id"] == "stop_instance"]
+            self.assertEqual([c["args"]["job"] for c in controls], ["11", "22"])
+            self.assertEqual(len({c["key"] for c in controls}), 2)
+            self.assertTrue(all(c["confirm"] for c in controls))
+            self.assertEqual(self.call("POST", base + "/control/refresh_instances", {"job": "11"})[0], 400)
+        self.assertEqual(self.call("POST", base + "/control/refresh_instances", {})[0], 409)
+
+    def test_registry_refresh_overrides_stale_log_metadata(self):
+        self.test_vscode_password_and_shared_pai()
+        base = f"/api/apps/pai/{self.dead}"
+        self.shell.instances = [("999", "node9", 4100, "RUNNING", "me")]
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.assertEqual(self.call("POST", base + "/control/refresh_instances", {})[0], 200)
+            state = self.call("GET", base)[1]
+            self.assertEqual(state["instance"]["job"], "999")
+            self.assertEqual(state["controls"][0]["args"], {"job": "999"})
 
 
 FAKE_KINIT = textwrap.dedent("""\
