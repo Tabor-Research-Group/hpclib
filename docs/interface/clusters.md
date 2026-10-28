@@ -25,13 +25,13 @@ Its address is `#/c/NAME/TAB`, so a tab can be bookmarked.
 | Tab | What it shows |
 | --- | --- |
 | Overview | what the cluster needs next, tiles for the agent tunnel, hpclib, jobs, storage and apps, and each app's state with its one action |
-| Jobs | every job of yours on the cluster, read with `squeue` and `sacct` over your login: queued (with Slurm's reason in plain words and the expected start), running, and finished in the last 24 hours (result, time taken, peak memory against what was asked for). Each job is labelled with what started it: an agent's template, the agent tunnel, an app, or something else |
-| Apps | each app's row (Start, Open, Stop, Log), showing only the buttons that apply; a package's apps too. Click an app's name for its page |
+| Jobs | every job of yours on the cluster, read with `squeue` and `sacct` over your login (the counts at the top show only that kind, queued, running, finished or failed; click again for all): queued (with Slurm's reason in plain words and the expected start), running, and finished in the last 24 hours (result, time taken, peak memory against what was asked for). Each job is labelled with what started it: an agent's template, the agent tunnel, an app, or something else |
+| Apps | each app's row (Start, Open, Stop, Log), showing only the buttons that apply; a package's apps too. Click an app's name for its page. **Pin** keeps an app in view on this cluster; the others wait under **More apps** (collapsed; a running one shows anyway); **Hide** drops one from the list (**Hidden apps** brings it back). The Overview lists the pinned and running ones |
 | Installed | hpclib, the agent setup and each app: whether it is installed, what the cluster reported, and Check / Install / Update; **Check all** checks every app |
-| Storage | the work directories' sizes and file counts, their largest folders, and your storage quota and project balance (**Check quotas**). **Scan now** runs `du` over your login at low priority, at most 5 minutes per directory (a longer scan is marked partial); the result is kept on this machine |
+| Storage | the work directories' sizes and file counts, their folders by size or by file count, and your storage quota and project balance (**Check quotas**). **Scan now** runs `du` over your login at low priority, at most 5 minutes per directory (a longer scan is marked partial); the result is kept on this machine |
 | Files | the cluster's files through its REST server (needs the agent tunnel), as the Files page was |
 | Agents | **Tunnel and setup**: the agent profile's row (start and stop the agent tunnel, its log, Update hpclib, Setup…, Set up SSH), the MCP server's name, and **Tunnel actions** (what tunnels may do for agents with your access: on or off per tunnel and per action, and whether each can run now); **Activity**: what agents did here; **SSH keys** |
-| Settings | the cluster's settings, in this order: its agent **Tunnel** (the tunnel's job), the REST **Server** (its limits and sandbox), **uv and pixi** (install them, and their Python and cache directories), ports (with **Clear leftover ports…**), **Quota checks**, **LLM clients** (its MCP entry in each client on this machine, with **Write entry**), and **Remove this cluster** |
+| Settings | the cluster's settings, in this order: its agent **Tunnel** (the tunnel's job), the REST **Server** (its limits and sandbox), **uv and pixi** (install them, and their Python and cache directories), ports (with **Clear leftover ports…**), **Quota checks**, **LLM clients** (its MCP entry in each client on this machine, with **Write entry**), **Apps on this cluster** (each app pinned, under More apps, or hidden), and **Remove this cluster** |
 
 ### LLM clients
 
@@ -66,6 +66,13 @@ clusters suggests a launcher for new clusters. (Setup… holds only what the clu
 How the quotas are checked, and changed, is [below](#quotas).
 
 ![The Storage tab: quotas, then each work directory's size by folder](../images/cluster-storage.png)
+
+Each work directory lists its folders with their size (`du -k`) and their file count (`du --inodes`: files,
+folders and links, what a file quota counts; `find` where `du` is older than coreutils 8.22). **By size** and
+**By files** sort them and scale the bars; the top 12 show, **Show all** the rest (up to 200). A folder of many
+small files, such as a Python environment, is the one to squash (see the README's *Squashed environments*).
+
+![The Storage tab sorted by file count](../images/cluster-storage-files.png)
 
 ![Settings, Quota checks](../images/cluster-quota-checks.png)
 

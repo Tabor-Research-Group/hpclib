@@ -125,6 +125,26 @@ class TestWorkspaceUI(pkg.ServerCase):
         self.page.locator("#jobs-list", has_text="4242").wait_for()
         self.assertEqual(self.errors, [])
 
+    def test_disk_usage(self):
+        for sub, n in (("big", 12), ("small", 2)):
+            (self.home / "proj" / sub).mkdir()
+            for i in range(n):
+                (self.home / "proj" / sub / f"f{i}").write_text("x" * 9000)
+        self.open()
+        self.page.locator("#files tr", has_text="proj/").click()
+        self.page.locator("#files tr", has_text="train.py").wait_for()
+        self.page.get_by_role("button", name="Usage", exact=True).click()
+        view = self.page.locator(".view:not([hidden]) .usage")
+        view.locator(".usage-table tbody tr", has_text="big/").wait_for()
+        self.assertIn("(files directly here)", view.inner_text())
+        view.get_by_role("button", name="By files").click()
+        first = view.locator(".usage-table tbody tr").first
+        self.assertIn("big/", first.inner_text())
+        self.assertIn("13", first.inner_text())                          # 12 files and the folder
+        first.get_by_role("button", name="Usage").click()
+        self.page.locator(".tabs .tab", has_text="Usage: big").wait_for()
+        self.assertEqual(self.errors, [])
+
     def test_terminal(self):
         self.open()
         self.page.get_by_role("button", name="Terminal here").click()

@@ -1219,7 +1219,9 @@ export class HpcAppSession extends TunnelRow {
     const link = this.getAttribute("app-href");
     const title = link ? el("a", { href: link, class: "cluster-link" }, this.appTitle) : el("strong", {}, this.appTitle);
     return [
-      [byApp ? title : s.cluster, el("div", { class: "muted" }, `port ${s.port}`)],
+      // viewControls (a page's): e.g. the Apps tab's Pin / Hide, drawn again with the row
+      [byApp ? title : s.cluster, el("div", { class: "muted" }, `port ${s.port}`),
+       typeof this.viewControls === "function" ? this.viewControls(s) : null],
       ...(byApp ? [] : [this.loginCells(lg, cluster)]),
       [el("hpc-state", { state: s.state, label: stateText, ...(notInstalled ? { tone: "starting" } : {}) }),
        up && !s.token_known ? el("div", { class: "muted" }, "token not seen yet; see Log") : null,

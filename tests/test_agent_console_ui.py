@@ -534,6 +534,110 @@ class TestConsoleUI(unittest.TestCase):
         self.assertIn('every port is clear', self.page.locator('pre.file').inner_text())
         self.assertEqual(self.errors, [])
 
+    def test_apps_tab_pinned_more_and_hidden(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
+             'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up'},
+             'app_view': {'pinned': ['pai'], 'hidden': ['vscode']}}
+        apps = [{'id': 'agents', 'title': 'Agents'}] + [{'id': i, 'title': t, 'kind': 'tunnel'} for i, t in
+                (('jupyter', 'JupyterLab'), ('vscode', 'VS Code'), ('pai', 'PAI'), ('workspace', 'Workspace'))]
+        def session(app, state='down'):
+            return {'app': app, 'cluster': 'demo', 'host': 'me@login', 'port': 8000, 'state': state, 'kind': 'tunnel',
+                    'install': {'state': 'installed'}, 'login': {'state': 'connected'}, 'tools': [], 'controls': []}
+        puts, fetched = [], []
+        def handler(route, path):
+            if path == 'clusters/demo/app-view':
+                body = route.request.post_data_json
+                puts.append(body)
+                c['app_view'] = {k: v for k, v in body.items() if v}
+                route.fulfill(body=json.dumps({'app_view': c['app_view']}), content_type='application/json')
+                return True
+            answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c, 'health': {'hpclib_version': '1.11.2'},
+                       'apps': {'apps': apps},
+                       'clusters/demo/settings': {'modes': ['all'], 'auto_approve_templates': 'all', 'tunnel_args': [],
+                                                  'connection_hours': 12, 'rest_on': 'job'}}
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            if path.startswith('apps/') and path.endswith('/demo'):
+                app = path.split('/')[1]
+                fetched.append(app)
+                route.fulfill(body=json.dumps(session(app, 'up' if app == 'workspace' else 'down')),
+                              content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/c/demo/apps")
+        main = self.page.locator('main')
+        main.locator('hpc-app-session[app="pai"]').wait_for()
+        front = main.locator('table.rows').first
+        # pinned, and running (Workspace) in view; JupyterLab under More apps, collapsed; VS Code hidden, not even asked
+        self.assertEqual(front.locator('hpc-app-session').evaluate_all('rs => rs.map(r => r.getAttribute("app"))'),
+                         ['pai', 'workspace'])
+        more = main.locator('details.more-apps').first
+        self.assertIn('More apps (1)', more.inner_text())
+        self.assertIsNone(more.get_attribute('open'))
+        self.assertNotIn('vscode', fetched)
+        self.assertIn('Hidden apps (1)', main.locator('details.hidden-apps').inner_text())
+        more.locator('summary').click()
+        more.locator('hpc-app-session[app="jupyter"]').get_by_role('button', name='Pin', exact=True).click()
+        self.page.wait_for_function("document.querySelectorAll('main table.rows')[0]?.querySelector('hpc-app-session[app=jupyter]')")
+        self.assertEqual(puts[-1], {'pinned': ['pai', 'jupyter'], 'hidden': ['vscode']})
+        main.locator('hpc-app-session[app="pai"]').get_by_role('button', name='Hide', exact=True).click()
+        main.locator('details.hidden-apps', has_text='Hidden apps (2)').wait_for()
+        self.assertEqual(puts[-1], {'pinned': ['jupyter'], 'hidden': ['vscode', 'pai']})
+        hidden = main.locator('details.hidden-apps')
+        hidden.locator('summary').click()
+        hidden.locator('tr', has_text='VS Code').get_by_role('button', name='Show').click()
+        main.locator('details.hidden-apps', has_text='Hidden apps (1)').wait_for()
+        self.assertEqual(puts[-1], {'pinned': ['jupyter'], 'hidden': ['pai']})
+        # Settings -> Apps on this cluster: the same, as one list
+        self.page.goto(self.base + "/#/c/demo/settings")
+        card = self.page.locator('#app-view')
+        card.get_by_label('PAI on demo').wait_for()
+        self.assertEqual(card.get_by_label('PAI on demo').input_value(), 'hidden')
+        card.get_by_label('Workspace on demo').select_option('pinned')
+        self.page.wait_for_timeout(300)
+        self.assertEqual(puts[-1], {'pinned': ['jupyter', 'workspace'], 'hidden': ['pai']})
+        self.assertEqual(self.errors, [])
+
+    def test_job_counts_filter_the_jobs_tab(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
+             'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up'}}
+        base = {'partition': 'cpu', 'elapsed': '0:10', 'time_limit': '1:00:00', 'cpus': '4', 'memory': '8G', 'gres': '',
+                'node_list': 'c01', 'start': '', 'reason': 'Priority', 'end': '2026-10-28T10:00:00', 'exit_code': '0:0',
+                'peak_memory_mb': None, 'source': {'kind': 'agent', 'label': 'agent: orca', 'token': 'llm'}}
+        jobs = {'at': 0, 'queued': [dict(base, id='1', name='waiting-job', state='PENDING')],
+                'running': [dict(base, id='2', name='running-job', state='RUNNING')],
+                'finished': [dict(base, id='3', name='good-job', state='COMPLETED'),
+                             dict(base, id='4', name='bad-job', state='FAILED', exit_code='1:0')],
+                'counts': {'queued': 1, 'running': 1, 'finished': 2, 'failed': 1}}
+        answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c, 'health': {'hpclib_version': '1.11.1'},
+                   'apps': {'apps': [{'id': 'agents', 'title': 'Agents'}]}, 'clusters/demo/jobs': jobs}
+        def handler(route, path):
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/c/demo/jobs")
+        main = self.page.locator('main')
+        main.get_by_text('running-job').wait_for()
+        main.get_by_role('button', name='1 failed').click()
+        main.get_by_text('Failed in the last 24 hours (1)').wait_for()
+        self.assertTrue(self.page.url.endswith('#/c/demo/jobs'), self.page.url)       # still the Jobs tab
+        text = main.inner_text()
+        self.assertIn('bad-job', text)
+        for gone in ('good-job', 'running-job', 'waiting-job'):
+            self.assertNotIn(gone, text)
+        self.assertEqual(main.get_by_role('button', name='1 failed').get_attribute('aria-pressed'), 'true')
+        main.get_by_role('button', name='1 running').click()
+        main.get_by_text('Running (1)').wait_for()
+        self.assertNotIn('bad-job', main.inner_text())
+        main.get_by_role('button', name='1 running').click()                          # again: everything
+        main.get_by_text('waiting-job').wait_for()
+        self.assertIn('good-job', main.inner_text())
+        self.assertEqual(self.errors, [])
+
     def test_cluster_pages_show_state_jobs_and_next_step(self):
         c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
              'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up', 'hpclib_version': '0.2.70'}}

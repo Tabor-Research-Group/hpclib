@@ -1,7 +1,7 @@
 {
   "format": 1,
   "name": "workspace",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "The Workspace: your files on a cluster in the browser, with an editor, viewers for images, HTML, PDFs and movies, terminals, and job scripts built from templates (uv, pixi, a venv or conda) and submitted with sbatch. Runs on the login node as you.",
   "apps": {
     "workspace": {

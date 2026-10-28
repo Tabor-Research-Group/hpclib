@@ -22,6 +22,8 @@ default). Routes, all but /health and the page's own files needing the token (X-
   POST /api/templates/edit {name, from?}   your copy to edit, in $HPCTUNNELS_DATA_DIR/script_templates
   POST /api/render {template, text?, input, values}   -> {script, name, dir, values, fields}
   POST /api/submit {script, name, dir, overwrite?, template?, values?}   write the job script, sbatch it -> {job_id}
+  GET  /api/usage?path=[&limit=]     a directory's folders by size (du -k) and file count (du --inodes, else a walk),
+                                     at low priority, up to limit seconds (120; at most 600; then partial)
   GET  /api/jobs                     your queued and running jobs (squeue): id, name, state, time, limit, directory
   POST /api/cancel {job}             scancel one of them
   GET  /raw/TOKEN/PATH               a file for an <img>, <iframe> or <video>, with Range; HTML and SVG with a
@@ -59,7 +61,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import script_templates  # noqa: E402
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 UI_DIR = os.path.join(HERE, "ui")
 MAX_ENTRIES = 5000
 MAX_JSON = 1 << 20
@@ -429,6 +431,87 @@ class Workspace:
             f.write(text)
         return {"path": path, "created": True}
 
+    # -- disk usage ------------------------------------------------------------------------------------------------
+
+    USAGE_LIMIT = 600
+
+    @staticmethod
+    def _du(args, path, limit):
+        """{path: number} from du --max-depth=1 (and whether it finished), at low priority with a time limit."""
+        try:
+            res = subprocess.run(["timeout", str(limit), "nice", "-n", "19", "du", "--max-depth=1"] + args + ["--", path],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                 universal_newlines=True, timeout=limit + 30)
+        except (OSError, subprocess.TimeoutExpired):
+            return {}, False, ""
+        out = {}
+        for line in res.stdout.splitlines():
+            value, _, p = line.partition("\t")
+            if value.isdigit():
+                out[p] = int(value)
+        return out, res.returncode == 0, res.stderr
+
+    @staticmethod
+    def _count(path, deadline):
+        """{path: entries} for path and each folder in it by walking (du too old for --inodes): files, folders and
+        links, each folder counting itself, as du --inodes does."""
+        out, done = {}, True
+
+        def walk(top):
+            n = 1
+            for base, dirs, files in os.walk(top, onerror=lambda e: None):
+                n += len(dirs) + len(files)
+                if time.time() > deadline:
+                    return n, False
+            return n, True
+        total = 1
+        try:
+            names = os.listdir(path)
+        except OSError as e:
+            raise oserror(e, path)
+        for name in names:
+            p = os.path.join(path, name)
+            if os.path.isdir(p) and not os.path.islink(p):
+                n, ok = walk(p)
+                out[p] = n
+                total += n
+                done = done and ok
+            else:
+                total += 1
+            if not done:
+                break
+        out[path] = total
+        return out, done
+
+    def usage(self, path, limit=120):
+        """A directory's folders by size (du -k) and by file count (du --inodes, else a walk): the Storage tab's
+        scan, for any directory. {path, kb, files, partial, children: [{name, path, kb, files}], here: {...}}."""
+        path = resolve(path)
+        if not os.path.isdir(path):
+            raise Refused(404, "{} isn't a directory".format(path))
+        limit = max(5, min(int(limit), self.USAGE_LIMIT))
+        start = time.time()
+        sizes, sized, _ = self._du(["-k"], path, limit)
+        counts, counted, err = self._du(["--inodes"], path, max(5, int(limit - (time.time() - start))))
+        method = "du --inodes"
+        if not counts and ("inodes" in err or "unrecognized" in err or "invalid option" in err):
+            counts, counted = self._count(path, time.time() + max(5, limit - (time.time() - start)))
+            method = "walk"
+        children = []
+        for p in sorted(set(sizes) | set(counts)):
+            if os.path.normpath(p) == path:
+                continue
+            children.append({"name": os.path.basename(p), "path": os.path.normpath(p), "kb": sizes.get(p),
+                             "files": counts.get(p)})
+        kb, files = sizes.get(path), counts.get(path)
+        here = None
+        if kb is not None and files is not None:
+            # what is directly in the directory: the total less its folders (and the folder itself, for files)
+            here = {"kb": max(0, kb - sum(c["kb"] or 0 for c in children)),
+                    "files": max(0, files - 1 - sum(c["files"] or 0 for c in children))}
+        return {"path": path, "kb": kb, "files": files, "partial": not (sized and counted), "children": children,
+                "here": here, "count_method": method, "seconds": round(time.time() - start, 1), "limit": limit}
+
     # -- jobs ------------------------------------------------------------------------------------------------------
 
     def jobs(self):
@@ -741,6 +824,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return 200, ws.render(self.json_body())
         if path == "/api/submit" and verb == "POST":
             return 200, ws.submit(self.json_body())
+        if path == "/api/usage" and verb == "GET":
+            try:
+                limit = int(q("limit") or 120)
+            except ValueError:
+                raise Refused(400, "limit: seconds")
+            return 200, ws.usage(q("path") or ws.root, limit)
         if path == "/api/jobs" and verb == "GET":
             return 200, ws.jobs()
         if path == "/api/cancel" and verb == "POST":

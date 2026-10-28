@@ -332,7 +332,9 @@ a.tile[href]:hover { border-color: var(--muted); }
 .tile-title { color: var(--muted); font-size: var(--font-size-small); text-transform: uppercase; letter-spacing: 0.04em; }
 .tile-value { font-size: var(--font-size-subheading); font-weight: var(--font-weight-semibold); margin: var(--space-xs) 0; }
 .counts { display: flex; gap: var(--space-md); flex-wrap: wrap; }
-.count { border: 1px solid var(--line); border-radius: var(--radius-control); padding: var(--space-xs) var(--space-md); color: var(--fg); text-decoration: none; }
+.count { border: 1px solid var(--line); border-radius: var(--radius-control); padding: var(--space-xs) var(--space-md); color: var(--fg); text-decoration: none; background: none; font: inherit; cursor: pointer; }
+.count:hover { border-color: var(--accent); }
+.count[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
 .count strong { font-size: var(--font-size-subheading); margin-right: 2px; }
 .count.up strong { color: var(--good); } .count.starting strong { color: var(--warn); } .count.error strong { color: var(--bad); }
 table.jobs { margin-bottom: var(--space-xl); }
@@ -343,7 +345,8 @@ table.bars td { border-bottom: none; padding: 3px var(--space-sm); vertical-alig
 table.bars td.bar-name { font-family: var(--font-mono); font-size: var(--font-size-code); width: 34%; overflow-wrap: anywhere; }
 table.bars td.bar-cell { width: 46%; }
 table.bars .bar { height: 10px; border-radius: 3px; background: var(--accent); opacity: 0.75; }
-table.bars td.num { text-align: right; }
+table.bars td.num, table.bars th.num { text-align: right; }
+table.bars th { font-weight: 400; color: var(--muted); font-size: var(--font-size-small); }
 pre.quota { max-height: 220px; }
 .quota-check h4 { margin: var(--space-md, 8px) 0 var(--space-xs, 4px); font-size: 0.95em; }
 .quota-check pre.quota { margin: 0; }
@@ -418,3 +421,9 @@ hpc-action-button.danger { --accent: var(--bad); }
 .connect-clients { margin-top: var(--space-lg, 12px); }
 .connect-clients h4 { margin: 0 0 var(--space-sm, 6px); }
 .ok-text { color: var(--good); }
+
+/* a cluster's Apps tab: More apps and Hidden apps, collapsed; Pin / Hide under each app's name */
+details.more-apps { margin-top: var(--space-lg); }
+details.more-apps > summary { cursor: pointer; font-weight: var(--font-weight-semibold); padding: var(--space-xs) 0; }
+.view-controls { display: flex; gap: var(--space-md); margin-top: 2px; }
+details.more-apps > summary .muted { font-weight: 400; }

@@ -93,6 +93,9 @@ The front end depends only on the routes below; nothing here depends on it.
   PUT  /api/clusters/NAME/quota/settings      {"storage"?, "project"?}: the cluster's checks (a command; "" for
                                               the default, "none" to turn one off), saved on the cluster
                                               ($HPCTUNNELS_DATA_DIR/settings/quota.sh), then checked
+  PUT  /api/clusters/NAME/app-view            {"pinned": [APP...], "hidden": [APP...]}: which apps the cluster's Apps
+                                              tab and Overview show always (pinned), not at all (hidden), or under
+                                              "More apps" (the rest); the profile's app_view
   GET  /api/clusters/NAME/python-tools        uv and pixi on the cluster over the login (lib/pytools.sh): where each
                                               is and its version, and their directories (Pythons, caches) with where
                                               each value comes from (your ~/.bashrc, hpclib's settings, the default)
@@ -449,7 +452,7 @@ def redact(value):
 REST_ROUTE_RE = re.compile(r"[A-Za-z0-9_./-]{1,256}")
 PROFILE_KEYS = ("name", "host", "port", "process_port", "work_dirs", "binds", "local_roots", "token_name", "preset",
                 "mcp_name", "created", "updated", "setup_config", "mcp_python", "mcp_command", "mcp_args", "python_spec",
-                "remote_python")
+                "remote_python", "app_view")
 
 
 class ConsoleError(Exception):
@@ -1011,33 +1014,47 @@ def parse_rss(value):
 
 
 def parse_storage(text):
-    """CLUSTER_STORAGE_SCRIPT's lines: {"dirs": [{path, kb, files, partial, missing, children: [...]}], "quota"}."""
-    dirs, current, quota = [], None, None
+    """CLUSTER_STORAGE_SCRIPT's lines: {"dirs": [{path, kb, files, partial, files_partial, missing, children:
+    [{path, kb, files}]}], "quota"}. Children are kept largest first, at most STORAGE_CHILDREN of them."""
+    dirs, current = [], None
     for line in text.splitlines():
         kind, _, rest = line.partition("|")
         if kind == "M":
             dirs.append({"path": rest, "missing": True, "kb": None, "files": None, "children": []})
+            current = None
         elif kind == "D":
             state, _, path = rest.partition("|")
             current = {"path": path, "partial": state != "ok", "kb": None, "files": None, "children": []}
             dirs.append(current)
-        elif kind == "S" and current is not None:
-            kb, _, path = rest.partition("|")
-            if not kb.isdigit():
+        elif kind in ("S", "F") and current is not None:
+            value, _, path = rest.partition("|")
+            if not value.isdigit():
                 continue
+            key = "kb" if kind == "S" else "files"
             if path.rstrip("/") == current["path"].rstrip("/"):
-                current["kb"] = int(kb)
-            else:
-                current["children"].append({"path": path, "kb": int(kb)})
-        elif kind == "I":
+                current[key] = int(value)
+                continue
+            child = next((ch for ch in current["children"] if ch["path"] == path), None)
+            if child is None:
+                child = {"path": path, "kb": None, "files": None}
+                current["children"].append(child)
+            child[key] = int(value)
+        elif kind == "C" and current is not None:
+            state, _, _ = rest.partition("|")
+            current["files_partial"] = state != "ok"
+        elif kind == "I":           # a scan by an older console: the total file count only
             count, _, path = rest.partition("|")
             for d in dirs:
                 if d["path"] == path and count.isdigit():
                     d["files"] = int(count)
     for d in dirs:
-        d["children"] = sorted(d["children"], key=lambda c: c["kb"], reverse=True)[:12]
+        d["children"] = sorted(d["children"], key=lambda c: (c["kb"] or 0, c["files"] or 0),
+                               reverse=True)[:STORAGE_CHILDREN]
     quotas = parse_quota(text)
     return {"dirs": dirs, "quotas": quotas, "quota": storage_quota(quotas)}
+
+
+STORAGE_CHILDREN = 200       # the folders kept per directory (the page shows the top ones, by size or by files)
 
 
 def parse_quota(text):
@@ -1092,8 +1109,9 @@ sacct -n -P -u "$USER" -S now-1day -o JobID,JobName,State,ExitCode,Elapsed,End,P
 """
 
 # Runs ON the login node: STORAGE_TIMEOUT DIR...: each directory's size by its children (du -k --max-depth=1) and
-# file count, at low priority and with a time limit (then marked partial). The scan adds the quota checks
-# (quota_script) after it.
+# their file counts (du --inodes --max-depth=1: files, folders and links, what a file quota counts; find where du is
+# too old for --inodes), at low priority and each with a time limit (then marked partial). The scan adds the quota
+# checks (quota_script) after it.
 CLUSTER_STORAGE_SCRIPT = r"""
 limit="$1"; shift
 tmp=$(mktemp) || exit 1
@@ -1105,8 +1123,21 @@ for d in "$@"; do
   timeout "$limit" nice -n 19 du -k --max-depth=1 -- "$d" > "$tmp" 2>/dev/null || state=partial
   printf 'D|%s|%s\n' "$state" "$d"
   sed 's/^\([0-9]*\)\t/S|\1|/' "$tmp"
-  files=$(timeout "$limit" nice -n 19 du -s --inodes -- "$d" 2>/dev/null | cut -f1)
-  printf 'I|%s|%s\n' "${files:-}" "$d"
+  counted=ok
+  : > "$tmp"
+  if ! timeout "$limit" nice -n 19 du --inodes --max-depth=1 -- "$d" > "$tmp" 2>/dev/null; then
+    counted=partial
+    if [ ! -s "$tmp" ]; then
+      # du without --inodes (coreutils before 8.22): find, folder by folder
+      timeout "$limit" nice -n 19 bash -c '
+        find "$1" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | while IFS= read -r -d "" c; do
+          printf "%s\t%s\n" "$(find "$c" 2>/dev/null | wc -l)" "$c"
+        done
+        printf "%s\t%s\n" "$(find "$1" 2>/dev/null | wc -l)" "$1"' hpclib-count "$d" > "$tmp" && counted=ok
+    fi
+  fi
+  printf 'C|%s|%s\n' "$counted" "$d"
+  sed 's/^\([0-9]*\)\t/F|\1|/' "$tmp"
 done
 """
 
@@ -3476,6 +3507,30 @@ class Clusters:
         self._write_mcp_port(fresh)
         return {"mcp_name": name, "previous": old, "llm_clients": self.sync_llm_clients(drop=[old] if old else [])}
 
+    APP_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+    def set_app_view(self, profile, body):
+        """{"pinned": [APP...], "hidden": [APP...]}: how the cluster's Apps tab and Overview list its apps (pinned:
+        always shown; hidden: not listed; the rest in a collapsed "More apps"). Kept in the profile, this machine."""
+        if not isinstance(body, dict) or set(body) - {"pinned", "hidden"}:
+            raise ConsoleError(400, 'send {"pinned": [APP...], "hidden": [APP...]}')
+        fresh = agent_profiles.load(profile["name"]) or profile
+        view = dict(fresh.get("app_view") or {})
+        for key in ("pinned", "hidden"):
+            if key not in body:
+                continue
+            ids = body[key]
+            if not isinstance(ids, list) or len(ids) > 200 or not all(isinstance(a, str) and self.APP_ID_RE.fullmatch(a)
+                                                                      for a in ids):
+                raise ConsoleError(400, f"{key}: a list of app ids")
+            view[key] = list(dict.fromkeys(ids))
+        clash = set(view.get("pinned") or []) & set(view.get("hidden") or [])
+        if clash:
+            raise ConsoleError(400, f"pinned and hidden at once: {', '.join(sorted(clash))}")
+        fresh["app_view"] = {k: v for k, v in view.items() if v}
+        agent_profiles.save(fresh)
+        return {"app_view": fresh["app_view"]}
+
     def new_ports(self, profile, body):
         """Pick new local ports for the agent tunnel (app: null) or an app, which must be stopped."""
         app = body.get("app")
@@ -3983,6 +4038,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 return 200, dict(c.quota(profile, self.query.get("kind", ["all"])[-1]), ok=True)
             if rest == ["quota", "settings"] and verb == "PUT":
                 return 200, dict(c.set_quota_checks(profile, self.json_body()), ok=True)
+            if rest == ["app-view"] and verb == "PUT":
+                return 200, dict(c.set_app_view(profile, self.json_body()), ok=True)
             if rest == ["python-tools"] and verb == "GET":
                 return 200, dict(c.python_tools(profile), ok=True)
             if rest == ["python-tools"] and verb == "PUT":

@@ -254,9 +254,12 @@ async function overview(c, local) {
   const jobs = login(c) ? await jobsSummary(c.name) : null;
   let st = null;
   try { st = await api(path(c.name, "storage")); } catch { /* an older console */ }
-  const apps = await appList();
+  const apps = (await appList()).filter((a) => appPlace(c, a.id) !== "hidden");
   const appIds = apps.map((a) => a.id);
   const states = await Promise.all(appIds.map((id) => api(`apps/${id}/${enc(c.name)}`).catch(() => null)));
+  // the Overview lists the pinned apps and running ones; the rest are on the Apps tab
+  const listed = states.filter((s) => s && (appPlace(c, s.app) === "pinned" || ACTIVE_STATES.includes(s.state)));
+  const unlisted = states.filter(Boolean).length - listed.length;
   const older = c.tunnel && c.tunnel.hpclib_version && local && versionCompare(c.tunnel.hpclib_version, local) < 0;
   const tile = (title, value, detail, link) => el("a", { class: "tile", href: link || null },
     el("div", { class: "tile-title" }, title), el("div", { class: "tile-value" }, value),
@@ -280,7 +283,9 @@ async function overview(c, local) {
         missing.length ? `${missing.length} not installed` : `${states.filter(Boolean).length} available`, `#/c/${enc(c.name)}/apps`)),
     widgets.strip("cluster.overview", { cluster: c.name }),
     el("h3", {}, "Apps"),
-    el("table", { class: "compact" }, el("tbody", {}, states.filter(Boolean).map((s) => {
+    !listed.length ? el("p", { class: "muted" }, "No app is pinned or running here. ",
+      el("a", { href: `#/c/${enc(c.name)}/apps` }, `All ${unlisted} on the Apps tab`)) : null,
+    el("table", { class: "compact" }, el("tbody", {}, listed.map((s) => {
       const title = (apps.find((a) => a.id === s.app) || {}).title || s.app;
       const notInstalled = s.install && s.install.state === "missing";
       return el("tr", {},
@@ -292,7 +297,9 @@ async function overview(c, local) {
           ? el("a", { class: "button primary", href: s.url, target: "_blank", rel: "noopener noreferrer" }, "Open")
           : el("a", { class: "button", href: notInstalled ? href(c.name, "installed") : appHref(c.name, s.app) },
               notInstalled ? "Install…" : s.state === "down" ? "Start…" : "View…")));
-    }))));
+    }))),
+    listed.length && unlisted ? el("p", { class: "muted small" },
+      el("a", { href: `#/c/${enc(c.name)}/apps` }, `${unlisted} more on the Apps tab`)) : null);
 }
 
 // ---------------------------------------------------------------- Jobs
@@ -315,56 +322,153 @@ async function jobsTab(c) {
   const table = (heads, rows, empty) => rows.length ? el("table", { class: "jobs" },
     el("thead", {}, el("tr", {}, heads.map((h) => el("th", {}, h)))), el("tbody", {}, rows))
     : el("p", { class: "muted" }, empty);
+  const failedState = (job) => job.state !== "COMPLETED";
+  const finishedRows = (only) => j.finished.filter((job) => !only || failedState(job)).map((job) => el("tr", {},
+    el("td", {}, el("strong", {}, job.name), el("div", { class: "muted small" }, job.id)), el("td", {}, source(job)),
+    el("td", {}, job.state === "COMPLETED" ? chip("completed", "up")
+      : chip(`${job.state.toLowerCase().replaceAll("_", " ")}${job.exit_code && job.exit_code !== "0:0" ? ` (${job.exit_code})` : ""}`, "error")),
+    el("td", {}, job.elapsed),
+    el("td", {}, job.peak_memory_mb === null ? el("span", { class: "muted" }, "—")
+      : `${job.peak_memory_mb >= 1024 ? (job.peak_memory_mb / 1024).toFixed(1) + " GB" : Math.round(job.peak_memory_mb) + " MB"}` +
+        (job.requested_memory ? ` of ${job.requested_memory}` : "")),
+    el("td", {}, (job.end || "").replace("T", " "))));
+  const sections = {
+    queued: () => [el("h3", { id: "queued" }, `Queued (${n.queued})`),
+      table(["Job", "From", "Partition", "Asked for", "Waiting because", "Expected start", ""], j.queued.map((job) => el("tr", {},
+        el("td", {}, el("strong", {}, job.name), el("div", { class: "muted small" }, job.id)), el("td", {}, source(job)),
+        el("td", {}, job.partition), el("td", {}, requested(job)),
+        el("td", { title: job.reason }, REASONS[job.reason] || job.reason),
+        el("td", {}, job.start ? job.start.replace("T", " ") : el("span", { class: "muted" }, "not estimated")),
+        el("td", { class: "next" }, cancel(job)))), "Nothing is waiting.")],
+    running: () => [el("h3", { id: "running" }, `Running (${n.running})`),
+      table(["Job", "From", "Node", "Time used", "Asked for", ""], j.running.map((job) => el("tr", {},
+        el("td", {}, el("strong", {}, job.name), el("div", { class: "muted small" }, job.id)), el("td", {}, source(job)),
+        el("td", {}, job.node_list), el("td", {}, `${job.elapsed} of ${job.time_limit}`), el("td", {}, requested(job)),
+        el("td", { class: "next" }, cancel(job)))), "Nothing is running.")],
+    finished: () => [el("h3", { id: "finished" }, `Finished in the last 24 hours (${n.finished})`),
+      table(["Job", "From", "Result", "Took", "Peak memory", "Ended"], finishedRows(false), "Nothing finished in the last day.")],
+    failed: () => [el("h3", { id: "failed" }, `Failed in the last 24 hours (${n.failed})`),
+      table(["Job", "From", "Result", "Took", "Peak memory", "Ended"], finishedRows(true), "Nothing failed in the last day.")],
+  };
+  // the counts filter the page to one kind of job (click again for all); not links: the page's own address is
+  // the route (#/c/NAME/jobs), and a fragment there would leave it
+  const body = el("div", {});
+  const buttons = [];
+  const draw = () => {
+    const only = jobFilter[c.name];
+    body.replaceChildren(...(only ? sections[only]() : ["queued", "running", "finished"].flatMap((k) => sections[k]())));
+    for (const b of buttons) b.setAttribute("aria-pressed", String(b.dataset.kind === only));
+  };
+  const count = (kind, tone, label, value) => {
+    const b = el("button", { type: "button", class: `count ${tone}`, "data-kind": kind,
+      title: `Show only ${label.trim()} jobs (click again for all)`,
+      onclick: () => { jobFilter[c.name] = jobFilter[c.name] === kind ? null : kind; draw(); } },
+      el("strong", {}, String(value)), label);
+    buttons.push(b);
+    return b;
+  };
+  draw();
   return el("div", {},
     el("div", { class: "toolbar" },
-      el("div", { class: "counts" },
-        el("a", { href: "#queued", class: "count starting" }, el("strong", {}, String(n.queued)), " queued"),
-        el("a", { href: "#running", class: "count up" }, el("strong", {}, String(n.running)), " running"),
-        el("a", { href: "#finished", class: "count" }, el("strong", {}, String(n.finished)), " finished today"),
-        n.failed ? el("a", { href: "#finished", class: "count error" }, el("strong", {}, String(n.failed)), " failed") : null),
+      el("div", { class: "counts", role: "group", "aria-label": "Show jobs" },
+        count("queued", "starting", " queued", n.queued),
+        count("running", "up", " running", n.running),
+        count("finished", "", " finished today", n.finished),
+        n.failed ? count("failed", "error", " failed", n.failed) : null),
       el("span", { class: "muted" }, `as of ${new Date(j.at * 1000).toLocaleTimeString()}`),
       action("Refresh", () => ctx.render())),
-    el("h3", { id: "queued" }, `Queued (${n.queued})`),
-    table(["Job", "From", "Partition", "Asked for", "Waiting because", "Expected start", ""], j.queued.map((job) => el("tr", {},
-      el("td", {}, el("strong", {}, job.name), el("div", { class: "muted small" }, job.id)), el("td", {}, source(job)),
-      el("td", {}, job.partition), el("td", {}, requested(job)),
-      el("td", { title: job.reason }, REASONS[job.reason] || job.reason),
-      el("td", {}, job.start ? job.start.replace("T", " ") : el("span", { class: "muted" }, "not estimated")),
-      el("td", { class: "next" }, cancel(job)))), "Nothing is waiting."),
-    el("h3", { id: "running" }, `Running (${n.running})`),
-    table(["Job", "From", "Node", "Time used", "Asked for", ""], j.running.map((job) => el("tr", {},
-      el("td", {}, el("strong", {}, job.name), el("div", { class: "muted small" }, job.id)), el("td", {}, source(job)),
-      el("td", {}, job.node_list), el("td", {}, `${job.elapsed} of ${job.time_limit}`), el("td", {}, requested(job)),
-      el("td", { class: "next" }, cancel(job)))), "Nothing is running."),
-    el("h3", { id: "finished" }, `Finished in the last 24 hours (${n.finished})`),
-    table(["Job", "From", "Result", "Took", "Peak memory", "Ended"], j.finished.map((job) => el("tr", {},
-      el("td", {}, el("strong", {}, job.name), el("div", { class: "muted small" }, job.id)), el("td", {}, source(job)),
-      el("td", {}, job.state === "COMPLETED" ? chip("completed", "up")
-        : chip(`${job.state.toLowerCase().replaceAll("_", " ")}${job.exit_code && job.exit_code !== "0:0" ? ` (${job.exit_code})` : ""}`, "error")),
-      el("td", {}, job.elapsed),
-      el("td", {}, job.peak_memory_mb === null ? el("span", { class: "muted" }, "—")
-        : `${job.peak_memory_mb >= 1024 ? (job.peak_memory_mb / 1024).toFixed(1) + " GB" : Math.round(job.peak_memory_mb) + " MB"}` +
-          (job.requested_memory ? ` of ${job.requested_memory}` : "")),
-      el("td", {}, (job.end || "").replace("T", " ")))), "Nothing finished in the last day."));
+    body);
 }
+const jobFilter = {};      // cluster -> the kind of job its Jobs tab shows (null: all), while the page is open
 
 // ---------------------------------------------------------------- Apps
 
+// Which apps a cluster lists (its profile's app_view): pinned ones always, hidden ones not at all, the rest under
+// "More apps", collapsed. A running app shows with the pinned ones wherever it is kept. Set per cluster from each
+// row (Pin, Hide), the hidden list (Show, Pin), or Settings -> Apps on this cluster.
+const APP_PLACES = [["pinned", "Pinned"], ["more", "Under More apps"], ["hidden", "Hidden"]];
+function appPlace(c, id) {
+  const v = c.app_view || {};
+  return (v.pinned || []).includes(id) ? "pinned" : (v.hidden || []).includes(id) ? "hidden" : "more";
+}
+async function setAppPlace(c, id, place) {
+  const v = c.app_view || {};
+  const pinned = (v.pinned || []).filter((a) => a !== id), hidden = (v.hidden || []).filter((a) => a !== id);
+  if (place === "pinned") pinned.push(id);
+  if (place === "hidden") hidden.push(id);
+  const out = await ctx.api(path(c.name, "app-view"), { method: "PUT", body: { pinned, hidden } });
+  c.app_view = out.app_view;
+}
+const ACTIVE_STATES = ["up", "starting", "queued"];
+const moreOpen = {};       // cluster -> "More apps" left open, while the page is open
+
 async function appsTab(c) {
   const { api } = ctx;
-  const ids = await appList();
-  const rows = await Promise.all(ids.map(async (a) => {
+  const apps = await appList();
+  const shown = apps.filter((a) => appPlace(c, a.id) !== "hidden");
+  const hidden = apps.filter((a) => appPlace(c, a.id) === "hidden");
+  const move = (id, place) => async () => { await setAppPlace(c, id, place); ctx.render(); };
+  const rows = await Promise.all(shown.map(async (a) => {
     const row = el("hpc-app-session", { app: a.id, "app-title": a.title, cluster: c.name, "by-app": "",
                                         "app-href": appHref(c.name, a.id) });
     try { row.data = await api(`apps/${a.id}/${enc(c.name)}`); } catch { return null; }
-    return row;
+    const place = appPlace(c, a.id);
+    row.viewControls = () => el("div", { class: "view-controls" },
+      el("button", { type: "button", class: "link-button", onclick: move(a.id, place === "pinned" ? "more" : "pinned"),
+                     title: place === "pinned" ? "Move it under More apps" : "Keep it in view on this cluster" },
+        place === "pinned" ? "Unpin" : "Pin"),
+      el("button", { type: "button", class: "link-button", onclick: move(a.id, "hidden"),
+                     title: "Don't list it on this cluster (Hidden apps, at the end, brings it back)" }, "Hide"));
+    return { row, place, active: ACTIVE_STATES.includes(row.data.state) };
   }));
-  const table = el("table", { class: "rows" }, el("thead", {}, el("tr", {}, ["App", "State", ""].map((h) => el("th", {}, h)))),
-    rows.filter(Boolean));
-  // an app's settings are on its own page here
-  table.addEventListener("hpc-app-settings", (e) => { e.stopPropagation(); location.hash = appHref(c.name, e.detail.app); });
-  return el("div", {}, table,
-    el("p", { class: "muted small" }, "Each app's page has its settings, its tools and what it has installed here."));
+  const ok = rows.filter(Boolean);
+  const front = ok.filter((r) => r.place === "pinned" || r.active);
+  const back = ok.filter((r) => !(r.place === "pinned" || r.active));
+  const table = (items) => {
+    const t = el("table", { class: "rows" }, el("thead", {}, el("tr", {}, ["App", "State", ""].map((h) => el("th", {}, h)))),
+      items.map((r) => r.row));
+    // an app's settings are on its own page here
+    t.addEventListener("hpc-app-settings", (e) => { e.stopPropagation(); location.hash = appHref(c.name, e.detail.app); });
+    return t;
+  };
+  const more = back.length ? el("details", { class: "more-apps", open: !!moreOpen[c.name] || !front.length && !(c.app_view || {}).pinned },
+    el("summary", {}, `More apps (${back.length})`, el("span", { class: "muted small" }, " · Pin the ones you use here")),
+    table(back)) : null;
+  if (more) more.addEventListener("toggle", () => { moreOpen[c.name] = more.open; });
+  const hiddenBox = hidden.length ? el("details", { class: "more-apps hidden-apps" },
+    el("summary", {}, `Hidden apps (${hidden.length})`),
+    el("table", { class: "compact" }, el("tbody", {}, hidden.map((a) => el("tr", {},
+      el("td", {}, a.title), el("td", { class: "next" }, el("div", { class: "actions" },
+        action("Show", move(a.id, "more")), action("Pin", move(a.id, "pinned"))))))))) : null;
+  return el("div", {},
+    front.length ? table(front) : el("p", { class: "muted" }, back.length
+      ? "No app is pinned on this cluster: Pin the ones you use, and the rest stay under More apps."
+      : "Every app is hidden on this cluster."),
+    more, hiddenBox,
+    el("p", { class: "muted small" }, "Each app's page has its settings, its tools and what it has installed here. Pin, " +
+      "Hide and Settings → Apps on this cluster choose what this cluster lists."));
+}
+
+// Settings -> Apps on this cluster: every app's place in one list
+async function appViewCard(c) {
+  const apps = await appList();
+  const card = el("section", { class: "card", id: "app-view" });
+  const draw = () => card.replaceChildren(
+    el("h3", {}, "Apps on this cluster ", el("span", { class: "muted" }, "· kept on this machine")),
+    el("p", { class: "muted" }, "Pinned apps are always on the Apps tab and the Overview; the rest wait under More apps " +
+      "(a running one shows anyway); hidden ones aren't listed."),
+    el("table", { class: "compact" }, el("tbody", {}, apps.map((a) => {
+      const select = el("select", { "aria-label": `${a.title} on ${c.name}` },
+        APP_PLACES.map(([v, label]) => el("option", { value: v, selected: appPlace(c, a.id) === v }, label)));
+      select.addEventListener("change", async () => {
+        select.disabled = true;
+        try { await setAppPlace(c, a.id, select.value); } catch (err) { card.append(ctx.errorBox(err)); }
+        draw();
+      });
+      return el("tr", {}, el("td", {}, a.title), el("td", {}, select));
+    }))));
+  draw();
+  return card;
 }
 
 // ---------------------------------------------------------------- one app: #/c/NAME/apps/APP
@@ -469,23 +573,57 @@ async function storageTab(c) {
   const dirs = st.dirs || [];
   const cards = dirs.map((d) => {
     if (d.missing) return el("section", { class: "card" }, el("h3", {}, d.path), el("p", { class: "muted" }, "doesn't exist"));
-    const top = d.children[0] ? d.children[0].kb : 0;
-    return el("section", { class: "card storage" },
-      el("div", { class: "storage-head" }, el("h3", {}, d.path),
-        el("div", { class: "storage-total" }, el("strong", {}, size(d.kb)), el("span", { class: "muted" }, ` · ${count(d.files)} files`),
-          d.partial ? chip("partial: the scan hit its time limit", "starting") : null)),
-      el("table", { class: "bars" }, el("tbody", {}, d.children.map((ch) => el("tr", {},
-        el("td", { class: "bar-name" }, ch.path.slice(d.path.replace(/\/$/, "").length + 1) || ch.path),
-        el("td", { class: "bar-cell" }, el("div", { class: "bar", style: `width: ${top ? Math.max(1, 100 * ch.kb / top) : 0}%` })),
-        el("td", { class: "num" }, size(ch.kb)), el("td", { class: "num muted" }, d.kb ? `${Math.round(100 * ch.kb / d.kb)}%` : ""))))));
+    return storageCard(d);
   });
   return el("div", {},
     el("div", { class: "toolbar" },
       el("span", {}, st.scanned ? `Scanned ${ago(st.scanned)}` : "Not scanned yet", (st.scan || {}).state === "failed"
         ? el("span", { class: "error-box" }, ` · the last scan failed: ${st.scan.error}`) : null),
-      scan, el("span", { class: "muted small" }, "du over your login, at low priority, up to 5 minutes per directory")),
+      scan, el("span", { class: "muted small" }, "du (sizes and file counts) over your login, at low priority, up to 5 minutes each per directory")),
     quotaCard(c, st),
     cards.length ? cards : el("p", { class: "muted" }, `Work directories: ${(st.work_dirs || []).join(", ") || "none set"}.`));
+}
+
+// One work directory's scan: its folders by size (du) or by file count (du --inodes: files, folders and links, what
+// a file quota counts), with bars against the largest; the top 12, or all that were kept.
+const storageSort = {};          // path -> "kb" | "files", kept while the console page is open
+function storageCard(d) {
+  const has = (key) => d.children.some((ch) => ch[key] !== null && ch[key] !== undefined);
+  let key = storageSort[d.path] || "kb", all = false;
+  const table = el("table", { class: "bars" });
+  const sortBy = el("div", { class: "segmented", role: "radiogroup", "aria-label": `Sort ${d.path}` });
+  const more = el("button", { type: "button", class: "link-button small" });
+  const draw = () => {
+    const kids = d.children.slice().sort((a, b) => (b[key] || 0) - (a[key] || 0));
+    const shown = all ? kids : kids.slice(0, 12);
+    const top = shown[0] ? shown[0][key] || 0 : 0;
+    const total = key === "kb" ? d.kb : d.files;
+    const value = (ch, k) => (ch[k] === null || ch[k] === undefined ? "—" : k === "kb" ? size(ch[k]) : count(ch[k]));
+    table.replaceChildren(
+      el("thead", {}, el("tr", {}, el("th", {}, "Folder"), el("th", {}), el("th", { class: "num" }, "Size"),
+        el("th", { class: "num" }, "Files"), el("th", { class: "num" }, ""))),
+      el("tbody", {}, shown.map((ch) => el("tr", {},
+        el("td", { class: "bar-name" }, ch.path.slice(d.path.replace(/\/$/, "").length + 1) || ch.path),
+        el("td", { class: "bar-cell" }, el("div", { class: "bar", style: `width: ${top ? Math.max(1, 100 * (ch[key] || 0) / top) : 0}%` })),
+        el("td", { class: `num${key === "kb" ? "" : " muted"}` }, value(ch, "kb")),
+        el("td", { class: `num${key === "files" ? "" : " muted"}` }, value(ch, "files")),
+        el("td", { class: "num muted" }, total && ch[key] ? `${Math.round(100 * ch[key] / total)}%` : "")))));
+    sortBy.replaceChildren(...[["kb", "By size"], ["files", "By files"]].map(([k, label]) => el("button", {
+      type: "button", role: "radio", "aria-checked": String(k === key), disabled: !has(k),
+      onclick: () => { key = storageSort[d.path] = k; draw(); } }, label)));
+    more.hidden = kids.length <= 12;
+    more.textContent = all ? "Show the top 12" : `Show all ${kids.length}`;
+  };
+  more.addEventListener("click", () => { all = !all; draw(); });
+  draw();
+  return el("section", { class: "card storage" },
+    el("div", { class: "storage-head" }, el("h3", {}, d.path),
+      el("div", { class: "storage-total" }, el("strong", {}, size(d.kb)), el("span", { class: "muted" }, ` · ${count(d.files)} files`),
+        d.partial ? chip("partial: the scan hit its time limit", "starting") : null,
+        d.files_partial && !d.partial ? chip("file counts partial: the count hit its time limit", "starting") : null),
+      sortBy),
+    !has("files") && d.children.length ? el("p", { class: "muted small" }, "Scan again for each folder's file count.") : null,
+    table, more);
 }
 
 // the quota checks (lib/quota.sh on the cluster): the storage quota and the project's balance, each the site's own
@@ -519,7 +657,7 @@ function quotaCard(c, st) {
 
 async function settings(c, local, sub) {
   // tunnel, server, port clearing, quota checks; then the MCP entry in the LLM clients; removal last
-  const page = el("div", {}, await ctx.settingsCards(c), llmClientsCard(c), removeCard(c));
+  const page = el("div", {}, await ctx.settingsCards(c), llmClientsCard(c), await appViewCard(c), removeCard(c));
   if (sub === "llm-clients") requestAnimationFrame(() => page.querySelector("#cluster-llm-clients")?.scrollIntoView());
   return page;
 }

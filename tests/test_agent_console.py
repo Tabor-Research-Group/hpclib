@@ -10,6 +10,7 @@ import json
 import os
 import socket
 import stat
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -742,6 +743,47 @@ class TestClusterJobsAndStorage(ConsoleTestCase):
         self.assertIn("hpclib_quota all --json", self.ran[-1][0])         # lib/quota.sh goes along
         self.assertEqual(self.ran[-1][1][1:], ("/scratch/me/llm", "~/.local/tunnels"))
         self.assertEqual(stat.S_IMODE(os.stat(self.clusters.storage_path(self.dead)).st_mode), 0o600)
+
+    def test_storage_script_counts_files_per_folder(self):
+        """The scan script itself, run here: each folder's size and file count (du --inodes, else find)."""
+        tree = Path(self.tmp) / "work"
+        for sub, n in (("big", 30), ("small", 3)):
+            (tree / sub / "deep").mkdir(parents=True)
+            for i in range(n):
+                (tree / sub / "deep" / f"f{i}").write_text("x" * 5000)
+        (tree / "top.txt").write_text("x")
+
+        def scan(path_env):
+            res = subprocess.run(["bash", "-c", agent_console.CLUSTER_STORAGE_SCRIPT, "scan", "60", str(tree),
+                                  str(tree / "gone")], capture_output=True, text=True, timeout=60,
+                                 env=dict(os.environ, PATH=path_env))
+            return agent_console.parse_storage(res.stdout)
+        for label, path_env in (("du --inodes", os.environ["PATH"]), ("find", self.old_du())):
+            out = scan(path_env)
+            work, gone = out["dirs"]
+            self.assertTrue(gone["missing"], label)
+            self.assertEqual((work["files"], work["files_partial"]), (39, False), label)
+            kids = {Path(c["path"]).name: c for c in work["children"]}
+            self.assertEqual((kids["big"]["files"], kids["small"]["files"]), (32, 5), label)   # files and folders
+            self.assertGreater(kids["big"]["kb"], kids["small"]["kb"], label)
+
+    def old_du(self):
+        """A PATH whose du has no --inodes (coreutils before 8.22)."""
+        d = Path(self.tmp) / "old-du"
+        d.mkdir(exist_ok=True)
+        real = shutil.which("du")
+        (d / "du").write_text(f'#!/bin/bash\nfor a in "$@"; do [ "$a" = --inodes ] && {{ echo "du: unrecognized option" >&2; exit 1; }}; done\nexec {real} "$@"\n')
+        (d / "du").chmod(0o755)
+        return f"{d}:{os.environ['PATH']}"
+
+    def test_app_view(self):
+        status, out = self.call("PUT", f"/api/clusters/{self.dead}/app-view", {"pinned": ["pai", "pai"], "hidden": ["vscode"]})
+        self.assertEqual((status, out["app_view"]), (200, {"pinned": ["pai"], "hidden": ["vscode"]}))
+        self.assertEqual(self.call("GET", f"/api/clusters/{self.dead}")[1]["app_view"], {"pinned": ["pai"], "hidden": ["vscode"]})
+        status, out = self.call("PUT", f"/api/clusters/{self.dead}/app-view", {"hidden": []})
+        self.assertEqual(out["app_view"], {"pinned": ["pai"]})                      # only what was sent changes
+        for bad in ({"pinned": "pai"}, {"pinned": ["a b"]}, {"other": []}, {"pinned": ["x"], "hidden": ["x"]}):
+            self.assertEqual(self.call("PUT", f"/api/clusters/{self.dead}/app-view", bad)[0], 400, bad)
 
     def test_scripts_parse(self):
         for script in (agent_console.CLUSTER_JOBS_SCRIPT, agent_console.CLUSTER_STORAGE_SCRIPT):

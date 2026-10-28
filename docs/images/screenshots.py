@@ -46,8 +46,9 @@ def cluster(name, host, login, tunnel, version=None, set_up=True, work=None):
 
 
 CLUSTERS = {
-    "hpclib-grace": cluster("hpclib-grace", "jdoe@grace.hprc.tamu.edu", True, "up", "1.3.1",
-                            work=["/scratch/user/jdoe/llm"]),
+    "hpclib-grace": dict(cluster("hpclib-grace", "jdoe@grace.hprc.tamu.edu", True, "up", "1.3.1",
+                                 work=["/scratch/user/jdoe/llm"]),
+                         app_view={"pinned": ["jupyter", "vscode", "pai"], "hidden": ["cmccdb"]}),
     "hpclib-faster": cluster("hpclib-faster", "jdoe@faster.hprc.tamu.edu", True, "down", None,
                              work=["/scratch/user/jdoe/llm"]),
     "hpclib-entropy": cluster("hpclib-entropy", "jdoe@entropy.chem.tamu.edu", False, "down", None,
@@ -126,16 +127,16 @@ STORAGE = {
                          "/scratch/user/jdoe  612.4G        1.0T        598120     1000000"]},
                      "dirs": [
                          {"path": "/scratch/user/jdoe/llm", "kb": int(486.2 * KB), "files": 412880, "partial": False,
-                          "children": [{"path": "/scratch/user/jdoe/llm/models", "kb": int(301.5 * KB)},
-                                       {"path": "/scratch/user/jdoe/llm/runs", "kb": int(118.0 * KB)},
-                                       {"path": "/scratch/user/jdoe/llm/envs", "kb": int(41.8 * KB)},
-                                       {"path": "/scratch/user/jdoe/llm/pai", "kb": int(16.4 * KB)},
-                                       {"path": "/scratch/user/jdoe/llm/inputs", "kb": int(6.1 * KB)},
-                                       {"path": "/scratch/user/jdoe/llm/scratch", "kb": int(2.4 * KB)}]},
+                          "children": [{"path": "/scratch/user/jdoe/llm/models", "kb": int(301.5 * KB), "files": 1840},
+                                       {"path": "/scratch/user/jdoe/llm/runs", "kb": int(118.0 * KB), "files": 61210},
+                                       {"path": "/scratch/user/jdoe/llm/envs", "kb": int(41.8 * KB), "files": 296400},
+                                       {"path": "/scratch/user/jdoe/llm/pai", "kb": int(16.4 * KB), "files": 48920},
+                                       {"path": "/scratch/user/jdoe/llm/inputs", "kb": int(6.1 * KB), "files": 3901},
+                                       {"path": "/scratch/user/jdoe/llm/scratch", "kb": int(2.4 * KB), "files": 608}]},
                          {"path": "/home/jdoe/.local/tunnels", "kb": int(1.3 * KB), "files": 5122, "partial": False,
-                          "children": [{"path": "/home/jdoe/.local/tunnels/rest", "kb": int(0.9 * KB)},
-                                       {"path": "/home/jdoe/.local/tunnels/sessions", "kb": int(0.3 * KB)},
-                                       {"path": "/home/jdoe/.local/tunnels/settings", "kb": 220}]}]},
+                          "children": [{"path": "/home/jdoe/.local/tunnels/rest", "kb": int(0.9 * KB), "files": 3100},
+                                       {"path": "/home/jdoe/.local/tunnels/sessions", "kb": int(0.3 * KB), "files": 1900},
+                                       {"path": "/home/jdoe/.local/tunnels/settings", "kb": 220, "files": 121}]}]},
     "hpclib-faster": {"scanned": None, "scan": {"state": "idle"}, "dirs": [], "quota": None,
                       "work_dirs": ["/scratch/user/jdoe/llm"]},
     "hpclib-entropy": {"scanned": None, "scan": {"state": "idle"}, "dirs": [], "quota": None, "work_dirs": ["/home/jdoe/llm"]},
@@ -391,6 +392,10 @@ def menu(page):
     page.locator("#console-menu > summary").click()
 
 
+def storage_by_files(page):
+    page.locator("section.card.storage").first.get_by_role("radio", name="By files").click()
+
+
 DOCS = [
     ("clusters-list", "#/c", 1280, None, False, None, "main"),
     ("clusters-add", "#/c", 1280, None, False, add_form, "main"),
@@ -401,6 +406,7 @@ DOCS = [
     ("cluster-apps", "#/c/hpclib-grace/apps", 1280, None, False, None, "main"),
     ("cluster-installed", "#/c/hpclib-grace/installed", 1280, None, False, None, "main"),
     ("cluster-storage", "#/c/hpclib-grace/storage", 1280, None, False, None, "main"),
+    ("cluster-storage-files", "#/c/hpclib-grace/storage", 1280, None, False, storage_by_files, "section.card.storage"),
     ("cluster-quota-checks", "#/c/hpclib-grace/settings", 1280, None, False, None, "section.card:has(h3:has-text('Quota checks'))"),
     ("cluster-settings", "#/c/hpclib-grace/settings", 1280, None, False, None, None),
     ("cluster-agents", "#/c/hpclib-grace/agents", 1280, None, False, None, "main"),
@@ -433,6 +439,7 @@ WORKSPACE_DOCS = [
     ("workspace", "projects/encoding", "editor"),
     ("workspace-submit", "projects/encoding", "submit"),
     ("workspace-viewer", "projects/encoding/results", "viewer"),
+    ("workspace-usage", "projects", "usage"),
 ]
 DEMO_TRAIN = """import argparse
 
@@ -484,6 +491,12 @@ def workspace_demo(home):
         im.save(proj / "results" / "loss.png")
     except ImportError:
         pass
+    # folders for Usage: an unpacked environment is many small files
+    for name, n, size in (("encoding/.venv-old/lib", 1800, 300), ("sweeps/runs", 240, 40000), ("notes", 12, 2000)):
+        d = home / "projects" / name
+        d.mkdir(parents=True, exist_ok=True)
+        for i in range(n):
+            (d / f"f{i}").write_bytes(b"x" * size)
     (home / "hpclib").mkdir()
     (home / "hpclib" / "hpclib.sh").write_text("# hpclib\n")
     fake = home / ".demo-bin"
@@ -562,6 +575,12 @@ def workspace_shots(browser, only):
             form.get_by_label("Modules").fill("CUDA/12.6.0")
             form.get_by_label("Arguments").fill("--epochs 40")
             page.wait_for_timeout(1200)
+        elif what == "usage":
+            page.get_by_role("button", name="Usage", exact=True).click()
+            view = page.locator(".view:not([hidden]) .usage")
+            view.locator(".usage-table tbody tr").first.wait_for()
+            view.get_by_role("button", name="By files").click()
+            page.wait_for_timeout(300)
         elif what == "viewer":
             page.locator("#files tr", has_text="loss.png").click()
             page.locator(".view:not([hidden]) img").wait_for()

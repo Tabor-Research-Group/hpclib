@@ -310,6 +310,45 @@ class TestServer(ServerCase):
         self.assertEqual(self.call("POST", "/api/cancel", {"job": "1; rm -rf ~"})[0], 400)
 
 
+class TestUsage(ServerCase):
+    def make_tree(self):
+        tree = self.home / "proj" / "envs"
+        for sub, n in (("big", 30), ("small", 3)):
+            (tree / sub / "deep").mkdir(parents=True)
+            for i in range(n):
+                (tree / sub / "deep" / f"f{i}").write_text("x" * 5000)
+        (tree / "note.txt").write_text("x")
+        return tree
+
+    def check(self, out, tree):
+        kids = {c["name"]: c for c in out["children"]}
+        self.assertEqual(sorted(kids), ["big", "small"])
+        self.assertEqual((kids["big"]["files"], kids["small"]["files"]), (32, 5))     # files and folders, as du --inodes
+        self.assertGreater(kids["big"]["kb"], kids["small"]["kb"])
+        self.assertEqual((out["path"], out["files"], out["here"]["files"], out["partial"]), (str(tree), 39, 1, False))
+
+    def test_sizes_and_file_counts(self):
+        tree = self.make_tree()
+        status, out = self.call("GET", f"/api/usage?path={urllib.parse.quote(str(tree))}")
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["count_method"], "du --inodes")
+        self.check(out, tree)
+        self.assertEqual(self.call("GET", "/api/usage?path=nowhere")[0], 404)
+        self.assertEqual(self.call("GET", f"/api/usage?path={urllib.parse.quote(str(tree / 'note.txt'))}")[0], 404)
+
+    def test_counts_by_walking_where_du_is_old(self):
+        tree = self.make_tree()
+        old = self.tmp / "old-du"
+        old.mkdir()
+        (old / "du").write_text(f'#!/bin/bash\nfor a in "$@"; do [ "$a" = --inodes ] && {{ echo "du: unrecognized option \'--inodes\'" >&2; exit 1; }}; done\nexec {shutil.which("du")} "$@"\n')
+        (old / "du").chmod(0o755)
+        with unittest.mock.patch.dict(os.environ, {"PATH": f"{old}:{os.environ['PATH']}"}):
+            status, out = self.call("GET", f"/api/usage?path={urllib.parse.quote(str(tree))}")
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["count_method"], "walk")
+        self.check(out, tree)
+
+
 class TestTerminal(ServerCase):
     def connect(self, query, origin=None):
         sock = socket.create_connection(("127.0.0.1", self.port), timeout=15)

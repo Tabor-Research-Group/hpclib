@@ -142,6 +142,10 @@ nothing else (**Check** says which Python it will use).
 - **Terminals**: **Terminal here** opens your login shell in the current folder (xterm.js), as many as you like,
   below the files. They end with the Workspace (Stop) or when you close their tab.
 - **My jobs**: your queued and running jobs (`squeue`), with Cancel; a job's name opens its folder.
+- **Usage** (and **Disk usage** in a folder's **⋯** menu): the folder's folders by size (`du -k`) and by file count
+  (`du --inodes`: files, folders and links, what a file quota counts), as the cluster's Storage tab shows them,
+  for any folder; **By size** and **By files** sort them, and each row opens the folder or its own usage. It runs
+  at low priority for up to two minutes (then it says it is partial).
 
 ![The Workspace: files, an editor, a terminal and your jobs](../images/workspace.png)
 
@@ -177,6 +181,8 @@ site without it, set **CDN** in the Workspace's settings to a mirror of npm pack
 plain text box and terminals don't open.
 
 ![A picture in the Workspace's viewer](../images/workspace-viewer.png)
+
+![Usage: folders by file count](../images/workspace-usage.png)
 
 ## Adding apps and settings from packages
 
