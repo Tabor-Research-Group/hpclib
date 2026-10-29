@@ -113,7 +113,7 @@ Usage: rest_server.py [--host H] [--port P] [--allow DIR ...] [--config F]
        rest_server.py --list-tokens | --hash-token-file
        rest_server.py --list-proposals | --approve-template NAME [--replace] | --reject-template NAME
        rest_server.py --init-config [--config-base F] [--rebuild] [--no-sandbox] [--sandbox-bind DIR ...]
-       rest_server.py --probe-sandbox
+       rest_server.py --probe-sandbox | --import-sandbox-image
        rest_server.py --sandbox-script SCRIPT [--sandbox-writable DIR ...] [--sandbox-read-only DIR ...]
                       [--sandbox-network host]    (prints bash that runs SCRIPT in the template jobs' sandbox)
 """
@@ -128,6 +128,7 @@ import abc
 import argparse
 import fcntl
 import functools
+import glob
 import hashlib
 import hmac
 import http.server
@@ -1299,6 +1300,18 @@ class HPCRESTHandler(RESTHandler):
                 "environment": {"jobs": jobs.job_env,
                                 "syncs": jobs.environments.sync_env if jobs.environments is not None else {}},
                 "sandbox": jobs.sandbox.describe(),
+                "extra_path": rest_sandbox.extra_path(),
+                "server_modules": rest_sandbox.server_modules(),
+                "slurm_modules": (detect_slurm_module(cache=300)
+                                  if not rest_sandbox.server_modules()
+                                  and (jobs.sandbox.describe().get("effective") == "unavailable"
+                                       or (isinstance(jobs.runner, rest_jobs.SlurmRunner) and not shutil.which("sbatch")))
+                                  else []),
+                "slurm_found": not isinstance(jobs.runner, rest_jobs.SlurmRunner) or bool(shutil.which("sbatch")),
+                # SLURM's directory, where a login shell finds it and this server doesn't: the console offers it
+                "slurm_missing": (detect_slurm_path(cache=300)
+                                  if isinstance(jobs.runner, rest_jobs.SlurmRunner) and not shutil.which("sbatch")
+                                  else []),
                 "environments": jobs.environments.describe() if jobs.environments is not None else None,
                 "template_proposals": jobs.proposal_policy(),
             },
@@ -1323,8 +1336,12 @@ class HPCRESTHandler(RESTHandler):
             apply_config(self.server, built)
         self.audit_detail = {"config": sorted(changes)}
         out = {"changed": sorted(changes), "config": new, "backup": backup, "applied": True}
-        if "sandbox" in changes and built["sandbox"].describe().get("effective") not in rest_sandbox.SANDBOXED:
-            out["warning"] = "template jobs are no longer sandboxed with this config"
+        if "sandbox" in changes:
+            state = built["sandbox"].describe()
+            if state.get("effective") == "unavailable":
+                out["warning"] = "sandbox unavailable; template jobs will be refused: " + state.get("error", "probe the sandbox")
+            elif state.get("effective") not in rest_sandbox.SANDBOXED:
+                out["warning"] = "template jobs are no longer sandboxed with this config"
         return 200, out
 
     # SLURM
@@ -1533,7 +1550,7 @@ class HPCRESTHandler(RESTHandler):
 
 CONFIG_KEYS = {"limits", "templates_dir", "jobs_db", "audit_log", "tokens_file", "cluster_notes",
                "poll_interval", "proposals_dir", "module_command", "sandbox", "environments", "environment",
-               "scheduler", "tunnel_actions"}
+               "scheduler", "tunnel_actions", "extra_path", "server_modules"}
 
 def load_config(path):
     """
@@ -1542,6 +1559,10 @@ def load_config(path):
        "audit_log": FILE or null, "tokens_file": FILE, "cluster_notes": TEXT,
        "poll_interval": SECONDS, "proposals_dir": DIR,
        "module_command": ["bash", "-lc", "module \"$@\" 2>&1", "hpclib-module"],
+       "extra_path": [DIR, ...] added to the end of PATH, for the server and what it starts (where SLURM is,
+                     on clusters that only put it on a login shell's PATH; setup and startup add it),
+       "server_modules": [NAME, ...] environment modules to load for the server and what it starts (SLURM's
+                     own module, e.g. "slurm/25.05", on clusters where it isn't on PATH otherwise),
        "sandbox": {...rest_sandbox.Sandbox...},
        "environments": {...rest_envs.EnvironmentManager...},
        "environment": {"all": {VAR: VALUE}, "jobs": {...}, "syncs": {...}},
@@ -1582,8 +1603,157 @@ def load_config(path):
 # Sections of config.json the owner may change while the server runs (PUT /admin/config);
 # paths, the module command and tokens stay as setup_agents wrote them.
 EDITABLE_CONFIG = ("limits", "cluster_notes", "environments", "environment", "sandbox", "poll_interval",
-                   "tunnel_actions")
+                   "tunnel_actions", "extra_path", "server_modules")
 CONFIG_LOCK = threading.Lock()
+
+
+def check_extra_path(value):
+    """The config's `extra_path`, checked: a list of absolute directories (they needn't exist on this node)."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value) or len(value) > 32:
+        raise ValueError("`extra_path` must be a list of directories (at most 32), e.g. "
+                         "[\"/cm/local/apps/slurm/current/bin\"]")
+    out = []
+    for item in value:
+        directory = os.path.normpath(os.path.expanduser(item.strip()))
+        if not os.path.isabs(directory) or any(c in directory for c in (os.pathsep, "\0", "\n")):
+            raise ValueError(f"`extra_path` entries must be absolute directories without ':' in them, not {item!r}")
+        if directory not in out:
+            out.append(directory)
+    return out
+
+
+def detect_slurm_module(timeout=60, cache=0):
+    """
+    The SLURM modules this cluster lists (`module avail slurm`), newest first, e.g. ["slurm/25.05"]; [] when it
+    has none or no module command. `cache` is how many seconds an earlier answer may be reused.
+    """
+    global _slurm_module_hint
+    if cache and time.time() - _slurm_module_hint[0] < cache:
+        return list(_slurm_module_hint[1])
+    found = []
+    try:
+        res = subprocess.run(["bash", "-lc", rest_sandbox.MODULE_INIT + 'module -t avail slurm 2>&1', "hpclib-modules"],
+                             capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+                             env=rest_sandbox.child_env(modules=False))
+        for line in res.stdout.splitlines():
+            name = re.sub(r"\(.*?\)", "", line).strip()
+            if re.fullmatch(r"slurm/[0-9][A-Za-z0-9._+-]*", name) and name not in found:
+                found.append(name)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    def newest(name):
+        return [int(n) for n in re.findall(r"[0-9]+", name)]
+    found.sort(key=newest, reverse=True)
+    _slurm_module_hint = (time.time(), found)
+    return list(found)
+
+
+_slurm_module_hint = (0.0, [])
+SLURM_COMMANDS = ("sbatch", "srun", "sinfo", "squeue", "sacct", "scancel")
+# where SLURM is usually installed, for when no shell puts it on PATH (patterns allowed; Bright Cluster Manager's first)
+SLURM_DIRS = ("/cm/local/apps/slurm/current/bin", "/cm/shared/apps/slurm/current/bin", "/cm/*/apps/slurm/*/bin",
+              "/opt/slurm/bin", "/opt/slurm/current/bin", "/opt/slurm*/bin", "/usr/local/slurm/bin",
+              "/apps/slurm/bin", "/usr/local/bin")
+_slurm_hint = (0.0, [])
+
+
+def detect_slurm_path(timeout=60, cache=0):
+    """
+    The directories SLURM's commands are in, as a login shell finds them, for the ones this process can't find
+    on its own PATH: the server starts without the module or profile line that puts SLURM on PATH, so
+    `sbatch` and `sinfo` fail for it though they work in your own terminal. `cache` is how many seconds an
+    earlier answer may be reused.
+    """
+    global _slurm_hint
+    if cache and time.time() - _slurm_hint[0] < cache:
+        return list(_slurm_hint[1])
+    dirs = []
+
+    def add(command_path):
+        if (command_path.startswith("/") and os.access(command_path, os.X_OK)
+                and not shutil.which(os.path.basename(command_path))):
+            directory = os.path.dirname(command_path)
+            if directory not in dirs:
+                dirs.append(directory)
+
+    # a login shell, then interactive ones (many sites load the SLURM module only in ~/.bashrc, which
+    # a non-interactive shell skips), then the usual install directories
+    for flags in ("-lc", "-ic", "-lic"):
+        try:
+            res = subprocess.run(["bash", flags, "for c in " + " ".join(SLURM_COMMANDS) + '; do command -v "$c"; done'],
+                                 capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+                                 env=rest_sandbox.child_env())
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        for line in res.stdout.splitlines():
+            add(line.strip())
+        if dirs:
+            break
+    if not dirs:
+        for pattern in SLURM_DIRS:
+            for directory in sorted(glob.glob(pattern)):
+                for command in SLURM_COMMANDS:
+                    add(os.path.join(directory, command))
+    _slurm_hint = (time.time(), dirs)
+    return list(dirs)
+
+
+def ensure_slurm_on_path(config):
+    """
+    At startup: where SLURM's commands aren't on this process's PATH but a login shell has them, add their
+    directories to the config's `extra_path`, in the file too (the old file is kept as config.json.replaced-TIME).
+    Returns (directories, saved file or None, backup) or None when there is nothing to do.
+    """
+    if rest_local.check_scheduler_section(config.get("scheduler"))["type"] != "slurm" or shutil.which("sbatch"):
+        return None
+    dirs = detect_slurm_path()
+    if not dirs:
+        return None
+    merged = check_extra_path(list(config.get("extra_path") or []) + dirs)
+    saved = backup = None
+    path = config.get("path")
+    if path and os.path.exists(path):
+        with CONFIG_LOCK:
+            raw = read_config_file(path)
+            raw["extra_path"] = check_extra_path(list(raw.get("extra_path") or []) + dirs)
+            backup = write_config_file(path, raw)
+        saved = path
+    config["extra_path"] = merged
+    rest_sandbox.set_extra_path(merged)
+    return dirs, saved, backup
+
+
+def ensure_slurm_module(config):
+    """
+    At startup: where SLURM still isn't on this process's PATH (no directory found either), load the cluster's
+    SLURM module, if it lists one, and save it as the config's `server_modules` (the file too; the old one is kept as
+    config.json.replaced-TIME). Returns (modules, saved file or None, backup) or None when there is nothing to do.
+    """
+    if (rest_local.check_scheduler_section(config.get("scheduler"))["type"] != "slurm" or shutil.which("sbatch")
+            or config.get("server_modules")):
+        return None
+    for module in detect_slurm_module()[:1]:
+        try:
+            rest_sandbox.load_server_modules([module])
+        except ValueError:
+            return None
+        if not shutil.which("sbatch"):
+            rest_sandbox.load_server_modules([])
+            return None
+        saved = backup = None
+        path = config.get("path")
+        if path and os.path.exists(path):
+            with CONFIG_LOCK:
+                raw = read_config_file(path)
+                raw["server_modules"] = [module]
+                backup = write_config_file(path, raw)
+            saved = path
+        config["server_modules"] = [module]
+        return [module], saved, backup
+    return None
 
 
 def read_config_file(path):
@@ -1628,16 +1798,21 @@ def updated_config(raw, changes):
     poll = new.get("poll_interval", 10)
     if isinstance(poll, bool) or not isinstance(poll, (int, float)) or not 1 <= poll <= 600:
         raise ValueError("`poll_interval` must be between 1 and 600 seconds")
-    sandbox = rest_sandbox.Sandbox(new.get("sandbox"), data_dir=rest_data_dir())
+    sandbox = make_sandbox(new)
     env = rest_jobs.check_env_section(new.get("environment"))
     actions = rest_actions.check_config(new.get("tunnel_actions"))
+    modules = rest_sandbox.check_module_names(new.get("server_modules"))
+    # loaded now, so that a module that doesn't load is refused here and nothing is saved
+    module_env = rest_sandbox.resolve_server_modules(modules) if modules != rest_sandbox.server_modules() else None
     built = {
         "tunnel_actions": actions,
+        "server_modules": (modules, module_env),
         "job_env": env["jobs"],
         "limits": _check_limits(new.get("limits", {})),
         "cluster_notes": notes,
         "poll_interval": poll,
         "sandbox": sandbox,
+        "extra_path": check_extra_path(new.get("extra_path")),
         "environments": rest_envs.EnvironmentManager(new.get("environments"), sandbox=sandbox,
                                                      data_dir=rest_data_dir(), sync_env=env["syncs"]),
     }
@@ -1661,6 +1836,10 @@ def apply_config(server, built):
     """Use a validated config from now on, without restarting."""
     if "tunnel_actions" in built:
         server.actions.config = built["tunnel_actions"]
+    if "server_modules" in built and built["server_modules"][1] is not None:
+        rest_sandbox.set_server_modules(*built["server_modules"])   # before the extra PATH, which goes after them
+    if "extra_path" in built:
+        rest_sandbox.set_extra_path(built["extra_path"])   # before the sandbox below looks for its runtime
     jobs = server.jobs
     jobs.limits = built["limits"]
     jobs.cluster_notes = built["cluster_notes"]
@@ -1671,6 +1850,8 @@ def apply_config(server, built):
     old = jobs.sandbox
     built["sandbox"].protect(hidden=getattr(old, "hidden", ()), read_only=getattr(old, "read_only_paths", ()))
     jobs.sandbox = built["sandbox"]
+    if jobs.sandbox.wants_base_image():
+        jobs.sandbox.import_base_image()   # Pyxis: in a thread; jobs wait for it (GET /sandbox says so)
     if isinstance(jobs.runner, rest_local.LocalRunner):
         jobs.runner.sandbox = jobs.sandbox   # it checks the sandbox's limits
     if server.sandbox_prober is not None:
@@ -1752,6 +1933,8 @@ def parse_args(argv=None):
     setup.add_argument("--sandbox-bind", action="append", default=[], metavar="DIR",
                        help="with --init-config: a directory jobs may read (repeatable); module trees found "
                             "on MODULEPATH are added automatically")
+    setup.add_argument("--import-sandbox-image", action="store_true",
+                       help="Pyxis sandbox: import its base image with enroot, once (a no-op otherwise)")
     setup.add_argument("--probe-sandbox", action="store_true",
                        help="print what this node supports for sandboxing, and test the configured sandbox")
     service = parser.add_argument_group(
@@ -1872,12 +2055,15 @@ def init_config(opts):
     stamp = time.strftime("%Y%m%dT%H%M%S")
     # a machine without SLURM (a development server) runs jobs itself
     no_slurm = not _has_slurm()
+    # SLURM found only by a login shell: the server doesn't get that PATH, so its directory goes in the config
+    slurm_dirs = [] if no_slurm else detect_slurm_path()
     if os.path.exists(path) and not opts.rebuild:
         with open(path) as f:
             config = json.load(f)
         needs_sandbox = "sandbox" not in config and not opts.no_sandbox
         needs_scheduler = no_slurm and "scheduler" not in config
-        if not needs_sandbox and not needs_scheduler:
+        needs_path = bool(slurm_dirs) and "extra_path" not in config
+        if not needs_sandbox and not needs_scheduler and not needs_path:
             print(f"kept the existing {path}")
             return
         shutil.copy2(path, f"{path}.replaced-{stamp}")
@@ -1888,6 +2074,9 @@ def init_config(opts):
         if needs_scheduler:
             config["scheduler"] = {"type": "local"}
             added.append("the local scheduler (no SLURM here)")
+        if needs_path:
+            config["extra_path"] = slurm_dirs
+            added.append(f"SLURM's directory ({', '.join(slurm_dirs)}) to extra_path")
         action = f"added {' and '.join(added)} to {path} (the old file is {path}.replaced-{stamp})"
     else:
         config = base
@@ -1897,6 +2086,8 @@ def init_config(opts):
             config["sandbox"] = _sandbox_section(config.get("sandbox"), opts.sandbox_bind)
         if no_slurm:
             config.setdefault("scheduler", {"type": "local"})
+        if slurm_dirs:
+            config.setdefault("extra_path", slurm_dirs)
         action = f"wrote {path}"
         if os.path.exists(path):
             os.replace(path, f"{path}.replaced-{stamp}")
@@ -1911,6 +2102,8 @@ def init_config(opts):
     print(action)
     if scheduler["type"] == "local":
         print("  jobs: run on this machine by the local scheduler (no SLURM); start its tunnel with rest_on=login")
+    if config.get("extra_path"):
+        print(f"  extra PATH: {', '.join(config['extra_path'])} (SLURM isn't on the PATH a server gets)")
     if sandbox.get("method") == "none":
         print("  job sandbox: off")
     else:
@@ -1923,9 +2116,35 @@ def init_config(opts):
             _detached_delete(old)
             print("  the sandbox's host image will be rebuilt by the next job")
 
+def make_sandbox(config):
+    """The Sandbox the config describes; it is told the scheduler, since Pyxis needs SLURM."""
+    scheduler = rest_local.check_scheduler_section(config.get("scheduler"))
+    return rest_sandbox.Sandbox(config.get("sandbox"), data_dir=rest_data_dir(), scheduler=scheduler["type"])
+
+def import_sandbox_image(config):
+    """--import-sandbox-image: import the Pyxis sandbox's base image (enroot), if it uses one and lacks it."""
+    sandbox = make_sandbox(config)
+    try:
+        kind = sandbox._locate()[0]
+    except Exception:
+        kind = None
+    if kind != "pyxis" or sandbox.image:
+        print("sandbox image: nothing to import (the sandbox isn't Pyxis with its base image)")
+        return True
+    state = sandbox.base_image_state()
+    if state["state"] != "ready":
+        print(f"importing {sandbox.base_image} with enroot into {state['path']} (this can take a few minutes) ...",
+              flush=True)
+        state = sandbox.import_base_image(wait=True)
+    if state["state"] == "ready":
+        print(f"sandbox image: ready, {state['path']}")
+        return True
+    print(f"rest_server: the Pyxis base image isn't there: {state.get('error') or state['state']}", file=sys.stderr)
+    return False
+
 def probe_sandbox(config):
     """--probe-sandbox: a short report, from this node, of the sandbox the config describes."""
-    sandbox = rest_sandbox.Sandbox(config.get("sandbox"), data_dir=rest_data_dir())
+    sandbox = make_sandbox(config)
     probe_dir = os.path.join(rest_data_dir(), "sandbox", "probe")
     os.makedirs(probe_dir, mode=0o700, exist_ok=True)
     info = rest_sandbox.probe(sandbox, probe_dir)
@@ -1982,7 +2201,7 @@ def sandbox_script(opts, config):
                       f"data ({clash[0]})", file=sys.stderr)
                 return 2
             binds[kind].append(real)
-    sandbox = protect_sandbox(rest_sandbox.Sandbox(config.get("sandbox"), data_dir=rest_data_dir()), config)
+    sandbox = protect_sandbox(make_sandbox(config), config)
     try:
         lines, plan = sandbox.launch(shebang, body, binds["writable"], extra_ro=binds["read-only"],
                                      network="host" if opts.sandbox_network == "host" else False)
@@ -1997,7 +2216,7 @@ def sandbox_script(opts, config):
     return 0
 
 def build_jobs(config, command_timeout, auto_approve=None):
-    sandbox = rest_sandbox.Sandbox(config.get("sandbox"), data_dir=rest_data_dir())
+    sandbox = make_sandbox(config)
     scheduler = rest_local.check_scheduler_section(config.get("scheduler"))
     if scheduler["type"] == "local":
         runner = rest_local.LocalRunner(scheduler, data_dir=rest_data_dir(), sandbox=sandbox, timeout=command_timeout)
@@ -2034,6 +2253,7 @@ def agent_protected_paths():
     """
     home = os.path.expanduser("~")
     paths = [hpclib_code_dir(), os.environ.get("HPCLIB_DIR"),
+             os.path.join(home, ".local", "share", "hpclib", "sandbox-tools"),
              os.environ.get("HPCLIB_TUNNEL_INSTALL_LOCATION") or os.environ.get("USER_TUNNEL_DIR") or
              os.path.join(home, ".local", "share", "hpclib", "tunnels"),
              os.environ.get("HPCTUNNELS_DIR")]
@@ -2074,6 +2294,13 @@ def main(argv=None, handler_class=HPCRESTHandler):
     if opts.init_config:
         return init_config(opts)
     config = load_config(opts.config)
+    try:
+        rest_sandbox.load_server_modules(config.get("server_modules"))
+    except ValueError as e:
+        print(f"WARNING: server_modules: {e}", file=sys.stderr)
+    rest_sandbox.set_extra_path(check_extra_path(config.get("extra_path")))
+    if opts.import_sandbox_image:
+        sys.exit(0 if import_sandbox_image(config) else 1)
     if opts.probe_sandbox:
         sys.exit(0 if probe_sandbox(config) else 1)
     if opts.sandbox_script:
@@ -2093,8 +2320,12 @@ def main(argv=None, handler_class=HPCRESTHandler):
     whitelist = PathWhitelist(opts.allow or None, base_dir=base_dir, deny=protected_paths(config, auth))
     if opts.auto_approve_templates not in (None, "new", "all"):
         raise SystemExit("--auto-approve-templates / $HPC_REST_AUTO_APPROVE_TEMPLATES must be new or all")
+    found_slurm = ensure_slurm_on_path(config)
+    found_module = ensure_slurm_module(config)
     jobs = build_jobs(config, opts.command_timeout, opts.auto_approve_templates)
     protect_sandbox(jobs.sandbox, config, auth)
+    if jobs.sandbox.wants_base_image():
+        jobs.sandbox.import_base_image()   # Pyxis: in a thread; jobs wait for it (GET /sandbox says so)
     audit = AuditLog(config["audit_log"]) if config.get("audit_log") else None
 
     if opts.host not in ("127.0.0.1", "localhost", "::1"):
@@ -2116,6 +2347,8 @@ def main(argv=None, handler_class=HPCRESTHandler):
         print(f"  job sandbox: {sandbox['runtime_path']}")
         if sandbox["effective"] == "podman" and not sandbox["limits"]["enforced"]:
             print(f"  job CPU and memory limits: NOT enforced ({sandbox['limits']['reason']})", file=sys.stderr)
+    elif sandbox["effective"] == "unavailable" and sandbox.get("base_image", {}).get("state") == "importing":
+        print("  job sandbox: Pyxis; importing its base image, jobs wait for it")
     elif sandbox["effective"] == "unavailable":
         print(f"  job sandbox: UNAVAILABLE, template jobs will be refused: {sandbox['error']}", file=sys.stderr)
     else:
@@ -2126,6 +2359,18 @@ def main(argv=None, handler_class=HPCRESTHandler):
         print(f"  jobs: run here by the local scheduler (no SLURM): {local['cpus']} CPUs, {local['memory_mb']} MB, "
               f"limits {'enforced' if local['limits']['enforced'] else 'NOT enforced: ' + local['limits']['reason']}"
               + ("" if local["limits"]["enforced"] or not local["enforce_limits"] else "; jobs will be refused"))
+    if rest_sandbox.extra_path():
+        print(f"  extra PATH: {', '.join(rest_sandbox.extra_path())}")
+    if rest_sandbox.server_modules():
+        print(f"  server modules: {', '.join(rest_sandbox.server_modules())}")
+    if found_module:
+        print(f"  SLURM wasn't on this server's PATH: loaded its module {found_module[0][0]} and saved it as "
+              f"`server_modules` in " + (f"{found_module[1]} (the old file is {found_module[2]})" if found_module[1]
+                                         else "memory only (no config file)"))
+    if found_slurm:
+        print(f"  SLURM wasn't on this server's PATH but is in your login shell's: added {', '.join(found_slurm[0])} "
+              f"to `extra_path` in " + (f"{found_slurm[1]} (the old file is {found_slurm[2]})" if found_slurm[1]
+                                         else "memory only (no config file)"))
     print(f"  base dir: {whitelist.base_dir}", flush=True)
 
     try:

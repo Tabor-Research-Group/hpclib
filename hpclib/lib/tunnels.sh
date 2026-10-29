@@ -846,6 +846,9 @@ function _hpclib_remote_setup_agents {
   "$python" "$hpclib/servers/rest_server.py" "${args[@]}" || status=1
   rm -f "$base"
   if [ "$sandbox" != no ]; then
+    # a Pyxis sandbox runs jobs in an image: import the base one now (a no-op for other sandboxes)
+    "$python" "$hpclib/servers/rest_server.py" --import-sandbox-image ||
+      echo "setup_agents: the Pyxis base image could not be imported; see the message above (jobs wait for it)" >&2
     "$python" "$hpclib/servers/rest_server.py" --probe-sandbox ||
       echo "setup_agents: the test container failed on this node; check the messages above, and GET /sandbox once the tunnel runs" >&2
   fi

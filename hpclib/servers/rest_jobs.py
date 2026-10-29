@@ -745,7 +745,8 @@ class JobTemplate:
                 return "\n".join(lines) + "\n\n" + "\n".join(launch) + "\n", plan
         if images:
             raise RESTError(422, f"the Python environment for template {self.name} is squashed into an image, which "
-                                 f"only a Singularity or Apptainer sandbox can mount; sync it without `squash`")
+                                 f"only a Singularity, Apptainer, Pyxis, Bubblewrap or Charliecloud sandbox can mount (the latter three need squashfuse); sync it "
+                                 f"without `squash`")
         if prelude:
             if not re.match(r"#!\s*(/bin/bash|/usr/bin/env\s+bash)\b", lines[0]):
                 raise RESTError(422, f"template {self.name} uses a Python environment, which needs a bash "
@@ -1265,14 +1266,24 @@ class ClusterInfo:
     def _try(self, args):
         try:
             res = self.runner.run(args)
-        except RESTError:
+        except RESTError as e:
+            self.problem = str(getattr(e, "message", None) or e)
             return None
-        return res.stdout if res.returncode == 0 else None
+        if res.returncode != 0:
+            self.problem = f"`{args[0]}` exited {res.returncode}: " + (" ".join((res.stderr or res.stdout).split())[-200:] or
+                                                                      "no output")
+            return None
+        return res.stdout
 
     def _collect(self):
         info = {"user": self.runner.user, "hostname": socket.gethostname()}
+        self.problem = None
         version = self._try(["sinfo", "--version"])
         info["slurm_version"] = version.strip() if version else None
+        if not version:
+            # say why, since a client sees only the empty partition list
+            info["slurm_problem"] = (f"{self.problem}; PATH: {os.environ.get('PATH', '')}" if self.problem
+                                     else "`sinfo --version` printed nothing")
         partitions = {}
         out = self._try(["sinfo", "-h", "-o", self.SINFO_FORMAT]) or ""
         for row in self.runner._parse(out, self.SINFO_FIELDS):

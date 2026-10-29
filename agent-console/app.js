@@ -991,9 +991,26 @@ async function serverSettings(c) {
   }));
   const binds = el("textarea", { rows: 3 }, (sandbox.binds || []).join("\n"));
   const writable = el("textarea", { rows: 2 }, (sandbox.writable || []).join("\n"));
+  const sandboxRuntime = el("input", { value: sandbox.runtime || "", placeholder: "auto", size: 35, "aria-label": "Runtime path" });
+  const sandboxBoundary = el("input", { value: sandbox.boundary_runtime || "", placeholder: "auto", size: 35 });
+  const sandboxImage = el("input", { value: sandbox.image || "", placeholder: "the host's software", size: 45 });
+  const sandboxNetwork = el("select", { "aria-label": "Sandbox network" },
+    [["none", "Isolated"], ["default", "Allow network"]].map(([value, label]) => el("option", {
+      value, selected: value === (sandbox.network || "none") }, label)));
+  const sandboxDevices = el("textarea", { rows: 2 }, (sandbox.devices || []).join("\n"));
   const gpus = el("select", {}, [["auto", "For jobs that ask for GPUs (default)"], ["always", "For every job"],
     ["never", "Never"]].map(([v, label]) => el("option", { value: v, selected: v === (sandbox.gpus || "auto") }, label)));
   const flags = el("input", { value: (sandbox.flags || []).join(" "), size: 30, placeholder: "none" });
+  const method = el("select", { "aria-label": "Container runtime" }, [["auto", "Detect automatically (recommended)"], ["singularity", "Singularity or Apptainer"],
+    ["pyxis", "Pyxis (SLURM with enroot)"], ["podman", "Podman"], ["bubblewrap", "Bubblewrap"],
+    ["charliecloud", "Charliecloud + Bubblewrap"], ["none", "No sandbox (not recommended)"]].map(
+    ([v, label]) => el("option", { value: v, selected: v === (sandbox.method || "auto") }, label)));
+  const extraPath = el("textarea", { rows: 2, placeholder: "/cm/local/apps/slurm/current/bin" }, (raw.extra_path || []).join("\n"));
+  method.addEventListener("change", () => {
+    sandboxRuntime.value = "";
+    flags.value = "";
+  });
+  const serverModules = el("textarea", { rows: 2, placeholder: "slurm/25.05" }, (raw.server_modules || []).join("\n"));
   const notes = el("textarea", { rows: 4 }, raw.cluster_notes || "");
   const envBoxes = Object.fromEntries(ENV_SCOPES.map(([k, label]) => {
     const box = el("hpc-env-editor", { label });
@@ -1004,7 +1021,13 @@ async function serverSettings(c) {
 
   const sandboxSection = () => {
     const out = Object.assign({}, sandbox, { binds: lines(binds.value), writable: lines(writable.value),
-                                             gpus: gpus.value, flags: words(flags.value) });
+                                             gpus: gpus.value, flags: words(flags.value), method: method.value });
+    if (out.method === "auto" && !("method" in sandbox)) delete out.method;
+    for (const [name, input] of [["runtime", sandboxRuntime], ["boundary_runtime", sandboxBoundary], ["image", sandboxImage]]) {
+      if (input.value.trim()) out[name] = input.value.trim(); else delete out[name];
+    }
+    if (sandboxNetwork.value !== "none" || "network" in sandbox) out.network = sandboxNetwork.value;
+    if (sandboxDevices.value.trim() || "devices" in sandbox) out.devices = lines(sandboxDevices.value);
     // defaults stay out of the file (and away from servers older than the `gpus` setting)
     if (out.gpus === "auto" && !("gpus" in sandbox)) delete out.gpus;
     if (!out.flags.length && !("flags" in sandbox)) delete out.flags;
@@ -1036,6 +1059,8 @@ async function serverSettings(c) {
       environment: Object.keys(environment).length ? environment : null,
       limits: lim,
       sandbox: sandboxSection(),
+      extra_path: lines(extraPath.value).length ? lines(extraPath.value) : null,
+      server_modules: lines(serverModules.value).length ? lines(serverModules.value) : null,
       cluster_notes: notes.value.trim() || null,
     };
   };
@@ -1063,6 +1088,47 @@ async function serverSettings(c) {
     return `Saved; in effect now.${res.backup ? ` The previous file is ${res.backup}.` : ""}`;
   });
 
+  // plain-language problems, each with what to do about it
+  const missing = eff.slurm_missing || [];
+  const slurmNotice = missing.length ? el("div", { class: "error-box" },
+    el("p", {}, `This server can't find SLURM's commands (sbatch, srun, sinfo), so it can't submit jobs. They are in ` +
+      `${missing.join(", ")} on the login node, but a server started over SSH doesn't get that directory.`),
+    action("Add it to the server's PATH", async () => {
+      const dirs = lines(extraPath.value);
+      for (const d of missing) if (!dirs.includes(d)) dirs.push(d);
+      const res = await api(base, { method: "PUT", body: { changes: { extra_path: dirs } } });
+      extraPath.value = dirs.join("\n");
+      shown.extra_path = dirs;
+      return `Saved to config.json; in effect now.${res.backup ? ` The previous file is ${res.backup}.` : ""} Reload ` +
+        `this page to see the status.`;
+    }, { primary: true, result: true }))
+    : (eff.slurm_found === false
+      ? el("div", { class: "error-box" },
+        el("p", {}, "This server can't find SLURM's commands (sbatch, srun, sinfo), so it can't submit jobs. " +
+          "Ask your cluster's support where SLURM is installed (or run `which sbatch` on the login node), then type " +
+          "that directory, such as /cm/local/apps/slurm/current/bin, into \"Extra PATH directories\" below and save."))
+      : null);
+  const slurmModules = eff.slurm_modules || [];
+  const moduleNotice = slurmModules.length && !lines(serverModules.value).length ? el("div", { class: "error-box" },
+    el("p", {}, `This cluster has a SLURM module (${slurmModules[0]}). If SLURM or the container runtime isn't ` +
+      "found, the server may need it loaded: it sets up SLURM's configuration as well as its PATH."),
+    action(`Load ${slurmModules[0]} for the server`, async () => {
+      const res = await api(base, { method: "PUT", body: { changes: { server_modules: [slurmModules[0]] } } });
+      serverModules.value = slurmModules[0];
+      shown.server_modules = [slurmModules[0]];
+      return `Saved to config.json; in effect now.${res.backup ? ` The previous file is ${res.backup}.` : ""} Reload ` +
+        `this page to see the status.`;
+    }, { primary: true, result: true })) : null;
+  const sb = eff.sandbox || {};
+  const sandboxNotice = sb.effective === "unavailable"
+    ? el("div", { class: "error-box" }, `Jobs can't run: ${sb.error || "no container runtime was found"}`) : null;
+  const image = sb.base_image;
+  const imageNote = image && image.state !== "ready"
+    ? el("p", { class: "muted" }, `Pyxis base image (imported once, jobs wait for it): ${image.state}` +
+      (image.error ? `, ${image.error}` : "")) : null;
+  const networkNote = sb.effective === "pyxis"
+    ? el("p", { class: "muted" }, "Pyxis jobs keep the node's network: this sandbox can't switch it off.") : null;
+
   const managers = (eff.environments || {}).managers || {};
   const found = Object.entries(managers).map(([m, i]) => `${m} ${i.available ? i.version || "" : "not found"}`).join(" · ");
   return el("section", { class: "card" }, head,
@@ -1079,10 +1145,28 @@ async function serverSettings(c) {
     el("h4", {}, "Job limits"),
     el("div", { class: "row" }, LIMIT_FIELDS.map(([k, label, kind]) =>
       field(label, limitInputs[k], kind === "list" ? "space-separated; empty for any" : "empty for no cap"))),
+    el("h4", {}, "Programs on the cluster"),
+    slurmNotice,
+    moduleNotice,
+    field("Extra PATH directories", extraPath, "one per line; where programs such as SLURM's sbatch live, for the server " +
+      "and the jobs it starts. Leave empty unless a program can't be found"),
+    field("Modules to load for the server", serverModules, "one per line, e.g. slurm/25.05; loaded for the server and " +
+      "the jobs it starts, before anything runs. Leave empty unless SLURM or a container runtime comes from a module"),
     el("h4", {}, "Sandbox ", el("span", { class: "muted" }, (eff.sandbox || {}).effective || "")),
+    sandboxNotice, imageNote, networkNote,
+    el("div", { class: "row" },
+      field("Container runtime", method, "what starts jobs in the sandbox; automatic picks Singularity or Apptainer, " +
+        "then Pyxis, then podman, then Bubblewrap"), field("Network", sandboxNetwork)),
+    el("p", { class: "muted small" }, "Charliecloud uses Bubblewrap to enforce read-only mounts and process/network boundaries. " +
+      "Pyxis shares host processes and networking. Singularity/Apptainer shares networking. Resource limits depend on Slurm or delegated cgroups."),
+    el("div", { class: "row" }, field("Runtime path", sandboxRuntime, "empty: detect, including interface installations"),
+      field("Bubblewrap path for Charliecloud", sandboxBoundary, "empty: detect")),
+    field("Image path", sandboxImage, "empty: host software; Pyxis uses its imported base image"),
     el("div", { class: "row" },
       field("Extra read-only directories", binds, "one per line, e.g. /software"),
       field("Extra writable directories", writable, "one per line; besides the token's own")),
+    field("Devices for Bubblewrap / Charliecloud", sandboxDevices,
+      "one explicit /dev path per line; GPU jobs also need the driver libraries in read-only binds"),
     el("div", { class: "row" },
       field("NVIDIA GPUs in jobs", gpus, "Singularity/Apptainer's --nv; a job asks for GPUs with gres, e.g. gpu:a100:1"),
       field("Extra runtime flags", flags, "space-separated, for every job; podman GPUs: --device nvidia.com/gpu=all")),
@@ -1096,6 +1180,46 @@ async function serverSettings(c) {
     el("div", { class: "actions" }, save),
     el("details", {}, el("summary", {}, "Edit the editable sections as JSON"), jsonBox,
       el("div", { class: "actions" }, saveJson)));
+}
+
+function sandboxToolsSettings(c) {
+  const body = el("div", {}, el("p", { class: "muted" }, "Checking the login node…"));
+  const card = el("section", { class: "card", id: "sandbox-tools" }, el("h3", {}, "Sandbox installation"), body);
+  if ((c.login || {}).state !== "connected") {
+    body.replaceChildren(el("p", { class: "muted" }, "Log in to check or install sandbox tools."));
+    return card;
+  }
+  const url = cluster(c.name) + "/sandbox-tools";
+  const modules = el("input", { value: "", size: 40, placeholder: "e.g. GCC WebProxy", "aria-label": "Sandbox installation modules" });
+  const probeResult = el("pre", { class: "quota", hidden: true });
+  const probe = action("Test active sandbox", async () => {
+    const result = await api(cluster(c.name) + "/rest/sandbox?refresh=1");
+    probeResult.hidden = false;
+    probeResult.textContent = JSON.stringify({ sandbox: result.sandbox, self_test: result.self_test, notes: result.notes }, null, 2);
+  }, { disabled: c.tunnel?.state !== "up" });
+  const draw = (info, note) => {
+    const rows = [["bubblewrap", "Bubblewrap"], ["charliecloud", "Charliecloud + Bubblewrap"]].map(([tool, title]) => {
+      const item = (info.tools || {})[tool] || {};
+      return el("tr", {}, el("td", {}, el("strong", {}, title)), el("td", {}, item.version || "not installed"),
+        el("td", { class: "muted" }, item.path || `${info.root || "~/.local/share/hpclib/sandbox-tools"}/bin`),
+        el("td", {}, action(item.path ? "Install pinned version" : "Install", async () => {
+          const result = await api(url + "/install", { method: "POST", body: { tool, modules: words(modules.value) } });
+          if (result.install?.ok) draw(result, "Installed. Choose the method in Server → Sandbox and save server settings. " +
+            "An existing REST process detects these paths; validate the execution node with sandbox_info.");
+          else draw(info, result.install?.error || result.error || "Installation failed");
+        })));
+    });
+    body.replaceChildren(el("p", { class: "muted" }, "Builds pinned upstream sources in your account, without administrator access. " +
+      "Requires a compiler, make, pkg-config, Python with pip, libseccomp and internet access. Charliecloud includes Bubblewrap. " +
+      "Installation does not change the active sandbox method."),
+      ...(note ? [el("pre", { class: "quota" }, note)] : []),
+      el("p", { class: "muted" }, `${info.host || "Login node"}: ${info.namespaces?.detail || "namespace support unknown"}`),
+      field("Installation modules", modules, "space-separated; loaded only while installing"),
+      el("table", { class: "rows" }, el("tbody", {}, rows)),
+      el("div", { class: "actions" }, probe), probeResult);
+  };
+  api(url).then(info => draw(info)).catch(error => body.replaceChildren(errorBox(error)));
+  return card;
 }
 
 // uv and pixi on the cluster (lib/pytools.sh, over the login): install them, and where they keep the Pythons they
@@ -1752,7 +1876,7 @@ async function packagesDialog() {
 clusterUI.init({
   api, errorBox, render: () => render(),
   // the cluster's Settings tab: the tunnel and its server first, then port clearing and quota checks
-  settingsCards: (c) => Promise.all([tunnelSettings(c), serverSettings(c).catch(errorBox), pythonToolsSettings(c),
+  settingsCards: (c) => Promise.all([tunnelSettings(c), serverSettings(c).catch(errorBox), sandboxToolsSettings(c), pythonToolsSettings(c),
                                      portSettings(c).catch(errorBox),
                                      quotaSettings(c).catch(errorBox)]),
   addCluster: addClusterControls,

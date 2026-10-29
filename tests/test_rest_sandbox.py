@@ -224,7 +224,7 @@ class TestProtectedPaths(unittest.TestCase):
         image = self.tmp / "image.sif"
         image.write_text("")
         self.sandbox = rest_sandbox.Sandbox({"method": "singularity", "image": str(image)}, data_dir=str(self.tmp / "data"),
-                                            which=lambda n: "/bin/true" if n == "singularity" else None)
+                                            which=lambda n: shutil.which("true") if n == "singularity" else None)
         self.sandbox.protect(hidden=[h / ".local/tunnels", h / ".ssh", self.tmp / "absent"],
                              read_only=[h / "hpclib", h / ".bashrc"])
 
@@ -558,11 +558,15 @@ class TestPodmanSandbox(SandboxServerTestCase):
         fake = bin_dir / "podman"
         fake.write_text(FAKE_PODMAN)
         fake.chmod(0o755)
+        fake_singularity = bin_dir / "singularity"
+        if singularity:
+            fake_singularity.write_text(FAKE_RUNTIME)
+            fake_singularity.chmod(0o755)
         self.runtime_log = self.tmp / "runtime.log"
         for key, value in (("FAKE_RUNTIME_LOG", str(self.runtime_log)), ("FAKE_PODMAN_INFO", json.dumps(info))):
             os.environ[key] = value
             self.addCleanup(os.environ.pop, key, None)
-        which = lambda name: str(fake) if name == "podman" else ("/usr/bin/singularity" if singularity else None)  # noqa: E731
+        which = lambda name: str(fake) if name == "podman" else (str(fake_singularity) if singularity else None)  # noqa: E731
         sandbox = rest_sandbox.Sandbox(config, data_dir=str(self.data / "rest"), which=which)
         self.jobs.sandbox = sandbox
         return sandbox
@@ -850,3 +854,413 @@ class TestSandboxScript(unittest.TestCase):
             res = self.run_server(flag, str(path))
             self.assertEqual(res.returncode, 2, (flag, path, res.stderr))
             self.assertIn("hpclib's own data", res.stderr)
+
+
+################################################################################
+##
+##  Pyxis (SLURM's enroot plugin)
+##
+
+FAKE_SRUN = textwrap.dedent("""\
+    #!/usr/bin/env python3
+    import json, os, subprocess, sys
+    args = sys.argv[1:]
+    FLAGS = ["--container-image", "--container-mounts", "--container-workdir", "--container-env",
+             "--no-container-mount-home", "--container-readonly"]
+    if args == ["--help"]:
+        omit = os.environ.get("FAKE_SRUN_OMIT", "").split(",")
+        for flag in FLAGS:
+            if flag not in omit:
+                print("      " + flag + "=VALUE")
+        print("  -n, --ntasks=ntasks")
+        sys.exit(0)
+    if args == ["--version"]:
+        print("slurm 0.0-fake"); sys.exit(0)
+    with open(os.environ["FAKE_RUNTIME_LOG"], "a") as f:
+        f.write(json.dumps(args) + "\\n")
+    if os.environ.get("FAKE_SRUN_FAIL"):
+        print("srun: error: pyxis: failed to import image", file=sys.stderr); sys.exit(1)
+    i, cwd, scratch = 0, None, None
+    while args[i].startswith("-"):
+        if args[i].startswith("--container-workdir="):
+            cwd = args[i].split("=", 1)[1]
+        if args[i].startswith("--container-mounts="):
+            for mount in args[i].split("=", 1)[1].split(","):
+                source, target = mount.split(":")[:2]
+                if target == "/tmp":
+                    scratch = source
+        i += 1
+    # /tmp in the "container" is the mounted scratch directory
+    command = [a.replace("/tmp/.hpc-sandbox-started", scratch + "/.hpc-sandbox-started") if scratch else a
+               for a in args[i:]]
+    sys.exit(subprocess.run(command, cwd=cwd).returncode)
+""")
+
+FAKE_ENROOT = textwrap.dedent("""\
+    #!/usr/bin/env python3
+    import json, os, sys
+    args = sys.argv[1:]
+    if args == ["version"]:
+        print("3.5.0-fake"); sys.exit(0)
+    with open(os.environ["FAKE_ENROOT_LOG"], "a") as f:
+        f.write(json.dumps(args) + "\\n")
+    run = os.environ.get("ENROOT_RUNTIME_PATH", "/run/enroot")
+    if not os.path.isdir(run):    # what the real one does without a login session
+        print("mkdir: cannot create directory \u2018" + run + "\u2019: Permission denied", file=sys.stderr); sys.exit(1)
+    if os.environ.get("FAKE_ENROOT_FAIL"):
+        print("enroot: error: could not pull the image", file=sys.stderr); sys.exit(1)
+    with open(args[args.index("-o") + 1], "w") as f:
+        f.write("sqsh")
+""")
+
+FAKE_SQUASHFUSE = textwrap.dedent("""\
+    #!/usr/bin/env python3
+    import json, os, sys
+    image, mount = sys.argv[1:3]
+    with open(os.environ["FAKE_FUSE_LOG"], "a") as f:
+        f.write(json.dumps(["squashfuse", image, mount]) + "\\n")
+    with open(os.path.join(mount, "FROM_IMAGE"), "w") as f:
+        f.write(image)
+""")
+
+FAKE_FUSERMOUNT = textwrap.dedent("""\
+    #!/usr/bin/env python3
+    import json, os, sys
+    args = sys.argv[1:]
+    with open(os.environ["FAKE_FUSE_LOG"], "a") as f:
+        f.write(json.dumps(["fusermount"] + args) + "\\n")
+    marker = os.path.join(args[-1], "FROM_IMAGE")
+    if os.path.exists(marker):
+        os.unlink(marker)
+""")
+
+
+class TestPyxisSandbox(SandboxServerTestCase):
+    """The pyxis method, with a fake srun (that has the plugin's options) and a fake enroot."""
+
+    def setenv(self, key, value):
+        os.environ[key] = value
+        self.addCleanup(os.environ.pop, key, None)
+
+    def use_pyxis(self, config, scheduler="slurm", ready=True, singularity=False, fuse=True):
+        self.bin_dir = self.tmp / "pyxis-bin"
+        self.bin_dir.mkdir(exist_ok=True)
+        files = {"srun": FAKE_SRUN, "enroot": FAKE_ENROOT, "singularity": FAKE_RUNTIME}
+        if fuse:
+            files.update(squashfuse_ll=FAKE_SQUASHFUSE, fusermount3=FAKE_FUSERMOUNT)
+        for name, text in files.items():
+            path = self.bin_dir / name
+            path.write_text(text)
+            path.chmod(0o755)
+        self.runtime_log, self.enroot_log, self.fuse_log = (self.tmp / n for n in ("runtime.log", "enroot.log", "fuse.log"))
+        for key, path in (("FAKE_RUNTIME_LOG", self.runtime_log), ("FAKE_ENROOT_LOG", self.enroot_log),
+                          ("FAKE_FUSE_LOG", self.fuse_log)):
+            self.setenv(key, str(path))
+        names = {"srun", "enroot"} | ({"singularity"} if singularity else set())
+        sandbox = rest_sandbox.Sandbox(config, data_dir=str(self.data / "rest"), scheduler=scheduler,
+                                       which=lambda name: str(self.bin_dir / name) if name in names else None)
+        if ready:
+            image = Path(sandbox.pyxis_base_image)
+            image.parent.mkdir(parents=True, exist_ok=True)
+            image.write_text("sqsh")
+        self.jobs.sandbox = sandbox
+        return sandbox
+
+    def test_the_error_says_what_detection_found(self):
+        # srun is there but doesn't have the plugin (the login node of a cluster that loads Pyxis only on compute nodes)
+        self.setenv("FAKE_SRUN_OMIT", "--container-image")
+        sandbox = self.use_pyxis({"method": "auto"})
+        with self.assertRaises(rest_sandbox.SandboxError) as caught:
+            sandbox.resolve()
+        message = str(caught.exception)
+        self.assertIn("was not found on the server's PATH", message)
+        self.assertIn(f"srun at {self.bin_dir / 'srun'} has no Pyxis plugin (its --help lacks --container-image)", message)
+        self.assertIn("podman not found", message)
+        self.assertIn("PATH: ", message)
+        # no srun at all, and no SLURM here
+        sandbox = rest_sandbox.Sandbox({"method": "auto"}, scheduler="slurm", which=lambda name: None)
+        with self.assertRaisesRegex(rest_sandbox.SandboxError, "srun: not found"):
+            sandbox.resolve()
+        sandbox = rest_sandbox.Sandbox({"method": "auto"}, scheduler="local", which=lambda name: None)
+        with self.assertRaisesRegex(rest_sandbox.SandboxError, "srun: not used"):
+            sandbox.resolve()
+
+    def test_a_srun_that_fails_is_reported(self):
+        self.setenv("FAKE_SRUN_FAIL", "1")
+        bad = self.tmp / "bad-bin"
+        bad.mkdir()
+        (bad / "srun").write_text("#!/bin/sh\necho 'srun: error: slurm_conf missing' >&2\nexit 1\n")
+        (bad / "srun").chmod(0o755)
+        sandbox = rest_sandbox.Sandbox({"method": "auto"}, scheduler="slurm",
+                                       which=lambda name: str(bad / name) if name == "srun" else None)
+        with self.assertRaisesRegex(rest_sandbox.SandboxError, r"did not run \(exit status 1: srun: error: slurm_conf missing"):
+            sandbox.resolve()
+
+    def srun_args(self):
+        return json.loads(self.runtime_log.read_text().splitlines()[-1])
+
+    def option(self, args, name):
+        return next(a.split("=", 1)[1] for a in args if a.startswith(name + "="))
+
+    def run_script(self, script, cwd, **env):
+        environ = dict(os.environ, TMPDIR=str(self.tmp), PATH=f"{self.bin_dir}:{os.environ['PATH']}", **env)
+        return subprocess.run(["bash", "-c", script], cwd=cwd, capture_output=True, text=True, env=environ,
+                              timeout=60)
+
+    def test_config(self):
+        self.assertIn("pyxis", rest_sandbox.SANDBOXED)
+        self.assertEqual(rest_sandbox.Sandbox({"method": "pyxis"}).base_image, "docker://ubuntu:24.04")
+        self.assertEqual(rest_sandbox.Sandbox({"method": "pyxis", "base_image": "docker://nvcr.io#nvidia/pytorch:24.01"})
+                         .base_image, "docker://nvcr.io#nvidia/pytorch:24.01")
+        for bad in ({"method": "pyxis", "base_image": "ubuntu"}, {"method": "pyxis", "base_image": "docker://a b"},
+                    {"method": "pyxis", "image": "docker://ubuntu"}, {"method": "pyxis", "image": "ubuntu:24.04"}):
+            with self.assertRaises(ValueError, msg=bad):
+                rest_sandbox.Sandbox(bad)
+
+    def test_auto_takes_pyxis_after_apptainer_and_before_nothing(self):
+        self.assertEqual(self.use_pyxis({"method": "auto"}).resolve()[0], "pyxis")
+        self.assertEqual(self.use_pyxis({"method": "auto"}, singularity=True).resolve()[0], "singularity")
+        self.assertEqual(self.use_pyxis({"method": "pyxis"}, singularity=True).resolve()[0], "pyxis")
+        # no plugin on this srun: not Pyxis
+        self.setenv("FAKE_SRUN_OMIT", "--container-image")
+        with self.assertRaisesRegex(rest_sandbox.SandboxError, "was not found"):
+            self.use_pyxis({"method": "auto"}).resolve()
+
+    def test_pyxis_needs_the_plugin_and_slurm(self):
+        self.setenv("FAKE_SRUN_OMIT", "--container-env,--container-readonly")
+        with self.assertRaisesRegex(rest_sandbox.SandboxError, "has no --container-env.*Pyxis plugin isn't loaded"):
+            self.use_pyxis({"method": "pyxis"}).resolve()
+        os.environ.pop("FAKE_SRUN_OMIT")
+        with self.assertRaisesRegex(rest_sandbox.SandboxError, "scheduler is the local one"):
+            self.use_pyxis({"method": "pyxis"}, scheduler="local").resolve()
+        # auto doesn't pick it for the local scheduler (which has no srun), and says why nothing is found
+        with self.assertRaises(rest_sandbox.SandboxError):
+            self.use_pyxis({"method": "auto"}, scheduler="local").resolve()
+        self.assertEqual(self.use_pyxis({"method": "pyxis", "runtime": str(self.tmp / "pyxis-bin" / "srun")}).resolve()[0],
+                         "pyxis")
+
+    def test_job_runs_in_pyxis(self):
+        self.use_pyxis({"method": "pyxis", "binds": ["/opt"], "writable": [str(self.outside)]})
+        out = self.llm.submit_job("hello", params={"message": "hi there"}, workdir=str(self.llm_root))
+        plan = out["sandbox"]
+        self.assertEqual((plan["method"], plan["network"], plan["network_isolated"]), ("pyxis", "host", False))
+        self.assertTrue(plan["host_image"])
+        res = self.run_script(fake_job(self.slurm, out["job_id"])["script"], self.llm_root)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("hi there", res.stdout)                                  # parameters reach the body
+        args = self.srun_args()
+        self.assertEqual(args[:3], ["--ntasks=1", "--nodes=1", "--cpus-per-task=1"])
+        self.assertEqual(self.option(args, "--container-image"), plan["image"])
+        self.assertTrue(plan["image"].endswith("/sandbox/pyxis/base.sqsh"))
+        for flag in ("--no-container-mount-home", "--container-readonly"):
+            self.assertIn(flag, args)
+        self.assertEqual(self.option(args, "--container-workdir"), str(self.llm_root))
+        self.assertEqual(self.option(args, "--container-env"), "PATH" if "LD_LIBRARY_PATH" not in os.environ
+                         else "PATH,LD_LIBRARY_PATH")
+        mounts = self.option(args, "--container-mounts").split(",")
+        self.assertIn(f"{self.llm_root}:{self.llm_root}", mounts)
+        self.assertIn(f"{self.outside}:{self.outside}", mounts)
+        self.assertIn("/usr:/usr:ro", mounts)
+        self.assertIn("/opt:/opt:ro", mounts)
+        self.assertNotIn(str(self.root), [m.split(":")[0] for m in mounts])  # only the token's directory
+        # your account over the host's /etc (so after its mount); the job's own scratch
+        etc = mounts.index("/etc:/etc:ro")
+        account = [m for m in mounts if m.endswith(("/etc/passwd:ro", "/etc/group:ro", "/etc/nsswitch.conf:ro"))]
+        self.assertGreaterEqual(len(account), 2)
+        self.assertTrue(all(mounts.index(m) > etc for m in account))
+        self.assertTrue(any(m.endswith(":/tmp") for m in mounts) and any(m.endswith(":/var/tmp") for m in mounts))
+        self.assertEqual(list(self.tmp.glob("hpc-sandbox.*")), [])             # scratch removed
+        self.assertEqual(list(self.tmp.glob("hpc-sandbox-etc.*")), [])
+
+    def test_body_failure_is_not_a_failure_to_start(self):
+        sandbox = self.use_pyxis({"method": "pyxis"})
+        lines, _ = sandbox.launch("#!/bin/bash", "echo failing; exit 3", [str(self.llm_root)])
+        res = self.run_script("\n".join(["#!/bin/bash"] + lines), self.llm_root)
+        self.assertEqual((res.returncode, res.stdout.strip()), (3, "failing"))
+        self.assertNotIn("failed to start", res.stderr)
+        # srun itself failing (the image can't be unpacked, say) is said to be a failure to start
+        self.setenv("FAKE_SRUN_FAIL", "1")
+        res = self.run_script("\n".join(["#!/bin/bash"] + lines), self.llm_root)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("the Pyxis sandbox failed to start (srun exit 1)", res.stderr)
+        self.assertEqual(list(self.tmp.glob("hpc-sandbox.*")), [])
+
+    def test_prelude_and_flags(self):
+        sandbox = self.use_pyxis({"method": "pyxis", "flags": ["--container-writable"]})
+        lines, _ = sandbox.launch("#!/usr/bin/env python3", "import sys; print('py', sys.version_info[0])",
+                                  [str(self.llm_root)], prelude=["export FROM_PRELUDE=yes"])
+        script = "\n".join(["#!/bin/bash"] + lines)
+        self.assertIn("--container-writable", script)
+        self.assertNotIn("--container-readonly", script.split("hpc_sandbox_prelude=")[0])
+        prelude = self.run_script("\n".join(["#!/bin/bash"] + sandbox.launch(
+            "#!/bin/bash", 'echo "prelude=$FROM_PRELUDE"', [str(self.llm_root)], prelude=["export FROM_PRELUDE=yes"])[0]),
+            self.llm_root)
+        self.assertEqual(prelude.stdout.strip(), "prelude=yes", prelude.stderr)
+        with self.assertRaisesRegex(rest_sandbox.SandboxError, "shell or Python"):
+            sandbox.launch("#!/usr/bin/perl", "1", [str(self.llm_root)])
+
+    def test_without_readonly_option_the_rootfs_is_left_alone(self):
+        self.setenv("FAKE_SRUN_OMIT", "--container-readonly")
+        sandbox = self.use_pyxis({"method": "pyxis"})
+        _, plan = sandbox.launch("#!/bin/bash", "true", [str(self.llm_root)])
+        self.assertFalse(plan["rootfs_read_only"])
+        self.assertFalse(sandbox.describe()["rootfs_read_only"])
+
+    def test_describe_says_network_is_not_isolated(self):
+        described = self.use_pyxis({"method": "auto"}).describe()
+        self.assertEqual(described["effective"], "pyxis")
+        self.assertFalse(described["network_isolated"])
+        self.assertFalse(described["pid_isolated"])
+        self.assertTrue(described["rootfs_read_only"])
+        self.assertEqual(described["base_image"]["state"], "ready")
+        self.assertIn("network access", described["isolation_notes"][0])
+        self.assertTrue(self.use_pyxis({"method": "singularity"}, singularity=True).describe()["effective"] == "singularity")
+
+    def test_jobs_wait_for_the_base_image(self):
+        sandbox = self.use_pyxis({"method": "pyxis"}, ready=False)
+        with self.assertRaisesRegex(rest_sandbox.SandboxError, "base image .* isn't there.*--import-sandbox-image"):
+            sandbox.resolve()
+        described = sandbox.describe()
+        self.assertEqual((described["effective"], described["base_image"]["state"]), ("unavailable", "missing"))
+        self.assertTrue(sandbox.wants_base_image())
+        state = sandbox.import_base_image(wait=True)
+        self.assertEqual(state["state"], "ready")
+        self.assertEqual(Path(sandbox.pyxis_base_image).read_text(), "sqsh")
+        argv = json.loads(self.enroot_log.read_text().splitlines()[-1])
+        self.assertEqual((argv[0], argv[1], argv[3]), ("import", "-o", "docker://ubuntu:24.04"))
+        self.assertIn(".partial.", argv[2])                                     # written aside, then renamed
+        self.assertEqual(list(Path(sandbox.pyxis_base_image).parent.glob("*.partial.*")), [])
+        self.assertEqual(sandbox.resolve()[0], "pyxis")
+        self.assertFalse(sandbox.wants_base_image())
+        self.assertEqual(sandbox.import_base_image()["state"], "ready")           # nothing more to do
+        self.assertEqual(len(self.enroot_log.read_text().splitlines()), 1)
+
+    def test_enroot_gets_a_runtime_directory_without_a_login_session(self):
+        # a server started over SSH has no XDG_RUNTIME_DIR: enroot would use /run/enroot, which only root can create
+        sandbox = self.use_pyxis({"method": "pyxis"}, ready=False)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ENROOT_RUNTIME_PATH", None)
+            self.assertEqual(sandbox.import_base_image(wait=True)["state"], "ready")
+            run = Path(sandbox._enroot_env()["ENROOT_RUNTIME_PATH"])
+        self.assertTrue(run.is_dir())
+        self.assertEqual(run.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(run.parent, Path(sandbox.pyxis_base_image).parent.parent)
+        # one the environment already sets is kept
+        with mock.patch.dict(os.environ, {"ENROOT_RUNTIME_PATH": "/site/enroot"}):
+            self.assertEqual(sandbox._enroot_env()["ENROOT_RUNTIME_PATH"], "/site/enroot")
+
+    def test_import_failures_are_reported(self):
+        self.setenv("FAKE_ENROOT_FAIL", "1")
+        sandbox = self.use_pyxis({"method": "pyxis"}, ready=False)
+        state = sandbox.import_base_image(wait=True)
+        self.assertEqual(state["state"], "failed")
+        self.assertIn("could not pull the image", state["error"])
+        self.assertEqual(list(Path(sandbox.pyxis_base_image).parent.glob("*")), [])   # no partial file left
+        with self.assertRaisesRegex(rest_sandbox.SandboxError, "import failed: .*could not pull"):
+            sandbox.resolve()
+        self.assertIn("could not pull", sandbox.describe()["base_image"]["error"])
+        # no enroot at all: say how to import it by hand
+        sandbox = rest_sandbox.Sandbox({"method": "pyxis"}, data_dir=str(self.data / "rest"),
+                                       which=lambda n: str(self.bin_dir / n) if n == "srun" else None)
+        state = sandbox.import_base_image()
+        self.assertEqual(state["state"], "failed")
+        self.assertIn("enroot import -o", state["error"])
+
+    def test_an_image_of_your_own(self):
+        image = self.tmp / "mine.sqsh"
+        image.write_text("sqsh")
+        sandbox = self.use_pyxis({"method": "pyxis", "image": str(image)}, ready=False)
+        method, _ = sandbox.resolve()                                            # no base image needed
+        plan = sandbox.plan([str(self.llm_root)])
+        self.assertEqual((method, plan["image"], plan["host_image"]), ("pyxis", str(image), False))
+        self.assertNotIn("/usr", plan["read_only"])                              # only what is bound is there
+        self.assertFalse(sandbox.wants_base_image())
+        (self.tmp / "gone.sqsh").write_text("x")
+        os.unlink(self.tmp / "gone.sqsh")
+        with self.assertRaisesRegex(rest_sandbox.SandboxError, "does not exist"):
+            self.use_pyxis({"method": "pyxis", "image": str(self.tmp / "gone.sqsh")}).resolve()
+
+    def test_mounts_cover_hidden_paths_in_order(self):
+        home = self.tmp / "home"
+        (home / ".ssh").mkdir(parents=True)
+        (home / "proj").mkdir()
+        sandbox = self.use_pyxis({"method": "pyxis"}).protect(hidden=[str(home / ".ssh")])
+        lines, plan = sandbox.launch("#!/bin/bash", "true", [str(home)])
+        res = self.run_script("\n".join(["#!/bin/bash"] + lines), self.llm_root)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        mounts = self.option(self.srun_args(), "--container-mounts").split(",")
+        bound = mounts.index(f"{home}:{home}")
+        covered = next(i for i, m in enumerate(mounts) if m.endswith(f":{home}/.ssh:ro"))
+        self.assertGreater(covered, bound)                                       # later mounts cover earlier ones
+        self.assertEqual(plan["hidden"], [f"{home}/.ssh"])
+
+    def test_paths_with_commas_or_colons_are_refused(self):
+        odd = self.tmp / "a,b"
+        odd.mkdir()
+        sandbox = self.use_pyxis({"method": "pyxis"})
+        with self.assertRaisesRegex(rest_sandbox.SandboxError, "can't mount"):
+            sandbox.launch("#!/bin/bash", "true", [str(odd)])
+
+    def test_squashed_environment_is_mounted_with_squashfuse(self):
+        proj = self.llm_root / "proj"
+        (proj / ".venv").mkdir(parents=True)
+        image = proj / ".venv.sqfs"
+        image.write_text("sqfs")
+        sandbox = self.use_pyxis({"method": "pyxis"})
+        lines, plan = sandbox.launch("#!/bin/bash", "true", [str(proj)], images=[(image, proj / ".venv")])
+        self.assertEqual(plan["images"], [[str(image), f"{proj}/.venv"]])
+        res = self.run_script("\n".join(["#!/bin/bash"] + lines), proj)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        mounts = self.option(self.srun_args(), "--container-mounts").split(",")
+        mount = next(m for m in mounts if m.endswith(f":{proj}/.venv:ro"))
+        self.assertIn("/img/0:", mount)                                          # the job's own directory, not .venv
+        self.assertGreater(mounts.index(mount), mounts.index(f"{proj}:{proj}"))
+        fuse = [json.loads(line) for line in self.fuse_log.read_text().splitlines()]
+        self.assertEqual(fuse[0][:2], ["squashfuse", str(image)])
+        self.assertEqual(fuse[1][:3], ["fusermount", "-u", "-z"])                # unmounted afterwards
+        self.assertFalse((proj / ".venv" / "FROM_IMAGE").exists())               # never mounted on the real path
+        self.assertEqual(list(self.tmp.glob("hpc-sandbox.*")), [])
+
+    def test_squashed_environment_needs_squashfuse(self):
+        proj = self.llm_root / "proj"
+        (proj / ".venv").mkdir(parents=True)
+        (proj / ".venv.sqfs").write_text("sqfs")
+        sandbox = self.use_pyxis({"method": "pyxis"}, fuse=False)
+        lines, _ = sandbox.launch("#!/bin/bash", "true", [str(proj)], images=[(proj / ".venv.sqfs", proj / ".venv")])
+        res = self.run_script("\n".join(["#!/bin/bash"] + lines), proj)
+        self.assertEqual(res.returncode, 125)
+        self.assertIn("needs squashfuse", res.stderr)
+        self.assertFalse(self.runtime_log.exists())                              # srun never started
+        self.assertEqual(list(self.tmp.glob("hpc-sandbox.*")), [])
+
+    def test_probe_lists_pyxis(self):
+        sandbox = self.use_pyxis({"method": "auto"}, ready=False)
+        with mock.patch.object(rest_sandbox, "_module_roots", return_value=([], [])):
+            info = rest_sandbox.probe(sandbox, str(self.tmp / "probe"), run_self_test=False)
+        entry = next(r for r in info["container_runtimes"] if r["name"] == "pyxis")
+        self.assertEqual(entry["version"], "slurm 0.0-fake with Pyxis")
+        self.assertTrue(all(entry["flags"].values()))
+        self.assertEqual((entry["enroot_version"], entry["base_image"]["state"]), ("3.5.0-fake", "missing"))
+        self.assertTrue(any("network" in n for n in info["notes"]))
+        self.assertTrue(any("--import-sandbox-image" in n for n in info["notes"]))
+        self.assertEqual(info["recommended_config"], {"sandbox": {"method": "auto"}})
+
+    def test_import_from_the_command_line(self):
+        data = self.tmp / "cli-data"
+        (data / "rest").mkdir(parents=True)
+        self.use_pyxis({"method": "pyxis"}, ready=False)
+        server = Path(rest_sandbox.__file__).resolve().parent / "rest_server.py"
+        env = dict(os.environ, HPCTUNNELS_DATA_DIR=str(data), PATH=f"{self.bin_dir}:{os.environ['PATH']}")
+
+        def run(sandbox):
+            (data / "rest" / "config.json").write_text(json.dumps({"sandbox": sandbox}))
+            return subprocess.run([sys.executable, str(server), "--import-sandbox-image"], capture_output=True,
+                                  text=True, env=env, timeout=60)
+
+        res = run({"method": "pyxis", "runtime": str(self.bin_dir / "srun")})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("ready", res.stdout)
+        self.assertTrue((data / "rest" / "sandbox" / "pyxis" / "base.sqsh").is_file())
+        res = run({"method": "singularity", "runtime": str(self.bin_dir / "singularity")})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("nothing to import", res.stdout)

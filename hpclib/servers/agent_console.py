@@ -103,6 +103,9 @@ The front end depends only on the routes below; nothing here depends on it.
                                               directories on the cluster ($HPCTUNNELS_DATA_DIR/settings/pytools.sh;
                                               "" for the tool's default); hpclib.sh exports them, ~/.bashrc wins
   POST /api/clusters/NAME/python-tools/install  {"tool": "uv"|"pixi"}: run its official installer over the login
+  GET  /api/clusters/NAME/sandbox-tools       installed runtimes and namespace/build prerequisites on the login node
+  POST /api/clusters/NAME/sandbox-tools/install {"tool": "bubblewrap"|"charliecloud", "modules": [NAME, ...]}
+
                                               (~/.local/bin/uv, ~/.pixi/bin/pixi; shell startup files untouched)
   GET  /api/clusters/NAME/ports               the login-node ports this console's tunnels use, and which run now
   POST /api/clusters/NAME/ports/clear         {"fresh_logins": false, "password"?, "max_logins"?}: clear what earlier
@@ -1080,6 +1083,7 @@ QUOTA_ENV = ("HPCLIB_STORAGE_QUOTA_CHECK", "HPCLIB_PROJECT_QUOTA_CHECK")
 QUOTA_KINDS = ("all", "storage", "project")
 PYTOOLS_SH = os.path.join(HPCLIB_DIR, "lib", "pytools.sh")
 PYTOOLS_VARS = ("UV_PYTHON_INSTALL_DIR", "UV_CACHE_DIR", "PIXI_CACHE_DIR")
+SANDBOX_TOOLS_PY = os.path.join(HPCLIB_DIR, "servers", "sandbox_tools.py")
 
 
 def pytools_script(call):
@@ -1828,6 +1832,43 @@ class Clusters:
         return result
 
     # -- leftover tunnel ports on the cluster's login nodes ---------------------
+
+    def sandbox_tools(self, profile, body=None):
+        """Report or install the user's sandbox runtimes over the existing trusted login."""
+        body = {} if body is None else body
+        if not isinstance(body, dict) or set(body) - {"tool", "modules"}:
+            raise ConsoleError(400, 'send {"tool": "bubblewrap"|"charliecloud", "modules": [NAME, ...]}')
+        tool = body.get("tool")
+        if tool is not None and tool not in ("bubblewrap", "charliecloud"):
+            raise ConsoleError(400, "tool must be bubblewrap or charliecloud")
+        modules = body.get("modules", [])
+        if (not isinstance(modules, list) or len(modules) > 20 or
+                any(not isinstance(m, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+/@:-]{0,127}", m) for m in modules)):
+            raise ConsoleError(400, "modules must be a list of module names")
+        if not self.logins.alive(profile):
+            raise ConsoleError(409, "Log in first: sandbox tools are installed through the console's cluster login")
+        with open(SANDBOX_TOOLS_PY) as source:
+            code = source.read()
+        prelude = ""
+        if modules:
+            prelude = ('type module >/dev/null 2>&1 || { echo "Load the site module initialization first" >&2; exit 3; }\n'
+                       'module load ' + " ".join(shlex.quote(m) for m in modules) + ' || exit 3\n')
+        args = " --install " + shlex.quote(tool) if tool else ""
+        script = prelude + "python3 -" + args + " <<'HPCLIB_SANDBOX_INSTALLER'\n" + code + "\nHPCLIB_SANDBOX_INSTALLER\n"
+        status, out, err = self.script_runner(profile, script, (), 900 if tool else 45)
+        match = re.search(r"^HPCLIB_SANDBOX_TOOLS (\{.*\})\s*$", out or "", re.M)
+        try:
+            result = json.loads(match.group(1)) if match else None
+        except ValueError:
+            result = None
+        if result is None:
+            raise ConsoleError(502, "Sandbox tools: " + self._one_line((err or out or f"exit {status}")[-2000:]))
+        if tool:
+            result["install"] = {"tool": tool, "ok": status == 0 and result.get("ok") is True,
+                                 "error": result.get("error")}
+        elif status:
+            raise ConsoleError(502, result.get("error") or "Could not inspect sandbox tools")
+        return result
 
     PORT_LINE_RE = re.compile(r"^HPCLIB_PORT_(HERE|CLEARED|BUSY|PENDING) ([A-Za-z0-9][A-Za-z0-9._-]{0,62})(?: ([0-9]{1,5}))?\s*$", re.M)
     CLEAR_LOGINS_MAX = 10
@@ -4124,6 +4165,13 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 return 200, dict(c.set_python_tools(profile, self.json_body()), ok=True)
             if rest == ["python-tools", "install"] and verb == "POST":
                 return 200, dict(c.install_python_tool(profile, self.json_body()), ok=True)
+            if rest == ["sandbox-tools"] and verb == "GET":
+                return 200, dict(c.sandbox_tools(profile), ok=True)
+            if rest == ["sandbox-tools", "install"] and verb == "POST":
+                body = self.json_body()
+                if not isinstance(body, dict) or not body.get("tool"):
+                    raise ConsoleError(400, "Choose bubblewrap or charliecloud to install")
+                return 200, dict(c.sandbox_tools(profile, body), ok=True)
             if rest == ["ports"] and verb == "GET":
                 return 200, {"ok": True, "ports": c.login_ports(profile)}
             if rest == ["ports", "clear"] and verb == "POST":

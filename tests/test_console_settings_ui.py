@@ -399,6 +399,56 @@ class TestConsoleSettingsUI(unittest.TestCase):
         self.assertNotIn("null", card.inner_text())
         self.assertEqual(self.errors, [])
 
+    def test_sandbox_installer_and_backend_selection(self):
+        demo = {"name": "demo", "host": "me@demo.example", "mcp_name": "hpclib-demo", "set_up": True, "port": 20735,
+                "has_owner_token": True, "login": {"state": "connected"}, "tunnel": {"state": "up"}}
+        calls = []
+        def handler(route, path):
+            method = route.request.method
+            body = route.request.post_data_json if route.request.post_data else None
+            calls.append((method, path, body))
+            if path in ("clusters", "clusters/demo"):
+                out = {"clusters": [demo]} if path == "clusters" else demo
+            elif path == "clusters/demo/settings":
+                out = {"modes": ["all"], "auto_approve_templates": "all", "tunnel_args": [], "rest_on": "login"}
+            elif path == "clusters/demo/rest/admin/config":
+                out = ({"changed": ["sandbox"]} if method == "PUT" else
+                       {"path": "/home/me/config.json", "editable": ["sandbox"],
+                        "config": {"sandbox": {"method": "pyxis", "runtime": "/usr/bin/srun", "flags": ["--exclusive"]}},
+                        "effective": {"limits": {}, "environments": {}, "sandbox": {"effective": "pyxis"}}})
+            elif path.startswith("clusters/demo/sandbox-tools"):
+                out = {"host": "login1", "root": "/home/me/.local/share/hpclib/sandbox-tools",
+                       "namespaces": {"ok": True, "detail": "namespaces work"}, "tools": {}}
+                if method == "POST":
+                    out.update(install={"ok": True}, tools={"charliecloud": {"path": "/home/me/.local/share/hpclib/sandbox-tools/bin/ch-run",
+                                                                          "version": "0.45.2"}})
+            elif path.startswith("clusters/demo/rest/sandbox"):
+                out = {"sandbox": {"effective": "charliecloud", "network_isolated": True}, "self_test": {"passed": True}}
+            else:
+                return self.handler(route, path)
+            route.fulfill(body=json.dumps(out), content_type="application/json")
+            return True
+        console_ui.TestConsoleUI.load_console(self, handler)
+        self.page.goto(self.base + "/#/c/demo/settings")
+        card = self.page.locator("#sandbox-tools")
+        card.get_by_label("Sandbox installation modules").fill("GCC WebProxy")
+        card.get_by_role("row").filter(has_text="Charliecloud + Bubblewrap").get_by_role("button", name="Install", exact=True).click()
+        card.get_by_text("Installed. Choose the method", exact=False).wait_for()
+        install = [call for call in calls if call[1].endswith("/sandbox-tools/install")][-1]
+        self.assertEqual(install[2], {"tool": "charliecloud", "modules": ["GCC", "WebProxy"]})
+        self.page.get_by_label("Container runtime", exact=True).select_option("charliecloud")
+        self.assertEqual(self.page.get_by_label("Runtime path", exact=True).input_value(), "")
+        self.page.get_by_role("button", name="Save server settings", exact=True).click()
+        self.page.get_by_text("Saved sandbox; in effect now.", exact=False).wait_for()
+        save = [call for call in calls if call[0] == "PUT" and call[1].endswith("/admin/config")][-1]
+        self.assertEqual(save[2]["changes"]["sandbox"]["method"], "charliecloud")
+        self.assertNotIn("runtime", save[2]["changes"]["sandbox"])
+        self.assertEqual(save[2]["changes"]["sandbox"]["flags"], [])
+        card.get_by_role("button", name="Test active sandbox", exact=True).click()
+        card.get_by_text('"passed": true', exact=False).wait_for()
+        self.assertTrue(any(call[0] == "GET" and call[1].startswith("clusters/demo/rest/sandbox") for call in calls))
+        self.assertEqual(self.errors, [])
+
     def test_tunnel_actions_are_turned_on_and_put_needs_its_own_yes(self):
         demo = {"name": "demo", "host": "me@demo.example", "mcp_name": "hpclib-demo", "set_up": True, "port": 20735,
                 "has_owner_token": True, "login": {"state": "connected"}, "tunnel": {"state": "up"}}
@@ -459,6 +509,69 @@ class TestConsoleSettingsUI(unittest.TestCase):
         self.assertEqual(puts[-1], {"data-transfer": {"enabled": True, "actions": {"put": True}}})
         self.assertTrue(card.get_by_label("Turn on data-transfer/put", exact=True).is_checked())
         self.assertEqual(self.errors, [])
+
+    def test_server_settings_offer_slurm_path_and_the_container_runtime(self):
+        """A cluster whose server can't find SLURM: a plain notice with a one-click fix that lands in config.json,
+        an Extra PATH box, and a Container runtime choice that keeps the other sandbox settings."""
+        demo = {"name": "demo", "host": "me@demo.example", "mcp_name": "hpclib-demo", "set_up": True, "port": 20735,
+                "has_owner_token": True, "login": {"state": "connected"}, "tunnel": {"state": "up"}}
+        slurm = "/cm/local/apps/slurm/current/bin"
+        config = {"sandbox": {"method": "auto", "binds": ["/sw", "/cm"]}}
+        puts = []
+
+        def effective():
+            return {"limits": {}, "environment": {"jobs": {}, "syncs": {}}, "environments": {"managers": {}},
+                    "extra_path": config.get("extra_path", []),
+                    "slurm_missing": [] if "extra_path" in config else [slurm],
+                    "sandbox": {"effective": "unavailable", "error": "jobs must run sandboxed but apptainer or "
+                                "singularity, or podman was not found on the server's PATH"}}
+
+        def handler(route, path):
+            if path == "clusters/demo/rest/admin/config":
+                if route.request.method == "PUT":
+                    puts.append(route.request.post_data_json["changes"])
+                    config.update({k: v for k, v in puts[-1].items() if v is not None})
+                route.fulfill(body=json.dumps({"path": "/home/me/.local/tunnels/rest/config.json", "config": config,
+                                               "editable": ["sandbox", "extra_path"], "rules": {},
+                                               "effective": effective(), "backup": "config.json.replaced-1",
+                                               "changed": sorted(puts[-1]) if puts else []}),
+                              content_type="application/json")
+                return True
+            if path in ("clusters", "clusters/demo"):
+                route.fulfill(body=json.dumps({"clusters": [demo]} if path == "clusters" else demo),
+                              content_type="application/json")
+                return True
+            if path == "clusters/demo/settings":
+                route.fulfill(body=json.dumps({"modes": ["all"], "auto_approve_templates": "all", "tunnel_args": [],
+                                               "connection_hours": 12, "rest_on": "job"}), content_type="application/json")
+                return True
+            if path.startswith("clusters/demo/python-tools"):
+                route.fulfill(body=json.dumps({"tools": {}, "dirs": {}, "shell": {}}), content_type="application/json")
+                return True
+            return self.handler(route, path)
+        console_ui.TestConsoleUI.load_console(self, handler)
+        self.page.goto(self.base + "/#/c/demo/settings")
+        card = self.page.locator("section.card", has=self.page.get_by_text("config.json on the cluster"))
+        notice = card.get_by_text("This server can't find SLURM's commands", exact=False)
+        notice.wait_for()
+        self.assertIn(slurm, card.inner_text())
+        self.assertIn("Jobs can't run: jobs must run sandboxed", card.inner_text())
+        self.assertEqual(card.get_by_label("Extra PATH directories").input_value(), "")
+        # one click: saved on the cluster, in config.json, with nothing else changed
+        card.get_by_role("button", name="Add it to the server's PATH").click()
+        card.get_by_text("Saved to config.json; in effect now.").wait_for()
+        self.assertEqual(puts, [{"extra_path": [slurm]}])
+        self.assertEqual(card.get_by_label("Extra PATH directories").input_value(), slurm)
+        # the runtime picker offers Pyxis, defaults to automatic, and a save sends the sandbox with its other keys
+        runtime = card.get_by_label("Container runtime")
+        self.assertEqual(runtime.input_value(), "auto")
+        self.assertIn("Pyxis (SLURM with enroot)", runtime.inner_text())
+        runtime.select_option("pyxis")
+        card.get_by_role("button", name="Save server settings").click()
+        card.get_by_text("Saved sandbox").wait_for()
+        self.assertEqual(puts[-1], {"sandbox": {"method": "pyxis", "binds": ["/sw", "/cm"], "writable": []}})
+        self.assertNotIn("extra_path", puts[-1])                  # unchanged sections aren't sent again
+        self.assertNotIn("null", card.inner_text())
 
     def test_clusters_page_without_widgets_and_its_add_form(self):
         self.open("#/c")

@@ -251,7 +251,7 @@ def build_server(client: RESTClient, enable_file_writes=False, local_roots=None)
         "the end of its log; check again with sync_status. Jobs from templates with an `environment` (e.g. "
         "python_project) then run in it; jobs never install packages themselves. "
         "squash=true packs the environment into one SquashFS file that jobs mount read-only (one file instead of "
-        "thousands on the cluster's filesystem; needs a Singularity or Apptainer sandbox), squash=false unpacks it, "
+        "thousands on the cluster's filesystem; needs Singularity/Apptainer, or Pyxis/Bubblewrap/Charliecloud with squashfuse), squash=false unpacks it, "
         "and leaving it out keeps it as it is. core=DIR builds this environment on another (a core, ideally "
         "squashed): its packages aren't installed again but used from the core, and the manifest gets the core's "
         "versions as constraints and [tool.hpclib] core, so later syncs keep it (core=\"\" stops). "

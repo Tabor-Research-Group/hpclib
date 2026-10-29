@@ -37,6 +37,23 @@ are bound read-only over the host's in the container. They hold nothing
 the job couldn't already learn as you, and add no host directory or
 socket to the sandbox.
 
+Pyxis (method "pyxis", or "auto" on a SLURM cluster without Singularity or
+Apptainer where `srun` has the Pyxis plugin's --container-* options): the job
+script starts the body with `srun --container-image=IMAGE
+--container-mounts=SRC:DST[:ro],... --no-container-mount-home`, with the
+same read-only and read-write mounts, masks and scratch directories. Pyxis
+(enroot) needs a real image: hpclib imports a small base image once per user
+(`enroot import docker://ubuntu:24.04`, the config's `base_image`) into its
+data directory and keeps it; the host's /usr, /etc and /opt and the `binds`
+are mounted over it, as for the host image. A `.sqsh` file in `image` is used
+instead. Jobs never pull an image. enroot gives the container no network of
+its own and no process table of its own, so a Pyxis job has the host's
+network (GET /sandbox says so: `network_isolated` is false) and the
+`network` setting has no effect. A squashed Python environment is mounted
+with squashfuse inside the job, before the container starts (it needs
+squashfuse and FUSE on the compute nodes). Pyxis needs SLURM: not with the
+local scheduler.
+
 Podman (method "podman", or "auto" where there is no Singularity or
 Apptainer): for machines that aren't clusters, rootless podman runs the
 same host image (`--rootfs`) with the same read-only and read-write binds,
@@ -55,11 +72,13 @@ job has only your primary group.
 
 Config, the `sandbox` key of the server's config.json:
 
-  {"method": "auto",          # auto | singularity | podman | none
-   "runtime": null,           # "apptainer", "singularity", "podman", or a path; default: whichever is found
+  {"method": "auto",          # auto | singularity | pyxis | podman | bubblewrap | charliecloud | none
+   "runtime": null,           # "apptainer", "singularity", "podman", "srun" (pyxis), or a path; default: whichever is found
    "image": null,             # default: the host image, built in the server's data directory
-                              #   (podman: also an image name, e.g. "docker.io/library/ubuntu:24.04")
-   "network": "none",         # podman: "none" (jobs have no network) or "default"
+                              #   (podman: also an image name, e.g. "docker.io/library/ubuntu:24.04";
+                              #   pyxis: a .sqsh file; default: the imported base_image)
+   "base_image": "docker://ubuntu:24.04",   # pyxis: imported once with enroot when `image` isn't given
+   "network": "none",         # podman / bubblewrap / charliecloud: "none" (jobs have no network) or "default"
    "binds": ["/sw"],          # extra read-only binds (software trees, reference data, ...)
    "writable": [],            # extra read-write binds, besides the token's directories
    "scratch": "job",          # /tmp in the container: "job" (a per-job directory under
@@ -70,6 +89,14 @@ Config, the `sandbox` key of the server's config.json:
                               #   "auto" for jobs that ask SLURM for GPUs (gres gpu), "always", or "never".
                               #   Podman: put its device flag (e.g. --device nvidia.com/gpu=all) in `flags`
    "allow_unsandboxed": false}  # with "auto": run jobs unsandboxed if no runtime is found
+
+Bubblewrap (method "bubblewrap") and Charliecloud ("charliecloud", requiring
+Bubblewrap) provide token-scoped binds, separate processes, opt-in networking
+and devices, no-new-privileges and a libseccomp policy. Charliecloud's writable
+binds are confined by locked source mounts in an outer Bubblewrap. The console
+installs pinned private builds; see docs/sandbox-runtimes.md. These backends
+share the kernel and require site resource limits. `devices` lists explicit
+/dev nodes; `boundary_runtime` optionally selects Charliecloud's Bubblewrap.
 
 With no `sandbox` key, jobs run unsandboxed, as before; the server warns
 about it and GET /sandbox recommends a config.
@@ -96,7 +123,13 @@ import tempfile
 import threading
 import time
 
-__all__ = ["SandboxError", "Sandbox", "build_host_image", "probe", "child_env"]
+try:
+    from . import rest_bwrap
+except ImportError:
+    import rest_bwrap
+
+__all__ = ["SandboxError", "Sandbox", "build_host_image", "probe", "child_env", "SANDBOXED", "set_extra_path",
+           "extra_path"]
 
 # Set by the Python launcher setup_agents writes when it loads a Python module:
 # the environment from before that, `env -0` on an inherited descriptor.
@@ -141,11 +174,192 @@ def _read_base_env_fd(text):
         return None
 
 
-def child_env(env=None):
+# Directories the config's `extra_path` adds to the end of PATH (see set_extra_path)
+_EXTRA_PATH = ()
+
+
+def extra_path():
+    """The directories set_extra_path added, as a list."""
+    return list(_EXTRA_PATH)
+
+
+def set_extra_path(dirs):
+    """
+    Add `dirs` to the end of PATH, for this process and for the commands and jobs it starts (child_env), and
+    take back the ones an earlier call added. For clusters whose non-interactive shells, which is what a
+    server started over SSH gets, lack the directory that SLURM or a container runtime is in, though a login
+    shell has it: the config's `extra_path` names those directories.
+    """
+    global _EXTRA_PATH
+    dirs = tuple(dirs or ())
+    current = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p and p not in _EXTRA_PATH]
+    os.environ["PATH"] = os.pathsep.join(current + [d for d in dirs if d not in current])
+    _EXTRA_PATH = dirs
+
+
+# The config's `server_modules`: environment modules the server loads for itself, and for the commands and jobs it
+# starts, on top of the Python launcher's own (which child_env leaves out). For clusters where SLURM (and its
+# configuration and libraries) comes from a module, as on Bright Cluster Manager's `slurm/25.05`.
+SERVER_MODULE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+@/-]{0,127}")
+MODULE_INIT = (
+    'if ! type module > /dev/null 2>&1; then\n'
+    '  for f in /etc/profile.d/lmod.sh /etc/profile.d/modules.sh /usr/share/lmod/lmod/init/bash '
+    '/usr/share/Modules/init/bash; do\n'
+    '    if [ -f "$f" ]; then . "$f" > /dev/null 2>&1; type module > /dev/null 2>&1 && break; fi\n'
+    '  done\n'
+    'fi\n')
+MODULE_ENV_BEFORE, MODULE_ENV_AFTER = b"\0HPCLIB-ENV-BEFORE\0", b"\0HPCLIB-ENV-AFTER\0"
+# what a module load changes that isn't the modules' doing: the shell's own bookkeeping, and Lmod's/Modules' state
+MODULE_ENV_SKIP = ("_", "SHLVL", "PWD", "OLDPWD", "LOADEDMODULES", "_LMFILES_")
+MODULE_ENV_SKIP_PREFIXES = ("BASH_FUNC_", "__MODULES_", "_ModuleTable", "LMOD_", "MODULES_", "_LMOD", "__LMOD")
+_SERVER_MODULES = ()
+_MODULE_ENV = {}     # VAR -> ("set", value) or ("list", entries put before, entries put after)
+_MODULE_SAVED = {}   # VAR -> what this process had before the modules' changes (None: unset)
+_MODULE_ERROR = None  # why the last load of the config's modules failed
+_MODULE_NOTE = None   # when they changed nothing: what the shell had loaded and said
+
+
+def module_status():
+    """One sentence on the config's `server_modules`: what loaded and what it changed, or why it didn't."""
+    if _MODULE_ERROR:
+        return f"server_modules did not load: {_MODULE_ERROR}"
+    if not _SERVER_MODULES:
+        return "no server_modules are set"
+    changed = ", ".join(sorted(_MODULE_ENV)) or "nothing (the modules changed no variables" + (
+        f"; {_MODULE_NOTE}" if _MODULE_NOTE else "") + ")"
+    return f"server_modules {', '.join(_SERVER_MODULES)} loaded, changing {changed}"
+
+
+def server_modules():
+    """The modules load_server_modules loaded, as a list."""
+    return list(_SERVER_MODULES)
+
+
+def _parse_env(data):
+    env = {}
+    for entry in data.split(b"\0"):
+        key, sep, value = entry.decode("utf-8", "replace").partition("=")
+        if sep and key:
+            env[key] = value
+    return env
+
+
+def _module_changes(before, after):
+    """What loading modules changed, between two environments: {VAR: ("set", value) | ("list", before, after)}."""
+    changes = {}
+    for key, value in after.items():
+        if key in MODULE_ENV_SKIP or key.startswith(MODULE_ENV_SKIP_PREFIXES) or before.get(key) == value:
+            continue
+        old = [p for p in (before.get(key) or "").split(os.pathsep) if p]
+        new = [p for p in value.split(os.pathsep) if p]
+        if os.pathsep in value and all(p in new for p in old):
+            # a PATH-like list that only grew: keep where the new entries went (PATH, LD_LIBRARY_PATH, ...)
+            first = new.index(old[0]) if old else 0
+            changes[key] = ("list", new[:first], [p for p in new[first:] if p not in old])
+        else:
+            changes[key] = ("set", value)
+    return changes
+
+
+def _apply_module_env(env, changes):
+    for key, change in changes.items():
+        if change[0] == "set":
+            env[key] = change[1]
+            continue
+        parts = [p for p in (env.get(key) or "").split(os.pathsep) if p]
+        env[key] = os.pathsep.join([p for p in change[1] if p not in parts] + parts +
+                                   [p for p in change[2] if p not in parts])
+
+
+def check_module_names(modules):
+    """`modules` as a list of module names (NAME or NAME/VERSION), or raise ValueError."""
+    if modules is None:
+        return []
+    if (not isinstance(modules, list) or len(modules) > 16 or
+            not all(isinstance(m, str) and SERVER_MODULE_RE.fullmatch(m.strip()) for m in modules)):
+        raise ValueError("`server_modules` must be a list of module names (at most 16), e.g. [\"slurm/25.05\"]")
+    out = []
+    for module in modules:
+        if module.strip() not in out:
+            out.append(module.strip())
+    return out
+
+
+def resolve_server_modules(modules, timeout=60):
+    """
+    What loading `modules` in a login shell (the one this server's commands use) changes in the environment:
+    {VAR: ("set", value) | ("list", before, after)}. Raises ValueError, saying why, when they don't load.
+    """
+    modules = check_module_names(modules)
+    if not modules:
+        return {}
+    script = (MODULE_INIT + "type module > /dev/null 2>&1 || { echo 'there is no module command on this cluster' >&2; exit 4; }\n"
+              '# a login shell can load the module itself (a profile that loads DefaultModules, which a plain unload of one\n'
+              '# module may not undo), and an environment can say one is loaded while its variables are not set; either way\n'
+              '# loading it again changes nothing, so purge first: what the load then changes is the modules\' own doing\n'
+              'module --force purge > /dev/null 2>&1 || module purge > /dev/null 2>&1 || true\n'
+              "printf '\\0HPCLIB-ENV-BEFORE\\0'; env -0\n"
+              'module load "$@" 1>&2 || exit 3\n'
+              "printf '\\0HPCLIB-ENV-AFTER\\0'; env -0\n")
+    try:
+        res = subprocess.run(["bash", "-lc", script, "hpclib-modules"] + modules, capture_output=True, timeout=timeout,
+                             stdin=subprocess.DEVNULL, env=child_env(modules=False))
+    except subprocess.TimeoutExpired:
+        raise ValueError(f"loading {', '.join(modules)} took more than {timeout} seconds")
+    except OSError as e:
+        raise ValueError(f"could not start a shell to load {', '.join(modules)}: {e}")
+    out = res.stdout
+    if res.returncode != 0 or MODULE_ENV_AFTER not in out or MODULE_ENV_BEFORE not in out:
+        why = " ".join(res.stderr.decode("utf-8", "replace").split())[-300:] or f"exit status {res.returncode}"
+        raise ValueError(f"could not load {', '.join(modules)}: {why}")
+    before, _, after = out.partition(MODULE_ENV_BEFORE)[2].partition(MODULE_ENV_AFTER)
+    before, after = _parse_env(before), _parse_env(after)
+    changes = _module_changes(before, after)
+    global _MODULE_NOTE
+    said = " ".join(res.stderr.decode("utf-8", "replace").split())[-200:]
+    _MODULE_NOTE = None if changes else (
+        f"after a purge the shell had LOADEDMODULES={before.get('LOADEDMODULES', '')!r}, PATH={before.get('PATH', '')!r}"
+        + (f", and `module load` said {said!r}" if said else ""))
+    return changes
+
+
+def set_server_modules(modules, changes):
+    """
+    Use `changes` (from resolve_server_modules) in this process and in what it starts, in place of an earlier
+    call's. `modules` is only remembered, for server_modules().
+    """
+    global _SERVER_MODULES, _MODULE_ENV, _MODULE_SAVED, _MODULE_ERROR
+    _MODULE_ERROR = None
+    for key, old in _MODULE_SAVED.items():
+        if old is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = old
+    _MODULE_SAVED = {key: os.environ.get(key) for key in changes}
+    _apply_module_env(os.environ, changes)
+    _SERVER_MODULES, _MODULE_ENV = tuple(modules or ()), dict(changes)
+    set_extra_path(_EXTRA_PATH)   # put its directories back at the end of the PATH the modules changed
+
+
+def load_server_modules(modules):
+    """resolve_server_modules and set_server_modules in one; returns the module list."""
+    global _MODULE_ERROR
+    modules = check_module_names(modules)
+    try:
+        changes = resolve_server_modules(modules)
+    except ValueError as e:
+        _MODULE_ERROR = str(e)
+        raise
+    set_server_modules(modules, changes)
+    return modules
+
+
+def child_env(env=None, modules=True):
     """
     The environment for processes the server starts: `env`, or the one saved
     from before the Python launcher loaded its modules (else this process's),
-    minus anything secret.
+    minus anything secret, with the config's `server_modules` applied
+    (unless `modules` is false) and its `extra_path` at the end of PATH.
     """
     if env is None:
         saved_fd = os.environ.get(BASE_ENV_FD_VAR)
@@ -156,16 +370,25 @@ def child_env(env=None):
     for key in list(env):
         if key.startswith(SECRET_ENV_PREFIXES) or key in (BASE_ENV_VAR, BASE_ENV_FD_VAR):
             del env[key]
+    if modules and _MODULE_ENV:
+        _apply_module_env(env, _MODULE_ENV)
+    if _EXTRA_PATH:
+        parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
+        env["PATH"] = os.pathsep.join(parts + [d for d in _EXTRA_PATH if d not in parts])
     return env
 
-METHODS = ("auto", "singularity", "podman", "none")
+METHODS = ("auto", "singularity", "pyxis", "podman", "charliecloud", "bubblewrap", "none")
 RUNTIMES = ("apptainer", "singularity")
 PODMAN = "podman"
+SRUN = "srun"
+ENROOT = "enroot"
 # the methods that sandbox a job (an effective method of either means jobs are sandboxed)
-SANDBOXED = ("singularity", "podman")
+SANDBOXED = ("singularity", "pyxis", "podman", "charliecloud", "bubblewrap")
+NAMESPACE_METHODS = ("charliecloud", "bubblewrap")
+MANAGED_BIN = os.path.expanduser("~/.local/share/hpclib/sandbox-tools/bin")
 NETWORKS = ("none", "default")
 CONFIG_KEYS = {"method", "runtime", "image", "binds", "writable", "scratch", "flags", "allow_unsandboxed", "network",
-               "storage", "gpus"}
+               "storage", "gpus", "base_image", "boundary_runtime", "devices"}
 GPU_MODES = ("auto", "always", "never")
 # file systems where rootless podman's storage can't live: they refuse the chown to your subordinate ids that its
 # overlay layers need ("chown ...: operation not permitted")
@@ -175,6 +398,13 @@ NETWORK_FILESYSTEMS = ("nfs", "nfs4", "cifs", "smb3", "smbfs", "fuse.sshfs", "lu
 PODMAN_INITS = ("/usr/libexec/podman/catatonit", "/usr/bin/catatonit", "/usr/libexec/catatonit/catatonit")
 # a podman image reference: [registry/]name[:tag][@digest]
 PODMAN_IMAGE_RE = re.compile(r"[a-z0-9][a-z0-9._/:-]{0,254}(@sha256:[0-9a-f]{64})?")
+# what srun must offer (the Pyxis plugin) for jobs to be sandboxed with it; --container-readonly is used when there
+PYXIS_REQUIRED = ("--container-image", "--container-mounts", "--container-workdir", "--container-env",
+                  "--no-container-mount-home")
+PYXIS_READONLY = "--container-readonly"
+PYXIS_BASE_IMAGE = "docker://ubuntu:24.04"
+# an image enroot imports: docker://[USER@][REGISTRY#]IMAGE[:TAG]
+PYXIS_IMAGE_URI_RE = re.compile(r"docker://[A-Za-z0-9][A-Za-z0-9._/:@#-]{0,254}")
 # host directories every host image binds read-only
 HOST_IMAGE_BINDS = ("/usr", "/etc", "/opt")
 # top-level directories that are symlinks into /usr on most current distributions
@@ -254,7 +484,7 @@ def add_mount_points(image, targets):
 class Sandbox:
     """Turns a template body into a job script section that runs it in the configured sandbox."""
 
-    def __init__(self, config=None, data_dir=None, which=shutil.which):
+    def __init__(self, config=None, data_dir=None, which=shutil.which, scheduler="slurm"):
         self.configured = config is not None
         config = dict(config or {"method": "none"})
         unknown = set(config) - CONFIG_KEYS
@@ -271,7 +501,8 @@ class Sandbox:
             raise ValueError("sandbox `image` must be a path")
         if image and not image.startswith(("/", "~")):
             if self.method != "podman" or not PODMAN_IMAGE_RE.fullmatch(image):
-                raise ValueError("sandbox `image` must be an absolute path (or, with method podman, an image name)")
+                raise ValueError("sandbox `image` must be an absolute path (or, with method podman, an image name); "
+                                 "Pyxis jobs never pull, so give a .sqsh file or leave `image` out for the base image")
             self.image = image
         else:
             self.image = _absolute(image, "image") if image else None
@@ -281,6 +512,20 @@ class Sandbox:
         if not isinstance(self.storage, str) or not (self.storage in ("auto", "default") or
                                                      os.path.isabs(os.path.expanduser(self.storage))):
             raise ValueError('sandbox `storage` must be "auto", "default", or an absolute directory')
+        self.base_image = config.get("base_image", PYXIS_BASE_IMAGE)
+        if not isinstance(self.base_image, str) or not PYXIS_IMAGE_URI_RE.fullmatch(self.base_image):
+            raise ValueError("sandbox `base_image` must be a docker:// image reference (enroot imports it once, "
+                             "for method pyxis)")
+        self.boundary_runtime = config.get("boundary_runtime")
+        if self.boundary_runtime is not None and not isinstance(self.boundary_runtime, str):
+            raise ValueError("sandbox boundary_runtime must be a path or null")
+        self.devices = [_absolute(d, "devices") for d in _string_list(config, "devices")]
+        if any(not d.startswith("/dev/") or os.path.isdir(d) for d in self.devices):
+            raise ValueError("sandbox devices must name individual paths under /dev")
+        if self.method in NAMESPACE_METHODS and config.get("flags"):
+            raise ValueError("Charliecloud/Bubblewrap flags are not accepted; use binds, writable, network and devices")
+        self.scheduler = scheduler
+        self._import = None
         self.network = config.get("network", "none")
         if self.network not in NETWORKS:
             raise ValueError(f"sandbox `network` must be one of {', '.join(NETWORKS)}")
@@ -308,21 +553,41 @@ class Sandbox:
 
     def _find(self, names):
         for name in names:
-            path = name if os.path.isabs(os.path.expanduser(name)) else self.which(name)
+            managed = os.path.join(MANAGED_BIN, name) if name in ("bwrap", "ch-run") else None
+            path = (managed if managed and os.access(managed, os.X_OK) else
+                    name if os.path.isabs(os.path.expanduser(name)) else self.which(name))
             if path and os.access(os.path.expanduser(path), os.X_OK):
                 return os.path.expanduser(path)
         return None
 
     def find_runtime(self):
         """The Singularity/Apptainer runtime's absolute path, or None."""
-        return self._find([self.runtime] if self.runtime and not self._is_podman(self.runtime) else RUNTIMES)
+        own = (self.runtime and not self._is_podman(self.runtime) and not self._is_srun(self.runtime)
+               and os.path.basename(self.runtime) not in ("bwrap", "ch-run"))
+        return self._find([self.runtime] if own else RUNTIMES)
 
     @staticmethod
     def _is_podman(name):
         return PODMAN in os.path.basename(name or "")
 
+    @staticmethod
+    def _is_srun(name):
+        return os.path.basename(name or "") == SRUN
+
+    def _auto_pyxis(self):
+        """srun's path if `auto` may use Pyxis: SLURM jobs, and srun has the plugin's --container-image."""
+        if self.scheduler == "local":
+            return None
+        srun = self._find([SRUN])
+        return srun if srun and self.srun_supports(srun, "--container-image") else None
+
     def _locate(self):
         """(kind, path) of the runtime the method calls for; path is None if it isn't found."""
+        for method, binary in (("bubblewrap", "bwrap"), ("charliecloud", "ch-run")):
+            if self.method == method or (self.method == "auto" and os.path.basename(self.runtime or "") == binary):
+                return method, self._find([self.runtime] if self.runtime else [binary])
+        if self.method == "pyxis" or (self.method == "auto" and self._is_srun(self.runtime)):
+            return "pyxis", self._find([self.runtime] if self.runtime else [SRUN])
         if self.method == "podman" or (self.method == "auto" and self._is_podman(self.runtime)):
             return "podman", self._find([self.runtime] if self.runtime else [PODMAN])
         if self.method == "singularity" or self.runtime:
@@ -330,12 +595,23 @@ class Sandbox:
         found = self.find_runtime()
         if found:
             return "singularity", found
+        pyxis = self._auto_pyxis()
+        if pyxis:
+            return "pyxis", pyxis
         podman = self._find([PODMAN])
-        return ("podman", podman) if podman else ("singularity", None)
+        if podman:
+            return "podman", podman
+        boundary = self._find(["bwrap"])
+        return ("bubblewrap", boundary) if boundary else ("singularity", None)
 
     @property
     def host_image(self):
         return os.path.join(self.data_dir or tempfile.gettempdir(), "sandbox", "host")
+
+    @property
+    def pyxis_base_image(self):
+        """The .sqsh file `base_image` is imported into, in the server's data directory."""
+        return os.path.join(self.data_dir or tempfile.gettempdir(), "sandbox", "pyxis", "base.sqsh")
 
     def host_image_for(self, method):
         """
@@ -344,6 +620,8 @@ class Sandbox:
         in your NFS home then can't be opened ("crun: readlink ``: No such file or directory"). So for podman it
         is kept on a local disk, beside the jobs' storage, when the server's directory is on one.
         """
+        if method == "pyxis":
+            return self.pyxis_base_image
         path = self.host_image
         if method != "podman" or _filesystem_type(path) not in NETWORK_FILESYSTEMS:
             return path
@@ -361,18 +639,203 @@ class Sandbox:
                             else "the config sets sandbox method none")
         kind, runtime = self._locate()
         if runtime is None:
-            wanted = self.runtime or (PODMAN if kind == "podman" or self.method == "podman"
-                                      else " or ".join(RUNTIMES) + (", or podman" if self.method == "auto" else ""))
-            reason = (f"{wanted} was not found on the server's PATH; set sandbox `runtime` to its full path "
-                      f"(GET /sandbox shows what the node has)")
+            wanted = self.runtime or ("ch-run" if kind == "charliecloud" else "bwrap" if kind == "bubblewrap"
+                                      else PODMAN if kind == "podman" or self.method == "podman"
+                                      else SRUN if self.method == "pyxis"
+                                      else " or ".join(RUNTIMES) + (", srun with Pyxis, podman, or bubblewrap"
+                                                                    if self.method == "auto" else ""))
+            reason = (f"{wanted} was not found on the server's PATH; set sandbox `runtime` to its full path, or "
+                      f"add its directory to `extra_path` (GET /sandbox shows what the node has)")
+            if self.method == "auto":
+                reason += f". Looked for: {self._auto_details()}. PATH: {os.environ.get('PATH', '')}"
             if self.method == "auto" and self.allow_unsandboxed:
                 return "none", reason
             raise SandboxError(f"jobs must run sandboxed but {reason}")
+        if kind in NAMESPACE_METHODS:
+            boundary = runtime if kind == "bubblewrap" else self._find([self.boundary_runtime or "bwrap"])
+            if not boundary:
+                raise SandboxError("Charliecloud requires Bubblewrap to enforce read-only binds; install both from cluster Settings")
+            required = ("--seccomp", "--unshare-user", "--unshare-pid", "--unshare-net", "--unshare-cgroup", "--remount-ro")
+            if kind == "bubblewrap":
+                required += ("--disable-userns",)
+            missing = [flag for flag in required if not self.srun_supports(boundary, flag)]
+            if missing:
+                raise SandboxError(f"{boundary} is missing {missing}; install a current Bubblewrap")
+        if kind == "pyxis":
+            self._check_pyxis(runtime)
         if self.image and self.image.startswith("/") and not os.path.exists(self.image):
             raise SandboxError(f"sandbox image {self.image} does not exist")
+        if kind in NAMESPACE_METHODS and self.image and not os.path.isdir(self.image):
+            if not os.path.isfile(self.image):
+                raise SandboxError("Charliecloud/Bubblewrap image must be a directory or regular SquashFS file")
+            try:
+                with open(self.image, "rb") as source:
+                    if source.read(4) not in (b"hsqs", b"sqsh"):
+                        raise SandboxError("Charliecloud/Bubblewrap images must be directories or raw SquashFS files; SIF/ext3 are not supported")
+            except OSError as error:
+                raise SandboxError(f"cannot read sandbox image {self.image}: {error}") from error
         if self.image and not self.image.startswith("/") and kind != "podman":
             raise SandboxError(f"sandbox image {self.image} is a podman image name, and the runtime is {runtime}")
         return kind, runtime
+
+    def _check_pyxis(self, srun):
+        """Raise SandboxError unless Pyxis can run jobs: SLURM, the plugin's options on srun, and an image."""
+        if self.scheduler == "local":
+            raise SandboxError("the pyxis sandbox runs jobs with srun, and this server's scheduler is the local one "
+                               "(no SLURM)")
+        missing = [f for f in PYXIS_REQUIRED if not self.srun_supports(srun, f)]
+        if missing:
+            raise SandboxError(f"{srun} has no {', '.join(missing)}: the Pyxis plugin isn't loaded on this node "
+                               f"(`{srun} --help | grep container` should list it)")
+        if not self.image:
+            state = self.base_image_state()
+            if state["state"] != "ready":
+                hint = {"importing": "it is being imported (enroot import); jobs can run when it is done",
+                        "failed": f"the import failed: {state.get('error')}",
+                        "missing": "import it with `rest_server.py --import-sandbox-image`"}[state["state"]]
+                raise SandboxError(f"the Pyxis base image {state['path']} isn't there: {hint}")
+
+    def _srun_help(self, srun):
+        """(text, problem) of `srun --help`, cached: problem says why it couldn't be run or why it failed, else None."""
+        with self._lock:
+            key = ("srun", srun)
+            if key not in self._help_cache:
+                problem = None
+                try:
+                    out = subprocess.run([srun, "--help"], capture_output=True, text=True, timeout=30,
+                                         stdin=subprocess.DEVNULL, env=child_env())
+                    text = out.stdout + out.stderr
+                    if out.returncode != 0 and "--container-image" not in text:
+                        problem = f"exit status {out.returncode}: " + (" ".join(text.split())[-200:] or "no output")
+                except subprocess.TimeoutExpired:
+                    text, problem = "", "it took more than 30 seconds"
+                except OSError as e:
+                    text, problem = "", str(e)
+                self._help_cache[key] = (text, problem)
+            return self._help_cache[key]
+
+    def srun_supports(self, srun, flag):
+        """Whether `srun --help` lists `flag` (cached)."""
+        return flag in self._srun_help(srun)[0]
+
+    def _auto_details(self):
+        """What automatic detection found for each runtime, in a sentence: why none of them was usable."""
+        out = []
+        for name in RUNTIMES:
+            path = self._find([name])
+            if path:
+                out.append(f"{name} at {path}")
+        if self.scheduler == "local":
+            out.append("srun: not used (no SLURM here)")
+        else:
+            srun = self._find([SRUN])
+            if srun is None:
+                out.append("srun: not found")
+            else:
+                text, problem = self._srun_help(srun)
+                if problem:
+                    out.append(f"srun at {srun} did not run ({problem})")
+                elif "--container-image" not in text:
+                    out.append(f"srun at {srun} has no Pyxis plugin (its --help lacks --container-image)")
+                else:
+                    out.append(f"srun at {srun} has Pyxis")
+        for name in (PODMAN, "bwrap"):
+            out.append(f"{name} " + (f"at {self._find([name])}" if self._find([name]) else "not found"))
+        out.append(module_status())
+        return "; ".join(out)
+
+    # -- the Pyxis base image --------------------------------------------------
+
+    def base_image_state(self):
+        """{"path", "source", "state": ready | importing | failed | missing, "error"} of the Pyxis base image."""
+        path = self.pyxis_base_image
+        state = {"path": path, "source": self.base_image}
+        try:
+            ready = os.path.getsize(path) > 0
+        except OSError:
+            ready = False
+        with self._lock:
+            imp = dict(self._import) if self._import else {}
+        if ready:
+            state["state"] = "ready"
+        elif imp.get("state") == "importing":
+            state["state"] = "importing"
+        elif imp.get("state") == "failed":
+            state.update(state="failed", error=imp.get("error"))
+        else:
+            state["state"] = "missing"
+        return state
+
+    def wants_base_image(self):
+        """Whether jobs would use Pyxis with the base image, and it isn't there yet."""
+        try:
+            return self._locate()[0] == "pyxis" and not self.image and self.base_image_state()["state"] != "ready"
+        except Exception:
+            return False
+
+    def import_base_image(self, wait=False, timeout=1800):
+        """
+        Import `base_image` with enroot into pyxis_base_image, once: in a thread, or here with `wait`. The file
+        appears only when complete. Returns the state (see base_image_state).
+        """
+        state = self.base_image_state()
+        if state["state"] in ("ready", "importing"):
+            if wait and state["state"] == "importing":
+                self._import["thread"].join()
+                return self.base_image_state()
+            return state
+        enroot = self._find([ENROOT])
+        if enroot is None:
+            with self._lock:
+                self._import = {"state": "failed", "error": f"enroot was not found on PATH; import it by hand: "
+                                f"enroot import -o {self.pyxis_base_image} {self.base_image}"}
+            return self.base_image_state()
+        thread = threading.Thread(target=self._import_base_image, args=(enroot, timeout), daemon=True)
+        with self._lock:
+            self._import = {"state": "importing", "thread": thread}
+        thread.start()
+        if wait:
+            thread.join()
+        return self.base_image_state()
+
+    def _enroot_env(self):
+        """
+        child_env() for running enroot as this user. Enroot keeps its working files in ENROOT_RUNTIME_PATH, which
+        defaults to $XDG_RUNTIME_DIR/enroot, or /run/enroot where a server started over SSH has no such directory
+        (no login session): "mkdir: cannot create directory '/run/enroot': Permission denied". Unless the
+        environment sets it, it goes in a private directory in the server's sandbox directory.
+        """
+        env = child_env()
+        if "ENROOT_RUNTIME_PATH" not in env:
+            run = os.path.join(os.path.dirname(os.path.dirname(self.pyxis_base_image)), "enroot-run")
+            os.makedirs(run, mode=0o700, exist_ok=True)
+            env["ENROOT_RUNTIME_PATH"] = run
+        return env
+
+    def _import_base_image(self, enroot, timeout):
+        path = self.pyxis_base_image
+        partial = f"{path}.partial.{os.getpid()}"
+        error = None
+        try:
+            os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+            if os.path.lexists(partial):
+                os.unlink(partial)
+            res = subprocess.run([enroot, "import", "-o", partial, self.base_image], capture_output=True, text=True,
+                                 timeout=timeout, stdin=subprocess.DEVNULL, env=self._enroot_env())
+            if res.returncode != 0 or not os.path.isfile(partial) or not os.path.getsize(partial):
+                error = ((res.stderr or res.stdout).strip()[-600:] or f"enroot import exited {res.returncode}")
+            else:
+                os.replace(partial, path)
+        except subprocess.TimeoutExpired:
+            error = f"enroot import did not finish within {timeout} s"
+        except OSError as e:
+            error = str(e)
+        finally:
+            if os.path.lexists(partial):
+                os.unlink(partial)
+        with self._lock:
+            self._import = {"state": "failed" if error else "done", "error": error,
+                            "thread": self._import["thread"] if self._import else None}
 
     def supports(self, runtime, flag):
         """Whether `runtime exec --help` lists `flag` (cached)."""
@@ -479,6 +942,13 @@ class Sandbox:
             plan.update(hidden=[h for _, h in masks], protected=protected, masks=masks, rebind=rebind)
         if method == "podman":
             plan["network"] = self.network
+        if method in NAMESPACE_METHODS:
+            plan.update(network=self.network, network_isolated=self.network == "none", pid_isolated=True,
+                        rootfs_read_only=True, devices=self.devices,
+                        boundary_runtime=detail if method == "bubblewrap" else self._find([self.boundary_runtime or "bwrap"]))
+        if method == "pyxis":
+            plan.update(network="host", network_isolated=False,
+                        rootfs_read_only=self.srun_supports(detail, PYXIS_READONLY))
         if missing:
             plan["missing"] = missing   # not on this node; left out
         return plan
@@ -493,6 +963,13 @@ class Sandbox:
         account comes from SSSD, which the container can't reach). Sets hpc_sandbox_account to their binds,
         which come after the /etc bind so they cover the host's files.
         """
+        if flag == "--ro-bind":
+            lines = Sandbox.account_lines(flag="--bind")
+            lines = [line.replace('--bind "$hpc_sandbox_etc/passwd:/etc/passwd:ro"', '--ro-bind "$hpc_sandbox_etc/passwd" /etc/passwd')
+                     .replace('--bind "$hpc_sandbox_etc/group:/etc/group:ro"', '--ro-bind "$hpc_sandbox_etc/group" /etc/group')
+                     .replace('--bind "$hpc_sandbox_etc/nsswitch.conf:/etc/nsswitch.conf:ro"', '--ro-bind "$hpc_sandbox_etc/nsswitch.conf" /etc/nsswitch.conf')
+                     for line in lines]
+            return lines
         return [
             'hpc_sandbox_etc=$(mktemp -d "${TMPDIR:-/tmp}/hpc-sandbox-etc.XXXXXX") || '
             '{ echo "hpclib: could not make the sandbox account files" >&2; exit 125; }',
@@ -558,13 +1035,33 @@ class Sandbox:
             raise SandboxError("mounting an image (a squashed Python environment) needs Singularity or Apptainer; "
                                "podman can't. Sync the environment without `squash`")
         runtime, image = plan["runtime"], plan["image"]
-        if plan["host_image"]:
+        if plan["host_image"] and plan["method"] != "pyxis":   # Pyxis mounts the host's directories over its image
             build_host_image(image, plan["read_only"] + plan["read_write"] + plan.get("hidden", []) +
                              plan.get("protected", []))
+        if plan["method"] in NAMESPACE_METHODS:
+            if network:
+                plan["network"] = "host" if network == "host" else "default"
+            plan["network_isolated"] = plan["network"] == "none"
+            if (self.gpus == "always" or self.gpus == "auto" and gpus > 0) and not self.devices:
+                raise SandboxError("Charliecloud/Bubblewrap GPU jobs need explicit devices and driver-library binds; no host devices are exposed automatically")
+            if plan["host_image"] and plan["method"] == "charliecloud":
+                # ch-run requires destinations in its read-only image, including project paths under home.
+                for target in plan["read_only"] + plan["read_write"] + plan.get("hidden", []) + plan.get("protected", []):
+                    mine = os.path.join(image, target.lstrip("/"))
+                    if not os.path.lexists(mine):
+                        os.makedirs(mine if os.path.isdir(target) else os.path.dirname(mine), exist_ok=True)
+                        if not os.path.isdir(target):
+                            open(mine, "a").close()
+            try:
+                return rest_bwrap.launch(self, plan, shebang, body, prelude), plan
+            except (rest_bwrap.BoundaryError, OSError) as error:
+                raise SandboxError(str(error)) from error
         if plan["method"] == "podman":
             if network:
                 plan["network"] = "host" if network == "host" else "default"
             return self._podman_launch(plan, shebang, body, prelude), plan
+        if plan["method"] == "pyxis":
+            return self._pyxis_launch(plan, shebang, body, prelude), plan
         # --no-home: no writable stand-in for $HOME (allowed directories under it are still bound)
         args = [runtime, "-q", "exec", "--contain", "--no-home", "--pid", "--ipc"]
         if self.supports(runtime, "--no-mount"):
@@ -734,6 +1231,101 @@ class Sandbox:
             args += [flag, f"{path}:{path}" + (":ro" if mode == "ro" else "")]
         return args
 
+    def _pyxis_launch(self, plan, shebang, body, prelude):
+        srun, image = plan["runtime"], plan["image"]
+        sources = [source for source, _ in plan.get("masks", [])] + [path for _, path in plan.get("images", [])]
+        for path in (plan["read_only"] + plan["read_write"] + plan.get("hidden", []) + plan.get("protected", []) +
+                     sources + [image]):
+            if ":" in path or "," in path:
+                raise SandboxError(f"Pyxis can't mount {path!r} (it contains ':' or ',')")
+        q = shlex.quote
+        rebind = {d for d, _ in plan.get("rebind", [])}
+        binds = ([f"{p}:{p}:ro" for p in plan["read_only"] if p not in rebind] +
+                 [f"{p}:{p}" for p in plan["read_write"] if p not in rebind])
+        covers = ([f"{source}:{path}:ro" for source, path in plan.get("masks", [])] +
+                  [f"{p}:{p}:ro" for p in plan.get("protected", [])] +
+                  [f"{p}:{p}" + (":ro" if mode == "ro" else "") for p, mode in plan.get("rebind", [])])
+        own_account = plan["host_image"] and "/etc" in plan["read_only"]
+
+        delimiter = "HPC_SANDBOX_BODY_" + secrets.token_hex(8)
+        while delimiter in body:
+            delimiter = "HPC_SANDBOX_BODY_" + secrets.token_hex(8)
+        lines = [
+            f"# template body, run in a Pyxis sandbox: read-write {', '.join(plan['read_write']) or '(none)'}; "
+            f"read-only {', '.join(plan['read_only']) or '(none)'}; the host's network",
+            f"hpc_sandbox_body=$(cat <<'{delimiter}'",
+            body.rstrip("\n"),
+            delimiter,
+            ")",
+        ]
+        # /tmp and /var/tmp are the job's own directories ("session" is the same here: the image's own would be
+        # read-only), and a place to mount squashed environments
+        parent = '"${TMPDIR:-/tmp}"' if self.scratch in ("job", "session") else q(os.path.expanduser(self.scratch))
+        lines += [
+            f'hpc_sandbox_tmp=$(mktemp -d {parent}/hpc-sandbox.XXXXXX) && mkdir "$hpc_sandbox_tmp/tmp" '
+            '"$hpc_sandbox_tmp/var-tmp" "$hpc_sandbox_tmp/img" || { echo "hpclib: could not make the sandbox '
+            'scratch directory" >&2; exit 125; }',
+            'hpc_sandbox_cleanup() {',
+            '  for hpc_sandbox_m in "$hpc_sandbox_tmp"/img/*; do',
+            '    [ -d "$hpc_sandbox_m" ] && { fusermount3 -u -z "$hpc_sandbox_m" 2>/dev/null || '
+            'fusermount -u -z "$hpc_sandbox_m" 2>/dev/null; }',
+            '  done',
+            '  rm -rf --one-file-system "$hpc_sandbox_tmp"',
+            '  [ -n "${hpc_sandbox_etc:-}" ] && rm -rf "$hpc_sandbox_etc"',
+            '}',
+        ]
+        if own_account:
+            lines += self.account_lines(flag="")
+        else:
+            lines += ["hpc_sandbox_etc=", "hpc_sandbox_account=()"]
+        lines += ["hpc_sandbox_mounts=(" + " ".join(q(b) for b in binds) + ")",
+                  'hpc_sandbox_mounts+=("$hpc_sandbox_tmp/tmp:/tmp" "$hpc_sandbox_tmp/var-tmp:/var/tmp" '
+                  '"${hpc_sandbox_account[@]}")']
+        if plan.get("images"):
+            # Pyxis has no way to mount an image file: mount it here, on the host, with squashfuse, and mount the
+            # result into the container (a directory of the job's own, not the real mount point, so that other
+            # jobs on this node don't see it)
+            lines += ['hpc_sandbox_fuse=$(command -v squashfuse_ll || command -v squashfuse) || '
+                      '{ echo "hpclib: mounting a squashed environment needs squashfuse (squashfuse_ll) on the compute '
+                      'node, and there is none; sync the environment without `squash`" >&2; hpc_sandbox_cleanup; '
+                      'exit 125; }']
+            for n, (img, target) in enumerate(plan["images"]):
+                lines += [f'mkdir "$hpc_sandbox_tmp/img/{n}" && "$hpc_sandbox_fuse" {q(img)} "$hpc_sandbox_tmp/img/{n}" '
+                          f'|| {{ echo "hpclib: squashfuse could not mount {img} (is FUSE available here?)" >&2; '
+                          f'hpc_sandbox_cleanup; exit 125; }}',
+                          f'hpc_sandbox_mounts+=("$hpc_sandbox_tmp/img/{n}:{target}:ro")']
+        if covers:
+            lines.append("hpc_sandbox_mounts+=(" + " ".join(q(c) for c in covers) + ")")
+        lines += [
+            'hpc_sandbox_mount_arg=$(IFS=,; printf %s "${hpc_sandbox_mounts[*]}")',
+            # the image's own PATH would replace the host's (with the template's modules loaded)
+            'hpc_sandbox_env=PATH',
+            '[ -n "${LD_LIBRARY_PATH:-}" ] && hpc_sandbox_env=PATH,LD_LIBRARY_PATH',
+        ]
+        # the first thing inside: a marker, so that a job that never started can be told from one that failed
+        inner = [': > /tmp/.hpc-sandbox-started 2>/dev/null || true'] + list(prelude or [])
+        delimiter = "HPC_SANDBOX_PRELUDE_" + secrets.token_hex(8)
+        lines += [f"hpc_sandbox_prelude=$(cat <<'{delimiter}'", "\n".join(inner) + '\nexec "$@"', delimiter, ")"]
+        interp = " ".join(q(w) for w in self.interpreter(shebang))
+        step = [q(srun), "--ntasks=1", "--nodes=1", '--cpus-per-task="${SLURM_CPUS_PER_TASK:-1}"',
+                "--export=ALL,TMPDIR=/tmp", "--container-image=" + q(image),
+                '--container-mounts="$hpc_sandbox_mount_arg"', "--no-container-mount-home",
+                '--container-workdir="$PWD"', '--container-env="$hpc_sandbox_env"']
+        if plan.get("rootfs_read_only"):
+            step.append(PYXIS_READONLY)
+        step += [q(f) for f in self.flags]
+        lines += [
+            " ".join(step) + f' /bin/bash -c "$hpc_sandbox_prelude" hpc-env {interp} -c "$hpc_sandbox_body" hpc-job',
+            "hpc_sandbox_status=$?",
+            'if [ "$hpc_sandbox_status" != 0 ] && [ ! -e "$hpc_sandbox_tmp/tmp/.hpc-sandbox-started" ]; then',
+            '  echo "hpclib: the Pyxis sandbox failed to start (srun exit $hpc_sandbox_status); see the pyxis: and '
+            'enroot: messages above" >&2',
+            "fi",
+            "hpc_sandbox_cleanup",
+            'exit "$hpc_sandbox_status"',
+        ]
+        return lines
+
     def _podman_launch(self, plan, shebang, body, prelude):
         runtime, image = plan["runtime"], plan["image"]
         for path in plan["read_only"] + plan["read_write"] + plan.get("hidden", []) + plan.get("protected", []) + [
@@ -854,11 +1446,29 @@ class Sandbox:
         out = {"configured": self.configured, "method": self.method, "runtime": self.runtime,
                "image": self.image, "binds": self.binds, "writable": self.writable, "scratch": self.scratch,
                "flags": self.flags, "gpus": self.gpus, "allow_unsandboxed": self.allow_unsandboxed,
-               "network": self.network, "storage": self.storage}
+               "network": self.network, "storage": self.storage, "boundary_runtime": self.boundary_runtime, "devices": self.devices}
         try:
             method, detail = self.resolve()
             out["effective"] = method
             out["runtime_path" if method != "none" else "reason"] = detail
+            out["network_isolated"] = {"podman": self.network == "none"}.get(method, False) if method != "none" else None
+            if method in NAMESPACE_METHODS:
+                out.update(network_isolated=self.network == "none", pid_isolated=True, rootfs_read_only=True,
+                           boundary_runtime_path=detail if method == "bubblewrap" else self._find([self.boundary_runtime or "bwrap"]),
+                           nested_userns_disabled=method == "bubblewrap", seccomp="deny-dangerous-syscalls",
+                           limits=self.limits(), squashfuse=shutil.which("squashfuse_ll") or shutil.which("squashfuse"),
+                           isolation_notes=["Shared host kernel; Slurm cgroups must enforce compute resources. "
+                                            "Login CPU/memory/process limits require site delegation."] +
+                                           (["Charliecloud setup requires nested user namespaces; Bubblewrap locks mount permissions."]
+                                            if method == "charliecloud" else []))
+            if method == "pyxis":
+                out.update(
+                    base_image=dict(self.base_image_state(), source=self.base_image),
+                    rootfs_read_only=self.srun_supports(detail, PYXIS_READONLY),
+                    pid_isolated=False,
+                    squashfuse=shutil.which("squashfuse_ll") or shutil.which("squashfuse"),
+                    isolation_notes=["enroot gives jobs the host's network and process table: sandboxed jobs keep "
+                                     "network access (the `network` setting has no effect)"])
             if method == "podman":
                 info = self.podman_info(detail)
                 out["limits"] = self.limits()
@@ -867,6 +1477,11 @@ class Sandbox:
         except SandboxError as e:
             out["effective"] = "unavailable"
             out["error"] = str(e)
+            try:
+                if self._locate()[0] == "pyxis" and not self.image:
+                    out["base_image"] = dict(self.base_image_state(), source=self.base_image)
+            except Exception:
+                pass
         return out
 
 
@@ -1023,7 +1638,12 @@ def self_test(sandbox: Sandbox, base_dir):
         'echo "pid_one=$(cat /proc/1/comm 2>/dev/null)"',
         'echo "programs=$(command -v bash >/dev/null && echo yes || echo no)"',
         'id -un >/dev/null 2>&1 && echo "user_known=yes" || echo "user_known=no"',
-        'echo "net_devices=$(ls /sys/class/net 2>/dev/null | tr "\\n" " ")"',
+        'echo "net_devices=$(sed -n \'3,$p\' /proc/net/dev | cut -d: -f1 | xargs)"',
+        'echo "pid_namespace=$(readlink /proc/self/ns/pid)"',
+        'echo "net_namespace=$(readlink /proc/self/ns/net)"',
+        'echo "effective_caps=$(sed -n \'s/^CapEff:[[:space:]]*//p\' /proc/self/status)"',
+        'echo "no_new_privs=$(sed -n \'s/^NoNewPrivs:[[:space:]]*//p\' /proc/self/status)"',
+        'echo "seccomp_mode=$(sed -n \'s/^Seccomp:[[:space:]]*//p\' /proc/self/status)"',
     ])
     try:
         lines, plan = sandbox.launch("#!/bin/bash", body, [allowed])
@@ -1040,8 +1660,15 @@ def self_test(sandbox: Sandbox, base_dir):
         checks = {k: results.get(k) == "yes"
                   for k in ("write_allowed", "outside_hidden", "usr_read_only", "home_read_only", "tmp_writable",
                             "programs", "user_known")}
-        if plan["method"] == "podman" and plan.get("network") == "none":
+        if plan["method"] in ("podman", "bubblewrap", "charliecloud") and plan.get("network") == "none":
             checks["network_isolated"] = results.get("net_devices", "").split() in ([], ["lo"])
+        if plan["method"] in NAMESPACE_METHODS:
+            checks["capabilities_dropped"] = results.get("effective_caps") == "0000000000000000"
+            checks["no_new_privileges"] = results.get("no_new_privs") == "1"
+            checks["seccomp_enforced"] = results.get("seccomp_mode") == "2"
+            checks["pid_isolated"] = bool(results.get("pid_namespace")) and results["pid_namespace"] != os.readlink("/proc/self/ns/pid")
+            if plan.get("network") == "none":
+                checks["network_namespace"] = bool(results.get("net_namespace")) and results["net_namespace"] != os.readlink("/proc/self/ns/net")
         return {"ran": True, "exit_code": res.returncode, "seconds": round(time.time() - start, 2),
                 "passed": res.returncode == 0 and all(checks.values()), "checks": checks,
                 "pid_one": results.get("pid_one"), "method": plan["method"], "stderr": res.stderr[-2000:]}
@@ -1092,6 +1719,25 @@ def probe(sandbox: Sandbox, base_dir, run_self_test=True):
                                                           os.path.expanduser("~/.local/share/containers/storage"))
         entry["job_storage"] = sandbox.podman_storage(podman)
         runtimes.append(entry)
+    srun = None if sandbox.scheduler == "local" else sandbox._find(
+        [sandbox.runtime] if sandbox._is_srun(sandbox.runtime) else [SRUN])
+    if srun and sandbox.srun_supports(srun, "--container-image"):
+        code, out, err = _run([srun, "--version"])
+        enroot = sandbox._find([ENROOT])
+        entry = {"name": "pyxis", "path": srun, "version": f"{(out or err).strip()} with Pyxis",
+                 "flags": {f: sandbox.srun_supports(srun, f) for f in PYXIS_REQUIRED + (PYXIS_READONLY,)},
+                 "enroot": enroot, "squashfuse": shutil.which("squashfuse_ll") or shutil.which("squashfuse"),
+                 "base_image": dict(sandbox.base_image_state(), source=sandbox.base_image)}
+        if enroot:
+            entry["enroot_version"] = (_run([enroot, "version"])[1] or "").strip()
+        runtimes.append(entry)
+    for method, binary in (("bubblewrap", "bwrap"), ("charliecloud", "ch-run")):
+        path = sandbox._find([sandbox.runtime] if sandbox.method == method and sandbox.runtime else [binary])
+        if path:
+            code, out, err = _run([path, "--version"])
+            runtimes.append({"name": method, "path": path, "version": (out or err).strip(),
+                             "boundary_runtime": sandbox._find([sandbox.boundary_runtime or "bwrap"]),
+                             "pid_isolated": True, "network_isolation_available": True})
     info["container_runtimes"] = runtimes
     modulepath, roots = _module_roots()
     info["modules"] = {"modulepath": modulepath, "roots": roots}
@@ -1120,9 +1766,22 @@ def probe(sandbox: Sandbox, base_dir, run_self_test=True):
                     notes.append(f"podman sets jobs up as one of your subordinate ids, which {blocked} (on a "
                                  f"network file system) doesn't let through, so {d} can't be bound into jobs; "
                                  f"`chmod o+x {blocked}` lets others pass through it without listing it")
-        limits = Sandbox(recommended, data_dir=sandbox.data_dir, which=sandbox.which).limits()
+        limits = Sandbox(recommended, data_dir=sandbox.data_dir, which=sandbox.which,
+                         scheduler=sandbox.scheduler).limits()
         if not limits["enforced"]:
             notes.append(f"jobs' CPU and memory limits can't be enforced: {limits['reason']}")
+    pyxis_entry = next((r for r in runtimes if r["name"] == "pyxis"), None)
+    if pyxis_entry and not any(r["name"] in RUNTIMES for r in runtimes):
+        notes.append("jobs would run with Pyxis (srun --container-image): enroot gives them the host's network and "
+                     "process table, so they are not isolated from the network")
+        if not pyxis_entry["enroot"]:
+            notes.append("enroot isn't on PATH here, so the Pyxis base image can't be imported by hpclib; import it "
+                         f"by hand: enroot import -o {sandbox.pyxis_base_image} {sandbox.base_image}")
+        elif pyxis_entry["base_image"]["state"] != "ready":
+            notes.append("the Pyxis base image isn't imported yet: rest_server.py --import-sandbox-image (setup_agents "
+                         "and the server start it)")
+        if not pyxis_entry["squashfuse"]:
+            notes.append("squashfuse isn't on PATH here: squashed Python environments can't be mounted in Pyxis jobs")
     if runtimes:
         if roots:
             recommended["binds"] = roots
@@ -1132,14 +1791,15 @@ def probe(sandbox: Sandbox, base_dir, run_self_test=True):
             notes.append(f"this runtime can't turn off the site's bind paths ({', '.join(site)}); jobs will see them")
     else:
         recommended = {"method": "none"}
-        notes.append("no Singularity, Apptainer or podman on this node, so jobs can't be sandboxed here; "
+        notes.append("no supported runtime on this node; install Bubblewrap from cluster Settings, or "
                      "`module avail` may list one to set as `runtime`")
     if info["automounts"]:
         notes.append("some paths are automounted (autofs); a bind of one fails if it isn't mounted yet")
     info["recommended_config"] = {"sandbox": recommended}
     info["notes"] = notes
     if run_self_test and runtimes:
-        current = sandbox if sandbox.method != "none" else Sandbox(dict(recommended), data_dir=sandbox.data_dir)
+        current = sandbox if sandbox.method != "none" else Sandbox(dict(recommended), data_dir=sandbox.data_dir,
+                                                                    scheduler=sandbox.scheduler)
         test_dir = base_dir
         try:
             if current.resolve()[0] == "podman" and _untraversable_on_network(base_dir):

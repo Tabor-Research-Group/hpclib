@@ -153,8 +153,11 @@ token's directories. Approved templates record who proposed and approved them; r
 | Method | Used where | Isolation |
 | --- | --- | --- |
 | `singularity` / `apptainer` | clusters | a container as you, without root, writable only in the token's directories, `writable` paths and private `/tmp`; the host's `/usr`, `/etc`, `/opt` and `binds` read-only |
+| `pyxis` | SLURM clusters with [Pyxis](https://github.com/NVIDIA/pyxis) and enroot | `srun --container-image=IMAGE --container-mounts=SRC:DST[:ro],... --no-container-mount-home`: the same read-only and read-write mounts, masks and private `/tmp` as Singularity, over a read-only root. **No network isolation**: enroot gives the container the host's network (and process table) |
 | `podman` | servers without SLURM | the same file view under rootless podman, plus no Linux capabilities, no new privileges, seccomp, and no network (environment syncs get the network) |
-| `auto` | default | Singularity/Apptainer if present, else podman |
+| `bubblewrap` | Linux with unprivileged namespaces | token-scoped mounts, private processes/network/devices and a syscall policy; [interface installation](sandbox-runtimes.md) |
+| `charliecloud` | Linux with Charliecloud and Bubblewrap | Charliecloud images with Bubblewrap enforcing read-only binds and process/network boundaries |
+| `auto` | default | Singularity/Apptainer if present, else Pyxis (SLURM, and `srun --help` lists `--container-image`), else Podman, else Bubblewrap |
 
 A directory bound into a job can hold things the job must not touch. Your home directory is one example, when a
 token's directories include it. Such paths are covered after the binds:
@@ -171,6 +174,33 @@ with your own account so programs that look up their user work without the sandb
 
 Sandboxed jobs run on one node and can't call SLURM commands. `sandbox_info` reports the node's features, the
 container runtime, the module trees to bind, and runs a test container.
+
+### Charliecloud and Bubblewrap
+
+See [runtime installation and isolation policy](sandbox-runtimes.md) for interface installation, token-scoped read-only mounts, network/process isolation, GPU devices and SquashFS support. Both methods run without administrator privileges. Charliecloud requires Bubblewrap to enforce its bind permissions.
+
+### Pyxis
+
+Pyxis (enroot) needs a real image, unlike the host image. hpclib imports a small base image once per user,
+`enroot import docker://ubuntu:24.04` (the sandbox's `base_image`), into `~/.local/tunnels/rest/sandbox/pyxis/base.sqsh`
+and keeps it; the host's `/usr`, `/etc`, `/opt` and the `binds` are mounted over it, so host programs and modules
+work as they do with the host image. `setup_agents` and the server start the import (`rest_server.py
+--import-sandbox-image` does it by hand, on a node with network access); until it is done, `sandbox_info` says
+`importing` and `submit_job` answers 503. Jobs never pull an image. Give `image` a `.sqsh` file of your own (then only
+`binds` are in it) to use another. Paths with `:` or `,` can't be mounted.
+
+What differs from Singularity and Apptainer:
+
+- **Network**: `sandbox_info` reports `network_isolated: false`. A sandboxed job keeps the host's network; the
+  `network` setting has no effect. Neither does `gpus`: enroot's NVIDIA hook decides what a job sees.
+- **Processes**: the job shares the host's process table (`pid_isolated: false`).
+- **Root file system**: read-only when `srun` offers `--container-readonly` (`rootfs_read_only`).
+- **Squashed environments** are mounted with `squashfuse_ll` (or `squashfuse`) inside the job before the container
+  starts, on a directory of the job's own, so FUSE must be available on the compute nodes; a job without it stops
+  with exit 125 and says so.
+- **SLURM only**: the local scheduler has no `srun`.
+- **Step**: the body runs as a one-task step (`--ntasks=1 --nodes=1 --cpus-per-task=$SLURM_CPUS_PER_TASK`); add
+  options in `flags` if your site needs more (GPU options, for example).
 
 ## Machines without SLURM
 
@@ -206,9 +236,11 @@ you in `/etc/subuid` and `/etc/subgid`, and lingering (`loginctl enable-linger`)
 | --- | --- | --- |
 | `limits` | per-job caps and **`max_concurrent_jobs`**; `null` means no cap | yes |
 | `cluster_notes` | free text the model reads in `cluster_info` | yes |
-| `sandbox` | method, image, read-only `binds`, extra `writable` paths, runtime `flags`, `gpus` (`auto`: `--nv` for jobs that ask for GPUs; `always`; `never`), `scratch`, `network`, `storage`, `allow_unsandboxed` | yes |
+| `sandbox` | method (`auto`, `singularity`, `pyxis`, `podman`, `bubblewrap`, `charliecloud`, `none`), image, Pyxis `base_image`, Charliecloud `boundary_runtime`, explicit `devices`, read-only `binds`, extra `writable` paths, runtime `flags`, `gpus` (`auto`: `--nv` for jobs that ask for GPUs; `always`; `never`), `scratch`, `network`, `storage`, `allow_unsandboxed` | yes |
 | `environments` | uv and pixi locations, modules to load before a sync, timeout, concurrent syncs | yes |
 | `environment` | variables for all jobs and syncs, template jobs only, or syncs only; names that would change `PATH`, the sandbox, hpclib or SLURM are refused | yes |
+| `extra_path` | directories added to the end of `PATH` for the server and the commands and jobs it starts, e.g. `["/cm/local/apps/slurm/current/bin"]`. Some clusters put SLURM on `PATH` only for login shells, so a server started over SSH can't find `sbatch` or `srun`. `setup_agents` and server start look for SLURM in a login shell, then an interactive one, then the usual install directories (Bright's `/cm/local/apps/slurm/current/bin`, `/opt/slurm/bin` and others), and save its directory here; the console's Server settings show it as **Extra PATH directories** and offer a one-click fix | yes |
+| `server_modules` | environment modules the server loads for itself and for the commands and jobs it starts, e.g. `["slurm/25.05"]`. For clusters where SLURM comes from a module (Bright Cluster Manager's `slurm/25.05`) that sets more than `PATH`, such as its configuration and libraries, which `extra_path` can't. The server loads them in a login shell and applies what they changed to its own environment. A module that doesn't load is refused when saving. At start, if SLURM still can't be found, the server loads the cluster's SLURM module itself and saves it here; the console's Server settings show it as **Modules to load for the server** and offer a one-click fix | yes |
 | `poll_interval` | how often job states are refreshed | yes |
 | `scheduler` | `{"type": "local"}` and its budget on machines without SLURM | restart |
 | `module_command` | how `module` is run (default `["bash", "-lc", "module \"$@\" 2>&1", "hpclib-module"]`), if a login shell isn't right | restart |

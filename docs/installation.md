@@ -11,7 +11,7 @@ for you, so in practice you install once locally and then point hpclib at each c
 | your machine | macOS, Linux, or Windows through WSL ([below](#windows-wsl)); `bash` 3.2 or newer, OpenSSH, Python 3.7 or newer (for the console), `git` (the installer checks) |
 | your machine, for agents | a Python with the MCP SDK (`pip install mcp`) for the MCP server |
 | cluster login node | `bash`, Python 3.9 or newer (found or loaded from a module by `setup_agents`), SLURM (`sbatch`, `squeue`) or podman |
-| cluster, for sandboxed agent jobs | Singularity or Apptainer; or rootless podman on a server without SLURM |
+| cluster, for sandboxed agent jobs | Singularity or Apptainer; or Pyxis (`srun --container-image`) with enroot to import its base image; or rootless podman on a server without SLURM; or [Bubblewrap/Charliecloud installed through the console](sandbox-runtimes.md) |
 | cluster, for some apps | conda or uv/pixi (JupyterLab), Singularity (VS Code, PAI, Data transfer) |
 
 
