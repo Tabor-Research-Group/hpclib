@@ -44,8 +44,9 @@ class TestPackage(unittest.TestCase):
         self.assertEqual(app["tunnel"], "workspace")
         unpacked = tmp / "console" / "packages" / "workspace" / "tunnels" / "workspace"
         for f in ("workspace_server.py", "script_templates.py", "ui/index.html", "ui/workspace.js",
-                  "script_templates/python-uv.sh", "sbatch_script.sh", "install.sh"):
+                  "script_templates/python-uv.sh", "sbatch_script.sh", "install.sh", "token_auth.py"):
             self.assertTrue((unpacked / f).is_file(), f)
+        self.assertEqual((unpacked / "token_auth.py").read_bytes(), (ROOT / "hpclib/servers/token_auth.py").read_bytes())
 
     def test_token_regex_finds_what_the_server_prints(self):
         import re
@@ -195,6 +196,12 @@ class ServerCase(unittest.TestCase):
         except ValueError:
             return res.status, data
 
+    def raw_base(self, name="movie.mp4"):
+        """The signed URL the server gives for a file in proj/, without the file's name."""
+        status, out = self.call("POST", "/api/raw-url", {"path": str(self.home / "proj" / name)})
+        self.assertEqual(status, 200, out)
+        return out["url"].rsplit("/", 1)[0]
+
 
 
 class TestServer(ServerCase):
@@ -203,7 +210,7 @@ class TestServer(ServerCase):
         self.assertEqual(self.call("GET", "/", token=False, raw=True)[0], 200)          # the page itself
         self.assertEqual(self.call("GET", "/api/info", token=False)[0], 401)
         self.assertEqual(self.call("GET", "/api/info", headers={"X-Workspace-Token": "nope"}, token=False)[0], 401)
-        self.assertEqual(self.call("GET", f"/api/info?token={self.token}", token=False)[0], 200)
+        self.assertEqual(self.call("GET", f"/api/info?token={self.token}", token=False)[0], 401)   # a header only
         self.assertEqual(self.call("GET", "/api/info", headers={"Host": "evil.example:80"})[0], 421)
         self.assertEqual(self.call("GET", "/ui/../workspace_server.py", token=False, raw=True)[0], 404)
 
@@ -250,7 +257,7 @@ class TestServer(ServerCase):
         self.assertEqual(self.call("GET", "/api/info")[0], 200)
 
     def test_raw_ranges_and_sandboxed_html(self):
-        base = f"/raw/{self.token}{urllib.parse.quote(str(self.home / 'proj'))}"
+        base = self.raw_base()
         status, headers, data = self.call("GET", f"{base}/movie.mp4", token=False, raw=True)
         self.assertEqual((status, len(data), headers["Content-Type"]), (200, 10240, "video/mp4"))
         status, headers, data = self.call("GET", f"{base}/movie.mp4", headers={"Range": "bytes=256-511"}, token=False, raw=True)
@@ -259,9 +266,11 @@ class TestServer(ServerCase):
         status, headers, _ = self.call("GET", f"{base}/page.html", token=False, raw=True)
         self.assertEqual(status, 200)
         self.assertIn("sandbox", headers["Content-Security-Policy"])
+        self.assertNotIn("allow-forms", headers["Content-Security-Policy"])
         self.assertIn("sandbox", self.call("GET", f"{base}/fig.svg", token=False, raw=True)[1]["Content-Security-Policy"])
-        self.assertEqual(self.call("GET", f"/raw/wrong{urllib.parse.quote(str(self.home / 'proj'))}/page.html",
-                                   token=False, raw=True)[0], 401)
+        # the page's own files load through the same URL, other directories don't
+        self.assertEqual(self.call("GET", f"{base}/train.py", token=False, raw=True)[0], 200)
+        self.assertEqual(self.call("GET", f"{base}/../hpclib/hpclib.sh", token=False, raw=True)[0], 401)
 
     def test_templates_render_submit_jobs(self):
         status, out = self.call("GET", "/api/templates")
@@ -308,6 +317,110 @@ class TestServer(ServerCase):
         self.assertEqual(self.call("POST", "/api/cancel", {"job": "4243"})[0], 200)
         self.assertEqual((self.home / "scancel.log").read_text().strip(), "4243")
         self.assertEqual(self.call("POST", "/api/cancel", {"job": "1; rm -rf ~"})[0], 400)
+
+
+class TestAuthentication(ServerCase):
+    """What a request must carry, and what a page the viewer shows (an opaque origin, no token) can do."""
+
+    def test_the_token_is_a_header_and_in_no_url(self):
+        for path in ("/api/info", "/api/list?path=proj", f"/api/stat?path={self.home}"):
+            self.assertEqual(self.call("GET", path)[0], 200, path)
+            self.assertEqual(self.call("GET", f"{path}{'&' if '?' in path else '?'}token={self.token}", token=False)[0],
+                             401, path)
+        status, out = self.call("POST", "/api/raw-url", {"path": str(self.home / "proj" / "page.html")})
+        self.assertEqual(status, 200, out)
+        self.assertNotIn(self.token, out["url"])
+        self.assertEqual(self.call("POST", "/api/raw-url", {"path": str(self.home / "proj" / "page.html")}, token=False)[0], 401)
+        self.assertEqual(self.call("POST", "/api/raw-url", {"path": str(self.home / "nope.html")})[0], 404)
+
+    def test_requests_that_change_things_are_json(self):
+        body = json.dumps({"path": "proj/sub"}).encode()
+        for kind in ("text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x", None):
+            headers = {"Content-Type": kind} if kind else {}
+            self.assertEqual(self.call("POST", "/api/mkdir", body=body, headers=headers)[0], 415, kind)
+        self.assertFalse((self.home / "proj" / "sub").exists())
+        self.assertEqual(self.call("POST", "/api/mkdir", body=body, headers={"Content-Type": "application/json; charset=utf-8"})[0], 200)
+        self.assertTrue((self.home / "proj" / "sub").is_dir())
+
+    def test_only_the_workspaces_own_page(self):
+        host = f"127.0.0.1:{self.port}"
+        for origin in ("null", "http://evil.example", "http://localhost:1", f"http://127.0.0.1:{self.port + 1}"):
+            self.assertEqual(self.call("POST", "/api/mkdir", {"path": "proj/o"}, headers={"Origin": origin})[0], 403, origin)
+            self.assertEqual(self.call("GET", "/api/info", headers={"Origin": origin})[0], 403, origin)
+        self.assertEqual(self.call("GET", "/api/info", headers={"Sec-Fetch-Site": "cross-site"})[0], 403)
+        self.assertEqual(self.call("GET", "/api/info", headers={"Sec-Fetch-Site": "same-site"})[0], 403)
+        self.assertFalse((self.home / "proj" / "o").exists())
+        for headers in ({"Origin": f"http://{host}", "Sec-Fetch-Site": "same-origin"}, {"Sec-Fetch-Site": "none"}):
+            self.assertEqual(self.call("GET", "/api/info", headers=headers)[0], 200, headers)
+
+    def test_signed_file_urls(self):
+        proj = str(self.home / "proj")
+        status, out = self.call("POST", "/api/raw-url", {"path": f"{proj}/page.html"})
+        url = out["url"]
+        prefix = url.split("/")[2]
+        expires, depth, signature = prefix.split(".")
+        self.assertEqual((int(expires) - time.time() > 3500, int(depth)), (True, len((self.home / "proj").parts) - 1))
+        quoted = urllib.parse.quote(proj)
+        self.assertEqual(self.call("GET", url, token=False, raw=True)[0], 200)
+        # tampered: another directory, another depth, another signature, another expiry
+        for bad in (f"/raw/{prefix}{urllib.parse.quote(str(self.home / 'hpclib'))}/hpclib.sh",
+                    f"/raw/{expires}.{int(depth) - 1}.{signature}{quoted}/page.html",
+                    f"/raw/{expires}.{depth}.{'0' * 40}{quoted}/page.html",
+                    f"/raw/{int(expires) + 99}.{depth}.{signature}{quoted}/page.html",
+                    f"/raw/{prefix}{quoted}/../../etc/passwd",
+                    f"/raw/{self.token}{quoted}/page.html", "/raw/", "/raw/x.y.z/etc/passwd"):
+            self.assertEqual(self.call("GET", bad, token=False, raw=True)[0], 401, bad)
+        # expired, with a signature that is right for it
+        late = int(time.time()) - 5
+        old = f"/raw/{late}.{depth}.{self.server.sign_raw(late, int(depth), proj)}{quoted}/page.html"
+        self.assertEqual(self.call("GET", old, token=False, raw=True)[0], 401)
+        # another run of the server (another token) can't use it
+        other = workspace_server.Server(("127.0.0.1", 0), "another-token-0123456789abcdef", self.server.workspace)
+        self.addCleanup(other.server_close)
+        self.assertNotEqual(other.sign_raw(int(expires), int(depth), proj), signature)
+        self.assertEqual(self.call("POST", "/api/raw-url", {"path": "/page.html"})[0], 404)
+
+    def test_terminal_tickets_are_single_use_and_short(self):
+        self.assertEqual(self.call("POST", "/api/term/ticket", token=False)[0], 401)
+        status, out = self.call("POST", "/api/term/ticket")
+        self.assertEqual(status, 200, out)
+        ticket = out["ticket"]
+        self.assertNotIn(self.token, ticket)
+        self.assertTrue(self.server.redeem_ticket(ticket))
+        self.assertFalse(self.server.redeem_ticket(ticket))                       # once
+        self.assertFalse(self.server.redeem_ticket(""))
+        ticket = self.call("POST", "/api/term/ticket")[1]["ticket"]
+        clock = [time.time()]
+        self.server.ticket_store.clock = lambda: clock[0]
+        late = self.server.new_ticket()
+        clock[0] += workspace_server.TICKET_SECONDS
+        self.assertFalse(self.server.redeem_ticket(late))                          # too old
+        self.server.ticket_store.clock = time.time
+        self.assertTrue(self.server.redeem_ticket(ticket))
+        self.assertEqual(len(self.server.ticket_store._tickets), 0)                              # the old ones are dropped
+
+    def test_what_a_shown_page_can_send_changes_nothing(self):
+        """A page in the viewer has its signed URL and nothing else: no token, the Origin `null`, no custom
+        headers, and forms or simple requests as its only means. None of it reaches an API route."""
+        (self.home / "proj" / "keep.txt").write_text("kept")
+        url = self.raw_base("page.html")
+        page_knows = {"prefix": url.split("/")[2]}
+        bodies = {"/api/mkdir": {"path": "proj/made"}, "/api/delete": {"path": "proj/keep.txt"},
+                  "/api/rename": {"from": "proj/keep.txt", "to": "proj/gone.txt"},
+                  "/api/submit": {"script": "#!/bin/bash\ntouch ~/ran\n", "name": "ran.sh", "dir": str(self.home),
+                                  "overwrite": True}}
+        for route, body in bodies.items():
+            for query in ("", f"?token={page_knows['prefix']}", f"?token={self.token[:-1]}"):
+                for kind, raw in (("text/plain", json.dumps(body)), ("application/json", json.dumps(body))):
+                    status, _ = self.call("POST", route + query, body=raw.encode(), token=False,
+                                          headers={"Content-Type": kind, "Origin": "null", "Sec-Fetch-Site": "cross-site"})
+                    self.assertIn(status, (401, 403, 415), (route, query, kind))
+        self.assertEqual(self.call("PUT", f"/api/file?path={urllib.parse.quote(str(self.home / 'put.txt'))}&token=x",
+                                   body=b"x", token=False, headers={"Origin": "null"})[0], 403)
+        self.assertEqual(sorted(p.name for p in self.home.iterdir() if p.is_file() and p.name != ".bash_profile"), [])
+        self.assertTrue((self.home / "proj" / "keep.txt").exists())
+        self.assertFalse((self.home / "proj" / "made").exists())
+        self.assertFalse((self.home / "sbatch.log").exists())
 
 
 class TestUsage(ServerCase):
@@ -369,9 +482,14 @@ class TestTerminal(ServerCase):
         head = bytes([0x80 | opcode]) + (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n))
         sock.sendall(head + mask + bytes(c ^ mask[i % 4] for i, c in enumerate(payload)))
 
+    def ticket(self):
+        status, out = self.call("POST", "/api/term/ticket")
+        self.assertEqual(status, 200, out)
+        return out["ticket"]
+
     def test_shell(self):
         cwd = urllib.parse.quote(str(self.home / "proj"))
-        sock, head, key = self.connect(f"token={self.token}&cwd={cwd}&cols=90&rows=20")
+        sock, head, key = self.connect(f"ticket={self.ticket()}&cwd={cwd}&cols=90&rows=20")
         self.assertIn("101", head.splitlines()[0])
         self.assertIn(workspace_server.ws_accept(key), head)
         rfile = sock.makefile("rb")
@@ -396,11 +514,20 @@ class TestTerminal(ServerCase):
         sock.close()
 
     def test_refused(self):
-        sock, head, _ = self.connect("token=wrong")
-        self.assertIn("401", head.splitlines()[0])
+        for query in ("ticket=wrong", "", f"token={self.token}"):                # the token is no way in
+            sock, head, _ = self.connect(query)
+            self.assertIn("401", head.splitlines()[0], query)
+            sock.close()
+        for origin in ("http://evil.example", "null"):
+            sock, head, _ = self.connect(f"ticket={self.ticket()}", origin=origin)
+            self.assertIn("403", head.splitlines()[0], origin)
+            sock.close()
+        ticket = self.ticket()                                                   # one use
+        sock, head, _ = self.connect(f"ticket={ticket}")
+        self.assertIn("101", head.splitlines()[0])
         sock.close()
-        sock, head, _ = self.connect(f"token={self.token}", origin="http://evil.example")
-        self.assertIn("403", head.splitlines()[0])
+        sock, head, _ = self.connect(f"ticket={ticket}")
+        self.assertIn("401", head.splitlines()[0])
         sock.close()
 
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 # A transfer job, from `smbshell submit`: smbshell.sh with this job's arguments, or entry SLURM_ARRAY_TASK_ID of a
 # manifest (--manifest FILE.jsonl, one JSON argument list per line). It never asks for a password: it signs in
-# with your Kerberos ticket or the saved password (smbshell login / save-credentials).
+# with your Kerberos ticket (smbshell login, or sign-in while opening the optional GUI).
 set -o pipefail
 dir="${SMBSHELL_DIR:?this job was submitted without SMBSHELL_DIR; submit it with smbshell submit}"
 export SMB_NONINTERACTIVE=1

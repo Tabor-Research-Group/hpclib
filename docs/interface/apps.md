@@ -94,31 +94,35 @@ on, and **Bind source** (run your checkout's code instead of the image's).
 
 ## Data transfer
 
-Moving files between a cluster and an SMB file server with rclone. Per cluster, one row:
+Command-line and agent transfers use Samba's `smbclient` with a private Kerberos ticket. The rclone web GUI is optional.
 
-- **Install** pulls the data-transfer-tools image.
-- **Start** runs a web GUI on the cluster's **login node** (no job), reached through your login: by default
-  rclone's own, for browsing and copying between the SMB server (`smb`, which opens at the settings' folder when
-  one is set; `smb-server` is then the whole server), the cluster's files (`cluster`), and any remotes a settings
-  package adds. **Open** signs you in to it automatically; **Copy username** and **Copy
-  password** are there if the browser asks anyway. **Stop** ends it.
-- **Kerberos log in (kinit)** gets a ticket with `kinit`, where the cluster has Kerberos; the GUI and jobs use it
-  while it lasts. It can run while the GUI does.
-- Otherwise **Save password for sync jobs** stores the SMB password on the cluster (mode 600, in rclone's
-  reversible encoding) so batch transfers (`smbshell submit`) can run unattended.
+- **Install** pulls the data-transfer-tools image, which supplies both clients.
+- **Sign in for transfers** creates the ticket without opening a GUI. Your account password is not saved.
+  A failed sign-in preserves the previous ticket. A sign-in in another shell can use a host-only cache;
+  the page distinguishes that from the transfer sign-in.
+- **Start** opens the optional GUI on the cluster's login node through your SSH connection. It asks for your
+  account password once, creates the transfer ticket automatically, and configures rclone to use a password
+  for that GUI session. Its private configuration is kept on a memory filesystem and removed on Stop or a
+  normal session exit. The GUI refuses to put the session password in a disk-backed temporary directory.
+- **Open** opens the running GUI with its generated browser login. Those browser credentials are separate
+  from your account password. **Stop** ends the GUI; the transfer ticket remains available to CLI and agents.
+- **Sign out of transfers** removes that ticket. Otherwise it expires normally; it is not renewed indefinitely.
+- **Check connection** checks access to the configured folder with `smbclient`; a ticket alone does not prove
+  that the storage server accepts it or grants folder access.
 
-Without a ticket or a saved password, Start asks for the SMB password, which is kept only in memory until Stop.
+Saved-password sign-in is retired. If an older password file exists, **Remove old saved password** removes it.
+Neither CLI transfers nor agents use it. The GUI always asks for a fresh session password.
 
-**Agents and the SMB server.** Data transfer also offers agents three [tunnel actions](../extending.md#tunnel-actions),
-which you turn on per cluster on its **Agents** tab: **list** a folder, **get** (copy from the server into a new
-directory in the agent's work directories) and **put** (copy to the server). They use your sign-in, so they work
-only while you have a Kerberos ticket or a saved password, and **put** stays off until you turn it on by itself.
-Copies run as SLURM jobs and go through a staging folder of yours, so an agent's links never lead them elsewhere.
+**Agents and the SMB server.** Enable **list** and **get** per cluster on its **Agents** tab; **put** remains off
+until the owner enables it. All three use `smbclient` and the transfer ticket, independently of the GUI. Copies
+run as SLURM jobs and retain the existing scoped staging path checks. The ticket must outlive a queued/running job.
 
-Settings: the SMB server, the share and folder paths are relative to, user name, domain, Kerberos realm, how to
-sign in, which **GUI** Start opens, and where the image is kept. GUI is `rclone` (the default), the name of a GUI
-a settings package provides, or a program on the cluster (see `smbshell --help`, and the README's Data transfer
-section, for what such a program gets and must print).
+Settings include the SMB server, share/folder, user name, GUI password domain, Kerberos realm and service name,
+optional GUI and image location. A short service identity such as `cifs/netapp-res-01` can be configured separately
+from the full connection hostname. With blank realm/service settings, transfers use their ticket's realm and
+try the short service name once after a definite unknown-principal response on a read-only probe, retaining
+the original server's network destination. Explicit settings take precedence. Existing encryption policy remains
+in force; client changes do not repair missing service identities or AES configuration on the storage/domain side.
 
 ## Workspace (a package)
 

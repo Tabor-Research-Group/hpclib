@@ -346,7 +346,7 @@ def answer(path, method):
             acts = [{"name": n, "title": t, "description": d, "mode": m, "scope": sc, "writes": w, "default": dflt,
                      "enabled": e, "permitted": True, "params": p}
                     for n, t, d, m, sc, w, dflt, e, p in (
-                        ("list", "List a folder on the SMB server", "The files and folders in REMOTE, as rclone lsjson entries.",
+                        ("list", "List a folder on the SMB server", "The files and folders in REMOTE, as structured Samba entries.",
                          "sync", "read", None, True, True, {"remote": {"type": "remote-path"}}),
                         ("get", "Copy from the SMB server", "Copies REMOTE into LOCAL, a new directory in your work directories, as a SLURM job.",
                          "job", "submit", "cluster", True, True, {"remote": {"type": "remote-path"},
@@ -355,7 +355,7 @@ def answer(path, method):
                          "job", "submit", "remote", False, False, {"local": {"type": "cluster-path", "access": "read"},
                                                                     "remote": {"type": "remote-path"}}))]
             return {"tunnels": [{"tunnel": "data-transfer", "title": "SMB server", "enabled": True, "actions": acts,
-                                 "description": "Files on your group's SMB server, with your sign-in: a Kerberos ticket or the saved password from Data transfer.",
+                                 "description": "Files on your group's SMB server, with your sign-in: a Data Transfer Kerberos ticket used by smbclient.",
                                  "availability": {"available": True, "detail": {"host": "files.example.edu", "root": "group/shared",
                                                                                 "ticket": {"principal": "jdoe@TAMU.EDU", "expires": "10/26/26 06:12:40"}}}}]}
         if rest[:3] == ["rest", "admin", "config"]:

@@ -685,7 +685,7 @@ VSCODE_CONTAINER=... --save` (as the console's VS Code settings do). Singularity
 available on the login node. code-server asks for the password in `VSCODE_ROOT_DIR/.config/code-server/config.yaml`,
 which the tunnel prints (and the console offers to copy).
 
-**Data transfer (SMB)**: `smbshell` moves files between a cluster and an SMB server with rclone from the
+**Data transfer (SMB)**: `smbshell` moves files between a cluster and an SMB server with Kerberos and Samba from the
 data-transfer-tools image. It isn't a port-forwarding tunnel; `tunnels/data-transfer/` holds the command, its
 SLURM job and the image's `install.sh`. The console's **Data transfer** page puts it all on one row per cluster:
 the settings (with Install), signing in, and a web GUI (below).
@@ -699,7 +699,7 @@ smbshell login                                            # on the cluster: kini
 smbshell ls                                               # SMB_ROOT (or, without one, the server's shares)
 smbshell ls proj/raw                                      # under SMB_ROOT if set, else SHARE/PATH; /SHARE/PATH
                                                           # and //HOST/SHARE/PATH are absolute
-smbshell get proj/raw /scratch/user/me/raw --include '*.h5'
+smbshell get proj/raw /scratch/user/me/raw
 smbshell put /scratch/user/me/results proj/results
 smbshell sync pull proj/raw /scratch/user/me/raw --dry-run  # sync deletes what the source lacks
 smbshell submit --time=2:00:00 get proj/raw /scratch/user/me/raw   # the same, as a SLURM job
@@ -714,8 +714,10 @@ own web GUI (`rclone rcd --rc-web-gui`). Its remotes are `smb` (the server; with
 `smbshell ls/get/put`, and then `smb-server` for the whole server) and `cluster` (the node's files: home,
 `/scratch`), for browsing and copying between them, plus any in
 `~/.local/tunnels/settings/data-transfer.d/rclone.conf` on the cluster (a settings package puts them there, e.g.
-an alias for your group's folder; see Console packages below). Start asks for the SMB password (unless there is a
-Kerberos ticket or a saved one), which is kept only in a private in-memory file until Stop; nothing is saved.
+an alias for your group's folder; see Console packages below). Start asks for your account password once,
+creates the transfer ticket automatically, and uses password authentication for the GUI. Its session
+configuration is kept on a private memory filesystem and removed on Stop or a normal exit. The ticket remains
+available to CLI and agents after the GUI stops; your account password is not saved for later.
 rclone runs without retries, so a refused password is one refused logon. rclone fetches the GUI itself from
 GitHub the first time (into `~/.cache/rclone`).
 
@@ -732,13 +734,16 @@ echo "HPCLIB_TRANSFER_GUI port=$HPCLIB_GUI_PORT path=/ user=$HPCLIB_GUI_USER pas
 
 (`path=`, `user=`/`pass=` and `query=`, already URL-encoded, are all optional; `smbshell --help` has the details.)
 
-Signing in (`SMB_AUTH=auto`): a Kerberos ticket from `smbshell login` (kinit on the login node, or in the image
-if the node has none; kept in `~/.config/hpclib/smb/krb5cc`, so jobs use it while it lasts), else a password
-saved with `smbshell save-credentials` (`~/.config/hpclib/smb/credentials`, mode 600, in rclone's reversible
-encoding), else `smbshell` asks. Jobs never ask: they need the ticket or the saved password. Kerberos needs an
-rclone with SMB Kerberos support (`smbshell status` says). The console's **Data transfer** row does the
-signing in beside the GUI: Kerberos log in (kinit) where the cluster has kinit, otherwise Save password for sync
-jobs, both through its password dialog, plus Install/Check for the image and the settings above.
+**Sign in for transfers** (or `smbshell login`) creates a private FILE Kerberos ticket for command-line,
+agent and SLURM transfers through `smbclient`. A GUI sign-in creates the same ticket automatically. You can
+use the ticket without opening the GUI; signing out removes it, and otherwise it expires normally. Saved
+passwords and `save-credentials` are retired. An old password can be removed with `forget-credentials`.
+`SMB_AUTH` is ignored by the transfer commands. Set `SMB_SPN=cifs/NAME` when the service identity differs from
+the connection hostname, and set the realm explicitly when needed. Existing crypto policy is preserved.
+
+See [SMB commands](docs/cli/tunnels.md#file-transfers-with-smb-smbshell) for supported flags, transfer checks,
+filename restrictions and the Kerberos profile override. Rclone-specific transfer flags are no longer accepted
+by `smbshell`; the optional GUI still supplies rclone's own transfer interface.
 
 **Console packages**: apps and settings that don't belong in hpclib (one group's server, a project's test
 instance) come as zip files, installed with the console's **Packages** button, which shows what a
@@ -796,3 +801,140 @@ To configure that, one will either need to load a module that supplies conda in 
 
 **NGL**: this, like Jupyter, requires a package to be installed in the base conda environment, although this time it's `mdsrv`
 from the people who make ngl
+
+## Unified hpclib token handling
+
+`hpclib.auth` provides shared first-party bearer verification, grants, expiring sessions,
+delegation, rotation, revocation, single-use tickets and signed resource links. REST,
+the browser console and Workspace reuse its implementation while retaining separate
+credentials and audiences. See the [authentication API](docs/authentication.txt).
+Kerberos tickets and credentials issued by rclone, Jupyter, code-server or other
+programs remain independent.
+
+This change does not restrict SSH access. The proposed custom SSH gateway, AsyncSSH
+browser backend, restricted `pssh` transport and OS-isolation installer are deferred:
+the implementation/maintenance cost is not justified for the current project without
+an end-to-end memory-only credential design. No connection backend is changed and no
+new SSH dependency is installed. Ordinary `pssh` and tunnel connection sharing retain
+their current behavior.
+
+New session secrets are returned once and stored server-side only as hashes alongside
+grant/session metadata. Clients can hold those secrets in memory, but existing owner
+credentials and client token files may persist on disk. Unified token handling does
+not make the complete deployment memory-only or isolate processes under the same OS
+user. It does not install agent restrictions or modify your agent settings.
+
+### Keep coding agents away from the SSH connection
+
+hpclib normally shares an authenticated OpenSSH connection through
+`~/.ssh/connections/%r@%h:%p`. A process able to connect to that control socket can
+reuse the login without knowing your password or presenting an hpclib REST token.
+Treat the socket as an account credential. See [OpenSSH connection sharing](https://man.openbsd.org/ssh_config.5#ControlMaster).
+
+For an agent that should use only scoped MCP/REST access:
+
+- Deny access to `~/.ssh`, including its control sockets, keys and configuration.
+  Include custom `ControlPath`/`IdentityFile` locations and their resolved targets.
+- Block connections to SSH control/agent Unix sockets, including the actual path
+  named by `SSH_AUTH_SOCK`, which may be outside `~/.ssh`. Remove `SSH_AUTH_SOCK` and
+  `SSH_AGENT_PID` from the agent's launch environment; unsetting them alone is not a
+  security boundary.
+- Protect owner credentials such as `~/.config/hpclib` and, wherever applicable,
+  `~/.local/tunnels`. Give the configured MCP server its delegated REST credential;
+  do not reopen the complete owner configuration directory for the agent's shell.
+- Keep sandboxing enabled and close unsandboxed escape paths. An instruction in
+  AGENTS.md/CLAUDE.md or a rule matching the `ssh` command alone does not block Python,
+  another executable, or a separately authorized tool from accessing the same socket.
+
+These are user/runtime controls. This patch does not implement them inside hpclib.
+
+### Codex example
+
+For Codex releases supporting permission profiles, a conservative local-command
+profile in your user `~/.codex/config.toml` is:
+
+```toml
+approval_policy = "never"
+default_permissions = "hpclib-rest-only"
+
+[features]
+network_proxy = true
+
+[permissions.hpclib-rest-only]
+extends = ":workspace"
+
+[permissions.hpclib-rest-only.filesystem]
+"~/.ssh" = "deny"
+"~/.config/hpclib" = "deny"
+"~/.local/tunnels" = "deny"
+
+[permissions.hpclib-rest-only.network]
+enabled = false
+dangerously_allow_all_unix_sockets = false
+```
+
+Do not combine this with legacy `sandbox_mode`, `sandbox_workspace_write`, or a
+`--sandbox` override: those can select the older policy instead. Keep SSH sockets off
+the effective Unix-socket allowlist; add exact socket denies if an inherited policy
+allows them. This example disables command networking. Configured MCP tools have
+separate access controls. Review plugins, MCP servers and computer-use permissions
+for other routes to a terminal or SSH connection. Use the effective profile supported
+by your installed release; managed policy can override local settings. See the
+[official Codex permissions documentation](https://learn.chatgpt.com/docs/permissions)
+and [approval controls](https://learn.chatgpt.com/docs/agent-approvals-security).
+
+### Claude Code example
+
+Merge these restrictions into user or managed Claude Code settings:
+
+```json
+{
+  "permissions": {
+    "deny": [
+      "Read(~/.ssh/**)",
+      "Edit(~/.ssh/**)",
+      "Read(~/.config/hpclib/**)",
+      "Edit(~/.config/hpclib/**)",
+      "Read(~/.local/tunnels/**)",
+      "Edit(~/.local/tunnels/**)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "excludedCommands": [],
+    "filesystem": {
+      "denyRead": ["~/.ssh", "~/.config/hpclib", "~/.local/tunnels"],
+      "denyWrite": ["~/.ssh", "~/.config/hpclib", "~/.local/tunnels"]
+    },
+    "network": {
+      "allowUnixSockets": [],
+      "allowAllUnixSockets": false
+    }
+  }
+}
+```
+
+Check merged settings for exceptions; empty lists do not remove entries from other
+scopes. Keep SSH sockets and unsandboxed command exceptions excluded. Bash sandbox
+rules and built-in file-tool rules are separate, hence both are shown. Hooks, local
+MCP servers and computer-use tools require their own controls. Managed policy is
+appropriate when repositories must not weaken settings. Check release/platform
+support in the [Claude Code sandbox documentation](https://code.claude.com/docs/en/sandboxing)
+and [permission rules](https://code.claude.com/docs/en/permissions).
+
+### Verify the boundary
+
+After changing settings, verify denial with a disposable test directory/socket in
+an equivalent protected location; do not test by sending commands through a live
+cluster control socket. Check both native file tools and shell subprocesses, and
+confirm that the configured scoped MCP workflow still functions. Recheck custom
+socket paths and exemptions after upgrades.
+
+`chmod 700 ~/.ssh/connections` protects against other OS users, but not unrestricted
+processes running as you. An unconfined same-user agent may obtain credentials or
+use another tool to bypass shell restrictions. For that threat model, run the agent
+in an enforced sandbox, separate account or VM without host SSH/browser credentials,
+and expose only its intended workspace and delegated API access. Changing a
+ControlPath name or unsetting an environment variable is insufficient by itself.

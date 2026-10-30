@@ -171,35 +171,66 @@ can override a bundled tunnel by installing one with the same name. To write a t
 
 ## File transfers with SMB: `smbshell`
 
-`smbshell` moves files between a cluster and an SMB file server with rclone, from the data-transfer-tools image.
-Configure and install once:
+CLI, agent and SLURM transfers use `smbclient` from the data-transfer-tools image and the app's Kerberos ticket.
+The optional rclone GUI uses password authentication for its session.
 
 ```bash
 tunnel_setup user@login.example data-transfer --set SMB_HOST=files.example.edu \
   --set SMB_ROOT=research/our_group --set SMB_DOMAIN=EXAMPLE --set SMB_REALM=AUTH.EXAMPLE.EDU \
   --save --install
-```
 
-Then, on the cluster (or from your machine with `smbshell --on user@login.example ...`):
-
-```bash
-smbshell login                                   # kinit: a Kerberos ticket jobs can use too
-smbshell save-credentials                        # or: a saved password, for unattended jobs
-smbshell ls                                      # SMB_ROOT (or the server's shares)
-smbshell get proj/raw /scratch/user/me/raw --include '*.h5'
+smbshell login                                   # obtain a transfer ticket; no GUI needed
+smbshell check                                   # test the configured folder with Samba
+smbshell ls --json                               # structured Path, Name, Size, ModTime, IsDir
+smbshell get proj/raw /scratch/user/me/raw
 smbshell put /scratch/user/me/results proj/results
-smbshell sync pull proj/raw /scratch/user/me/raw --dry-run     # sync deletes what the source lacks
-smbshell submit --time=2:00:00 get proj/raw /scratch/user/me/raw  # the same, as a SLURM job
-smbshell submit --manifest transfers.json        # [["get", "proj/a", "/scratch/.../a"], ...]: a job array
-smbshell gui --port 27555                        # a web GUI on the login node: rclone's, or SMB_GUI's
-smbshell status                                  # how it would sign in, and what rclone supports
+smbshell sync pull proj/raw /scratch/user/me/raw --dry-run
+smbshell submit --time=2:00:00 get proj/raw /scratch/user/me/raw
+smbshell submit --manifest transfers.json        # JSON argument lists, one transfer per array task
+smbshell gui --port 27555                        # optional; one password also creates a ticket
+smbshell status
+smbshell logout                                 # remove the transfer ticket
+smbshell forget-credentials                      # remove a password saved by an older version
 ```
 
-Paths are relative to `SMB_ROOT` when it is set; `/SHARE/PATH` and `//HOST/SHARE/PATH` are absolute. Signing in
-uses a Kerberos ticket if there is one, else the saved password, else asks; jobs never ask.
+The same commands work from your machine with `smbshell --on user@login.example COMMAND ...`.
+Paths are relative to `SMB_ROOT`; `/SHARE/PATH` and `//HOST/SHARE/PATH` are absolute. The Samba transport accepts
+`--json` for listings and `--dry-run` for copies/sync. Rclone-specific flags such as `--include` are not accepted;
+unknown flags fail before remote operations. Sync copies source contents and removes extra destination entries
+only after all copies succeed. Get/put never delete extra destination files.
 
-`SMB_GUI` picks what `smbshell gui` serves: `rclone` (the default), `NAME` for `NAME.gui.sh` in
-`~/.local/tunnels/settings/data-transfer.d/` (a settings package's file), or a program on the cluster. A program
-of your own is given the port, a session login to require, the signed-in rclone remotes and rclone in the image,
-and prints `HPCLIB_TRANSFER_GUI port=PORT [path=...] [user=... pass=...]` once it serves; `smbshell --help` lists
-the details.
+The GUI asks for an account password once, feeds it to `kinit` on stdin, and keeps only rclone's session
+credentials in a private memory-backed configuration. GUI startup stops if ticket acquisition fails. Closing
+or stopping the GUI removes that configuration but retains the transfer ticket for jobs and agents. No saved
+password is used or created. `SMB_AUTH` is a retired setting; it cannot enable password fallback for CLI/jobs.
+
+The private ticket cache is `SMB_KRB5CCNAME` (a path or `FILE:/path`, not KCM/KEYRING). Its directory and the
+prepared profile are explicitly mounted in the image. A plain host `kinit` can use KCM and does not replace
+`smbshell login`. A failed login preserves the previous ticket. Ticket expiration remains in force.
+
+`SMB_SPN=cifs/NAME` selects the service identity independently of `SMB_HOST`. Samba connects to the resolved
+address of `SMB_HOST` while requesting the configured name; `SMB_REALM` sets the realm explicitly. The realm
+may also be included in `SMB_SPN`, but conflicting realms are rejected. When neither sets a realm, transfers
+use the principal realm from their own FILE ticket instead of Samba's DNS-based guess. `kinit` keeps its
+existing krb5.conf default unless a realm is configured.
+
+With a blank `SMB_SPN`, a definite unknown-service-principal response during a read-only listing/session
+probe permits one retry using the short server name. The network destination remains the address resolved
+from `SMB_HOST`. The selected identity is used for the rest of that operation, without changing saved settings.
+Explicit identities are never replaced. Writes and ambiguous failures are never retried; neither passwords,
+NTLM nor encryption-policy changes are used as a fallback. Set `SMB_SPN` explicitly to avoid discovery on
+each invocation. Check Connection retains the actual authentication error and attempted identity in its
+message, rather than replacing them with a generic folder-access error.
+
+`SMB_KRB5_CONF`, then `KRB5_CONFIG`, then `/etc/krb5.conf` selects the profile source. Includes are expanded and
+realm sections merged before mounting the generated profile. Explicit encryption restrictions are preserved;
+server-side AES/SPN problems can therefore still prevent access. `find-spn` is diagnostic, not a storage login.
+
+The native transport checks listing output and names before copying. Names containing command separators,
+double quotes, backslashes, wildcard characters or control characters are rejected explicitly. Local downloads
+are published after a size check; uploads use a unique temporary server file, a size check and a replacing
+rename. These checks detect partial transfers, not same-length data corruption. Transfers are streamed by
+Samba; no Python runtime is required inside the image. The host needs Python 3.8 or newer.
+
+`SMB_GUI` still selects rclone, a package-provided `NAME.gui.sh`, or a program. Custom GUIs receive the same
+session-password configuration and generated browser credentials; see `smbshell --help` for the interface.

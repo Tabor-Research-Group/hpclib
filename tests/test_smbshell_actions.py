@@ -3,6 +3,7 @@ singularity whose rclone copies from and to a directory standing in for the SMB 
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,27 +13,7 @@ SMBSHELL = ROOT / "hpclib" / "tunnels" / "data-transfer" / "smbshell.sh"
 HELPER = ROOT / "hpclib" / "servers" / "action_paths.py"
 
 # singularity exec [--bind X]... IMAGE rclone (copy|lsjson|...) ...: smb:PATH is $FAKE_SMB/PATH
-FAKE_SINGULARITY = """#!/usr/bin/env python3
-import os, shutil, sys
-args = sys.argv[2:]
-while args and args[0].startswith("--"):
-    args = args[2:]
-args = args[1:]                      # the image
-if args[:2] == ["rclone", "help"]:
-    sys.exit(0)
-if args[0] != "rclone" or args[1] != "copy":
-    sys.exit(f"fake singularity: {args}")
-paths = [a for a in args[2:] if not a.startswith("-")]
-src, dst = paths[-2:]
-smb = os.environ["FAKE_SMB"]
-real = lambda p: os.path.join(smb, p[4:].lstrip("/")) if p.startswith("smb:") else p
-src, dst = real(src), real(dst)
-os.makedirs(dst, exist_ok=True)
-if os.path.isdir(src):
-    shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=True)
-else:
-    shutil.copy(src, dst)
-"""
+from smbclient_fixture import FAKE_TOOL
 
 
 class TestSmbshellActions(unittest.TestCase):
@@ -41,8 +22,16 @@ class TestSmbshellActions(unittest.TestCase):
         self.addCleanup(subprocess.run, ["rm", "-rf", str(self.tmp)])
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
-        (self.bin / "singularity").write_text(FAKE_SINGULARITY)
+        (self.bin / "python3").symlink_to(sys.executable)
+        (self.bin / "singularity").write_text(f"#!{sys.executable}\n" + FAKE_TOOL)
         (self.bin / "singularity").chmod(0o755)
+        for name in ("klist", "kinit"):
+            tool = self.bin / name
+            tool.write_text(f"#!{sys.executable}\n" + FAKE_TOOL)
+            tool.chmod(0o755)
+        self.cache = self.tmp / "cache" / "krb5cc"
+        self.cache.parent.mkdir()
+        self.cache.write_text('{"valid": true}')
         self.smb = self.tmp / "smb"
         (self.smb / "group" / "raw").mkdir(parents=True)
         (self.smb / "group" / "raw" / "a.dat").write_text("A")
@@ -54,6 +43,8 @@ class TestSmbshellActions(unittest.TestCase):
         self.image = self.tmp / "image.sif"
         self.image.write_text("")
         self.data = self.tmp / "data"
+        self.krb5 = self.tmp / "krb5.conf"
+        self.krb5.write_text("[libdefaults]\n dns_lookup_kdc = true\n")
 
     def scope(self):
         path = self.tmp / f"scope-{len(list(self.tmp.glob('scope-*')))}.json"
@@ -63,7 +54,8 @@ class TestSmbshellActions(unittest.TestCase):
     def run_smbshell(self, *args):
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", HOME=str(self.home), FAKE_SMB=str(self.smb),
                    HPCTUNNELS_DATA_DIR=str(self.data), SMB_HOST="files.example.edu", SMB_ROOT="",
-                   SMB_IMAGE=str(self.image), SMB_AUTH="password", SMB_NONINTERACTIVE="1", SMB_KRB5_CONF="/nonexistent")
+                   SMB_IMAGE=str(self.image), SMB_AUTH="kerberos", SMB_NONINTERACTIVE="1", SMB_KRB5_CONF=str(self.krb5),
+                   SMB_KRB5CCNAME=str(self.tmp / "cache" / "krb5cc"))
         return subprocess.run(["bash", str(SMBSHELL), *args], capture_output=True, text=True, env=env, timeout=60)
 
     def test_get_goes_through_staging_into_a_new_directory(self):
@@ -103,7 +95,23 @@ class TestSmbshellActions(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         line = [ln for ln in out.stdout.splitlines() if ln.startswith("HPCLIB_SMB_STATUS ")][0]
         status = json.loads(line.split(" ", 1)[1])
-        self.assertEqual((status["host"], status["credentials"], status["image"]), ("files.example.edu", True, True))
+        self.assertEqual((status["host"], status["credentials"], status["image"]), ("files.example.edu", False, True))
+
+    def test_sync_dry_run_then_copy_and_remove_extra_destination_entries(self):
+        source = self.agent / "results"
+        source.mkdir()
+        (source / "a name.dat").write_text("NEW")
+        preview = self.run_smbshell("sync", "push", str(source), "group/new/deep", "--dry-run")
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        self.assertFalse((self.smb / "group" / "new").exists())
+        actual = self.run_smbshell("sync", "push", str(source), "group/new/deep")
+        self.assertEqual(actual.returncode, 0, actual.stderr)
+        target = self.smb / "group" / "new" / "deep"
+        self.assertEqual((target / "a name.dat").read_text(), "NEW")
+        (target / "extra").write_text("OLD")
+        again = self.run_smbshell("sync", "push", str(source), "group/new/deep")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual([p.name for p in target.iterdir()], ["a name.dat"])
 
 
 if __name__ == "__main__":

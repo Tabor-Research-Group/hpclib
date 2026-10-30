@@ -73,7 +73,9 @@ async function api(path, { method = "GET", body, raw = false, headers = {} } = {
   return data;
 }
 const q = (params) => new URLSearchParams(params).toString();
-const rawUrl = (path) => `/raw/${encodeURIComponent(token)}${path.split("/").map(encodeURIComponent).join("/")}`;
+// A file for an <img>, <iframe> or <video>: the server signs a URL that expires and covers the file's directory (the
+// token itself never goes in a URL, where a page the viewer shows could read it).
+const rawUrl = async (path) => (await api("/api/raw-url", { method: "POST", body: { path } })).url;
 const join = (dir, name) => (dir === "/" ? "" : dir) + "/" + name;
 const dirname = (p) => p.replace(/\/[^/]*$/, "") || "/";
 const basename = (p) => p.replace(/^.*\//, "");
@@ -272,11 +274,13 @@ function fileMenu(e, path, at) {
   ], at);
 }
 
-function download(path) {
-  const a = el("a", { href: rawUrl(path), download: basename(path) });
-  document.body.append(a);
-  a.click();
-  a.remove();
+async function download(path) {
+  try {
+    const a = el("a", { href: await rawUrl(path), download: basename(path) });
+    document.body.append(a);
+    a.click();
+    a.remove();
+  } catch (err) { toast(err.message, 6000); }
 }
 
 async function rename(path) {
@@ -392,8 +396,9 @@ function kindOf(path) {
   return "text";
 }
 
-function openViewer(path, kind) {
-  const url = rawUrl(path);
+async function openViewer(path, kind) {
+  let url;
+  try { url = await rawUrl(path); } catch (err) { toast(err.message, 6000); return; }
   const body = el("div", { class: `body${kind === "pdf" || kind === "html" ? "" : " center"}` });
   if (kind === "image") body.append(el("img", { src: url, alt: basename(path) }));
   else if (kind === "video") body.append(el("video", { src: url, controls: true, preload: "metadata" }));
@@ -401,11 +406,11 @@ function openViewer(path, kind) {
   else if (kind === "pdf") body.append(el("iframe", { src: url, title: basename(path) }));
   else if (kind === "html") {
     // the page runs its scripts, in an opaque origin (the server's CSP sandbox, and this frame's)
-    body.append(el("iframe", { src: url, title: basename(path), sandbox: "allow-scripts allow-popups allow-forms allow-modals" }));
+    body.append(el("iframe", { src: url, title: basename(path), sandbox: "allow-scripts allow-popups" }));
   }
-  const reload = () => {
-    const media = body.firstChild;
-    media.src = `${url}?t=${Date.now()}`;
+  const reload = async () => {
+    try { url = await rawUrl(path); } catch (err) { toast(err.message, 6000); return; }
+    body.firstChild.src = `${url}?t=${Date.now()}`;
   };
   const bar = el("div", { class: "bar" },
     el("code", {}, path),
@@ -741,7 +746,10 @@ async function newTerminal(cwd = state.dir) {
   term.fit = () => { try { fit && fit.fit(); } catch (e) { /* hidden */ } };
   term.fit();
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(`${proto}//${location.host}/terminal?${q({ token, cwd, cols: xt.cols, rows: xt.rows })}`);
+  let ticket;
+  try { ticket = (await api("/api/term/ticket", { method: "POST" })).ticket; }
+  catch (err) { xt.write(`\r\n[can't open the terminal: ${err.message}]\r\n`); term.ended = true; drawTermTabs(); return; }
+  const ws = new WebSocket(`${proto}//${location.host}/terminal?${q({ ticket, cwd, cols: xt.cols, rows: xt.rows })}`);
   ws.binaryType = "arraybuffer";
   term.ws = ws;
   const enc = new TextEncoder();

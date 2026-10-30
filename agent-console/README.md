@@ -22,7 +22,7 @@ python3 -m http.server 8000 --bind 127.0.0.1 -d agent-console
 
 The top bar holds what spans clusters: **Clusters** (`#/c`, one row per cluster), **Proposals** and
 **Packages**. A cluster's page (`#/c/NAME/TAB`, `cluster.js`) has its Overview, Jobs, Apps, Installed, Storage,
-Files, Agents (the agent profile's row, Activity, SSH keys) and Settings; `#/c/NAME/apps/APP` is one app there
+Files, SSH keys, Agents (the agent profile's row and Activity) and Settings; `#/c/NAME/apps/APP` is one app there
 with its settings in place, and a package's tabs for it. The older pages below still open from their addresses.
 The tunnel apps the console lists (`GET /api/apps`): **JupyterLab**, **VS Code** and **PAI**, each a session per
 cluster in a SLURM job behind its own tunnel (Start, Open, Stop, Log,
@@ -114,11 +114,16 @@ See the [cluster preset package format](../docs/cluster-presets.md).
 
 ## SSH keys
 
-A cluster's **Agents → Tunnel and setup → Set up SSH** creates or reuses a compute identity in the shared
-cluster home after login. **Agents → SSH keys** lists identities and provides public-key
-copying, key creation/deletion, targeted authorization editing, and host identity bindings.
-General management requires a live REST tunnel and owner token. Private key contents stay
-on the cluster. See the [SSH key guide and REST reference](../docs/ssh-keys.md).
+A cluster's **SSH keys** tab (`#/c/NAME/ssh`) has separate controls for this computer's login key,
+the cluster's compute key, and general management of keys stored on the cluster. After the first
+login, Overview offers **Set up login key…**. Pick an existing local identity or explicitly create
+and install a dedicated Ed25519 key (without a passphrase). The public key is authorized through
+that active login, and future hpclib logins use the selected local identity. MFA may still be required.
+**Set up compute SSH** creates or reuses a compute identity in the cluster's shared home. Both
+setup actions work before agents or a REST tunnel exist. Sites that manage SSH keys retain that policy.
+General cluster key management requires a live REST tunnel and owner token; its private keys
+stay on the cluster. The old `#/c/NAME/agents/keys` link opens the restored tab. See the
+[SSH key guide and REST reference](../docs/ssh-keys.md).
 
 ## The console menu
 

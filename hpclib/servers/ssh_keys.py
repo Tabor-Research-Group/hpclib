@@ -2,7 +2,7 @@
 """Targeted, owner-managed SSH files in the cluster user's shared ~/.ssh.
 
 No private key material is returned. Native OpenSSH validates public keys and
-creates key pairs. --setup also runs over the login connection before REST starts.
+creates key pairs. --setup and --authorize also run over the login before REST starts.
 Generated keys have no passphrase, for unattended cluster services. Existing keys
 are never replaced; encrypted keys with their public files can be reused.
 """
@@ -420,6 +420,21 @@ class SSHKeyStore:
             self._write(path, "".join(lines).encode(), old)
             return self.hosts()
 
+    def authorize_login(self, line):
+        """Authorize a workstation's public key without relaxing an existing entry's restrictions."""
+        details = self.public_details(line)
+        if details["options"]:
+            raise SSHKeyError(422, "login setup takes a public key without authorization options")
+        with self.locked():
+            existing = [e for e in self.authorized()["entries"] if e["fingerprint"] == details["fingerprint"]]
+            if not existing:
+                self.change_authorized(details["public_key"])
+            os.chmod(str(self._path("authorized_keys")), 0o600)
+            os.chmod(str(self.root), 0o700)
+            return {"authorized": True, "authorization_added": not existing,
+                    "restrictions_preserved": any(e["options"] for e in existing),
+                    "fingerprint": details["fingerprint"]}
+
     def setup_cluster(self):
         with self.locked():
             private = self._path(COMPUTE_KEY)
@@ -456,11 +471,13 @@ class SSHKeyStore:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--setup", action="store_true", required=True,
-                        help="initialize or reuse the compute key in this shared home")
-    parser.parse_args(argv)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--setup", action="store_true", help="initialize or reuse the compute key in this shared home")
+    mode.add_argument("--authorize", metavar="PUBLIC_KEY", help="authorize one workstation public key; preserve existing restrictions")
+    args = parser.parse_args(argv)
     try:
-        print(json.dumps(SSHKeyStore().setup_cluster()))
+        store = SSHKeyStore()
+        print(json.dumps(store.authorize_login(args.authorize) if args.authorize is not None else store.setup_cluster()))
         return 0
     except SSHKeyError as e:
         print(json.dumps({"error": str(e)}))

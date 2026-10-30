@@ -1,0 +1,99 @@
+Shared first-party authentication API implemented by this patch
+
+Python: from hpclib.auth import TokenRegistry, TokenAuth, ServiceToken,
+CapabilityTickets, ResourceSigner. Only the standard library is required.
+Standalone servers import token_auth beside rest_server.py. Legacy imports of
+TokenAuth/TokenIdentity from rest_server continue to work.
+
+TokenRegistry(path, audience='hpclib:rest')
+  create_grant(name, scopes, allow) -> grant (privileged)
+  update_grant(grant_id, scopes, allow) -> grant (privileged)
+  issue(grant_id, ttl=900, lease=43200, scopes=None, allow=None, device_id=None)
+    -> {token, session} (privileged; secret returned once)
+  identify(token) -> TokenIdentity or None
+  delegate(token, ttl=900, scopes=None, allow=None) -> {token, session}
+  rotate(token, ttl=900) -> {token, session}
+  revoke(record_id) -> {revoked} (privileged)
+  revoke_self(token) -> {revoked}
+  list() -> records without hashes (privileged metadata)
+
+Issuance/update/revoke are trusted server-side methods, not authorization checks.
+The HTTP layer below enforces privileges. Only trusted issuer code may invoke them. The current owner/admin authorization
+model remains; this API adds no SSH connection restrictions.
+
+HTTP: new REST routes, all still require Authorization: Bearer TOKEN
+
+Owner / existing '*' administrator token:
+  GET  /admin/auth                    -> {records, auth_api: 2}
+  POST /admin/auth/grants             {name, scopes, allow}
+  PUT  /admin/auth/grants             {grant_id, scopes, allow}
+  POST /admin/auth/sessions           {grant_id, ttl?, lease?, scopes?, allow?, device_id?}
+  POST /admin/auth/revoke             {record_id}
+
+Active session only (owner and legacy tokens cannot use these as refresh APIs):
+  GET    /auth/session                -> current effective identity
+  POST   /auth/session/delegate       {ttl?, scopes?, allow?}
+  POST   /auth/session/rotate         {ttl?}
+  DELETE /auth/session                -> revoke self and invalidate descendants
+
+GET /health now reports auth_api=2. Invalid/expired/revoked credentials return 401;
+missing privileges or widened delegation return 403; malformed issuance parameters
+return 400. A server without a tokens_file returns 503 for registry operations.
+Credentials and hashes are omitted from listings/audit metadata. JSON responses
+are no-store. Token mutation audit records contain operation names, not bodies.
+An already authorized request can finish after concurrent revocation; revocation
+applies to the next authorization check, not cancellation of a running operation.
+
+Scopes: the existing read, submit, propose, files:write, envs vocabulary; new
+sessions exclude '*' and raw 'slurm'. A directory allowlist is always required.
+The existing server/agent whitelist still applies. Grant checks do not replace
+execution isolation. The API neither accepts nor manages Kerberos tickets,
+rclone passwords, Jupyter tokens, code-server passwords, or mdsrv credentials.
+
+Registry format: legacy {name, sha256, scopes, allow, created} remains valid.
+New grant and session records use kind + rights and omit top-level scopes. Older
+verifiers reject them even if presented a valid secret: they must not accidentally
+ignore expiry. Redeploying an older server disables new sessions. Existing legacy
+tokens stay non-expiring; there is no automatic secret/policy migration.
+Legacy add/revoke/scope-upgrade operations share the registry lock and preserve
+new records. Legacy add-scopes refuses new sessions. Grant revocation by the legacy
+name API retains a tombstone. Owner token creation/hash handling remains available.
+
+ServiceToken hashes one first-party service startup secret in memory and checks it
+only for its audience. Console, REST and Workspace do not accept one another's
+credentials. This is shared implementation, not shared authorization.
+CapabilityTickets stores hashed, bounded, expiring single-use tickets tied to an
+audience, purpose and resource. ResourceSigner provides audience/purpose-separated
+HMAC signatures for expiring resource links. These are separate credential kinds;
+a terminal ticket or file link is never a general REST bearer.
+
+Workspace package builds embed the exact hpclib/servers/token_auth.py source via
+core_helpers. Only allowlisted core module names may be embedded, and destinations
+must be inside this package's declared tunnel directories. No extra pip dependency
+or duplicated handwritten auth implementation. Build/install require the updated
+console_packages.py; already-running older Workspace instances are unchanged.
+Raw-link signatures change; reopen files after the updated Workspace restarts.
+The Workspace startup bearer still grants that app's existing full-user access.
+Its expiration policy is not silently converted to REST session expiry.
+
+Examples (synthetic names and paths; run against a disposable registry):
+
+  registry = TokenRegistry('/private/test-tokens.json')
+  grant = registry.create_grant('project-agent', ['read'], ['/scratch/example'])
+  access = registry.issue(grant['id'], device_id='my-laptop')
+  # The caller securely delivers access['token'] once to the intended client.
+  child = registry.delegate(access['token'], allow=['/scratch/example/subdir'])
+  rotated = registry.rotate(access['token'])
+  registry.revoke(grant['id'])  # all those sessions stop authorizing requests
+
+Session and parent rotation are serialized by a filesystem lock. Rotating a parent
+to an earlier expiry can invalidate children that outlive it; the backend should
+retain sufficient parent lifetime or replace child credentials before reducing it.
+No grace window or automatic retry of arbitrary mutating requests is introduced.
+
+The initial registry has safety limits of 128 unexpired, unrevoked sessions per
+grant and 10,000 total records. Rotation reuses a record. Issuance refuses further
+records at capacity; it does not discard revocation tombstones. Owner maintenance
+must keep revoked grant names reserved and treat missing managed-session records
+as unavailable, never as permission to reissue automatically. An explicit retention policy and any additional rate limits are separate work.
+No connection backend, SSH gateway, or OS-isolation change is included.

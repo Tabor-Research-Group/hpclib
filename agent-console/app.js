@@ -497,12 +497,12 @@ async function clustersPage() {
 }
 
 async function sshKeysPage(only = null) {
-  // only: a cluster page's (its Agents tab): that cluster, no picker
+  // only: a cluster page's SSH keys tab: that cluster, no picker
   const { clusters } = await api("clusters");
   const pick = el("hpc-cluster-picker", { live: true, value: only, hidden: !!only });
   pick.clusters = clusters;
   if (only && !pick.options.some((c) => c.name === only)) {
-    return el("p", { class: "muted" }, `Start ${only}'s agent tunnel (Tunnel and setup) to manage its SSH keys.`);
+    return el("p", { class: "muted" }, `Start ${only}'s agent tunnel on the Agents tab with an owner token to manage keys stored on the cluster. The login and compute setup controls above work before that.`);
   }
   const body = el("div", { class: "ssh-manager" });
   const status = el("span", { class: "muted", role: "status" });
@@ -610,7 +610,7 @@ async function sshKeysPage(only = null) {
   };
   pick.addEventListener("change", () => load().catch(() => {}));
   if (pick.options.length) await load().catch(() => {});
-  else status.textContent = "Start a cluster REST tunnel with an owner token to manage keys. Set up compute SSH from the Clusters page.";
+  else status.textContent = "Start a cluster REST tunnel with an owner token to manage keys. Login and compute SSH setup are on each cluster's SSH keys tab.";
   return [el("div", { class: "toolbar" }, only ? null : el("h2", {}, "SSH keys"), pick,
     action("Reload keys", load, { disabled: !pick.options.length }), status), body];
 }
@@ -1649,6 +1649,10 @@ function route() {
   const segs = location.hash.replace(/^#\/?/, "").split("?")[0].split("/");
   // the cluster-first pages: #/c (the clusters) and #/c/NAME/TAB (one cluster)
   if (segs[0] === "c") {
+    // Keep bookmarks from the nested 1.x Agents subtab working after restoring the visible SSH tab.
+    if (segs[2] === "agents" && segs[3] === "keys") {
+      return { app: "c", page: "cluster", cluster: decodeURIComponent(segs[1]), tab: "ssh", sub: "" };
+    }
     const tab = clusterUI.CLUSTER_TABS.some(([id]) => id === segs[2]) || segs[2] === "widget" ? segs[2] : "overview";
     return { app: "c", page: segs[1] ? "cluster" : "home", cluster: segs[1] ? decodeURIComponent(segs[1]) : null, tab,
              sub: decodeURIComponent(segs[3] || "") };

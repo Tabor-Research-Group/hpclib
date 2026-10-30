@@ -1,6 +1,37 @@
-# Cluster SSH keys
+# SSH keys and first-login setup
 
-From **Agents → Clusters**, log in, then choose **Set up SSH**. The console runs the same
+Open a cluster's **SSH keys** tab (`#/c/NAME/ssh`). It is visible without an agent tunnel;
+old `#/c/NAME/agents/keys` bookmarks open the same tab. Setup uses the active SSH login,
+while general cluster key management uses the owner REST tunnel.
+
+## This computer → cluster
+
+After the first password/MFA login, Overview offers **Set up login key…**. Choose an identity
+pair already in this computer's `~/.ssh`, or explicitly create a dedicated Ed25519 login key.
+New keys have no passphrase and are stored locally with private-file mode 600. Existing keys
+are never overwritten; encrypted identities use the normal SSH agent or passphrase prompt.
+
+**Install login key** sends only the public key over the active login and adds it to the cluster's
+`~/.ssh/authorized_keys`. It preserves other lines and existing restrictions for that fingerprint.
+The console saves `-i /local/path/to/key` in this cluster's profile for future hpclib logins,
+retaining ports, jump hosts, and other login arguments. Your ordinary SSH config is unchanged.
+For standalone SSH, use that identity with `ssh -i /local/path/to/key [other login options] user@host`.
+
+Setup does not close the current login or claim to have tested a fresh connection. The cluster
+must permit this authorization file and key type, and may still require MFA or separate site
+registration. Sites marked `ssh_keys: site-managed` disable these mutations. No saved password,
+REST tunnel, remote hpclib installation, or agent token is required. The remote helper needs
+Python 3.7+ and native `ssh-keygen`, as compute setup does.
+
+If remote installation fails after creating a local key, that pair is retained for retry. Choose
+**Reload identities**, select it, and install again. A successful remote authorization followed
+by a local save conflict is reported explicitly; refresh and retry. Switching the selected
+identity does not revoke older authorizations.
+
+## Login node → compute nodes
+
+After login, choose **Set up compute SSH** on the same tab. The old **Agents → Tunnel and setup →
+Set up SSH** control remains available. The console runs the same
 command available in the shell:
 
 ```bash
@@ -52,7 +83,7 @@ CONNECT_TO_JOB_SSH_ARGS=(-o "IdentityFile=$HOME/.ssh/another key")
 
 ## General key management
 
-**Agents → SSH keys** needs a live REST tunnel and the cluster owner token. It supports:
+The **Keys stored on the cluster** section needs a live REST tunnel and the cluster owner token. It supports:
 
 - Listing named identity pairs, key types, SHA256 fingerprints, comments, and public keys.
 - Creating Ed25519 or RSA-3072 pairs, copying public keys, changing public-file comments,
@@ -108,6 +139,14 @@ detect stale edits; the console sends them for authorizations and host bindings.
 authorization entries are reported as ambiguous rather than removed together. Manual editors
 do not take the advisory lock; refresh before editing after an external file change.
 Deleting a pair does not remove remote registrations or authorization entries automatically.
+
+The authenticated local console exposes `GET /api/clusters/NAME/ssh/login-keys` (local public metadata,
+the suggested key name, and the configured identity) and `POST /api/clusters/NAME/ssh/login-key`
+with `{"key": "simple-filename", "create": false}`. The latter needs an active login; `create: true`
+creates a new Ed25519 pair without a passphrase before authorization. Key paths and private-key
+uploads are rejected. On success the profile's `ssh_login_key` records public metadata, and its
+`login` arguments select the identity. These endpoints belong to the local console, not the REST/MCP
+agent interface. SSH bootstrap uses batch mode so an expired master cannot start a password prompt.
 
 The console also exposes `POST /api/clusters/NAME/ssh/setup` with `{}`. It requires an active
 login and starts a tracked `ssh_setup` operation; read its state and log through the existing

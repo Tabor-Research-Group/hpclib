@@ -90,7 +90,7 @@ class TestWorkspaceUI(pkg.ServerCase):
         self.page.locator("#files tr", has_text="page.html").click()
         frame = self.page.locator(".view:not([hidden]) iframe")
         frame.wait_for()
-        self.assertEqual(frame.get_attribute("sandbox"), "allow-scripts allow-popups allow-forms allow-modals")
+        self.assertEqual(frame.get_attribute("sandbox"), "allow-scripts allow-popups")
         self.page.locator("#files tr", has_text="movie.mp4").click()
         self.page.locator(".view:not([hidden]) video").wait_for()
         self.assertEqual(len(self.page.locator(".tabs .tab").all()), 4)

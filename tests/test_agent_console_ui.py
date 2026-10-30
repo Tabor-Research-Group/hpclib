@@ -532,6 +532,76 @@ class TestConsoleUI(unittest.TestCase):
         self.assertEqual(store.authorized()['entries'], [])
         self.assertEqual(self.errors, [])
 
+    def test_ssh_setup_after_first_login_works_before_agents_and_keeps_old_bookmarks(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': False, 'port': 1234,
+             'has_owner_token': False, 'login': {'state': 'none'}, 'tunnel': {'state': 'down'}}
+        info = {'keys': [], 'errors': [], 'suggested_key': 'id_ed25519_hpclib_demo', 'configured': None}
+        mutations, rest_requests = [], []
+        def handler(route, path):
+            if '/rest/' in path:
+                rest_requests.append(path)
+                route.fulfill(status=503, body='{}', content_type='application/json')
+                return True
+            if route.request.method != 'GET':
+                mutations.append((path, route.request.post_data_json))
+                if path == 'clusters/demo/login': c['login'] = {'state': 'connected'}
+                if path == 'clusters/demo/ssh/login-key':
+                    c['ssh_login_key'] = info['configured'] = {'name': 'id_ed25519_hpclib_demo', 'fingerprint': 'SHA256:local'}
+                    info['keys'] = [dict(info['configured'], private_available=True)]
+                    result = {'message': 'Public key installed. Future hpclib logins will use it; MFA may still be required.'}
+                elif path == 'clusters/demo/ssh/setup': result = {'kind': 'ssh_setup', 'state': 'running'}
+                else: result = c['login']
+            else:
+                answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c,
+                           'health': {'hpclib_version': '1.0.0'}, 'clusters/demo/login': c['login'],
+                           'clusters/demo/ssh/login-keys': info,
+                           'clusters/demo/operation': {'kind': 'ssh_setup', 'state': 'succeeded', 'log': ['Compute key ready.']}}
+                if path not in answers: return False
+                result = answers[path]
+            route.fulfill(body=json.dumps(result), content_type='application/json')
+            return True
+        self.load_console(handler)
+        self.page.goto(self.base + '/#/c/demo/ssh')
+        def assert_clean_key_card():
+            text = self.page.locator('#ssh-login-key').inner_text()
+            for artifact in ('null', 'undefined', '[object '):
+                self.assertNotIn(artifact, text)
+        create = self.page.get_by_role('button', name='Create and install login key', exact=True)
+        create.wait_for()
+        assert_clean_key_card()
+        self.assertTrue(create.is_disabled())
+        self.assertTrue(self.page.get_by_role('button', name='Set up compute SSH', exact=True).is_disabled())
+        self.page.goto(self.base + '/#/c/demo/overview')
+        self.page.locator('.cluster-head').get_by_role('button', name='Log in', exact=True).click()
+        self.page.locator('hpc-dialog input[autocomplete=current-password]').fill('test-only-password')
+        self.page.locator('hpc-dialog form').get_by_role('button', name='Log in', exact=True).click()
+        self.page.get_by_role('link', name='Set up login key…', exact=True).wait_for(timeout=10000)
+        self.page.get_by_role('link', name='Set up login key…', exact=True).click()
+        self.page.get_by_text('The new private key stays on this computer, without a passphrase.', exact=False).wait_for()
+        assert_clean_key_card()
+        self.assertFalse(create.is_disabled())
+        create.click()
+        self.page.get_by_text('Public key installed. Future hpclib logins will use it; MFA may still be required.', exact=True).wait_for()
+        assert_clean_key_card()
+        self.assertIn(('clusters/demo/ssh/login-key', {'key': 'id_ed25519_hpclib_demo', 'create': True}), mutations)
+        info['errors'] = [{'name': 'broken-one', 'error': 'public key file is missing'},
+                          {'name': 'broken-two', 'error': 'public key file is invalid'}]
+        self.page.get_by_role('button', name='Reload identities', exact=True).click()
+        self.page.get_by_text('broken-one: public key file is missing', exact=True).wait_for()
+        self.page.get_by_text('broken-two: public key file is invalid', exact=True).wait_for()
+        assert_clean_key_card()
+        self.page.get_by_role('button', name='Set up compute SSH', exact=True).click()
+        self.page.get_by_text('Compute SSH setup: succeeded', exact=True).wait_for()
+        self.assertFalse(self.page.get_by_role('button', name='Set up compute SSH', exact=True).is_disabled())
+        self.page.goto(self.base + '/#/c/demo/agents/keys')
+        self.page.get_by_text('This computer → cluster', exact=True).wait_for()
+        self.assertEqual(self.page.locator('#pages a.active').inner_text(), 'SSH keys')
+        self.page.goto(self.base + '/#/c/demo/overview')
+        self.page.locator('.cluster-head').get_by_role('button', name='Log out', exact=True).wait_for()
+        self.assertEqual(self.page.locator('#ssh-first-login').count(), 0)
+        self.assertEqual(rest_requests, [])
+        self.assertEqual(self.errors, [])
+
     def test_settings_clear_leftover_ports_warns_about_extra_logins(self):
         cluster = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 20735,
                    'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'down'}}
@@ -711,16 +781,16 @@ class TestConsoleUI(unittest.TestCase):
         self.page.get_by_text('behind higher-priority jobs').wait_for()
         self.assertEqual(self.page.locator('#pages a.active').inner_text(), 'Jobs')
         self.assertEqual(self.page.locator('#pages a').all_text_contents(),
-                         ['Overview', 'Jobs', 'Apps', 'Installed', 'Storage', 'Files', 'Agents', 'Settings'])
+                         ['Overview', 'Jobs', 'Apps', 'Installed', 'Storage', 'Files', 'SSH keys', 'Agents', 'Settings'])
         self.assertEqual(self.page.locator('#apps a').all_text_contents(), ['Clusters', 'Proposals '])
         # the cluster's name is a switcher: the same tab on another cluster
         self.page.get_by_label('Cluster', exact=True).locator('select').select_option('other')
         self.page.get_by_text("Log in to see this cluster's jobs.").wait_for()
         self.assertTrue(self.page.url.endswith('#/c/other/jobs'), self.page.url)
-        # Agents: the profile's row (tunnel, setup), with Activity and SSH keys beside it
+        # Agents: the profile's row (tunnel, setup), with Activity beside it; SSH keys has its own tab.
         self.page.goto(self.base + "/#/c/demo/agents")
         self.page.locator('hpc-cluster-row[cluster="demo"]').wait_for()
-        self.assertEqual(self.page.locator('nav.subtabs a').all_text_contents(), ['Tunnel and setup', 'Activity', 'SSH keys'])
+        self.assertEqual(self.page.locator('nav.subtabs a').all_text_contents(), ['Tunnel and setup', 'Activity'])
         self.page.goto(self.base + "/#/c/other/agents/activity")
         self.page.get_by_text("Start other's agent tunnel", exact=False).wait_for()
         # old links to a cluster's files open its Files tab

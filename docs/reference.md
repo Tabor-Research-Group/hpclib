@@ -36,7 +36,7 @@
 | `~/.local/tunnels/rest/jobs.sqlite` | agent-API job history, token/label attribution and observed scheduler details; configurable with `jobs_db` |
 | `~/.local/tunnels/rest/python` | the Python launcher `setup_agents` chose |
 | `~/.local/share/hpclib/tunnels/` | installed tunnels (`HPCLIB_TUNNEL_INSTALL_LOCATION`) |
-| `~/.config/hpclib/smb/` | `smbshell`'s Kerberos ticket and saved password |
+| `~/.config/hpclib/smb/` | `smbshell`'s private Kerberos ticket; old password files are unused |
 
 ## Environment variables
 

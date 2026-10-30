@@ -81,7 +81,9 @@ class FakeShell:
         self.downloads_error = None                                              # what --downloads says instead
         self.clear_output = ""                                                   # what clear_tunnel_ports prints
         self.smb_status = {"host": "files.example.edu", "user": "me", "auth": "auto", "kinit": "host",
-                           "rclone_kerberos": True, "ticket": None, "credentials": False, "image": True}
+                           "rclone_kerberos": False, "ticket": None, "credentials": False, "image": True,
+                           "transfer_backend": "smbclient", "smbclient": True}
+        self.smb_check_error = None
 
     def __call__(self, args, log):
         self.calls.append(list(args))
@@ -150,6 +152,11 @@ class FakeShell:
             log.write(self.clear_output.encode())
         if args[0] == "smbshell" and "status" in args:      # like tunnels/data-transfer/smbshell.sh status --json
             log.write(("HPCLIB_SMB_STATUS " + json.dumps(self.smb_status) + "\n").encode())
+        if args[0] == "smbshell" and args[-1] == "check":
+            if self.smb_check_error:
+                log.write(("smbshell: " + self.smb_check_error + "\n").encode())
+                return subprocess.Popen(["bash", "-c", "exit 1"], start_new_session=True)
+            log.write(b"HPCLIB_SMB_CHECK OK\nConnection verified.\n")
         return subprocess.Popen(["sleep", "30" if args[0] in ("agent_tunnel", "launch_tunnel") else "0"], start_new_session=True)
 
 
@@ -1757,13 +1764,13 @@ class TestDataTransfer(ConsoleTestCase):
             state = self.call("GET", self.route)[1]
             tools = {t["id"]: t["text"] for t in state["tools"]}
             self.assertIn("Kerberos ticket for me@AUTH.EXAMPLE.EDU", tools["signin"])
-            self.assertEqual([c["id"] for c in state["controls"]], ["kdestroy", "status"])
+            self.assertEqual([c["id"] for c in state["controls"]], ["kdestroy", "check_connection", "status"])
             self.call("POST", self.route + "/control/kdestroy", {})
             self.assertEqual(self.shell.calls[-2], ["smbshell", "--on", self.host, "logout"])
             # no kinit: a password saved for sync jobs
             self.shell.smb_status.update(kinit=None, ticket=None)
             self.call("POST", self.route + "/control/status", {})
-            self.assertEqual([c["id"] for c in self.call("GET", self.route)[1]["controls"]], ["save_credentials", "status"])
+            self.assertEqual([c["id"] for c in self.call("GET", self.route)[1]["controls"]], ["status"])
             self.shell.smb_status["credentials"] = True
             self.call("POST", self.route + "/control/status", {})
             controls = self.call("GET", self.route)[1]["controls"]
@@ -1775,12 +1782,13 @@ class TestDataTransfer(ConsoleTestCase):
                                          ticket={"principal": "me@AUTH.EXAMPLE.EDU", "expires": "later"})
             self.call("POST", self.route + "/control/status", {})
             state = self.call("GET", self.route)[1]
-            self.assertIn("needs the server's DNS name", {t["id"]: t["text"] for t in state["tools"]}["signin"])
-            self.assertEqual([c["id"] for c in state["controls"]], ["save_credentials", "kdestroy", "status"])
+            self.assertIn("Kerberos ticket", {t["id"]: t["text"] for t in state["tools"]}["signin"])
+            self.assertEqual([c["id"] for c in state["controls"]], ["kdestroy", "check_connection", "status"])
         # its settings: the server, and how to sign in
-        out = self.call("PUT", self.route + "/settings", {"settings": {"SMB_HOST": "files.example.edu", "SMB_AUTH": "kerberos"}})[1]
-        self.assertEqual(out["settings"], {"SMB_HOST": "files.example.edu", "SMB_AUTH": "kerberos"})
+        out = self.call("PUT", self.route + "/settings", {"settings": {"SMB_HOST": "files.example.edu", "SMB_REALM": "AUTH.EXAMPLE.EDU"}})[1]
+        self.assertEqual(out["settings"], {"SMB_HOST": "files.example.edu", "SMB_REALM": "AUTH.EXAMPLE.EDU"})
         self.assertEqual(self.call("PUT", self.route + "/settings", {"settings": {"SMB_AUTH": "magic"}})[0], 422)
+
         # the address as it is usually written: the host, and the folder smbshell's paths are relative to
         for given in ("//10.0.0.12/research/our_group", "\\\\10.0.0.12\\research\\our_group"):
             out = self.call("PUT", self.route + "/settings", {"settings": {"SMB_HOST": given}})[1]
@@ -1792,27 +1800,48 @@ class TestDataTransfer(ConsoleTestCase):
         self.assertEqual(pushed[:3], ["tunnel_setup", self.host, "data-transfer"])
         self.assertIn("SMB_ROOT=research/our_group", pushed)
 
-    def test_password_mode_controls_with_kerberos_available(self):
+    def test_host_signin_is_distinct_from_a_transfer_ticket(self):
+        self.shell.smb_status.update(ticket_cache="FILE", host_ticket={"principal": "me@AUTH.EXAMPLE.EDU",
+                                                                      "cache": "KCM:", "expires": "later"})
         with mock.patch.object(self.clusters.logins, "alive", return_value=True):
-            for host in ("files.example.edu", "10.0.0.12"):
-                for ticket in (None, {"principal": "me@AUTH.EXAMPLE.EDU", "expires": "later"}):
-                    for saved in (False, True):
-                        with self.subTest(host=host, ticket=bool(ticket), saved=saved):
-                            self.shell.smb_status.update(host=host, auth="password", kinit="host",
-                                                         rclone_kerberos=True, ticket=ticket, credentials=saved)
-                            status, out = self.call("POST", self.route + "/control/status", {})
-                            self.assertEqual(status, 200, out)
-                            state = self.call("GET", self.route)[1]
-                            control = "forget_credentials" if saved else "save_credentials"
-                            self.assertEqual([c["id"] for c in state["controls"]], [control, "status"])
-                            signin = {t["id"]: t["text"] for t in state["tools"]}["signin"]
-                            if saved:
-                                self.assertIn("a saved password is used", signin)
-                                self.assertIn("password sign-in is selected", state["controls"][0]["confirm"])
-                            else:
-                                self.assertIn("password sign-in selected", signin)
-                                self.assertEqual(state["controls"][0]["label"], "Save password for sync jobs")
-                                self.assertTrue(state["controls"][0]["primary"])
+            self.call("POST", self.route + "/control/status", {})
+            state = self.call("GET", self.route)[1]
+            text = {tool["id"]: tool["text"] for tool in state["tools"]}["signin"]
+            self.assertIn("shell is signed in", text)
+            self.assertNotIn("KCM", text)  # product flow need not explain the cache implementation
+            self.assertEqual([control["id"] for control in state["controls"]], ["kinit", "status"])
+
+    def test_connection_control_uses_the_one_shot_backend_check(self):
+        self.shell.smb_status.update(ticket_cache="FILE", ticket={"principal": "me@AUTH.EXAMPLE.EDU",
+                                                                 "expires": "later"})
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.call("POST", self.route + "/control/status", {})
+            state = self.call("GET", self.route)[1]
+            self.assertIn("check_connection", [control["id"] for control in state["controls"]])
+            code, result = self.call("POST", self.route + "/control/check_connection", {})
+            self.assertEqual(code, 200, result)
+            self.assertEqual(result["message"], "Connection verified.")
+            self.assertIn(["smbshell", "--on", self.host, "check"], self.shell.calls)
+            self.shell.smb_check_error = "unsupported KRB5CCNAME: KCM:"
+            code, result = self.call("POST", self.route + "/control/check_connection", {})
+            self.assertEqual(code, 502)
+            self.assertIn("unsupported KRB5CCNAME: KCM:", str(result))
+            self.assertNotIn("Connection verified", str(result))
+
+    def test_old_password_mode_never_offers_password_storage(self):
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            for ticket in (None, {"principal": "me@AUTH.EXAMPLE.EDU", "expires": "later"}):
+                for saved in (False, True):
+                    self.shell.smb_status.update(auth="password", kinit="host", rclone_kerberos=False,
+                                                 ticket=ticket, credentials=saved)
+                    self.call("POST", self.route + "/control/status", {})
+                    state = self.call("GET", self.route)[1]
+                    controls = [control["id"] for control in state["controls"]]
+                    self.assertNotIn("save_credentials", controls)
+                    self.assertIn("kdestroy" if ticket else "kinit", controls)
+                    self.assertEqual("forget_credentials" in controls, saved)
+                    self.assertEqual("check_connection" in controls, bool(ticket))
+            self.assertEqual(self.call("POST", self.route + "/control/save_credentials", {})[0], 404)
 
     def test_kinit_in_the_page(self):
         with mock.patch.object(self.clusters.logins, "alive", return_value=True):
@@ -1859,6 +1888,19 @@ class TestTransferGui(ConsoleTestCase):
         self.assertEqual(status, 202, out)
         self.assertEqual(self.shell.calls[-1], ["smbshell", "--on", "-L", f"127.0.0.1:{self.port}:127.0.0.1:{self.port}",
                                                 self.host, "gui", "--port", str(self.port)])
+
+    def test_gui_ticket_status_is_imported_once_and_logout_stays_effective(self):
+        self.start()
+        observed = dict(self.shell.smb_status, ticket={"principal": "me@AUTH.EXAMPLE.EDU", "expires": "later"},
+                        observed_at=12345)
+        self.printed("HPCLIB_SMB_STATUS " + json.dumps(observed))
+        state = self.call("GET", self.route)[1]
+        self.assertEqual(state["auth"]["ticket"], observed["ticket"])
+        self.assertIn("check_connection", [item["id"] for item in state["controls"]])
+        self.shell.smb_status["ticket"] = None
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.call("POST", self.route + "/control/kdestroy", {})
+        self.assertIsNone(self.call("GET", self.route)[1]["auth"]["ticket"])
 
     def printed(self, line):
         self.log.write_text(self.log.read_text() + line + "\r\n")

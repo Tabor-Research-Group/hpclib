@@ -160,7 +160,7 @@ DOWNLOAD_KIND_RE = re.compile(r"[a-z][a-z0-9_-]{0,19}")
 DOWNLOAD_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}")
 TOKEN_KEYS = {"label", "scopes", "default_scope", "days", "description"}
 SCOPE_RE = re.compile(r"[a-z][a-z0-9_-]{0,19}")
-TOP_KEYS = {"format", "name", "version", "description", "apps", "tunnels", "settings", "clusters", "widgets"}
+TOP_KEYS = {"format", "name", "version", "description", "apps", "tunnels", "settings", "clusters", "widgets", "core_helpers"}
 WIDGET_KEYS = {"id", "title", "slot", "entry", "reads", "height", "description"}
 WIDGET_SLOTS = ("home", "cluster.overview", "cluster.tab")
 WIDGET_TOPICS = ("clusters", "jobs", "storage", "apps")      # and "theme", which every widget gets
@@ -353,6 +353,25 @@ def _check_install_files(value, app_id, members):
     return dict(value)
 
 
+# Only these first-party modules may be embedded at build time. This is a
+# source-distribution feature, not an installer that reads arbitrary local files.
+CORE_HELPERS = {"token_auth": "token_auth.py"}
+
+
+def core_helpers(manifest):
+    if not isinstance(manifest, dict):
+        raise PackageError("package manifest must be an object")
+    requests = manifest.get("core_helpers", {})
+    tunnels = manifest.get("tunnels", {})
+    if not isinstance(requests, dict) or not isinstance(tunnels, dict):
+        raise PackageError("core_helpers must map packaged tunnel paths to known core helper names")
+    for dest, helper in requests.items():
+        if (not isinstance(dest, str) or _member_path(dest) is None or not isinstance(helper, str) or helper not in CORE_HELPERS
+                or not any(isinstance(d, str) and dest.startswith(d.rstrip("/") + "/") for d in tunnels.values())):
+            raise PackageError("invalid core helper destination or name")
+    return requests
+
+
 def check_manifest(manifest, members, builtin_tunnels):
     """The manifest, normalized; raises PackageError. `builtin_tunnels`: hpclib's own tunnel names."""
     if not isinstance(manifest, dict):
@@ -362,6 +381,9 @@ def check_manifest(manifest, members, builtin_tunnels):
         raise PackageError(f"unknown keys in {MANIFEST}: {sorted(unknown)} (known: {sorted(TOP_KEYS)})")
     if manifest.get("format") != FORMAT:
         raise PackageError(f"`format` must be {FORMAT}")
+    for destination in core_helpers(manifest):
+        if destination not in members:
+            raise PackageError(f"missing embedded core helper {destination}")
     name = manifest.get("name")
     if not isinstance(name, str) or not NAME_RE.fullmatch(name):
         raise PackageError("`name` must be letters, digits, . _ - (at most 64)")
@@ -972,6 +994,9 @@ def build(directory, out=None):
     directory = os.path.abspath(directory)
     if not os.path.isfile(os.path.join(directory, MANIFEST)):
         raise PackageError(f"no {MANIFEST} in {directory}")
+    with open(os.path.join(directory, MANIFEST)) as f:
+        raw_manifest = json.load(f)
+    embedded = core_helpers(raw_manifest)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for base, dirs, names in os.walk(directory):
@@ -983,11 +1008,19 @@ def build(directory, out=None):
                 if os.path.islink(path):
                     raise PackageError(f"{path} is a symbolic link; packages hold plain files only")
                 rel = os.path.relpath(path, directory).replace(os.sep, "/")
+                if rel in embedded:
+                    raise PackageError(f"{rel} is generated from core; remove the local copy before building")
                 info = zipfile.ZipInfo(rel, date_time=(2020, 1, 1, 0, 0, 0))
                 info.external_attr = (0o755 if os.access(path, os.X_OK) else 0o644) << 16
                 info.compress_type = zipfile.ZIP_DEFLATED
                 with open(path, "rb") as f:
                     zf.writestr(info, f.read())
+        for dest, helper in embedded.items():
+            info = zipfile.ZipInfo(dest, date_time=(2020, 1, 1, 0, 0, 0))
+            info.external_attr = 0o644 << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), CORE_HELPERS[helper]), "rb") as f:
+                zf.writestr(info, f.read())
     data = buf.getvalue()
     raw, members = read_zip(data)
     builtin = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tunnels")

@@ -63,7 +63,7 @@ previously installed presets and before saving local app settings or a setup con
 An app's explicitly declared secret fields cannot be used as defaults, even under a name
 that does not look like a credential. Configuration text is for public settings only.
 
-`SMB_AUTH: "password"` is an authentication-method choice, not a password. Actual SSH
+`SMB_AUTH: "password"` is a legacy non-secret setting; Data Transfer now ignores it. Actual SSH
 passwords and MFA codes are supplied during login, held in memory only and cleared after
 use. No credential-storage field or remembered-password option is added by presets.
 

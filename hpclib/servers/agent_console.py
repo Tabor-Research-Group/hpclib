@@ -159,6 +159,10 @@ The front end depends only on the routes below; nothing here depends on it.
   POST /api/clusters/NAME/tunnel/start        runs agent_tunnel NAME ({"auto_approve_templates": all|new|review})
   POST /api/clusters/NAME/ssh/setup           initialize shared-home compute SSH via the active login;
                                               tracked ssh_setup operation, body {}
+  GET  /api/clusters/NAME/ssh/login-keys      public metadata for identities on this computer and its installed login key
+  POST /api/clusters/NAME/ssh/login-key       {"key": NAME, "create"?: false}: authorize a local public key through the
+                                              active login and save its identity in the profile; create makes a new
+                                              unencrypted Ed25519 pair, refusing to overwrite existing files
   POST /api/clusters/NAME/tunnel/stop         runs agent_stop NAME
   GET  /api/clusters/NAME/tunnel/log?lines=N  the console's log of that tunnel
   POST /api/clusters/NAME/tunnel/answer       {"answer": ...}: a password the tunnel's ssh asks for (its
@@ -189,7 +193,6 @@ from html import unescape as html_unescape
 import concurrent.futures
 import contextlib
 import io
-import hmac
 import http.client
 import http.server
 import json
@@ -217,10 +220,12 @@ import agent_profiles  # noqa: E402
 import local_platform  # noqa: E402
 sys.path.insert(0, HERE)
 import console_packages  # noqa: E402
+from token_auth import ServiceToken  # noqa: E402
 import console_prefs  # noqa: E402
 import console_styles  # noqa: E402
 import console_update  # noqa: E402
 import mcp_clients  # noqa: E402
+from ssh_keys import SSHKeyError, SSHKeyStore  # noqa: E402
 
 VERSION = "0.1"
 DEFAULT_PORT = 27180
@@ -288,19 +293,17 @@ APPS = {
         "tunnel": "data-transfer",
         "kind": "login",
         "smb": True,
-        "description": "Files between each cluster and an SMB server, with rclone from the data-transfer-tools "
-                       "image. Start serves a web GUI on the cluster's login node, through the console's ssh "
-                       "login: rclone's by default (remotes smb, the server, and cluster, its files, plus any a "
-                       "settings package adds), or the one Settings… → GUI names. Sign in once beside it: "
-                       "Kerberos (kinit) where the cluster has it, or a password saved for sync jobs; without "
-                       "either, Start asks for the password and keeps it only until Stop. On the cluster: "
-                       "smbshell (smbshell --help), and smbshell submit for SLURM jobs.",
+        "description": "Sign in for command-line and agent transfers with Kerberos and Samba. "
+                       "Optionally start rclone's web GUI with a password for that session; the same sign-in "
+                       "automatically creates the transfer ticket. Closing the GUI keeps the ticket until it "
+                       "expires or you sign out.",
         "open_path": "/",
         "health_path": "/",                 # anything that answers (rclone rcd: 401 without its login) is up
         # smbshell gui prints where to open the GUI, and its own random login, once (SMB_GUI picks which GUI)
         "gui_re": TRANSFER_GUI_RE,
-        "note": "The SMB password for this session's GUI, on the cluster's login node: it is kept (in rclone's "
-                "reversible encoding) in a private in-memory file until you Stop it. Nothing is saved for later.",
+        "note": "Enter your account password once to open the optional GUI and sign in for transfers. "
+                "The GUI keeps its password only for this session in memory. Command-line tools and agents "
+                "use a Kerberos ticket, which remains available after the GUI closes.",
         "settings": [
             ("SMB_HOST", "SMB server", "just the host, e.g. files.example.edu; //HOST/SHARE/FOLDER fills in the folder too"),
             ("SMB_ROOT", "Folder", "SHARE/FOLDER that smbshell paths are relative to, e.g. research/our_group"),
@@ -309,12 +312,12 @@ APPS = {
             ("SMB_DOMAIN", "Domain", "for a password, the domain if User name has none (rclone's default is "
                                      "WORKGROUP), e.g. example.edu"),
             ("SMB_REALM", "Kerberos realm", "for kinit (the user name without its @domain, in this realm), e.g. "
-                                            "AUTH.EXAMPLE.EDU; default krb5.conf's"),
-            ("SMB_SPN", "Kerberos name of the server", "if Kerberos says cifs/SERVER is \"not found in Kerberos "
-                                                       "database\": smbshell find-spn shows the one it knows"),
-            ("SMB_AUTH", "Sign in with", "auto: a Kerberos ticket if you have one, else the saved password",
-             ("auto", "kerberos", "password")),
-            ("SMB_GUI", "GUI", "what Start opens: rclone (rclone's web GUI), NAME for NAME.gui.sh from a settings "
+                                            "AUTH.EXAMPLE.EDU; kinit defaults to krb5.conf, transfers to the ticket's realm"),
+            ("SMB_SPN", "Kerberos name of the server", "optional cifs/NAME override; when blank, an unknown server "
+                                                       "principal is retried with the short name on a read-only probe"),
+            ("SMB_KRB5_CONF", "Kerberos configuration", "optional configuration file on the cluster supplied by IT; "
+                                                      "otherwise use the cluster's existing configuration"),
+            ("SMB_GUI", "Optional GUI", "what Start opens: rclone (rclone's web GUI), NAME for NAME.gui.sh from a settings "
                                "package, or a program on the cluster (smbshell --help); default rclone"),
             ("SMB_IMAGE", "Image", "where data-transfer-tools.sif is kept; default /scratch/user/USER/images/"
                                    "data-transfer-tools.sif"),
@@ -455,7 +458,7 @@ def redact(value):
 REST_ROUTE_RE = re.compile(r"[A-Za-z0-9_./-]{1,256}")
 PROFILE_KEYS = ("name", "host", "port", "process_port", "work_dirs", "binds", "local_roots", "token_name", "preset",
                 "mcp_name", "created", "updated", "setup_config", "mcp_python", "mcp_command", "mcp_args", "python_spec",
-                "remote_python", "app_view")
+                "remote_python", "app_view", "ssh_login_key")
 
 
 class ConsoleError(Exception):
@@ -1165,6 +1168,7 @@ class Clusters:
         self.control_procs = {}      # (name, app): a row's control that asks for a password (kinit), beside its GUI
         self.instance_queries = {}   # (name, app): recent registry recovery when launch metadata is unavailable
         self._clear_requests = {}    # name -> clear_ports' options (its password too), until its operation ends
+        self.ssh_login_lock = threading.Lock()  # public-key bootstrap; no REST server needed
         self.script_runner = self._login_script
         self.storage_scans = {}      # name -> {"state": "running", "started": ...} while a storage scan runs
         self.storage_lock = threading.Lock()   # the storage cache file: a scan and quota checks both write it
@@ -1574,9 +1578,10 @@ class Clusters:
 
     # -- every job of yours on a cluster, and its storage --------------------------------------------------------
 
-    def _login_script(self, profile, script, args=(), wait=60):
+    def _login_script(self, profile, script, args=(), wait=60, batch=False):
         """`script` run with bash on the cluster's login node over the console's login: (exit code, stdout, stderr)."""
-        argv = self.hpclib_argv(["pssh"] + ssh_options(profile) + [profile["host"], shlex.join(["bash", "-s", "--", *args])])
+        options = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ConnectionAttempts=1"] if batch else []
+        argv = self.hpclib_argv(["pssh"] + options + ssh_options(profile) + [profile["host"], shlex.join(["bash", "-s", "--", *args])])
         try:
             res = subprocess.run(argv, input=script.encode(), capture_output=True, timeout=wait,
                                  env=dict(os.environ, **self.HPCLIB_ENV), start_new_session=True)
@@ -2035,6 +2040,85 @@ class Clusters:
             login.append(profile["host"])
         return self.run_operation(profile, "ssh_setup", ["setup_cluster_ssh"] + login,
                                   title="Set up cluster SSH")
+
+    def ssh_login_keys(self, profile):
+        """Public metadata from this computer, separate from the cluster's REST key store."""
+        try:
+            info = SSHKeyStore().keys()
+        except SSHKeyError as e:
+            raise ConsoleError(e.status, str(e)) from e
+        # Profile directory names may contain @, whereas identity filenames may not.
+        label = re.sub(r"[^A-Za-z0-9_.-]+", "_", profile["name"]).strip("._-") or "cluster"
+        suggested = ("id_ed25519_hpclib_" + label)[:128]
+        if suggested.endswith(".pub"):
+            suggested = suggested[:-4] + "_pub"  # .pub is reserved for a pair's public file
+        return dict(info, configured=profile.get("ssh_login_key"),
+                    suggested_key=SSHKeyStore.name(suggested))
+
+    def install_ssh_login_key(self, profile, body):
+        if (profile.get("preset") or {}).get("ssh_keys") == "site-managed":
+            raise ConsoleError(409, "this site's SSH keys are managed by the cluster; use its key registration process")
+        if (not isinstance(body, dict) or set(body) - {"key", "create"}
+                or not isinstance(body.get("create", False), bool)):
+            raise ConsoleError(422, "login key setup takes a key name and optional create: true|false")
+        try:
+            name = SSHKeyStore.name(body.get("key"))
+        except SSHKeyError as e:
+            raise ConsoleError(e.status, str(e)) from e
+        if not self.logins.alive(profile):
+            raise ConsoleError(409, "log in first; your active login is used to install the public key")
+        if not self.ssh_login_lock.acquire(blocking=False):
+            raise ConsoleError(409, "another login key setup is running; try again when it finishes")
+        try:
+            store = SSHKeyStore()
+            if body.get("create"):
+                store.create(name, "ed25519", "hpclib login: " + profile["name"][:100])
+            key = store.key(name)
+            if key.get("error") or not key["private_available"] or key.get("options"):
+                raise ConsoleError(422, "choose a local identity pair with a valid, unrestricted public key file")
+            # Ship the native helper over the authenticated login, just as compute setup does.
+            # Only the public line crosses the connection; no REST process or remote install is needed.
+            with open(os.path.join(HERE, "ssh_keys.py")) as f:
+                helper = f.read()
+            script = ('launcher="${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/rest/python"\n'
+                      '[ -x "$launcher" ] || launcher=python3\n'
+                      'exec "$launcher" - --authorize "$1" <<\'HPCLIB_SSH_PUBLIC_KEY_HELPER\'\n'
+                      + helper + '\nHPCLIB_SSH_PUBLIC_KEY_HELPER\n')
+            code, out, err = self.script_runner(profile, script, [key["public_key"]], wait=45, batch=True)
+            try:
+                result = json.loads(out.strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                result = {}
+            if not isinstance(result, dict):
+                result = {}
+            if code or result.get("authorized") is not True or result.get("fingerprint") != key["fingerprint"]:
+                message = result.get("error") or err.strip()[-1000:] or "the cluster did not confirm authorization"
+                raise ConsoleError(502, "public key installation failed: " + message)
+            # Re-read after the network operation, preserving unrelated profile edits and refusing to bind
+            # this authorization to an account whose address/login changed in the meantime.
+            current = agent_profiles.load(profile["name"])
+            if not current or current.get("host") != profile.get("host") or ssh_options(current) != ssh_options(profile):
+                raise ConsoleError(409, "the cluster login settings changed; the public key was authorized, but its local settings were not saved. Refresh and retry")
+            identity = str(store.root / name)
+            options = ssh_options(current)
+            previous = (current.get("ssh_login_key") or {}).get("name")
+            old_identity = str(store.root / previous) if previous else None
+            # Replace only a previous managed -i, leaving user-specified ports, jumps and identities intact.
+            if old_identity:
+                options = [value for i, value in enumerate(options)
+                           if not (value == "-i" and i + 1 < len(options) and options[i + 1] == old_identity)
+                           and not (i > 0 and options[i - 1] == "-i" and value == old_identity)]
+            if not any(options[i:i + 2] == ["-i", identity] for i in range(len(options))):
+                options = ["-i", identity] + options
+            current["login"] = options + [current["host"]]
+            current["ssh_login_key"] = {"name": name, "fingerprint": key["fingerprint"], "installed": time.time()}
+            agent_profiles.save(current)
+            return dict(result, key=current["ssh_login_key"],
+                        message="Public key installed. Future hpclib logins will use it; the site may still require MFA. A new login has not been tested.")
+        except SSHKeyError as e:
+            raise ConsoleError(e.status, str(e)) from e
+        finally:
+            self.ssh_login_lock.release()
 
     def setup(self, profile, body):
         unknown = set(body) - {"work_dirs", "binds", "local_roots", "templates", "rebuild", "repair_owner_token", "mcp_python",
@@ -2894,12 +2978,11 @@ class Clusters:
     TRANSFER_CONTROLS = {
         # id: (smbshell command, runs in a terminal that may ask for a password, note for the password dialog)
         "status": ("status", False, None),
+        "check_connection": ("check", False, None),
         "kinit": ("login", True, "Kerberos sign-in for the SMB server (kinit, on the cluster): your password "
-                                  "goes to kinit, which keeps a ticket on the cluster; nothing is stored here."),
+                                  "goes to kinit, which keeps a transfer ticket on the cluster. Your account "
+                                  "password is not saved."),
         "kdestroy": ("logout", False, None),
-        "save_credentials": ("save-credentials", True,
-                             "The SMB server's password, saved on the cluster (mode 600, in rclone's reversible "
-                             "encoding) so sync jobs can sign in without prompting."),
         "forget_credentials": ("forget-credentials", False, None),
     }
 
@@ -2918,50 +3001,27 @@ class Clusters:
         if auth.get("host"):
             tools.append({"id": "folder", "kind": "info", "label": "Folder",
                           "text": auth.get("root") or "none: smbshell paths are SHARE/PATH"})
-        if auth.get("auth") == "password":
-            text = ("a saved password is used by smbshell and sync jobs" if auth.get("credentials") else
-                    "password sign-in selected: save a password for sync jobs (smbshell asks for it otherwise)")
-            tools.append({"id": "signin", "kind": "info", "label": "Signing in", "text": text})
-            controls.append({"id": "forget_credentials", "label": "Forget saved password",
-                             "confirm": "Remove the password saved on the cluster? Sync jobs can't sign in "
-                                        "without it while password sign-in is selected."} if auth.get("credentials") else
-                            {"id": "save_credentials", "label": "Save password for sync jobs", "primary": True})
-            controls.append({"id": "status", "label": "Refresh"})
-            return tools, controls
-        kerberos = bool(auth.get("kinit")) and auth.get("rclone_kerberos")
         ticket = auth.get("ticket")
-        by_address = bool(re.fullmatch(r"[0-9.]+|.*:.*", auth.get("host") or ""))
-        if kerberos and by_address:
-            # tickets are for cifs/NAME: an address can't be signed in to with Kerberos
-            text = ("the SMB server is an address, so Kerberos can't be used (it needs the server's DNS name); "
-                    + ("a saved password signs in" if auth.get("credentials") else "save a password, or use its name"))
-            tools.append({"id": "signin", "kind": "info", "label": "Signing in", "text": text})
-            controls.append({"id": "forget_credentials", "label": "Forget saved password",
-                             "confirm": "Remove the password saved on the cluster?"} if auth.get("credentials")
-                            else {"id": "save_credentials", "label": "Save password for sync jobs", "primary": True})
-            if ticket:
-                controls.append({"id": "kdestroy", "label": "Kerberos log out"})
-            controls.append({"id": "status", "label": "Refresh"})
-            return tools, controls
+        kerberos = bool(auth.get("kinit"))
         if ticket:
             text = f"Kerberos ticket for {ticket.get('principal')}, until {ticket.get('expires')}"
-        elif auth.get("credentials"):
-            text = "a saved password (used by sync jobs, and by smbshell when there is no ticket)"
         elif kerberos:
-            text = "kinit is available: sign in with Kerberos"
-        elif auth.get("kinit"):
-            text = "kinit is available, but this image's rclone has no Kerberos: save a password for jobs"
+            text = ("Your shell is signed in, but transfers need their own sign-in. Use Sign in below."
+                    if auth.get("host_ticket") else "Sign in below for command-line and agent transfers.")
         else:
-            text = "no kinit here: save a password for sync jobs (smbshell asks for it otherwise)"
-        tools.append({"id": "signin", "kind": "info", "label": "Signing in", "text": text})
+            text = "Transfer sign-in is unavailable: kinit is needed on the cluster or in the image."
+        tools.append({"id": "signin", "kind": "info", "label": "Transfer sign-in", "text": text})
+        tools.append({"id": "gui_signin", "kind": "info", "label": "Optional GUI",
+                      "text": "Start asks for a session password and also signs in for transfers. "
+                              "Closing the GUI keeps your transfer ticket until it expires or you sign out."})
         if kerberos:
-            controls.append({"id": "kdestroy", "label": "Kerberos log out"} if ticket else
-                            {"id": "kinit", "label": "Kerberos log in (kinit)", "primary": True})
-        if not kerberos or auth.get("credentials"):
-            controls.append({"id": "forget_credentials", "label": "Forget saved password",
-                             "confirm": "Remove the password saved on the cluster? Sync jobs can't sign in "
-                                        "without it (or a Kerberos ticket)."} if auth.get("credentials") else
-                            {"id": "save_credentials", "label": "Save password for sync jobs"})
+            controls.append({"id": "kdestroy", "label": "Sign out of transfers"} if ticket else
+                            {"id": "kinit", "label": "Sign in for transfers", "primary": True})
+        if auth.get("saved_credentials") or auth.get("credentials"):
+            controls.append({"id": "forget_credentials", "label": "Remove old saved password",
+                             "confirm": "Remove the password saved by an older version? New transfers use your ticket."})
+        if ticket:
+            controls.append({"id": "check_connection", "label": "Check connection"})
         controls.append({"id": "status", "label": "Refresh"})
         return tools, controls
 
@@ -2977,9 +3037,16 @@ class Clusters:
         args = ["smbshell", "--on"] + ssh_options(profile) + [profile["host"]]
         if not interactive:
             text = self._run_setup(profile, args + ([command, "--json"] if command == "status" else [command]), 120)
+            if command == "check" and ("HPCLIB_SMB_CHECK OK" not in text.splitlines()
+                                       or re.search(r"\(exit [1-9][0-9]*\)\s*$", text)):
+                # _run_setup(check=True) deliberately hides generic setup errors.
+                # Here retain the bounded SMB/client error so the user can fix it.
+                reason = " ".join(text.strip().splitlines()[-3:])[-1200:]
+                raise ConsoleError(502, f"Connection check failed: {reason or 'no result from the cluster'}")
             if command != "status":
                 text = self._run_setup(profile, args + ["status", "--json"], 120)
-            return {"auth": self._record_auth(profile, app, text), "message": "Done."}
+            return {"auth": self._record_auth(profile, app, text),
+                    "message": "Connection verified." if command == "check" else "Done."}
         if not self.logins.alive(profile):
             raise ConsoleError(409, f"log in to {name} first: this runs over the console's ssh login")
         with self.lock:
@@ -3001,7 +3068,7 @@ class Clusters:
         threading.Thread(target=then, daemon=True).start()
         return {"started": command, "message": "Started; answer the password dialog."}
 
-    def _record_auth(self, profile, app, text):
+    def _record_auth(self, profile, app, text, launch=None):
         found = SMB_STATUS_RE.findall(text)
         if not found:
             tail = " ".join(text.strip().splitlines()[-2:])
@@ -3010,6 +3077,8 @@ class Clusters:
         auth = json.loads(found[-1])
         fresh, conf = self.app_config(profile, app, save=False)
         conf["auth"] = dict(auth, checked=time.time())
+        if launch is not None:
+            conf["auth_launch"] = launch
         agent_profiles.save(fresh)
         return conf["auth"]
 
@@ -3133,6 +3202,12 @@ class Clusters:
         if spec.get("downloads"):    # the row's download toolbar (a package's `downloads` section)
             out["downloads"] = spec["downloads"]
         if spec.get("smb"):
+            # The GUI creates a transfer ticket before it starts. Consume its
+            # status marker once; a later explicit logout must not be undone by
+            # rereading the old launch log on every page refresh.
+            observed = SMB_STATUS_RE.findall(self._last_launch(name, app))
+            if observed and observed[-1] != conf.get("auth_launch"):
+                conf["auth"] = self._record_auth(profile, app, "HPCLIB_SMB_STATUS " + observed[-1], launch=observed[-1])
             with self.lock:
                 control = self.control_procs.get((name, app))
             out["auth"] = conf.get("auth")
@@ -3880,6 +3955,7 @@ class ConsoleServer(http.server.ThreadingHTTPServer):
     def __init__(self, address, key, clusters: Clusters, allow_origin=None, static_dir=None,
                  max_body=256 << 20):
         self.key = key
+        self.auth = ServiceToken(key, "hpclib:console")
         self.clusters = clusters
         self.allow_origin = allow_origin.rstrip("/") if allow_origin else None
         self.static_dir = os.path.realpath(static_dir) if static_dir else None
@@ -3968,7 +4044,7 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
 
     def authorized(self):
         scheme, _, value = (self.headers.get("Authorization") or "").partition(" ")
-        return scheme.lower() == "bearer" and hmac.compare_digest(value.strip().encode(), self.server.key.encode())
+        return scheme.lower() == "bearer" and self.server.auth.check(value.strip(), "hpclib:console")
 
     # responses
     def send_json(self, status, payload):
@@ -4182,6 +4258,10 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 return 200, dict(c.new_ports(profile, self.json_body()), ok=True)
             if rest == ["ssh", "setup"] and verb == "POST":
                 return 202, dict(c.setup_ssh(profile, self.json_body()), ok=True)
+            if rest == ["ssh", "login-keys"] and verb == "GET":
+                return 200, dict(c.ssh_login_keys(profile), ok=True)
+            if rest == ["ssh", "login-key"] and verb == "POST":
+                return 200, dict(c.install_ssh_login_key(profile, self.json_body()), ok=True)
             if rest == ["operation"] and verb == "GET":
                 return 200, dict(c.operation(profile["name"], self.int_arg("lines", 200, 1, 5000), self.flag("latest")), ok=True)
             if rest == ["login"] and verb == "GET":

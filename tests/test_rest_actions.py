@@ -53,6 +53,7 @@ class TestManifest(unittest.TestCase):
         self.assertEqual({n: (a["mode"], a["default"], a["writes"]) for n, a in m["actions"].items()},
                          {"list": ("sync", True, None), "get": ("job", True, "cluster"), "put": ("job", False, "remote")})
         self.assertTrue((DATA_TRANSFER / m["actions"]["get"]["run"][0]).is_file())
+        self.assertEqual(m["available"]["any"], ["ticket"])
 
     def test_refused(self):
         def bad(**change):

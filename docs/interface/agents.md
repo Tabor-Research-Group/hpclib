@@ -1,7 +1,7 @@
 # Agents in the interface
 
 The agent side of each cluster is on that cluster's page (see [Clusters](clusters.md)): its **Agents** tab has
-**Tunnel and setup** (the row described under Clusters below), **Activity** and **SSH keys**, its **Files** and
+**Tunnel and setup** (the row described under Clusters below) and **Activity**; its **SSH keys**, **Files** and
 **Settings** tabs are the pages of those names, and **Proposals** is in the top bar, for every cluster. The pages
 below, with a cluster picker, still open from their old addresses (`#/clusters`, `#/activity`, `#/keys`,
 `#/settings`). Pages that read from a cluster (everything but Clusters) need that cluster's agent tunnel to be
@@ -111,10 +111,15 @@ http://127.0.0.1:27180/#/files?cluster=hpclib-grace&path=/scratch/user/me/llm/ru
 
 ## SSH keys
 
-Choose a live owner cluster to list and create identity keys, copy their public keys, edit public
-comments, manage individual authorized-key entries, and bind keys to SSH hosts such as GitHub.
-Private keys remain on the cluster. See [Cluster SSH keys](../ssh-keys.md) for file behavior,
-compute connection settings, and the REST API.
+Open the cluster's **SSH keys** tab. After logging in once, install a local public key for future
+hpclib logins or set up the cluster's compute key; neither requires an agent tunnel. The Overview
+offers a link after login until a local login key has been installed. Site-managed clusters use
+their own registration process. MFA may still be required.
+
+With a live owner tunnel, the same tab also lists and creates cluster identity keys, copies their
+public keys, edits public comments, manages individual authorized-key entries, and binds keys to
+SSH hosts such as GitHub. Those private keys remain on the cluster. Old `agents/keys` bookmarks
+open this tab. See [Cluster SSH keys](../ssh-keys.md) for details and the REST API.
 
 ## Settings
 

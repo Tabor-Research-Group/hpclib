@@ -5,10 +5,17 @@ templates and submitted with sbatch. It runs on the login node as you (the works
 it), listens on 127.0.0.1 only, and answers only with the token it prints at start (the console's Open adds it):
 a login node is shared, and anyone on it could reach the port.
 
+The token is a credential for the API, so it travels only where page JavaScript can set a header: every /api/ call
+sends it as X-Workspace-Token, and nothing accepts it in a URL. The two things a header can't carry get their own,
+short-lived credentials: the terminal's WebSocket opens with a single-use ticket (POST /api/term/ticket), and the
+viewer's files (<img>, <iframe>, <video>) come from signed URLs that expire and cover one directory
+(POST /api/raw-url). Requests that change something must be JSON (or, for PUT /api/file, a body with the token
+header), and a request that names an Origin other than the page's own is refused.
+
   workspace_server.py --port PORT [--root DIR] [--cdn URL] [--edit-limit-mb N] [--confirm-mb N]
 
 The page (ui/) loads CodeMirror (the editor) and xterm.js (the terminal) from --cdn, an npm mirror (jsDelivr's by
-default). Routes, all but /health and the page's own files needing the token (X-Workspace-Token, or ?token=):
+default). Routes, all but /health and the page's own files needing the token (X-Workspace-Token):
 
   GET  /health                       {"ok", "version"}
   GET  /api/info                     home, user, host, hpclib.sh's path, places (home, scratch), limits, the CDN
@@ -26,9 +33,14 @@ default). Routes, all but /health and the page's own files needing the token (X-
                                      at low priority, up to limit seconds (120; at most 600; then partial)
   GET  /api/jobs                     your queued and running jobs (squeue): id, name, state, time, limit, directory
   POST /api/cancel {job}             scancel one of them
-  GET  /raw/TOKEN/PATH               a file for an <img>, <iframe> or <video>, with Range; HTML and SVG with a
-                                     sandboxing Content-Security-Policy (an opaque origin: no access to the page)
-  GET  /terminal?token=&cwd=&cols=&rows=   WebSocket: your login shell in a pseudo-terminal (binary frames both
+  POST /api/raw-url {path}           {url}: a signed URL for the file (below), good for an hour, for the files in
+                                     its directory
+  GET  /raw/EXPIRES.DEPTH.SIGNATURE/PATH   a file for an <img>, <iframe> or <video>, with Range; HTML and SVG with a
+                                     sandboxing Content-Security-Policy (an opaque origin: no access to the page).
+                                     DEPTH is how many leading parts of PATH the signature covers: a page's own
+                                     images and scripts load, other directories don't
+  POST /api/term/ticket              {ticket}: opens one terminal, within ten seconds
+  GET  /terminal?ticket=&cwd=&cols=&rows=   WebSocket: your login shell in a pseudo-terminal (binary frames both
                                      ways; text frames JSON: {"type": "resize", "cols", "rows"} in, {"type": "exit"} out)
 
 Python 3.6+, standard library only.
@@ -36,7 +48,6 @@ Python 3.6+, standard library only.
 import argparse
 import base64
 import hashlib
-import hmac
 import http.server
 import json
 import mimetypes
@@ -57,18 +68,24 @@ import threading
 import time
 import urllib.parse
 
+from token_auth import ServiceToken, CapabilityTickets, ResourceSigner
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import script_templates  # noqa: E402
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 UI_DIR = os.path.join(HERE, "ui")
 MAX_ENTRIES = 5000
 MAX_JSON = 1 << 20
 MAX_TEMPLATE = 256 * 1024
 CHUNK = 1 << 16
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-SANDBOX_CSP = "sandbox allow-scripts allow-popups allow-forms allow-modals allow-downloads"
+# a page the viewer shows is somebody's file, not the Workspace's: it may run, open links and offer downloads,
+# and nothing more (no forms, no dialogs), in an origin of its own
+SANDBOX_CSP = "sandbox allow-scripts allow-popups allow-downloads"
+RAW_URL_SECONDS = 3600       # how long a viewer's file URL works (a movie keeps requesting ranges while it plays)
+TICKET_SECONDS = 10          # how long a terminal's ticket works: the page uses it at once
 SANDBOXED_TYPES = ("text/html", "image/svg+xml", "application/xhtml+xml", "text/xml", "application/xml")
 JOB_RE = re.compile(r"Submitted batch job (\d+)")
 TEMPLATE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
@@ -701,9 +718,51 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address, token, workspace):
-        self.token = token
+        self.auth = ServiceToken(token, "hpclib:workspace")
+        self.ticket_store = CapabilityTickets("hpclib:workspace")
+        self.raw_signer = ResourceSigner(token, "hpclib:workspace")
         self.workspace = workspace
         http.server.HTTPServer.__init__(self, address, Handler)
+
+    # -- terminal tickets: a WebSocket can't carry the token in a header, so the page asks for one use of it
+
+    def new_ticket(self):
+        return self.ticket_store.issue("terminal", "login-shell", TICKET_SECONDS)
+
+    def redeem_ticket(self, ticket):
+        return self.ticket_store.redeem(ticket, "terminal", "login-shell")
+
+    # -- signed file URLs: /raw/EXPIRES.DEPTH.SIGNATURE/PATH, where the signature covers the first DEPTH parts of
+    # PATH (the file's directory) and the expiry, so a URL reads that directory for an hour and is no credential
+
+    def sign_raw(self, expires, depth, directory):
+        return self.raw_signer.sign("raw", expires, [depth, directory])
+
+    def raw_url(self, path):
+        directory = os.path.dirname(path)
+        parts = [p for p in directory.split("/") if p]
+        if not parts:
+            raise Refused(400, "files directly in / can't be shown")
+        expires = int(time.time()) + RAW_URL_SECONDS
+        return "/raw/{}.{}.{}{}".format(expires, len(parts), self.sign_raw(expires, len(parts), directory),
+                                        urllib.parse.quote(path))
+
+    def verify_raw(self, prefix, path):
+        """The absolute path a signed URL's `prefix` allows `path` (already unquoted) to be, else Refused."""
+        wrong = Refused(401, "this file's link has expired or isn't valid (open the file again)")
+        try:
+            expires, depth, signature = prefix.split(".")
+            expires, depth = int(expires), int(depth)
+        except ValueError:
+            raise wrong
+        path = os.path.normpath(path)             # a ".." can't leave the signed directory: it is signed as it is
+        parts = [p for p in path.split("/") if p]
+        if depth < 1 or depth >= len(parts) or expires < time.time():
+            raise wrong
+        directory = "/" + "/".join(parts[:depth])
+        if not self.raw_signer.check(signature, "raw", expires, [depth, directory]):
+            raise wrong
+        return path
 
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):    # a page that went away
@@ -746,11 +805,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").lower()
         return re.fullmatch(r"(127\.0\.0\.1|localhost|\[::1\])(:\d+)?", host) is not None
 
-    def authorized(self, token=None):
-        given = token or self.headers.get("X-Workspace-Token") or self.query.get("token", [""])[-1]
-        return bool(given) and hmac.compare_digest(given.encode(), self.server.token.encode())
+    def authorized(self):
+        """Whether the request carries the token, in its header: never in a URL, where it would be kept in
+        histories and handed to every page the viewer shows."""
+        given = self.headers.get("X-Workspace-Token") or ""
+        return self.server.auth.check(given, "hpclib:workspace")
+
+    def same_origin(self):
+        """Whether the request comes from the Workspace's own page: a request that names another Origin (a page the
+        viewer shows has the Origin `null`) or is marked cross-site is refused."""
+        host = (self.headers.get("Host") or "").lower()
+        origin = self.headers.get("Origin")
+        if origin is not None and urllib.parse.urlsplit(origin.lower()).netloc != host:
+            return False
+        return (self.headers.get("Sec-Fetch-Site") or "same-origin") in ("same-origin", "none")
 
     def json_body(self):
+        if (self.headers.get("Content-Type") or "").split(";")[0].strip().lower() != "application/json":
+            raise Refused(415, "send JSON (Content-Type: application/json)")
         length = int(self.headers.get("Content-Length") or 0)
         if length > MAX_JSON:
             raise Refused(413, "the request is too large")
@@ -775,14 +847,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if verb in ("GET", "HEAD") and (path == "/" or path.startswith("/ui/")):
                 return self.static(path)
             if path.startswith("/raw/") and verb in ("GET", "HEAD"):
-                token, _, rest = path[len("/raw/"):].partition("/")
-                if not self.authorized(token):
-                    raise Refused(401, "the Workspace's token is missing or wrong (Open it from the console again)")
-                return self.send_file(urllib.parse.unquote("/" + rest), editing=False)
+                prefix, _, rest = path[len("/raw/"):].partition("/")
+                return self.send_file(self.server.verify_raw(prefix, urllib.parse.unquote("/" + rest)), editing=False)
+            if not self.same_origin():
+                raise Refused(403, "the Workspace answers only its own page")
+            if path == "/terminal" and verb == "GET":
+                if not self.server.redeem_ticket(self.query.get("ticket", [""])[-1]):
+                    raise Refused(401, "the terminal's ticket is missing, used or too old")
+                return self.terminal()
             if not self.authorized():
                 raise Refused(401, "the Workspace's token is missing or wrong (Open it from the console again)")
-            if path == "/terminal" and verb == "GET":
-                return self.terminal()
             status, payload = self.route(verb, path)
             if payload is not None:
                 self.send_json(status, payload)
@@ -816,6 +890,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return 200, ws.rename(body.get("from"), body.get("to"))
         if path == "/api/delete" and verb == "POST":
             return 200, ws.delete(self.json_body().get("path"))
+        if path == "/api/raw-url" and verb == "POST":
+            return 200, {"url": self.server.raw_url(ws.stat(self.json_body().get("path"))["path"])}
+        if path == "/api/term/ticket" and verb == "POST":
+            return 200, {"ticket": self.server.new_ticket()}
         if path == "/api/templates" and verb == "GET":
             return 200, ws.templates()
         if path == "/api/templates/edit" and verb == "POST":

@@ -41,6 +41,22 @@ class TestSSHFiles(unittest.TestCase):
                            (self.store.root / "authorized_keys", 0o600)):
             self.assertEqual(stat.S_IMODE(file.stat().st_mode), mode)
 
+    def test_login_authorization_preserves_restrictions_and_other_lines(self):
+        key = self.store.create('workstation')
+        auth = self.store.root / 'authorized_keys'
+        original = '# existing keys\nrestrict ' + key['public_key'] + '\n'
+        auth.write_text(original)
+        result = self.store.authorize_login(key['public_key'])
+        self.assertTrue(result['authorized'])
+        self.assertTrue(result['restrictions_preserved'])
+        self.assertFalse(result['authorization_added'])
+        self.assertEqual(auth.read_text(), original)
+        other = self.store.create('other')
+        self.assertTrue(self.store.authorize_login(other['public_key'])['authorization_added'])
+        self.assertFalse(self.store.authorize_login(other['public_key'])['authorization_added'])
+        self.assertEqual(auth.read_text(), original + other['public_key'] + '\n')
+        self.assert_error(422, self.store.authorize_login, 'restrict ' + other['public_key'])
+
     def test_setup_recovers_public_and_refuses_orphans_or_mismatches(self):
         result = self.store.setup_cluster()
         public = self.store.root / (COMPUTE_KEY + ".pub")

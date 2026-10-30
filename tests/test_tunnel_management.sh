@@ -619,7 +619,7 @@ case "$out" in *"isn't on your PATH"*) ;; *) fail "no PATH advice: $out" ;; esac
 if HPCLIB_PYTHON=false "$HPCLIB_DIR/launch-tunnel-manager" > /dev/null 2>&1; then fail 'ran without a usable Python'; fi
 
 ################################################################################
-# smbshell: rclone in the data-transfer-tools image, with Kerberos or a saved password
+# Data Transfer image installation; behavioral cases use the native Samba fixture below.
 sb="$test_dir/smb"
 mkdir -p "$sb/bin" "$sb/home" "$sb/data" "$sb/scratch/out" "$sb/images"
 : > "$sb/images/dtt.sif"
@@ -673,6 +673,7 @@ cat > "$sb/bin/sbatch" <<'SCRIPT'
 #!/usr/bin/env bash
 { printf 'sbatch'; printf ' %s' "$@"; printf '\nSMBSHELL_DIR=%s\n' "$SMBSHELL_DIR"; } >> "$TEST_SMB_LOG"; echo 9001
 SCRIPT
+printf '#!/usr/bin/env bash\necho "Version 4.17.12"\n' > "$sb/bin/smbclient"
 chmod +x "$sb/bin/"*
 mkdir -p "$sb/data/settings"
 printf 'export SMB_HOST=files.example.edu SMB_DOMAIN=EXAMPLE SMB_REALM=AUTH.EXAMPLE.EDU SMB_IMAGE=%q\n' "$sb/images/dtt.sif" \
@@ -681,267 +682,11 @@ smbsh() {  # smbsh ARGS: smbshell on "the cluster", with no terminal
   env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
     SMB_KRB5_CONF=/dev/null bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" "$@" < /dev/null
 }
-case "$(smbsh status --json)" in
-  *'"host": "files.example.edu"'*'"kinit": "host"'*'"rclone_kerberos": true'*'"ticket": null'*'"credentials": false'*) ;;
-  *) fail "status: $(smbsh status --json)" ;;
-esac
-if smbsh ls proj 2> "$sb/err"; then fail 'ls signed in with nothing to sign in with'; fi
-grep -q 'smbshell login (Kerberos) or smbshell save-credentials' "$sb/err" || fail "no advice: $(cat "$sb/err")"
-if smbsh submit get proj/raw "$sb/scratch/out" 2> "$sb/err"; then fail 'submitted a job that could not sign in'; fi
-
-# a saved password (as save-credentials leaves it), given to rclone in its environment only
-mkdir -p "$sb/home/.config/hpclib/smb" && printf 'pass=OBS:hunter2\n' > "$sb/home/.config/hpclib/smb/credentials"
-: > "$sb/log"; smbsh ls proj/raw --json
-grep -q '^rclone lsjson --retries 1 --low-level-retries 1 smb:proj/raw$' "$sb/log" || fail "ls: $(cat "$sb/log")"
-grep -q '^RCLONE_CONFIG_SMB_PASS=OBS:hunter2$' "$sb/log" || fail 'the saved password was not used'
-grep -q '^RCLONE_CONFIG_SMB_HOST=files.example.edu$' "$sb/log" && grep -q '^RCLONE_CONFIG_SMB_DOMAIN=EXAMPLE$' "$sb/log" ||
-  fail 'host or domain missing'
-# paths under SMB_ROOT, a share and folder: relative ones there, /SHARE/... from the top
-: > "$sb/log"; SMB_ROOT=research/our_group smbsh ls raw
-grep -q '^rclone lsf --retries 1 --low-level-retries 1 smb:research/our_group/raw$' "$sb/log" || fail "root: $(cat "$sb/log")"
-: > "$sb/log"; SMB_ROOT=research/our_group smbsh ls
-grep -q '^rclone lsf --retries 1 --low-level-retries 1 smb:research/our_group$' "$sb/log" || fail "root itself: $(cat "$sb/log")"
-: > "$sb/log"; SMB_ROOT=research/our_group smbsh ls /other/x
-grep -q '^rclone lsf --retries 1 --low-level-retries 1 smb:other/x$' "$sb/log" || fail "absolute: $(cat "$sb/log")"
-: > "$sb/log"; smbsh ls
-grep -q '^rclone lsf --retries 1 --low-level-retries 1 smb:$' "$sb/log" || fail "the shares: $(cat "$sb/log")"
-smbsh forget-credentials > /dev/null
-[ ! -e "$sb/home/.config/hpclib/smb/credentials" ] || fail 'forget-credentials kept the password'
-
-# save-credentials asks at a terminal and writes the encoded password, mode 600
-HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" SMB_KRB5_CONF=/dev/null \
-  python3 - "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" <<'PY'
-import os, pty, sys, time
-pid, fd = pty.fork()
-if pid == 0:
-    os.execvp("bash", ["bash", sys.argv[1], "save-credentials"])
-out = b""
-while b"Password for" not in out:
-    out += os.read(fd, 1024)
-os.write(fd, b"s3cret\n")
-while True:
-    try:
-        chunk = os.read(fd, 1024)
-    except OSError:
-        break
-    if not chunk:
-        break
-    out += chunk
-os.waitpid(pid, 0)
-assert b"s3cret" not in out, out          # not echoed
-PY
-assert_equal "$(cat "$sb/home/.config/hpclib/smb/credentials")" 'pass=OBS:s3cret'
-assert_equal "$(stat -c %a "$sb/home/.config/hpclib/smb/credentials" 2>/dev/null || stat -f %Lp "$sb/home/.config/hpclib/smb/credentials")" 600
-rm -f "$sb/home/.config/hpclib/smb/credentials"
-
-# Kerberos: login keeps the ticket where jobs see it; transfers use it, and no password
-smbsh login > "$sb/out" || fail "login: $(cat "$sb/out")"
-grep -q '^kinit me@AUTH.EXAMPLE.EDU$' "$sb/log" 2>/dev/null || grep -q "^kinit $(id -un)@AUTH.EXAMPLE.EDU$" "$sb/log" ||
-  fail "kinit: $(cat "$sb/log")"
-grep -q 'signed in: me@AUTH.EXAMPLE.EDU' "$sb/out" || fail "login output: $(cat "$sb/out")"
-[ -f "$sb/home/.config/hpclib/smb/krb5cc" ] || fail 'the ticket cache is not where jobs look'
-: > "$sb/log"; smbsh get //other.example.edu/proj/raw "$sb/scratch/out" --include '*.h5'
-grep -q "^rclone copy --stats=1m --stats-one-line -v smb:proj/raw $sb/scratch/out --include \*.h5$" "$sb/log" ||
-  fail "get: $(cat "$sb/log")"
-grep -q '^RCLONE_CONFIG_SMB_USE_KERBEROS=true$' "$sb/log" || fail 'Kerberos not used'
-grep -q '^RCLONE_CONFIG_SMB_HOST=other.example.edu$' "$sb/log" || fail '//HOST/... did not pick the host'
-grep -q 'RCLONE_CONFIG_SMB_PASS' "$sb/log" && fail 'a password went with a Kerberos transfer'
-grep -q "binds=.*$sb/scratch/out" "$sb/log" || fail 'the local folder was not bound into the image'
-: > "$sb/log"; smbsh sync push "$sb/scratch/out" proj/out --dry-run 2> "$sb/err"
-grep -q "^rclone sync --stats=1m --stats-one-line -v $sb/scratch/out smb:proj/out --dry-run$" "$sb/log" || fail "sync: $(cat "$sb/log")"
-grep -q 'deleting what' "$sb/err" || fail 'sync did not warn that it deletes'
-
-# submit: a job with the transfer, the tunnel's sbatch defaults, and yours
-: > "$sb/log"; assert_equal "$(smbsh submit --time=1:00:00 get proj/raw "$sb/scratch/out" 2>/dev/null)" 9001
-grep -q -- "--job-name=smb-transfer --output=$sb/data/sessions/data-transfer/transfer-%j.log --time=0-4:00:00 --mem=2gb --ntasks=1 --cpus-per-task=2 --time=1:00:00 $HPCLIB_DIR/tunnels/data-transfer/sbatch_script.sh get proj/raw $sb/scratch/out$" "$sb/log" ||
-  fail "sbatch: $(cat "$sb/log")"
-grep -q "^SMBSHELL_DIR=$HPCLIB_DIR/tunnels/data-transfer$" "$sb/log" || fail 'the job does not know where smbshell is'
-printf '[["get", "proj/a", "%s/scratch/a"], ["put", "%s/scratch/out", "proj/b", "--checksum"]]\n' "$sb" "$sb" > "$sb/manifest.json"
-: > "$sb/log"; smbsh submit --manifest "$sb/manifest.json" > /dev/null 2>&1 || fail 'manifest not submitted'
-grep -q -- '--array=0-1 ' "$sb/log" || fail "no array: $(cat "$sb/log")"
-lines=$(ls "$sb/data/sessions/data-transfer/"manifest-*.jsonl)
-printf '[["ls"]]\n' > "$sb/bad.json"
-if smbsh submit --manifest "$sb/bad.json" 2>/dev/null; then fail 'accepted a manifest entry that is not a transfer'; fi
-# the job itself: entry 1 of the manifest, signed in without asking
-: > "$sb/log"
-env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" SMB_KRB5_CONF=/dev/null \
-  SMBSHELL_DIR="$HPCLIB_DIR/tunnels/data-transfer" SLURM_ARRAY_TASK_ID=1 SLURM_JOB_ID=9001 \
-  bash "$HPCLIB_DIR/tunnels/data-transfer/sbatch_script.sh" --manifest "$lines" > "$sb/job.out" 2>&1 < /dev/null ||
-  fail "the job failed: $(cat "$sb/job.out")"
-grep -q "^rclone copy --stats=1m --stats-one-line -v $sb/scratch/out smb:proj/b --checksum$" "$sb/log" || fail "job: $(cat "$sb/log")"
-# rclone's Kerberos library gets a krb5.conf it can read (RHEL's has includedir and dns_canonicalize_hostname=fallback)
-printf 'includedir /etc/krb5.conf.d/\n[libdefaults]\n    dns_canonicalize_hostname = fallback\n    default_realm = AUTH.EXAMPLE.EDU\n' > "$sb/krb5.conf"
-: > "$sb/log"
-env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
-  SMB_KRB5_CONF="$sb/krb5.conf" bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" ls proj < /dev/null
-copy="$sb/home/.config/hpclib/smb/krb5.conf"
-grep -q includedir "$copy" && fail 'includedir left in the copy for rclone'
-grep -q '^    dns_canonicalize_hostname = false$' "$copy" || fail "fallback not turned into false: $(cat "$copy")"
-grep -q 'default_realm = AUTH.EXAMPLE.EDU' "$copy" || fail 'the rest of krb5.conf was lost'
-grep -q '^    dns_lookup_kdc = true$' "$copy" || fail "KDCs not looked up in DNS: $(cat "$copy")"
-printf '[libdefaults]\n dns_lookup_kdc = false\n' > "$sb/krb5-nodns.conf"
-env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
-  SMB_KRB5_CONF="$sb/krb5-nodns.conf" bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" status > /dev/null < /dev/null
-assert_equal "$(grep -c dns_lookup_kdc "$copy")" 1          # a site's own choice is kept
-grep -q "binds=.*$copy:/etc/hpclib-krb5.conf:ro" "$sb/log" || fail 'the copy is not what the image sees'
-grep -q '^RCLONE_CONFIG_SMB_USE_KERBEROS=true$' "$sb/log" || fail 'Kerberos not used with a server name'
-# a server given by address: no Kerberos (no ticket names it), so the password
-printf 'pass=OBS:hunter2\n' > "$sb/home/.config/hpclib/smb/credentials"
-: > "$sb/log"; smbsh ls //10.0.0.12/proj 2> "$sb/err"
-grep -q 'USE_KERBEROS' "$sb/log" && fail 'Kerberos used with an address'
-grep -q '^RCLONE_CONFIG_SMB_PASS=OBS:hunter2$' "$sb/log" || fail 'the password was not used for an address'
-grep -q "needs the server's name" "$sb/err" || fail "no note about the address: $(cat "$sb/err")"
-if SMB_AUTH=kerberos smbsh ls //10.0.0.12/proj 2>/dev/null; then fail 'SMB_AUTH=kerberos accepted an address'; fi
-# a user name as smbclient takes it, me@tamu.edu: rclone gets the user and the domain apart
-mkdir -p "$sb/data2/settings"
-printf 'export SMB_HOST=files.example.edu SMB_USER=me@tamu.edu SMB_IMAGE=%q\n' "$sb/images/dtt.sif" > "$sb/data2/settings/data-transfer.sh"
-: > "$sb/log"
-env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data2" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" SMB_AUTH=password \
-  bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" ls proj < /dev/null 2>/dev/null
-grep -q '^RCLONE_CONFIG_SMB_USER=me$' "$sb/log" && grep -q '^RCLONE_CONFIG_SMB_DOMAIN=tamu.edu$' "$sb/log" ||
-  fail "user@domain: $(cat "$sb/log")"
-# and kinit asks for the user in the Kerberos realm, not in the Windows domain
-: > "$sb/log"
-env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data2" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
-  bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" login < /dev/null > /dev/null 2>&1
-grep -qx 'kinit me' "$sb/log" || fail "kinit with user@domain: $(cat "$sb/log")"
-: > "$sb/log"
-env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data2" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" SMB_REALM=AUTH.TAMU.EDU \
-  bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" login < /dev/null > /dev/null 2>&1
-grep -qx 'kinit me@AUTH.TAMU.EDU' "$sb/log" || fail "kinit with a realm: $(cat "$sb/log")"
-rm -f "$sb/home/.config/hpclib/smb/krb5cc"
-# find-spn: the names DNS gives for the server, tried with kvno; SMB_SPN then reaches rclone
-cat > "$sb/bin/kvno" <<'SCRIPT'
-#!/usr/bin/env bash
-[ "$1" = "cifs/FILES" ]
-SCRIPT
-chmod +x "$sb/bin/kvno"
-if smbsh find-spn > /dev/null 2>&1; then fail 'find-spn ran without a ticket'; fi
-smbsh login > /dev/null
-out=$(smbsh find-spn) || fail "find-spn: $out"
-case "$out" in *"not known: cifs/files.example.edu"*"known:     cifs/FILES"*"--set SMB_SPN=cifs/FILES"*) ;; *) fail "find-spn: $out" ;; esac
-: > "$sb/log"; SMB_SPN=cifs/FILES smbsh ls proj
-grep -q '^RCLONE_CONFIG_SMB_SPN=cifs/FILES$' "$sb/log" || fail "SMB_SPN not given to rclone: $(cat "$sb/log")"
-smbsh logout > /dev/null
-# gui: rclone's web GUI for the session, its remotes in a private file that goes away with it
-mkdir -p "$sb/run" "$sb/data/settings/data-transfer.d"
-printf '[ours]\ntype = alias\nremote = smb:research/our_group\n' > "$sb/data/settings/data-transfer.d/rclone.conf"
-printf 'pass=OBS:hunter2\n' > "$sb/home/.config/hpclib/smb/credentials"
-: > "$sb/log"
-out=$(env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
-  XDG_RUNTIME_DIR="$sb/run" SMB_ROOT=research/our_group SMB_AUTH=password \
-  bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" gui --port 27555 2>/dev/null < /dev/null) || fail "gui: $out"
-case "$out" in "HPCLIB_TRANSFER_GUI port=27555 user=hpclib pass="[0-9a-f]*" query=login_token="*) ;; *) fail "gui line: $out" ;; esac
-# rclone's GUI takes the login again as login_token: base64url of user:pass, URL-encoded
-python3 - "$out" <<'PY2' || fail "gui login_token: $out"
-import base64, sys, urllib.parse
-f = dict(x.split("=", 1) for x in sys.argv[1].split()[1:])
-token = urllib.parse.quote(base64.urlsafe_b64encode(f"{f['user']}:{f['pass']}".encode()).decode(), safe="")
-sys.exit(f["query"] != "login_token=" + token)
-PY2
-grep -q -- '--rc-web-gui --rc-web-gui-no-open-browser --rc-addr 127.0.0.1:27555 --rc-user hpclib --rc-pass ' "$sb/log" ||
-  fail "rcd: $(cat "$sb/log")"
-sed -n '/^--- config$/,/^--- end$/p' "$sb/log" > "$sb/gui.conf"
-# with SMB_ROOT, smb opens at that folder (as for ls/get/put) and smb-server is the whole server, which the
-# settings file's remotes (written for smb: as the server) now name
-for want in '[smb-server]' 'type = smb' 'host = files.example.edu' 'domain = EXAMPLE' 'pass = OBS:hunter2' \
-            '[smb]' 'type = alias' 'remote = smb-server:research/our_group' \
-            '[cluster]' 'type = local' '[ours]'; do
-  grep -qxF "$want" "$sb/gui.conf" || fail "gui config lacks '$want': $(cat "$sb/gui.conf")"
-done
-[ "$(grep -cxF 'remote = smb-server:research/our_group' "$sb/gui.conf")" = 2 ] ||
-  fail "the settings file's alias still names smb: $(cat "$sb/gui.conf")"
-grep -q 'remote = smb:' "$sb/gui.conf" && fail "a remote still points at smb: $(cat "$sb/gui.conf")"
-grep -qF '[lab]' "$sb/gui.conf" && fail 'the gui config still has a [lab] remote of its own'
-# a GUI of your own (SMB_GUI=NAME: NAME.gui.sh, as a settings package leaves it, not executable): signed in, with
-# the session's remotes, a login to require, and rclone in the image to call; it says where to open it
-cat > "$sb/data/settings/data-transfer.d/mine.gui.sh" <<'SCRIPT'
-echo "HPCLIB_TRANSFER_GUI port=$HPCLIB_GUI_PORT path=/files user=$HPCLIB_GUI_USER pass=$HPCLIB_GUI_PASS"
-echo "mine port=$HPCLIB_GUI_PORT dir=$HPCLIB_GUI_DIR config=$RCLONE_CONFIG" >> "$TEST_SMB_LOG"
-[ "$(dirname "$RCLONE_CONFIG")" = "$HPCLIB_GUI_DIR" ] && grep -qxF '[ours]' "$RCLONE_CONFIG" ||
-  echo "mine: no session config" >> "$TEST_SMB_LOG"
-"$SMBSHELL_RCLONE" lsjson smb:research
-SCRIPT
-: > "$sb/log"
-out=$(env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
-  XDG_RUNTIME_DIR="$sb/run" SMB_AUTH=password SMB_GUI=mine \
-  bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" gui --port 27555 2>/dev/null < /dev/null) || fail "own gui: $out"
-case "$out" in "HPCLIB_TRANSFER_GUI port=27555 path=/files user=hpclib pass="[0-9a-f]*) ;; *) fail "own gui line: $out" ;; esac
-grep -q "^mine port=27555 dir=$sb/run/hpclib-rclone-gui\." "$sb/log" || fail "own gui's environment: $(cat "$sb/log")"
-grep -q 'mine: no session config' "$sb/log" && fail "own gui's config: $(cat "$sb/log")"
-grep -q "^rclone --config $sb/run/hpclib-rclone-gui\.[A-Za-z0-9]*/rclone.conf lsjson smb:research$" "$sb/log" ||
-  fail "own gui's rclone: $(cat "$sb/log")"
-grep -q "^binds=.*$sb/run/hpclib-rclone-gui\." "$sb/log" || fail "own gui's rclone sees no config: $(cat "$sb/log")"
-grep -q -- '--rc-web-gui' "$sb/log" && fail "rclone's GUI ran too: $(cat "$sb/log")"
-# without SMB_ROOT, smb is the server itself, and there is no smb-server
-sed -n '/^--- config$/,/^--- end$/p' "$sb/log" > "$sb/gui2.conf"
-if [ -s "$sb/gui2.conf" ]; then
-  grep -qxF '[smb]' "$sb/gui2.conf" && grep -qxF 'type = smb' "$sb/gui2.conf" && ! grep -qF 'smb-server' "$sb/gui2.conf" ||
-    fail "gui config without SMB_ROOT: $(cat "$sb/gui2.conf")"
-fi
-# one that isn't there, or isn't a name, stops before asking for a password
-for gui in nope 'a b'; do
-  out=$(env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
-    XDG_RUNTIME_DIR="$sb/run" SMB_GUI="$gui" bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" gui --port 27555 \
-    2>&1 < /dev/null) && fail "SMB_GUI=$gui ran"
-  case "$out" in *"no GUI nope"*|*"SMB_GUI is rclone, a NAME"*) ;; *) fail "SMB_GUI=$gui: $out" ;; esac
-done
-# a settings file may add remotes, not replace smbshell's own
-printf '[smb]\ntype = local\n' > "$sb/data/settings/data-transfer.d/rclone.conf"
-if env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
-  XDG_RUNTIME_DIR="$sb/run" SMB_AUTH=password bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" gui --port 27555 \
-  > /dev/null 2>&1 < /dev/null; then fail 'a settings file replaced the smb remote'; fi
-rm -rf "$sb/data/settings/data-transfer.d"
-[ -z "$(ls -A "$sb/run")" ] || fail 'the session config was left behind'
-if smbsh gui 2>/dev/null; then fail 'gui ran without a port'; fi
-# a GUI an earlier session left on the port is stopped first, and this one goes with the session that started it
-(
-PATH="$CLEAN_PATH"   # the real python3
-port=$(free_port)
-(exec -a "rclone rcd --config /run/user/1/hpclib-rclone-gui.Old000/rclone.conf --rc-addr 127.0.0.1:$port" \
-  python3 -c 'import socket, sys, time
-s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(300)' "$port") &
-stale=$!
-for _ in $(seq 50); do _hpclib_port_free "$port" || break; sleep 0.1; done
-rm -f "$sb/rcd.pid"
-env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
-  XDG_RUNTIME_DIR="$sb/run" SMB_AUTH=password TEST_RCD_LISTEN="$sb/rcd.pid" HPCSESSIONS_DIR="$sb/sessions" \
-  bash -c 'bash "$1" gui --port "$2" > "$3" 2>&1 < /dev/null & sleep 3' _ \
-  "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" "$port" "$sb/gui.out"
-kill -0 "$stale" 2> /dev/null && fail "the stale GUI was left on the port: $(cat "$sb/gui.out")"
-[ -s "$sb/rcd.pid" ] || fail "the new GUI did not start: $(cat "$sb/gui.out")"
-grep -q 'stopped what an earlier hpclib session left listening' "$sb/gui.out" || fail "$(cat "$sb/gui.out")"
-# its session (the shell that started it) has ended: within a few seconds the GUI stops and the port is free
-for _ in $(seq 100); do _hpclib_port_free "$port" && break; sleep 0.1; done
-_hpclib_port_free "$port" || fail "the GUI outlived its session: $(cat "$sb/gui.out")"
-grep -q 'the session that started the GUI has ended' "$sb/gui.out" || fail "$(cat "$sb/gui.out")"
-for _ in $(seq 50); do [ -z "$(ls -A "$sb/run")" ] && break; sleep 0.1; done
-[ -z "$(ls -A "$sb/run")" ] || fail 'the session config was left behind'
-# and a TERM (the console's Stop, an ssh hangup) stops it too
-rm -f "$sb/rcd.pid"
-env HOME="$sb/home" HPCTUNNELS_DATA_DIR="$sb/data" PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" \
-  XDG_RUNTIME_DIR="$sb/run" SMB_AUTH=password TEST_RCD_LISTEN="$sb/rcd.pid" HPCSESSIONS_DIR="$sb/sessions" \
-  bash "$HPCLIB_DIR/tunnels/data-transfer/smbshell.sh" gui --port "$port" > "$sb/gui.out" 2>&1 < /dev/null &
-gui=$!
-for _ in $(seq 50); do [ -s "$sb/rcd.pid" ] && ! _hpclib_port_free "$port" && break; sleep 0.1; done
-kill -TERM "$gui"; wait "$gui" 2> /dev/null || true
-for _ in $(seq 50); do _hpclib_port_free "$port" && break; sleep 0.1; done
-_hpclib_port_free "$port" || fail "TERM left the GUI running: $(cat "$sb/gui.out")"
-)
-rm -f "$sb/home/.config/hpclib/smb/credentials"
-
-# a refused sign-in: tried once, without rclone's retries, and the transfer isn't started
-printf 'pass=OBS:wrong\n' > "$sb/home/.config/hpclib/smb/credentials"
-smbsh logout > /dev/null
-: > "$sb/log"
-if TEST_RCLONE_REFUSE=OBS:wrong smbsh get //10.0.0.12/proj/raw "$sb/scratch/out" 2> "$sb/err"; then fail 'a refused sign-in went on'; fi
-grep -q 'refused the sign-in (tried once' "$sb/err" || fail "refusal: $(cat "$sb/err")"
-grep -q '^rclone lsf --max-depth 1 --retries 1 --low-level-retries 1 smb:proj$' "$sb/log" || fail "probe: $(cat "$sb/log")"
-grep -q '^rclone copy' "$sb/log" && fail 'the transfer ran after a refused sign-in'
-rm -f "$sb/home/.config/hpclib/smb/credentials"
-smbsh logout > /dev/null
-[ ! -e "$sb/home/.config/hpclib/smb/krb5cc" ] || fail 'logout kept the ticket'
+# Authentication, GUI lifecycle, CLI copies and action staging now run through
+# the shared synthetic Samba/Kerberos fixtures, including a real PTY sign-in.
+# The old rclone-password fallback assertions no longer describe this interface.
+PYTHONPATH="$repo_dir/tests${PYTHONPATH:+:$PYTHONPATH}" "${HPCLIB_TEST_PYTHON:-python3}" \
+  -m unittest test_smbshell_kerberos test_smbshell_actions test_smbclient_transfer -q
 
 # the image: checked and installed with setup_tunnel.sh, from a source of your choosing
 rm -f "$sb/images/dtt.sif"
@@ -952,7 +697,7 @@ case "$out" in *"HPCLIB_TUNNEL_STATUS missing not installed: no image at $sb/ima
 : > "$sb/built.sif"
 out=$(env HOME="$sb/home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PATH="$HPCLIB_DIR/tunnels" HPCTUNNELS_DATA_DIR="$sb/data" \
   PATH="$sb/bin:$CLEAN_PATH" TEST_SMB_LOG="$sb/log" bash "$HPCLIB_DIR/tunnels/setup_tunnel.sh" data-transfer --install --check)
-case "$out" in *"HPCLIB_TUNNEL_STATUS installed installed: $sb/images/dtt.sif (rclone v1.70.0; Kerberos in rclone: yes)"*) ;;
+case "$out" in *"HPCLIB_TUNNEL_STATUS installed installed: $sb/images/dtt.sif (Version 4.17.12; optional GUI: rclone v1.70.0)"*) ;;
   *) fail "install: $out" ;; esac
 # by default it is pulled from the lab's registry, and Reinstall pulls it again
 mkdir -p "$sb/pull-bin"

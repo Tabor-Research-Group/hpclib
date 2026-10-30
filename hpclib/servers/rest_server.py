@@ -285,246 +285,11 @@ class PathWhitelist:
         return logical, real
 
 
-def _tokens_locked(method):
-    """Holds an exclusive lock beside the tokens file while `method` reads, changes and writes it (a revoke and a
-    concurrent --add-token can't undo each other)."""
-    @functools.wraps(method)
-    def locked(cls, tokens_file, *args, **kwargs):
-        os.makedirs(os.path.dirname(os.path.abspath(tokens_file)), mode=0o700, exist_ok=True)
-        fd = os.open(tokens_file + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            return method(cls, tokens_file, *args, **kwargs)
-        finally:
-            os.close(fd)
-    return locked
-
-
-class TokenIdentity:
-    def __init__(self, name, scopes, allow=None):
-        self.name = name
-        self.scopes = tuple(scopes)
-        self.allow = allow
-
-    def has_scope(self, scope):
-        return scope is None or "*" in self.scopes or scope in self.scopes
-
-    def to_json(self):
-        return {"name": self.name, "scopes": list(self.scopes), "allow": self.allow}
-
-
-class TokenAuth:
-    """Bearer-token checking plus loading/creating the tokens themselves."""
-
-    TOKEN_ENV_VAR = 'HPC_REST_TOKEN'
-    TOKEN_FILE_ENV_VAR = 'HPC_REST_TOKEN_FILE'
-    TOKEN_FILE_NAME = 'rest_token'
-    TOKEN_BYTES = 32
-    HASH_PREFIX = "sha256:"
-    OWNER = "owner"
-    SCOPES = ("read", "submit", "propose", "files:write", "envs", "slurm", "*")
-    NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
-
-    def __init__(self, token, source=None, tokens_file=None):
-        if not token:
-            raise ValueError("an empty token would allow anyone in")
-        if token.startswith(self.HASH_PREFIX):
-            self.owner_hash = token[len(self.HASH_PREFIX):].strip().lower()
-            if not re.fullmatch(r"[0-9a-f]{64}", self.owner_hash):
-                raise ValueError("owner token hash must be 64 hex digits")
-        else:
-            self.owner_hash = self.hash(token)
-        self.source = source
-        self.tokens_file = tokens_file
-        self._tokens_cache = (None, [])
-        self._lock = threading.Lock()
-
-    @staticmethod
-    def hash(token):
-        return hashlib.sha256(token.encode()).hexdigest()
-
-    def scoped_tokens(self):
-        """Entries of the tokens file, re-read whenever it changes."""
-        if not self.tokens_file:
-            return []
-        try:
-            mtime = os.stat(self.tokens_file).st_mtime_ns
-        except FileNotFoundError:
-            return []
-        with self._lock:
-            if self._tokens_cache[0] != mtime:
-                entries = self.read_tokens_file(self.tokens_file)
-                self._tokens_cache = (mtime, [e for e in entries if self.valid_entry(e)])
-            return self._tokens_cache[1]
-
-    @classmethod
-    def valid_entry(cls, entry):
-        scopes = entry.get("scopes", [])
-        if not isinstance(entry.get("sha256"), str) or not cls.NAME_RE.fullmatch(str(entry.get("name", ""))):
-            return False
-        if not scopes or any(s not in cls.SCOPES for s in scopes):
-            return False
-        # anything short of full access has to be pinned to directories
-        if "*" not in scopes and not entry.get("allow"):
-            print(f"ignoring token {entry['name']}: scoped tokens need an `allow` list", file=sys.stderr)
-            return False
-        return True
-
-    def identify(self, header):
-        if not header:
-            return None
-        scheme, _, value = header.partition(" ")
-        if scheme.lower() != "bearer" or not value.strip():
-            return None
-        digest = self.hash(value.strip())
-        if hmac.compare_digest(digest, self.owner_hash):
-            return TokenIdentity(self.OWNER, ("*",))
-        for entry in self.scoped_tokens():
-            if hmac.compare_digest(digest, entry["sha256"]):
-                return TokenIdentity(entry["name"], entry["scopes"], entry.get("allow"))
-        return None
-
-    def check(self, header) -> bool:
-        return self.identify(header) is not None
-
-    @classmethod
-    def default_token_file(cls):
-        return os.path.join(tunnels_data_dir(), cls.TOKEN_FILE_NAME)
-
-    @classmethod
-    def default_tokens_file(cls):
-        return os.path.join(rest_data_dir(), "tokens.json")
-
-    @staticmethod
-    def check_private(path):
-        info = os.stat(path)
-        if hasattr(os, "getuid") and info.st_uid != os.getuid():
-            raise PermissionError(f"{path} is not owned by the current user")
-        if info.st_mode & 0o077:
-            raise PermissionError(f"{path} is accessible by other users; run `chmod 600 {path}`")
-
-    @classmethod
-    def read_token_file(cls, token_file):
-        cls.check_private(token_file)
-        with open(token_file) as f:
-            token = f.read().strip()
-        if not token:
-            raise ValueError(f"token file {token_file} is empty")
-        return token
-
-    @staticmethod
-    def write_private(path, text):
-        os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".tokens.")
-        with os.fdopen(fd, "w") as f:
-            f.write(text)
-        os.replace(tmp, path)  # mkstemp files are already 600
-
-    @classmethod
-    def create_token_file(cls, token_file):
-        token = secrets.token_urlsafe(cls.TOKEN_BYTES)
-        os.makedirs(os.path.dirname(os.path.abspath(token_file)), mode=0o700, exist_ok=True)
-        # O_EXCL so two servers starting at once can't clobber each other
-        fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(token + "\n")
-        return token
-
-    @classmethod
-    def read_tokens_file(cls, tokens_file):
-        cls.check_private(tokens_file)
-        with open(tokens_file) as f:
-            data = json.load(f)
-        return data.get("tokens", [])
-
-    @classmethod
-    @_tokens_locked
-    def add_token(cls, tokens_file, name, scopes, allow=None):
-        if not cls.NAME_RE.fullmatch(name) or name == cls.OWNER:
-            raise ValueError(f"invalid token name {name!r}")
-        bad = [s for s in scopes if s not in cls.SCOPES]
-        if not scopes or bad:
-            raise ValueError(f"unknown scopes {bad}; choose from {cls.SCOPES}")
-        if "*" not in scopes and not allow:
-            raise ValueError("scoped tokens must be limited to directories with --token-allow")
-        entries = cls.read_tokens_file(tokens_file) if os.path.exists(tokens_file) else []
-        if any(e.get("name") == name for e in entries):
-            raise ValueError(f"a token named {name!r} already exists; revoke it first")
-        token = secrets.token_urlsafe(cls.TOKEN_BYTES)
-        entry = {"name": name, "sha256": cls.hash(token), "scopes": list(scopes), "created": time.time()}
-        if allow:
-            entry["allow"] = [os.path.realpath(os.path.expanduser(a)) for a in allow]
-        cls.write_private(tokens_file, json.dumps({"tokens": entries + [entry]}, indent=2) + "\n")
-        return token
-
-    @classmethod
-    @_tokens_locked
-    def revoke_token(cls, tokens_file, name):
-        entries = cls.read_tokens_file(tokens_file) if os.path.exists(tokens_file) else []
-        kept = [e for e in entries if e.get("name") != name]
-        if len(kept) == len(entries):
-            raise ValueError(f"no token named {name!r}")
-        cls.write_private(tokens_file, json.dumps({"tokens": kept}, indent=2) + "\n")
-
-    @classmethod
-    def lookup_token_hash(cls, tokens_file, digest):
-        """The name of the scoped token whose sha256 is `digest`, or None."""
-        entries = cls.read_tokens_file(tokens_file) if os.path.exists(tokens_file) else []
-        for e in entries:
-            if hmac.compare_digest(str(e.get("sha256", "")), digest):
-                return e.get("name")
-        return None
-
-    @classmethod
-    @_tokens_locked
-    def revoke_token_hash(cls, tokens_file, digest):
-        """Revoke the token whose sha256 is `digest`; returns its name."""
-        entries = cls.read_tokens_file(tokens_file) if os.path.exists(tokens_file) else []
-        names = [e.get("name") for e in entries if hmac.compare_digest(str(e.get("sha256", "")), digest)]
-        if not names:
-            raise ValueError("no token has that hash")
-        cls.write_private(tokens_file, json.dumps({"tokens": [e for e in entries if e.get("name") not in names]},
-                                                  indent=2) + "\n")
-        return names[0]
-
-    @classmethod
-    @_tokens_locked
-    def add_scopes_by_hash(cls, tokens_file, digest, scopes):
-        """Add `scopes` to the token whose sha256 is `digest`; returns (name, scopes added)."""
-        bad = [s for s in scopes if s not in cls.SCOPES]
-        if not scopes or bad or "*" in scopes:
-            raise ValueError(f"scopes must come from {[s for s in cls.SCOPES if s != '*']}")
-        entries = cls.read_tokens_file(tokens_file) if os.path.exists(tokens_file) else []
-        for e in entries:
-            if hmac.compare_digest(str(e.get("sha256", "")), digest):
-                added = [s for s in scopes if s not in e.get("scopes", [])]
-                if added:
-                    e["scopes"] = list(e.get("scopes", [])) + added
-                    cls.write_private(tokens_file, json.dumps({"tokens": entries}, indent=2) + "\n")
-                return e.get("name"), added
-        raise ValueError("no token has that hash")
-
-    @classmethod
-    def hash_token_file(cls, token_file):
-        token = cls.read_token_file(token_file)
-        if token.startswith(cls.HASH_PREFIX):
-            return False
-        cls.write_private(token_file, cls.HASH_PREFIX + cls.hash(token) + "\n")
-        return True
-
-    @classmethod
-    def load(cls, token_file=None, tokens_file=None):
-        token = os.environ.pop(cls.TOKEN_ENV_VAR, None)  # keep it out of child processes
-        if token:
-            return cls(token, source=f"${cls.TOKEN_ENV_VAR}", tokens_file=tokens_file)
-        if token_file is None:
-            token_file = os.environ.get(cls.TOKEN_FILE_ENV_VAR) or cls.default_token_file()
-        token_file = os.path.expanduser(token_file)
-        try:
-            token = cls.create_token_file(token_file)
-        except FileExistsError:
-            token = cls.read_token_file(token_file)
-        return cls(token, source=token_file, tokens_file=tokens_file)
+# Public compatibility imports; tunnels share the same implementation.
+try:
+    from .token_auth import TokenAuth, TokenIdentity, TokenRegistry
+except ImportError:
+    from token_auth import TokenAuth, TokenIdentity, TokenRegistry
 
 
 class AuditLog:
@@ -718,6 +483,9 @@ class RESTHandler(http.server.BaseHTTPRequestHandler):
             "path": self.path if len(self.path) <= self.AUDIT_PATH_MAX else self.path[:self.AUDIT_PATH_MAX] + "...",
             "status": self.response_status,
         }
+        if getattr(self.identity, "session_id", None):
+            entry["session_id"] = self.identity.session_id
+            entry["grant_id"] = self.identity.grant_id
         if self.audit_detail:
             entry["detail"] = self.audit_detail
         try:
@@ -729,6 +497,7 @@ class RESTHandler(http.server.BaseHTTPRequestHandler):
         body = json.dumps(payload).encode() + b"\n"
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -834,6 +603,10 @@ class HPCRESTHandler(RESTHandler):
     ROUTE_SCOPES = {
         **{
             ("GET", "/health"): None,
+            ("GET", "/auth/session"): None,
+            ("POST", "/auth/session/rotate"): None,
+            ("POST", "/auth/session/delegate"): None,
+            ("DELETE", "/auth/session"): None,
             ("GET", "/cluster"): "read",
             ("GET", "/sandbox"): "read",
             ("GET", "/templates"): "read",
@@ -873,6 +646,15 @@ class HPCRESTHandler(RESTHandler):
     def get_routes(self) -> 'dict[tuple[str,str],method]':
         routes = {
             ("GET", "/health"): self.do_health,
+            ("GET", "/auth/session"): self.do_auth_session,
+            ("POST", "/auth/session/rotate"): self.do_auth_rotate,
+            ("POST", "/auth/session/delegate"): self.do_auth_delegate,
+            ("DELETE", "/auth/session"): self.do_auth_logout,
+            ("GET", "/admin/auth"): self.do_admin_auth,
+            ("POST", "/admin/auth/grants"): self.do_admin_grant,
+            ("PUT", "/admin/auth/grants"): self.do_admin_update_grant,
+            ("POST", "/admin/auth/sessions"): self.do_admin_session,
+            ("POST", "/admin/auth/revoke"): self.do_admin_auth_revoke,
             ("GET", "/cluster"): self.do_cluster,
             ("GET", "/sandbox"): self.do_sandbox,
             ("GET", "/templates"): self.do_templates,
@@ -1069,6 +851,7 @@ class HPCRESTHandler(RESTHandler):
         wl = self.whitelist
         return 200, {
             "status": "ok",
+            "auth_api": 2,
             "server": self.server_version,
             "hpclib_version": hpclib_version(),
             "hostname": socket.gethostname(),
@@ -1244,6 +1027,59 @@ class HPCRESTHandler(RESTHandler):
         return 200, {"entries": picked, "more": more, "window_truncated": truncated,
                      "latest": picked[-1]["time"] if picked else since}
 
+    @property
+    def token_registry(self):
+        if not self.server.auth.tokens_file:
+            raise RESTError(503, "this server has no token registry configured")
+        return TokenRegistry(self.server.auth.tokens_file)
+
+    def auth_change(self, method, **fixed):
+        body = self.read_json()
+        if not isinstance(body, dict) or set(body) & set(fixed):
+            raise RESTError(400, "invalid auth request fields")
+        try:
+            result = method(**dict(body, **fixed))
+        except (ValueError, TypeError) as e:
+            raise RESTError(400, str(e))
+        # Request bodies and newly issued secrets must never enter the audit log.
+        self.audit_detail = {"auth_operation": method.__name__}
+        return 200, result
+
+    def session_secret(self):
+        if not getattr(self.identity, "session_id", None):
+            raise RESTError(403, "an expiring session is required; owner and legacy tokens cannot self-renew or delegate")
+        return self.headers["Authorization"].partition(" ")[2].strip()
+
+    def do_auth_session(self):
+        self.session_secret()
+        return 200, self.identity.to_json()
+
+    def do_auth_rotate(self):
+        secret = self.session_secret()
+        return self.auth_change(self.token_registry.rotate, token=secret)
+
+    def do_auth_delegate(self):
+        secret = self.session_secret()
+        return self.auth_change(self.token_registry.delegate, token=secret)
+
+    def do_auth_logout(self):
+        return 200, self.token_registry.revoke_self(self.session_secret())
+
+    def do_admin_auth(self):
+        return 200, {"records": self.token_registry.list(), "auth_api": 2}
+
+    def do_admin_grant(self):
+        return self.auth_change(self.token_registry.create_grant)
+
+    def do_admin_update_grant(self):
+        return self.auth_change(self.token_registry.update_grant)
+
+    def do_admin_session(self):
+        return self.auth_change(self.token_registry.issue)
+
+    def do_admin_auth_revoke(self):
+        return self.auth_change(self.token_registry.revoke)
+
     def do_admin_tokens(self):
         auth = self.server.auth
         entries = TokenAuth.read_tokens_file(auth.tokens_file) if auth.tokens_file and \
@@ -1261,6 +1097,8 @@ class HPCRESTHandler(RESTHandler):
                    "source": "token file" if auth.source and not auth.source.startswith("$") else auth.source,
                    "active": True, "last_used": last_used.get(TokenAuth.OWNER)}]
         for e in entries:
+            if e.get("kind") is not None:
+                continue
             tokens.append({"name": e.get("name"), "scopes": e.get("scopes"), "allow": e.get("allow"),
                            "created": e.get("created"), "active": e.get("name") in valid,
                            "last_used": last_used.get(e.get("name"))})

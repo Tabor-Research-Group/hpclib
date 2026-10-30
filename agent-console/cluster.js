@@ -1,5 +1,5 @@
 // The cluster-first pages: #/c lists the clusters with what each needs, and #/c/NAME/TAB[/SUB] is one cluster's
-// page (Overview, Jobs, Apps, Installed, Storage, Files, Agents, Settings); #/c/NAME/apps/APP is one app there, with
+// page (Overview, Jobs, Apps, Installed, Storage, Files, SSH keys, Agents, Settings); #/c/NAME/apps/APP is one app there, with
 // its controls, tools and settings, and a package's tabs for it. They use the console's existing API, plus
 // GET clusters/NAME/jobs, GET/POST clusters/NAME/storage[/scan] and GET clusters/NAME/quota. app.js passes what they share with it (init).
 import { el, action, confirmDialog, connectClients, ownerRecovery } from "./components.js";
@@ -13,13 +13,13 @@ export function init(given) { ctx = given; }
 const enc = encodeURIComponent;
 const path = (name, rest = "") => `clusters/${enc(name)}${rest ? "/" + rest : ""}`;
 export const CLUSTER_TABS = [["overview", "Overview"], ["jobs", "Jobs"], ["apps", "Apps"], ["installed", "Installed"],
-                             ["storage", "Storage"], ["files", "Files"], ["agents", "Agents"], ["settings", "Settings"]];
+                             ["storage", "Storage"], ["files", "Files"], ["ssh", "SSH keys"], ["agents", "Agents"], ["settings", "Settings"]];
 // the tabs, with a packaged widget's own (slot cluster.tab): [id, label, sub]
 export function tabs() {
   return [...CLUSTER_TABS.map(([id, label]) => [id, label, ""]),
           ...widgets.forSlot("cluster.tab").map((w) => ["widget", w.title, w.key])];
 }
-const AGENT_PAGES = [["", "Tunnel and setup"], ["activity", "Activity"], ["keys", "SSH keys"]];
+const AGENT_PAGES = [["", "Tunnel and setup"], ["activity", "Activity"]];
 export const href = (name, tab = "overview", sub = "") => `#/c/${enc(name)}/${tab}${sub ? "/" + enc(sub) : ""}`;
 const appHref = (name, app) => href(name, "apps", app);
 // the apps a cluster page lists: a package's tab apps too, after their parent
@@ -245,7 +245,7 @@ export async function clusterPage(name, tab, sub = "") {
     el("div", { class: "actions" }, login(c)
       ? action("Log out", async () => { await api(path(name, "logout"), { method: "POST" }); ctx.render(); })
       : action("Log in", () => runStep(c, "login"), { primary: true })));
-  const pages = { overview, jobs: jobsTab, apps: appsTab, installed, storage: storageTab, files, agents, settings,
+  const pages = { overview, jobs: jobsTab, apps: appsTab, installed, storage: storageTab, files, ssh: sshTab, agents, settings,
                   widget: widgetTab };
   const body = await (tab === "apps" && sub ? appPage(c, sub) : (pages[tab] || overview)(c, local, sub));
   followWhileStarting([c]);
@@ -271,6 +271,10 @@ async function overview(c, local) {
   const running = states.filter((s) => s && s.state === "up");
   const missing = states.filter((s) => s && s.install && s.install.state === "missing");
   return el("div", {},
+    login(c) && !c.ssh_login_key && c.preset?.ssh_keys !== "site-managed"
+      ? el("section", { class: "card", id: "ssh-first-login" }, el("h3", {}, "Set up SSH for future logins"),
+          el("p", {}, "Now that you're logged in, you can install a public key from this computer without starting agents."),
+          el("a", { class: "button", href: href(c.name, "ssh") }, "Set up login key…")) : null,
     step ? el("section", { class: "next-step" }, el("div", {}, el("strong", {}, "Next: "), step[2]),
       stepAction(step)) : null,
     el("div", { class: "tiles" },
@@ -732,11 +736,80 @@ async function files(c) {
   return el("div", {}, await ctx.files(c.name));
 }
 
+async function sshTab(c) {
+  const siteManaged = c.preset?.ssh_keys === "site-managed";
+  const local = el("section", { class: "card", id: "ssh-login-key" }, el("h3", {}, "This computer → cluster"));
+  const draw = (info, message = "") => {
+    const keys = (info.keys || []).filter((key) => key.private_available && !key.error && !key.options);
+    const choice = el("select", { "aria-label": "Login identity" },
+      keys.map((key) => el("option", { value: key.name }, `${key.name} · ${key.fingerprint}`)),
+      el("option", { value: "" }, "Create a dedicated Ed25519 login key"));
+    choice.value = info.configured?.name || (keys.some((key) => key.name === info.suggested_key)
+      ? info.suggested_key : keys[0]?.name || "");
+    if (!keys.some((key) => key.name === choice.value)) choice.value = "";
+    const name = el("input", { value: info.suggested_key, "aria-label": "New login key name", size: 40 });
+    const creation = el("div", {}, el("label", {}, "Key name ", name),
+      el("p", { class: "muted small" }, "The new private key stays on this computer, without a passphrase. Existing key files are never replaced."));
+    const install = action("Install login key", async () => {
+      const create = choice.value === "";
+      const result = await ctx.api(path(c.name, "ssh/login-key"), {
+        method: "POST", body: { key: create ? name.value : choice.value, create },
+      });
+      draw(await ctx.api(path(c.name, "ssh/login-keys")), result.message + (result.restrictions_preserved
+        ? " Existing authorization restrictions were preserved." : ""));
+    }, { primary: true, disabled: !login(c) });
+    const update = () => {
+      creation.hidden = choice.value !== "";
+      install.setAttribute("label", choice.value === "" ? "Create and install login key" : "Install login key");
+    };
+    choice.addEventListener("change", update);
+    update();
+    local.replaceChildren(...[el("h3", {}, "This computer → cluster"),
+      el("p", {}, "Use your current login to add this computer's public key to the cluster. Future hpclib logins will use the selected identity. No agent tunnel is needed."),
+      info.configured ? el("p", {}, `Installed: ${info.configured.name} · ${info.configured.fingerprint}`) : null,
+      !login(c) ? el("p", { class: "muted" }, "Log in once with your existing credentials to enable setup.") : null,
+      el("label", {}, "Identity on this computer ", choice), creation,
+      el("p", { class: "muted small" }, "Only the public key is sent. Encrypted identities use your SSH agent or normal passphrase prompt. The cluster may still require MFA or use a separate key registration service."),
+      el("div", { class: "actions" }, install, action("Reload identities", async () => draw(await ctx.api(path(c.name, "ssh/login-keys"))))),
+      el("p", { role: "status", class: "saved" }, message),
+      (info.errors || []).map((error) => el("p", { class: "muted" }, `${error.name}: ${error.error}`))
+    ].flat(Infinity).filter((node) => node !== null && node !== undefined && node !== false));
+  };
+  if (siteManaged) {
+    local.append(el("p", { class: "muted" }, "SSH keys are managed by this site. Use its key registration process; hpclib won't change its authorized keys."));
+  } else {
+    try { draw(await ctx.api(path(c.name, "ssh/login-keys"))); }
+    catch (error) { local.append(ctx.errorBox(error)); }
+  }
+  const operation = el("div", {});
+  const setup = action("Set up compute SSH", async () => {
+    showOperation(await ctx.api(path(c.name, "ssh/setup"), { method: "POST", body: {} }));
+  }, { disabled: siteManaged || !login(c) || c.operation?.state === "running" });
+  const showOperation = (op) => {
+    setup.disabled = siteManaged || !login(c) || op.state === "running";
+    const title = op.kind === "ssh_setup" ? "Compute SSH setup" : op.title || op.kind;
+    const state = el("p", { role: "status" }, `${title}: ${op.state}`);
+    const log = el("hpc-log", { src: path(c.name, "operation?lines=200"), field: "log", every: 2 });
+    log.addEventListener("update", ({ detail: current }) => {
+      setup.disabled = siteManaged || !login(c) || current.state === "running";
+      state.textContent = `${title}: ${current.state}`;
+      if (current.state !== "running") log.setAttribute("every", "0");
+    });
+    operation.replaceChildren(state, log);
+  };
+  if (c.operation) showOperation(c.operation);
+  const compute = el("section", { class: "card", id: "ssh-compute-key" }, el("h3", {}, "Login node → compute nodes"),
+    el("p", {}, "Create or reuse a key in the cluster's shared home for connections between its nodes. Your active login is enough; agents can be set up afterward."),
+    siteManaged ? el("p", { class: "muted" }, "Compute SSH keys are managed by this site.") : null,
+    setup, operation);
+  return el("div", {}, local, compute,
+    el("section", { class: "card" }, el("h3", {}, "Keys stored on the cluster"), await ctx.sshKeys(c.name)));
+}
+
 async function agents(c, local, sub) {
   const page = AGENT_PAGES.some(([id]) => id === sub) ? sub : "";
   const tabs = subTabs(AGENT_PAGES.map(([id, label]) => [href(c.name, "agents", id), label, id]), page);
   if (page === "activity") return el("div", {}, tabs, await ctx.activity(c.name));
-  if (page === "keys") return el("div", {}, tabs, await ctx.sshKeys(c.name));
   // the agent profile's row: its tunnel (Start, Stop, Log), Update hpclib and setup_agents (Set up), as on the old
   // Clusters page; its panels open under it
   const row = el("hpc-cluster-row", { cluster: c.name, local });

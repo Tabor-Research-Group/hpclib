@@ -541,7 +541,7 @@ programmed against the server: an `actions.json` beside the tunnel's scripts (th
   and prints the job's ID: the job is recorded with the template jobs, so `job_status`, `wait_for_job`, cancel and
   the concurrent-job cap apply, and the console labels it "agent: TUNNEL/ACTION".
 - **Availability.** `available` runs a quick status command; the action answers 409 with the tunnel's `message`
-  while it says no (for Data transfer: no ticket and no saved password).
+  while it says no (for Data transfer: no transfer ticket).
 - **Never the agent's path.** An action's job copies between the agent's directory and a staging folder of yours
   with `{helper}` (`action_paths.py`), which follows no links and checks the token's directories (`{scope_file}`)
   again when the job runs: an agent can't swap in a link to `~/.ssh` while the job waits.

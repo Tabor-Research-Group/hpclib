@@ -310,7 +310,7 @@ function tunnel_setup {
   fi
 }
 
-# SMB transfers with rclone from the data-transfer-tools image (tunnels/data-transfer/smbshell.sh; smbshell --help).
+# SMB transfers with Kerberos and smbclient from the data-transfer-tools image (tunnels/data-transfer/smbshell.sh; smbshell --help).
 # On a cluster it runs there; from your own machine, --on runs it on a cluster's login node over ssh, with a
 # terminal, so it can ask for a password:
 #   smbshell --on [ssh options] user@host get proj/raw /scratch/user/me/raw

@@ -5,7 +5,7 @@ fi
 
 # Bump on every release: install_hpclib only replaces a remote copy
 # whose HPCLIB_VERSION is older than this one. setup.py reads it too.
-HPCLIB_VERSION="1.13.6"
+HPCLIB_VERSION="1.13.10"
 
 MAIN_USER=$(whoami)
 MAIN_PARTITION=""
