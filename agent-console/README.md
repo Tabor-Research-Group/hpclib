@@ -20,6 +20,10 @@ python3 -m http.server 8000 --bind 127.0.0.1 -d agent-console
 # open http://127.0.0.1:8000/?api=http://127.0.0.1:27180
 ```
 
+The page imports its shared elements from `./hpclib-ui/` (the files in `hpclib/ui/`), which `agent_console` serves
+itself. A plain static server does not have that path: link it first, `ln -s ../hpclib/ui agent-console/hpclib-ui`
+(the link is not committed; `.gitignore` lists it).
+
 The top bar holds what spans clusters: **Clusters** (`#/c`, one row per cluster), **Proposals** and
 **Packages**. A cluster's page (`#/c/NAME/TAB`, `cluster.js`) has its Overview, Jobs, Apps, Installed, Storage,
 Files, SSH keys, Agents (the agent profile's row and Activity) and Settings; `#/c/NAME/apps/APP` is one app there

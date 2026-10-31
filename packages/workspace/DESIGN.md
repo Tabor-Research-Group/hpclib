@@ -22,7 +22,7 @@ It is not a job browser (the console's Jobs tab, `check_quota`, the job queue an
 | Question | Decision | Section |
 | --- | --- | --- |
 | Bootstrap or jQuery? | Neither: hpclib's CSS variables and custom elements already cover it, and Bootstrap would fight `default-styles.css`. | 2.3 |
-| Third-party libraries | xterm.js 6 (+ fit, web-links, search addons) and CodeMirror 6, from a CDN, pinned, with integrity hashes and an offline vendor mode. PDFs use the browser's viewer. | 2.3 |
+| Third-party libraries | xterm.js 6 (+ fit and web-links addons; no search addon yet), Wunderbaum from a CDN, pinned, with integrity hashes; CodeMirror 6 as a bundle that ships in `hpclib/ui/vendor/` (section 16). PDFs use the browser's viewer. | 2.3 |
 | Where does shared UI live? | New `hpclib/ui/`. The console serves it; the Workspace package gets a copy at build time, so it never depends on the hpclib version on the cluster. | 2.2 |
 | What replaces "My jobs"? | "Runs from here": only jobs this Workspace submitted. No queue browser. | 3 |
 | How is a job described? | A small JSON spec (command, environment, resources). The script is generated from it and embeds it, so a `.slurm` file reopens as the same form. | 4 |
@@ -68,7 +68,7 @@ Required changes, all server-side and small:
 | A reload loses everything | Only `#dir=` is kept | Open files, unsaved edits and terminals vanish | Persist layout and drafts; reattach terminals |
 | The file list is not keyboard-operable | `<tr onclick>`, "⋯" is `visibility:hidden` until hover | Not usable without a mouse | File manager's job; the shell supplies roving focus helpers |
 | Tabs are `div`s with `role="tab"` | `drawTabs()` | Roles without focus or arrow-key handling | Shared `<hpc-tabs>` |
-| Pins are behind | CodeMirror 5.65.18, xterm 5.5.0, fit 0.10.0 | Current: 5.65.21, 6.0.0, 0.11.0 | Section 2.3 |
+| Pins were behind (fixed in phase 1; CodeMirror 5 is gone since 1.6.0) | CodeMirror 5.65.18, xterm 5.5.0, fit 0.10.0 | Now: CodeMirror 6 bundle, xterm 6.0.0, fit 0.11.0 | Section 2.3 |
 | Theme ignores the console | Only `prefers-color-scheme`; own palette names (`--ok`, `--danger`, `--hover`) | The console's dark switch and Interface Settings do not apply | Shared tokens, theme bridge (2.2) |
 
 ### 1.3 Hand-rolled pieces
@@ -184,7 +184,7 @@ agent-console/components.js  keeps the console-only elements and re-exports hpcl
 | `hpc-split` | new | Pointer and arrow-key resizing, minimum sizes, `persist="key"`. |
 | `hpc-menu` | new | Native `popover`, array or child-button items, keyboard navigation, context-menu mode. |
 | `hpc-toast` | new | One live region; `toast(text, {tone})`. |
-| `hpc-code` | new | Editor wrapper: `value`, `language`, `readonly`, `diff-against`; events `change`, `save`. **Light DOM**, because CodeMirror's styles do not cross a shadow boundary. |
+| `hpc-code` | new | Editor wrapper: `value`, `language`, `readonly`; events `change`, `save`. The diff is a separate `<hpc-diff>` (`show(original, modified)`), in the same file. **Light DOM**, because CodeMirror's styles do not cross a shadow boundary. |
 | `hpc-terminal` | new | xterm wrapper: `connect` callback returning a WebSocket; reattach on reload; light DOM for the same reason. |
 | `hpc-resources` | new | Typed Slurm resource form (4.3). The console's app settings (job time, memory, CPUs, partition) can reuse it. |
 | `hpc-usage-table` | extract | From `cluster.js`'s `storageCard` and the Workspace's usage tab, which duplicate each other. |
@@ -219,16 +219,16 @@ Versions are what `npm view` reported on 2026-10-29.
 
 | Need | Choice | Notes |
 | --- | --- | --- |
-| Terminal | `@xterm/xterm` 6.0.0; addons `fit` 0.11.0, `web-links` 0.12.0, `search` 0.16.0 | No alternative worth considering. The 6.0.0 tarball keeps `lib/xterm.js` and `css/xterm.css`, so the current loader paths still work; test before bumping from 5.5.0 (renderer and API changes). |
-| Editor | CodeMirror 6 (`codemirror` 6.0.2, `@codemirror/lang-python` 6.2.1, `@codemirror/legacy-modes` 6.5.5 for shell, TOML, Fortran, Julia and R, `@codemirror/search` 6.7.2) | CodeMirror 5 is in maintenance mode and has accessibility and large-file limits CodeMirror 6 does not. CodeMirror 6 has no official no-build bundle, so how it is delivered needs a short spike (see below). Fallback: CodeMirror 5.65.21 behind the same `<hpc-code>`. |
-| Script diff | `@codemirror/merge` 6.12.3 | Shows "generated" against "edited by hand" in Submit. Free if CodeMirror 6 is chosen. |
+| Terminal | `@xterm/xterm` 6.0.0; addons `fit` 0.11.0, `web-links` 0.12.0 (the `search` 0.16.0 addon was planned and is not added) | No alternative worth considering. The 6.0.0 tarball keeps `lib/xterm.js` and `css/xterm.css`, so the current loader paths still work; test before bumping from 5.5.0 (renderer and API changes). |
+| Editor (done, 1.6.0) | CodeMirror 6 as built: `@codemirror/view` 6.43.15, `state` 6.7.6, `language` 6.13.1, `commands` 6.11.1, `search` 6.7.2, `lang-python` 6.2.1, `legacy-modes` 6.5.5 for the other languages (no Markdown yet), `theme-one-dark` 6.1.3 | CodeMirror 5 is in maintenance mode and has accessibility and large-file limits CodeMirror 6 does not. CodeMirror 6 has no official no-build bundle, so how it is delivered needs a short spike (see below). The spike's answer is section 16: a committed esbuild bundle. |
+| Script diff (done, 1.6.0) | `@codemirror/merge` 6.12.3 | The unified merge view in `<hpc-diff>` shows what the form's version would change in an opened `.slurm`. |
 | PDF, images, video | The browser | No pdf.js: 6.x is heavy and browsers already have viewers. |
 | Tabs, split, menu, toast, dialog | Shared custom elements | About 400 lines in total; none of these has a CDN library that is smaller than the glue to adapt it. |
 | Bootstrap 5.3.8, jQuery 4.0.0 | Not used | hpclib's UI is variables plus custom elements, with a user-editable theme (Interface Settings). Bootstrap's own variables and resets would compete with that; jQuery adds nothing over `el()`. |
-| Icons | Inline SVG sprite (Lucide, ISC licence) in `hpclib/ui/icons.svg` | No icon-font CDN. The file manager can use it too. |
+| Icons | Planned: inline SVG sprite (Lucide, ISC licence) in `hpclib/ui/icons.svg` | Not built: the page uses text labels and Wunderbaum's own icons. No icon-font CDN either way. |
 | Markdown preview | Later: `marked` plus DOMPurify inside a sandboxed viewer | Not v1. |
 
-**CodeMirror 6 spike (one day).** It passes if one pinned URL set loads without duplicate-instance errors and
+**CodeMirror 6 spike (done: section 16; the committed bundle was the candidate that passed).** It had to pass if one pinned URL set loads without duplicate-instance errors and
 covers: Python, shell, YAML, TOML, JSON, Markdown, C/C++, Fortran, Julia, R; save on Ctrl/⌘-S; in-file search;
 a 50 MB file; colours from the CSS variables (dark and light); and `@codemirror/merge`. Candidates for delivery:
 jsDelivr's `+esm` endpoints, esm.sh with pinned versions, or a single bundle built once with esbuild and committed
@@ -238,8 +238,8 @@ under `hpclib/ui/vendor/`. If none passes, ship CodeMirror 5.65.21.
 sha384 hashes. `libs.js` loads them lazily (first terminal, first editor) from `WORKSPACE_CDN` (default jsDelivr),
 or from `ui/vendor/` when that exists. Classic scripts (xterm, CodeMirror 5) get `integrity` attributes;
 for ES modules, integrity through import maps is recent and uneven across browsers, so pin exact versions and verify
-hashes at build time instead. `console_packages.py build --vendor` fills `ui/vendor/` for sites whose browsers
-cannot reach a CDN. A missing library degrades as today: a plain textarea, and a terminal that says why it cannot
+hashes at build time instead. The `--vendor` build option was planned and not built; `libs.js` can read a vendor directory laid out like the CDN
+(`configureLibs({vendor})`), but nothing fills one yet. A missing library degrades as today: a plain textarea, and a terminal that says why it cannot
 open.
 
 ## 3. Layout
@@ -567,11 +567,11 @@ and those are cached.
 
 | Phase | Contents | Done when |
 | --- | --- | --- |
-| 0 | Section 1.1 authentication changes and their regression test | The test passes; the existing Workspace tests still pass |
-| 1 | `hpclib/ui/` extracted; `<hpc-tabs>`, `<hpc-split>`, `<hpc-menu>`, `<hpc-toast>`; the shell with the registry; package `bundle`; theme bridge; file manager slots in | The Workspace follows the console's theme; no hand-rolled tab, menu, splitter or toast remains |
-| 2 | `ws/` split; detached terminals; login environment; `fs/tail` and the log follower; Runs from here; My jobs removed; layout persistence | A reload keeps tabs, drafts and terminals; a tunnel drop and reconnect reattaches |
-| 3 | Spec, generator and Check; `<hpc-resources>` with `/api/cluster`; the environment card with detect, status, Prepare (uv and pixi), directories; classic templates preserved | A script in a uv project goes from file to followed output with no text field edited; the generated script traps TERM; a stale lock blocks Submit |
-| 4 | `.slurm` round trip with diff; profiles; arrays; dependencies; interactive mode; squash (after 5.6); CodeMirror 6 if not done in phase 1 | |
+| 0 (done: section 9) | Section 1.1 authentication changes and their regression test | The test passes; the existing Workspace tests still pass |
+| 1 (done: section 10) | `hpclib/ui/` extracted; `<hpc-tabs>`, `<hpc-split>`, `<hpc-menu>`, `<hpc-toast>`; the shell with the registry; package `bundle`; theme bridge; file manager slots in | The Workspace follows the console's theme; no hand-rolled tab, menu, splitter or toast remains |
+| 2 (done: section 13) | `ws/` split; detached terminals; login environment; `fs/tail` and the log follower; Runs from here; My jobs removed; layout persistence | A reload keeps tabs, drafts and terminals; a tunnel drop and reconnect reattaches |
+| 3 (done: section 11) | Spec, generator and Check; `<hpc-resources>` with `/api/cluster`; the environment card with detect, status, Prepare (uv and pixi), directories; classic templates preserved | A script in a uv project goes from file to followed output with no text field edited; the generated script traps TERM; a stale lock blocks Submit |
+| 4 (done except squash: sections 14, 15, 16) | `.slurm` round trip with diff; profiles; arrays; dependencies; interactive mode; CodeMirror 6 (4a: arrays, sweeps, dependencies, profiles, 1.4.0; 4b: round trip and interactive, 1.5.0; 4c: CodeMirror 6 and the merge view, 1.6.0). Squash stays deferred (decision 5) | Each item has its tests; squash waits on 5.6 |
 
 Tests: extend `tests/test_workspace_package.py` and `tests/test_workspace_ui.py`; put fake `sbatch`, `sinfo`,
 `sacctmgr` and `squeue` on `PATH` (see `tests/process_queue_tests/slurm_test_helpers.sh`) so Submit, Check and Runs
@@ -608,3 +608,330 @@ Two small behaviours to know: a viewer file link covers its own directory only, 
 `../` resources gets a 401 (the signed prefix can be widened later if that matters); and clicking a file twice
 quickly can open two viewer tabs, because the signed URL is fetched before the tab is added (phase 1's shell
 should de-duplicate opens).
+
+## 10. Phase 1 status: done (Workspace 1.1.0)
+
+What landed:
+
+- **`hpclib/ui/`** holds the shared elements and helpers (`index.js`, `core.js`, `libs.js` with `libs.json` and
+  `update_libs.py`, `base.css`, `components/*.js`). The console imports them (`agent-console/components.js`
+  re-exports `./hpclib-ui/index.js` and keeps its own elements; `style.css` imports `base.css`), served at
+  `/hpclib-ui/` by `agent_console`. New elements: `<hpc-tabs>`, `<hpc-split>`, `<hpc-menu>` (`showMenu`), `<hpc-toasts>`
+  (`toast`), `<hpc-code>`, `<hpc-terminal>`, and `promptDialog` beside `confirmDialog`.
+- **`bundle`** in `hpclib-package.json`: `console_packages.py build` copies `hpclib/ui` (without `.py`, `.pyc` and
+  `.md`), `default-styles.css` and `theme.js` into `ui/hpclib-ui/` of the zip. The checks refuse unsafe paths,
+  missing sources and collisions; the output is deterministic.
+- **The shell** (`ui/index.html`, `app.js`, `shell.js`, `client.js`, `features/`): two `<hpc-split>`s (side, dock;
+  plus the jobs list under the files), two `<hpc-tabs>`, a registry (`registerOpener`, `registerAction`,
+  `registerDock`) and the page events of 2.1 (`ws:cwd`, `ws:open`, `ws:select`, `ws:reveal`, `ws:fs-changed`,
+  `ws:job-submitted`). Opening the same file twice shows one tab, even while the first is loading. Tabs that can be
+  restored come back after a reload. `features/files.js` is the stand-in file manager; its header is the contract a
+  replacement keeps. `features/jobs.js` ("My jobs") stays until phase 2 and nothing depends on it.
+- **Theme bridge**: the console's Open link adds `#theme=…&console=http://127.0.0.1:PORT` for apps with
+  `"theme_link": true` (a new manifest key; `appUrl()` in `agent-console/components.js`). `ui/bridge.js` sets
+  `data-theme`, keeps both for the next visit and loads that console's `/user.css`; only a loopback address is
+  accepted. `workspace.css` is layout only: it has no colour of its own and uses hpclib's variable names.
+- **Libraries**: xterm.js 6.0.0 with fit 0.11.0 and web-links 0.12.0, CodeMirror 5.65.21, pinned in `libs.json`
+  with sha384 hashes (checked on the default CDN and on a vendor directory, left off for another mirror).
+  CodeMirror 6 followed in phase 4c (section 16), and CodeMirror 5 is gone.
+
+Found while testing: a custom element's constructor must not set attributes (`document.createElement` refuses the
+element), which broke `<hpc-menu>` and `<hpc-toasts>`; and an automatic popover closes on the mouse-up of the
+right-click that opened it on Linux and macOS, so `<hpc-menu>` is a manual popover that closes itself. A test now
+creates every shared element with `createElement`.
+
+Tests: `TestShellStructure` and `TestBundle` in `tests/test_workspace_package.py`; the page tests in
+`tests/test_workspace_ui.py` run against the built package (theme bridge, de-duplicated opens, keyboard tabs and
+splitters, the menu, toasts); `tests/test_app_url.mjs`.
+
+Open from this phase when it closed, and closed since: unsaved editor drafts and the dock's terminals now survive a
+reload (phase 2, section 13). Still open: the bottom bar for narrow screens is the stacked layout only.
+
+## 11. Phase 3 status: done, on the Phase 1 code (Workspace 1.2.0)
+
+Phase 3 was built before phase 2 (the order was changed on 2026-10-30), on the 1.1.0 code: none of phase 2's work
+(the `ws/` split, detached terminals, login-environment capture, `fs/tail`, Runs from here, My jobs removed) is
+assumed or in it.
+
+What landed:
+
+- **Shared, pure, 3.6-safe modules in `hpclib/servers/`**, embedded into the package by `core_helpers`:
+  `envinfo.py` (detect, find the project, status, the activation lines; `rest_envs.py` now delegates to it, so the
+  REST server and the Workspace agree on what "ready" means and on `.venv.hpclib.json` and its marker; the 26
+  `test_rest_envs` tests are the guard) and `clusterinfo.py` (sinfo, gres, sacctmgr, `sbatch --test-only` parsing;
+  time and memory parsing and formatting). `console_packages.CORE_HELPERS` lists them. `rest_jobs.py` still has its
+  own copies of the parsing: unify them when it is next touched (it was not changed so that the REST server's tests
+  keep their meaning).
+- **`jobspec.py`** (Workspace tunnel): `validate(spec, cluster)`, `render(spec, cluster, env)`, `embedded_spec(script)`.
+  The spec is JSON; the script carries it as `#HPCLIB-SPEC {...}`, so a generated script opens in the form again and
+  renders to the same text. Every value that reaches the shell is `shlex.quote`d, arguments are split with
+  `shlex.split` and quoted again, `extra_sbatch` lines must start `#SBATCH `, names and partitions have character
+  sets, and a single-line rule refuses newlines. The script traps TERM (`--signal=B:TERM@60`; the program runs in
+  the background and the script waits in a loop, so the trap runs at once and the program is told).
+  Problems the cluster would raise (time limit, memory, GPUs per node, unknown partition) are warnings here, and
+  `sbatch --test-only` (Check) has the last word.
+- **`ws_envs.py`** (Workspace tunnel): the card (status words ready, not prepared, stale, busy, failed, tool missing,
+  none found), Prepare for uv and pixi (a child of the server on the login node; marker `.venv.hpclib-syncing`,
+  record `.venv.hpclib.json` with the interpreter and the package list, log under `workspace/operations/`),
+  `hpclib_pytools install` and `set`, and the directory settings. Prepare does not do cores, layers or squash (the
+  REST server's), and an operation lost with the server leaves no record (the card then says "not prepared" or
+  "stale" again).
+- **Routes**: `GET /api/cluster`, `/api/modules`, `/api/env`, `/api/env/operation`, `/api/job`, `/api/tail`;
+  `POST /api/env/{prepare,tool,dirs}`, `/api/jobs/{render,check,submit}`. Submit answers 409 while the environment
+  would block it. Each submit writes `workspace/runs/JOBID.json` (job id, spec, script path and hash, the environment's
+  record, git HEAD and whether the tree is dirty, the output path). `/api/tail` is the smallest follower the guided
+  path needed; phase 2's `fs/tail` supersedes it.
+- **UI**: `<hpc-resources>` and `units.js` in `hpclib/ui` (shared with the console's later use), the guided
+  `features/submit.js` (form, environment card, read-only script with "Edit by hand…", Check, Submit, Submit and
+  follow), `features/follow.js` (a dock view opened with `ws.dockOpen("follow", …)`; features still do not import
+  each other) and `features/classic.js` (the old template form, opener `submit-classic`, one link away).
+- **Tests**: `tests/test_workspace_jobspec.py` (golden scripts under `bash -n`, a real bash forwarding TERM to its
+  child, quoting against hostile values, round trip, warnings), `TestSubmission` in `tests/test_workspace_package.py`
+  (fake `sinfo`, `sacctmgr`, `sbatch --test-only`, `module` and `uv`: file to followed output, a stale
+  environment blocks Submit, a busy one and a missing tool say so, hand-edited scripts), the browser path in
+  `tests/test_workspace_ui.py`, `tests/units.test.mjs` for the browser's parsers, and the 3.6 grammar guard now covers
+  the new modules.
+
+Known limits: the environment card looks at one project (the nearest to the script) and the default pixi
+environment; "none found" does not block Submit; a hand-edited script is checked and submitted as written (an
+embedded spec only decides the environment gate); `module -t avail` is read in a login shell and cached ten minutes;
+the job's state comes from `squeue`, then `sacct` (needs accounting).
+
+## 12. Phase 4, as it looks after phase 3
+
+1. **`.slurm` round trip.** Opening a `.slurm` or `.sbatch` file shows the form when it carries a spec (done: the
+   script does) and, for a hand-written one, an import: parse `#SBATCH` lines into a spec where they map (time,
+   nodes, tasks, CPUs, memory, GPUs, partition, account, QOS, output), keep the rest as `extra_sbatch`, keep the body as
+   the command, and show a diff between the file and what the form would make, with **Adopt** (write the form's) or
+   **Keep mine**. Needs the merge view of CodeMirror 6 (below).
+2. **Profiles.** A named spec (resources, modules, shell init, environment mode) saved per user in
+   `workspace/profiles/` (not browser storage), plus an optional `.hpclib/job.json` in a project that is offered when
+   a script there is submitted. "Last used" becomes the first profile.
+3. **Arrays and sweeps.** `array: {range, limit}` and `sweep: {name: [values]}` in the spec; a sweep writes
+   `NAME.params.tsv` beside the script and the script picks its row by `SLURM_ARRAY_TASK_ID`; output becomes
+   `%x-%A_%a.out`. The follower and the run record need to know a run has many tasks (state per task from
+   `squeue -r`/`sacct`).
+4. **Dependencies and chains.** `--dependency=afterok:ID` chosen from Runs from here (phase 2) rather than typed;
+   "submit these two as a chain".
+5. **Interactive mode.** `salloc`/`srun --pty` built from the same resources and opened as a dock terminal; no
+   script.
+6. **Squash.** After one convention exists for squashed environments (the REST server's): Prepare gains "squash after
+   preparing" and the card shows image size and "unsquash"; jobs then mount through the existing prelude.
+7. **CodeMirror 6.** Replace `<hpc-code>`'s internals behind its current attributes and methods; gains the merge
+   view (1), better large files, language packs. Pin and hash it in `libs.json` like the others.
+8. **What phase 3 left plain on purpose:** named pixi environments and cores/layers in the card; sandboxed or
+   squashed Prepare; mail and requeue options (`--mail-type`, `--requeue`, checkpoint signals beyond TERM); several
+   clusters in one page; `rest_jobs.py` using `clusterinfo.py`.
+
+Phase 2 has since landed (section 13) and did what this paragraph said it would: the routes moved into `ws/`
+modules, `/api/tail` and `follow.js` became `fs/tail` and the shared follower, the run records are the data behind
+Runs, the login environment captured once replaced `login_shell_run` (Check's stdin variant included), and My jobs and
+`/api/jobs` went. What that changes in this list is at the end of section 13.
+
+## 13. Phase 2 status: done, with the Wunderbaum file browser (Workspace 1.3.0; tree fixes 1.3.1; 1.3.2: one-click fold, the "null" in the editor bar, the Submit tab no longer waits on a slow Slurm)
+
+Two pieces of work are in this step: the file browser from the `hpclib-wunderbaum` draft, ported onto the new shell,
+and phase 2 itself.
+
+### 13.1 The file browser (from `chatgpt_drafts/hpclib-wunderbaum.patch`)
+
+The draft was written against the old, pre-shell Workspace. What was kept is its design: one shared element,
+`<hpc-file-browser>` (`hpclib/ui/components/file-browser.js`), used by the Workspace's `features/files.js` and the
+console's Files page, with Wunderbaum 0.14.1 as the Tree view (pinned and hashed in `libs.json`, loaded from the
+CDN like CodeMirror and xterm), a Details table, breadcrumbs, and a plain `<details>` tree as the fallback when the
+library does not load. What was changed in porting:
+
+- It sits behind the shell's registry like everything else: `files.js` configures the element (list, open, menu,
+  directory and error callbacks) and keeps the path bar, Places, Upload, Usage and the ⋯ menu. The file manager still
+  sends `ws:cwd`, `ws:open` and `ws:select`, listens to `ws:reveal` and `ws:fs-changed`, and now `ws:tab-path`
+  (the shell sends it when the shown tab is a file, so the tree selects it).
+- The draft's CSS went into `base.css`; the Workspace's own table styles were removed.
+- `update_libs.py` asked for `dist/wunderbaum.min.css`, which the package does not have; the entry uses
+  `dist/wunderbaum.css`.
+- A bug: Wunderbaum fires `activate` after `setActive`, not during it, so selecting the open file from code
+  activated the node, which opened the file, which selected it again, without end. `activateQuietly` marks the key
+  as programmatic and the `activate` handler ignores exactly that key once.
+- Follow-up fixes after first use: the tree's icons were font glyphs the page never loaded (a box for folders, a dot
+  for files, in spans of no fixed width), so a folder's files lined up with the folder names above and looked like
+  its siblings. Folders and files now have drawn icons (inline SVG, no font) in boxes of fixed width, with one visible
+  step of indent per level. Double-clicking a folder, or Enter on the active one, makes it the top of the tree
+  (`enter(path)`): the breadcrumbs, Up and Top lead back out.
+- Tests: `tests/test_file_browser.mjs` (the element's logic with stubs), the Workspace UI tests (both views; the
+  Wunderbaum ones need `WORKSPACE_TEST_NPM` to hold the pinned package and are skipped without it).
+
+### 13.2 What phase 2 did
+
+- **`ws/` split.** `workspace_server.py` is the HTTP side only (token, routes, static files, signed file URLs). The
+  work is in `ws/`: `common` (Refused, `resolve`, directories), `shellenv`, `fs`, `terminal`, `cluster`, `envs` (was
+  `ws_envs.py`), `jobspec` (moved), `jobs` and `templates`. They know nothing of HTTP and are tested through it.
+  Not done as planned: authentication stayed in `workspace_server.py` (it is the HTTP side's, and `token_auth.py` is
+  already its own module), and the classic templates stayed in `templates.py` rather than a renamed `recipes.py`
+  (the guided path has no recipes yet).
+- **The login environment, once.** `ShellEnv` runs `bash -lc 'env -0'` after a marker (so a profile's banner is not
+  mistaken for the environment), keeps it, and runs `sbatch`, `sinfo`, `squeue`, `sacct`, `sacctmgr` and `scancel`
+  directly with it: no shell parses a job id or a file name, and no profile runs per query. A program that is not found
+  asks for a fresh capture once. `module` is a shell function, so `login()` runs it in a login shell, dropping what the
+  profile printed. The capture leaves out `WORKSPACE_TOKEN`.
+- **Terminals that outlive the page.** A session is a login shell in a pty that the server keeps; the page attaches
+  over the WebSocket (`/terminal?ticket=&session=ID`), and leaving detaches. The last 256 KiB of output is kept and
+  replayed on attach, several pages can watch one session, 16 may run, and an ended session is forgotten once nobody is
+  attached. `GET /api/terms` lists them and `POST /api/term/close` hangs one up. `<hpc-terminal>` reconnects by itself
+  (1, 2, 4 … 15 s, eight times) when a named session's connection drops, resets its screen and takes the replay; the
+  page remembers its sessions' ids per user and host and attaches after a reload. Closing a tab ends its shell, as it
+  did before; leaving does not. The sessions end with the Workspace (a tunnel restart loses them: discovering
+  sessions that were started by an earlier server is not possible, since they were its children).
+- **`fs/tail` and one follower.** `GET /api/fs/tail?path=&offset=&id=` returns the new bytes and an id for the file
+  (device and inode); a follower that sends it back learns when the file was replaced and starts again from its end
+  (`restarted`), as it does for a file that shrank. `follow.js` follows any file ("Follow as it grows" in the file
+  menus) and, given a job, also its state and a Cancel. Keystrokes typed while a terminal is disconnected are dropped,
+  not queued.
+- **Runs from here.** `GET /api/runs[?dir=]` lists the run records newest first, with state from one `squeue` and one
+  `sacct` call for all of them; a finished run's state is written into its record, so it is never asked about again.
+  `POST /api/runs/ID/cancel` cancels a run of the Workspace's (a job from elsewhere is the terminal's). `features/runs.js`
+  shows them under the file list, "From here" (the folder shown and below) or "All", with Follow, Script, Output and
+  Cancel. My jobs, `/api/jobs` and `/api/cancel` are gone.
+- **Layout.** The open tabs are kept under a key per user and host (the unscoped key of 1.1 is read once if the
+  scoped one is absent). Unsaved editor changes are kept as drafts (20 files of up to 1 MB, a second after the last
+  keystroke) and put back when the file is opened again if it has not changed on the cluster, or after asking if it
+  has; saving, reloading from disk and closing the tab drop the draft. The editor limit is 64 MB by default (it was
+  800; a JavaScript string cannot hold that).
+- **Tests.** `TestTerminal` gained reattach-with-replay, two pages on one session and close; `TestSubmission` gained
+  runs (state, scope, remembering the end, cancel) and `fs/tail`; `TestShellEnv` is new; the 3.6 grammar guard reads
+  every `ws/*.py`; the browser tests cover Runs, a reload with a terminal, a dropped connection, drafts and the key
+  scope.
+
+### 13.3 Known limits
+
+A run whose record could not be written (a read-only data directory) is not listed. A terminal's shell is a child of
+the server: stop the server and the sessions go. `squeue` and `sacct` are asked for at most 100 unfinished runs at a
+time. The "From here" scope compares working directories as strings (a symbolic link is not followed).
+
+## 14. Phase 4a status: arrays, sweeps, dependencies, profiles (Workspace 1.4.0)
+
+Done, in the order section 12 lists them (items 2 to 4; 1, 5 and 7 are 4b and 4c; 6 stays deferred):
+
+- **Arrays and sweeps.** Spec keys `array {range, limit}` and `sweep {NAME: [values]}` (only present when set).
+  A sweep is an array `0-(N-1)` over the combinations (first name slowest). *Change from section 12:* the combinations
+  are written into the script itself (a quoted heredoc and one `awk`), not into `NAME.params.tsv` beside it, so a
+  script is self-contained and a second submission of the same name can't change the table under tasks still queued.
+  Each task exports its row's names; `{NAME}` in the arguments becomes `"${NAME}"`. Names and values are restricted
+  (plain names; letters, digits and `. : + / = @ - _`), so the `eval` of an awk-made `export` list cannot be abused.
+  Output defaults to `%x-%A_%a.out`; the follower shows the first task's file.
+- **Run state per task.** `squeue -r` and `sacct -X` rows `ID_N` / `ID_[a-b%c]` are folded into one state per run
+  (running beats pending beats the worst end) with the counts in `tasks`; the run record keeps `tasks` (the total) and
+  the Runs list says "3/10 done, 1 failed".
+- **Dependencies.** Spec key `dependency {type, jobs}` becomes `--dependency=TYPE:ids` and
+  `--kill-on-invalid-dep=yes`; the form lists the runs from the working directory that are still going, and takes
+  other job numbers.
+- **Profiles.** `ws/profiles.py`; `GET/POST /api/profiles`, `POST /api/profiles/delete`. A profile is resources,
+  modules, environment mode and shell init, output and extra `#SBATCH` lines; never the script, folder, arguments,
+  sweep or dependency. Sources: last used (kept by the server on every submission), the project's
+  `.hpclib/job.json` (found from the script's folder up to home), and saved ones under `workspace/profiles/`. The form
+  opens with the project's, else the last used.
+
+What 4b and 4c still hold: interactive mode, the `.slurm` import with a diff and Adopt / Keep mine, CodeMirror 6.
+
+### 14.1 Follow-ups (1.4.1)
+
+- The Submit form opens at once; Slurm and the environment answer into it (each gives up after a while) and it says how
+  long each took. Finding uv and pixi no longer runs a login shell (`Environments.tools()` reads the PATH and the
+  installers' directories); `hpclib_pytools --json`, which also starts an interactive shell for `~/.bashrc`, is asked only
+  when the card's directory section is opened (`GET /api/env/settings`). A slow login node had made the card say "not
+  installed" for tools that were there, and the form wait for it.
+- The file filter applies to folders, and leaves out those with nothing to show.
+- Fixed: `<hpc-resources>` printed its datalists as "[object HTMLDataListElement]" (an array passed as a child); the job
+  script panel is taller.
+
+## 15. Phase 4b status: the `.slurm` round trip and interactive sessions (Workspace 1.5.0)
+
+- **Your own script as a spec.** Spec kind `body` keeps the script's commands verbatim in `body`; `render` writes the
+  #SBATCH lines from the fields, then the body as it is (no TERM forwarding: there is no program of the form's to
+  forward it to, and no `--signal` line). `jobspec.parse_script` reads a hand-written script: the options the form has
+  fields for (name, time, nodes, tasks per node, CPUs, memory, GPUs by `--gres` or `--gpus`, partition, account, QOS,
+  chdir, output, array with limit, a dependency of one kind) become the spec; every other option stays as an
+  `extra_sbatch` line; the leading comments and commands are the body. Anything the parser can't place is kept, never
+  dropped. A script with no `--time` gets a warning, since the form's default would change its limit.
+- **Opening one.** "Open as job form…" on a `.slurm` or `.sbatch` file (`GET /api/jobs/import`): the form's own file
+  comes back as its embedded spec; a hand-written one is imported. When the file differs from what the form would write,
+  a line diff (`ui/diff.js`: prefix and suffix set aside, LCS for the middle, remove-all/add-all past two million
+  cells) shows the difference with **Adopt the form's version** (`POST /api/jobs/adopt`: the file is rewritten and the
+  original kept as `NAME.bak`) and **Keep mine** (the text stays as written; Submit runs `sbatch` on the file where it
+  lies, refusing if it changed on disk since it was shown: `as_is` in `POST /api/jobs/submit`). Submitting the form's
+  version of an opened script writes it over the file (`script_dir` keeps it where it was).
+  *Change from section 12:* the diff is our own small view, not CodeMirror's merge view; 4c swapped it (section 16).
+- **Interactive sessions.** The "Interactive session" button turns the form's resources into
+  `srun --job-name=… --time=… --pty bash -il` (with the modules loaded first through `bash -lc 'module load …; exec bash -il'`)
+  and opens a dock terminal in the working directory with that line typed into it, so it sits in the shell's history
+  and can be edited. Arrays, sweeps and dependencies don't apply (the page says so). The environment (a uv project's venv)
+  isn't activated: run `uv run` or activate it in the session.
+
+What 4c held, CodeMirror 6, is section 16. Squash stays deferred (section 8).
+
+## 16. Phase 4c status: CodeMirror 6 and the merge view (Workspace 1.6.0)
+
+- **Delivery (the spike's answer).** CodeMirror 6 has no no-build script on npm, so hpclib builds one: `hpclib/ui/vendor/_build/`
+  holds `cm6-entry.js`, a `package.json` with every package at an exact version (view 6.43.15, state 6.7.6, language 6.13.1,
+  commands 6.11.1, search 6.7.2, merge 6.12.3, lang-python 6.2.1, legacy-modes 6.5.5, theme-one-dark 6.1.3, esbuild 0.28.2),
+  a `package-lock.json`, and `build.sh` (`npm ci`, esbuild, minified IIFE; prints the sha384). The result,
+  `hpclib/ui/vendor/codemirror6.js` (about 570 KB), is committed and defines one global, `CM6`. It is the same bytes on every
+  build (checked: two builds compare equal). `libs.json` has the entry `{"local": "vendor/codemirror6.js"}` with its sha384
+  (`update_libs.py` hashes it; a test checks the two agree), and `libs.js` loads a `local` library from beside itself with
+  `integrity`. So the editor needs no CDN and no `--cdn` mirror; xterm.js and Wunderbaum still do. The Workspace's zip
+  carries the bundle but not `_build/` (`bundle` skips directories that start with `_`).
+- **`<hpc-code>`** keeps its attributes (`language`, `readonly`), methods and events; underneath it is a CM6 `EditorView`
+  with compartments for language, read-only and theme. `languageFor()` still answers with the old mode names, which
+  `CM6.language()` maps (Python by its Lezer grammar, the rest by the legacy stream modes: shell, YAML, TOML, JSON, JS/TS,
+  XML/HTML, CSS, C/C++/Java, Fortran, R, Julia, SQL, properties). Markdown is plain text for now (it would need
+  `@codemirror/lang-markdown`). The colours come from the page's tokens (`--bg`, `--fg`, `--line`, `--accent`, `--good`,
+  `--bad`), the syntax colours follow dark mode. Loading a file isn't an undo step; `isClean` compares documents, so undoing
+  back to the saved text is clean again (CM5 behaved the same). The textarea fallback stays for a page where the script
+  can't load; `view` exposes the `EditorView`.
+- **`<hpc-diff>`** (same file) is CM6's unified merge view, read-only: `diff.show(original, modified)`. It replaces
+  `ui/diff.js` and its tests and the `.diff*` CSS; the import banner of an opened `.slurm` uses it, so changed lines are
+  shaded, changed words are marked inside them, and runs of unchanged lines fold (two lines of context).
+- **Behaviour changes to know**: Tab indents the line (CM5 inserted spaces at the cursor); the search panel is CM6's
+  (Ctrl/⌘-F), Ctrl/⌘-G finds next; the editor is a bigger script than CM5's (570 KB against about 250 KB of files, but local).
+- Tests now locate `.cm-content` / `.cm-editor` and read `hpc-code.value`; new ones: the editor highlights and undo returns
+  to clean, the diff test reads the merge view, the bundle's hash matches `libs.json`, the zip carries the bundle.
+
+### 16.1 Follow-up (1.6.1)
+
+- The diff is easier to read: solid soft backgrounds for added and removed lines (the page's `--good` and `--bad` mixed into
+  `--bg`, so they work in dark mode), a stronger tint for changed words, no underline or strike-through, no syntax colours
+  inside the diff (they turned comments brown on red), and up to 480 px of height. `<hpc-diff>.show()` does nothing when
+  called again with the same two texts, so a form that re-renders doesn't rebuild the view.
+
+### 16.2 Follow-up (1.6.2): creating the same file twice
+
+- `PUT /api/file?how=create` is now exclusive on the server: the temporary file is hard-linked into place (which fails when the
+  name exists) instead of renamed over it, so two creates of one name at once give one 200 and the rest 409, and no
+  `.workspace-tmp` file is left. (Before, both could pass the existence check and the later rename replaced the earlier file.)
+- **New file** and **New folder** ignore a second request while one is still asking or creating, so a repeated click or
+  Enter can't start a second create. Reported as a freeze in Zen (Firefox) when the first create hadn't returned; the
+  freeze itself did not reproduce in Chromium, so this removes the race rather than a found loop.
+
+## 17. Where the plan stands (Workspace 1.6.2, 2026-10-31)
+
+Done: phases 0 to 4 as in the table in section 7, except squash. Not built, on purpose or not yet:
+
+- **Squash** (5.6): deferred by decision 5; needs the two conventions unified first.
+- **Markdown highlighting** in the editor (needs `@codemirror/lang-markdown` in the bundle); Markdown preview ("later" in 2.3).
+- **xterm search addon**, the icon sprite and `console_packages.py build --vendor`: planned in section 2.3, not built (see the rows there).
+- **Section 12 item 8** (named pixi environments and layers in the card, mail and requeue options, several clusters in one page,
+  `rest_jobs.py` using `clusterinfo.py`) and the limits in 13.3.
+- Not yet tried on real clusters: arrays, sweeps, dependencies, profiles and interactive sessions on Entropy, and Grace and
+  Faster for the environment card; the editor and diff in Firefox-based browsers (Zen); the "create twice" freeze (16.2).
+
+## 18. Links to a file (Workspace 1.7.0)
+
+- **In the Workspace page**: `#file=/path[&line=N]` shows the file's folder in the browser and, once last time's tabs are
+  back, opens the file (`ws.open` with `line`; an already open tab is brought to the front and moved to the line).
+  `<hpc-code>.goto(line)` does the scrolling (CM6: selection plus `scrollIntoView` centred; textarea: a selection range).
+  `dir=` still opens a folder alone. `bridge.js` removes only `theme` and `console` from the address, so `file` and
+  `line` survive it. A path that is not absolute is read from the home directory.
+- **In the console** (what a model gives you): `#/c/CLUSTER/apps/workspace?file=…&line=N`, beside the Files page's
+  `#/c/CLUSTER/files?path=…`. The app page reads `file` and `line` for an app with `theme_link`; a running app is opened in
+  the same tab at once (not when the page is reached with Back), otherwise the page says to start it and **Open** carries
+  the file. `appUrl(url, state, link)` adds `file` and `line` after `theme` and `console`.
+- Not done: a "Copy link" action inside the Workspace (it does not know the cluster's name in the console, nor the
+  console's address beyond the loopback port in its address).

@@ -824,37 +824,30 @@ async function filesPage(only = null) {
   }
   history.replaceState(null, "", filesHash(c.name, open ? open.path : listing.path));
 
-  const go = (path) => { location.hash = filesHash(c.name, path); };
-  const atBase = listing.path === base;
-  const up = el("button", { type: "button", disabled: atBase }, "Up");
+  const viewer = el("div", { class: "file-preview" });
+  const browser = el("hpc-file-browser");
+  const pathInput = el("input", { "aria-label": "Directory", spellcheck: "false", value: listing.path });
+  const up = el("button", { type: "button" }, "Up");
+  const go = (path) => browser.run(() => browser.navigate(path));
+  const pathForm = el("form", { class: "file-path-form" }, pathInput);
+  pathForm.addEventListener("submit", (event) => { event.preventDefault(); go(pathInput.value.trim() || base); });
   up.addEventListener("click", () => go(listing.path.replace(/\/[^/]+\/?$/, "") || "/"));
-  const home = el("button", { type: "button", disabled: atBase }, "Top");
-  home.addEventListener("click", () => go(base));
-  const viewer = el("div");
-
-  const entries = listing.entries.slice().sort((a, b) =>
-    (a.type === "directory" ? 0 : 1) - (b.type === "directory" ? 0 : 1) || a.name.localeCompare(b.name));
-  const rows = entries.map((e) => {
-    const isDir = e.type === "directory";
-    const name = isDir ? el("a", { href: filesHash(c.name, e.path), class: "dir" }, e.name + "/")
-                       : el("span", {}, e.name);
-    const actions = el("div", { class: "actions" });
-    if (e.type === "file") {
-      const view = el("button", {}, "View");
-      view.addEventListener("click", () => viewFile(c.name, e, viewer));
-      actions.append(view, action("Download", () => downloadFile(c.name, e)));
-    }
-    return el("tr", {}, el("td", {}, name), el("td", { class: "num" }, isDir ? "" : size(e.size)),
-      el("td", { class: "num" }, when(e.mtime)), el("td", {}, actions));
+  browser.configure({
+    boundary: base, storageKey: "hpclib-console-files-mode", list: files, size, when,
+    onOpen: (entry) => viewFile(c.name, entry, viewer),
+    onDirectory: (value) => {
+      listing = value;
+      pathInput.value = listing.path;
+      up.disabled = listing.path === base;
+      history.replaceState(null, "", filesHash(c.name, listing.path));
+    },
   });
-  if (open) viewFile(c.name, open, viewer);   // same size rules as View: large files aren't loaded
+  await browser.navigate(listing.path);
+  if (open) { browser.select(open.path); viewFile(c.name, open, viewer); }
   return [
     only ? null : el("h2", {}, "Files"),
-    el("div", { class: "toolbar" }, pick, home, up, el("code", {}, listing.path)),
-    viewer,
-    entries.length ? el("table", {},
-      el("thead", {}, el("tr", {}, ["Name", "Size", "Modified", ""].map((h) => el("th", {}, h)))),
-      el("tbody", {}, rows)) : el("p", { class: "muted" }, "Empty directory."),
+    el("div", { class: "toolbar" }, pick, action("Top", () => go(base)), up, pathForm),
+    el("div", { class: "file-browser-layout" }, browser, viewer),
   ];
 }
 

@@ -72,8 +72,9 @@ import threading
 import time
 
 try:
-    from . import rest_manifests, rest_sandbox
+    from . import envinfo, rest_manifests, rest_sandbox
 except ImportError:
+    import envinfo
     import rest_manifests
     import rest_sandbox
 
@@ -124,12 +125,7 @@ def saved_tool_dirs(environ=None):
     return out
 
 
-class EnvironmentError_(Exception):
-    """A request about environments that can't be done; `status` is the HTTP status."""
-    def __init__(self, status, message, **extra):
-        super().__init__(message)
-        self.status = status
-        self.extra = extra
+EnvironmentError_ = envinfo.EnvironmentError_      # the same class the Workspace raises
 
 
 def _has_pixi_table(pyproject):
@@ -269,156 +265,18 @@ class EnvironmentManager:
 
     # -- projects ------------------------------------------------------------
 
-    @staticmethod
-    def side_path(project, manager, name, suffix):
-        """hpclib's files beside an environment, in its project: .venv.sqfs, .venv.hpclib.json (uv); for pixi
-        .pixi-NAME.sqfs and so on (outside .pixi/, which pixi tidies)."""
-        return os.path.join(project, (".venv" if manager == "uv" else f".pixi-{name}") + suffix)
-
-    @classmethod
-    def read_record(cls, info):
-        """What the last sync recorded about the environment (rest of hpclib's sidecar JSON), or {}."""
-        try:
-            with open(cls.side_path(info["project"], info["manager"], info.get("environment") or "default",
-                                    RECORD_SUFFIX)) as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
-            return {}
-
-    @staticmethod
-    def _marker(path):
-        """The operation working on an environment (its marker file), unless it is stale."""
-        try:
-            with open(path) as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            return None
-        pid = data.get("pid")
-        try:
-            os.kill(int(pid), 0)                # the server that started it is gone: stale
-        except (OSError, TypeError, ValueError):
-            return None
-        if time.time() - float(data.get("started") or 0) > 24 * 3600:
-            return None
-        return data
+    side_path = staticmethod(envinfo.side_path)
+    read_record = staticmethod(envinfo.read_record)
+    _marker = staticmethod(envinfo.marker)
 
     @classmethod
     def detect(cls, project, manager="auto", name="default", _depth=0):
-        """What `project` (a real, allowed directory) holds."""
-        if not os.path.isdir(project):
-            raise EnvironmentError_(422, f"{project} is not a directory")
-        if not ENV_NAME_RE.fullmatch(name or ""):
-            raise EnvironmentError_(400, "environment names are letters, digits, _ and -")
-        files = [f for f in ("pixi.toml", "pixi.lock", "pyproject.toml", "uv.lock") if
-                 os.path.isfile(os.path.join(project, f))]
-        pyproject = os.path.join(project, "pyproject.toml")
-        if manager == "auto":
-            if "pixi.toml" in files or "pixi.lock" in files or ("pyproject.toml" in files and _has_pixi_table(pyproject)):
-                manager = "pixi"
-            elif "pyproject.toml" in files or "uv.lock" in files:
-                manager = "uv"
-            else:
-                return {"project": project, "manager": None, "files": files, "ready": False,
-                        "problem": "no pyproject.toml (uv) or pixi.toml (pixi) in this directory"}
-        if manager not in MANAGERS:
-            raise EnvironmentError_(400, f"`manager` must be auto, uv or pixi, not {manager!r}")
-        out = {"project": project, "manager": manager, "files": files}
-        if manager == "uv":
-            env_path = os.path.join(project, ".venv")
-            manifest = pyproject
-            unpacked = os.path.exists(os.path.join(env_path, "bin", "python"))
-            out.update(environment=None, locked="uv.lock" in files)
-            if "pyproject.toml" not in files:
-                out["problem"] = "uv needs a pyproject.toml"
-        else:
-            env_path = os.path.join(project, ".pixi", "envs", name)
-            manifest = os.path.join(project, "pixi.toml" if "pixi.toml" in files else "pyproject.toml")
-            unpacked = os.path.isdir(os.path.join(env_path, "conda-meta"))
-            out.update(environment=name, manifest=manifest, locked="pixi.lock" in files)
-            if not os.path.isfile(manifest):
-                out["problem"] = "pixi needs a pixi.toml (or a pyproject.toml with [tool.pixi])"
-        out["path"] = env_path
-        image = cls.side_path(project, manager, name, IMAGE_SUFFIX)
-        record = cls.read_record(dict(out, environment=out.get("environment") or name))
-        # an image hpclib made wins over files a tool put back in the mount point (uv run, pixi run outside hpclib)
-        squashed = os.path.isfile(image) and (record.get("squashed", True) if record else not unpacked)
-        out.update(image=image if squashed else None, squashed=squashed, unpacked=unpacked and not squashed,
-                   ready=squashed or unpacked)
-        if squashed and unpacked:
-            out["note"] = (f"{env_path} has files again (a sync outside hpclib?), which jobs don't see: they mount "
-                           f"{image}. Sync through hpclib to change the environment, or unsquash it.")
-        if record:
-            out.update(synced=record.get("synced"), python=record.get("python"),
-                       packages=len(record.get("packages") or []))
-            if record.get("failed"):
-                out.update(ready=False, problem="its last sync failed; sync it again")
-        try:
-            with open(manifest, errors="replace") as f:
-                declared = rest_manifests.read_core(f.read(1 << 20))
-            if declared.get("core"):
-                out["core_declared"] = declared
-        except (OSError, rest_manifests.ManifestError):
-            pass
-        marker = cls._marker(cls.side_path(project, manager, name, MARKER_SUFFIX))
-        if marker:
-            out.update(busy=marker, ready=False,
-                       problem=f"a {marker.get('kind', 'sync')} ({marker.get('id')}) is working on it; wait for it")
-        core = record.get("core")
-        if core and _depth == 0:
-            try:
-                ci = cls.detect(core["project"], manager, core.get("environment") or "default", _depth=1)
-            except EnvironmentError_ as e:
-                ci = {"ready": False, "problem": str(e)}
-            out["core"] = {"project": core["project"], "environment": core.get("environment"),
-                           "path": ci.get("path") or core.get("path"), "image": ci.get("image"),
-                           "squashed": bool(ci.get("squashed")), "ready": bool(ci.get("ready")),
-                           "synced": ci.get("synced"), "built_on": core.get("synced")}
-            if not ci.get("ready"):
-                out.update(ready=False, problem=f"its core environment ({core['project']}) isn't usable: "
-                                                f"{ci.get('problem') or 'not synced'}")
-            elif ci.get("synced") != core.get("synced"):
-                out.update(ready=False, problem=f"its core ({core['project']}) was synced again since this "
-                                                "environment was built on it; sync this one again")
-        return out
+        """What `project` (a real, allowed directory) holds (envinfo.detect, which the Workspace uses too)."""
+        return envinfo.detect(project, manager, name, read_core=rest_manifests.read_core, _depth=_depth)
 
     def prelude(self, info):
         """Bash lines that activate `info`'s environment (run inside the job's sandbox)."""
-        env, q = info["path"], shlex.quote
-        missing = (f"echo {q('hpclib: the ' + info['manager'] + ' environment in ' + info['project'] + ' is missing or broken inside the job; sync it again (sync_environment / POST /envs/sync)')} >&2; exit 4")
-        core = info.get("core")
-        if info["manager"] == "uv":
-            lines = [
-                f"export VIRTUAL_ENV={q(env)}",
-                'export PATH="$VIRTUAL_ENV/bin:$PATH"' if not core else
-                f'export PATH="$VIRTUAL_ENV/bin:{_dq(core["path"])}/bin:$PATH"',
-                "unset PYTHONHOME",
-                f'[ -x "$VIRTUAL_ENV/bin/python" ] || {{ {missing}; }}',
-            ]
-            if core:     # the core's packages come through _hpclib_core.pth, so its site-packages must be there
-                lines.append(f'[ -d {q(core["path"])}/lib ] || {{ {missing}; }}')
-            return lines
-        lines = [f"export PIXI_PROJECT_ROOT={q(info['project'])} PIXI_ENVIRONMENT_NAME={q(info['environment'])} "
-                 "PIXI_IN_SHELL=1",
-                 "unset PYTHONHOME"]
-        activate = lambda prefix: [                                     # noqa: E731
-            f"export CONDA_PREFIX={q(prefix)}",
-            f'[ -d "$CONDA_PREFIX/conda-meta" ] || {{ {missing}; }}',
-            'for hpc_activate in "$CONDA_PREFIX"/etc/conda/activate.d/*.sh; do',
-            '  [ -f "$hpc_activate" ] && . "$hpc_activate"',
-            "done",
-            "unset hpc_activate"]
-        if not core:
-            return lines + ['export PATH="%s/bin:$PATH"' % _dq(env)] + activate(env)
-        # a layer on a core: the core's interpreter and libraries, the layer's packages through the user site
-        # (PYTHONUSERBASE: site-packages there come before the core's, .pth files included)
-        cp = core["path"]
-        return lines + [
-            f'export PATH="{_dq(env)}/bin:{_dq(cp)}/bin:$PATH"',
-            f'export LD_LIBRARY_PATH="{_dq(env)}/lib:{_dq(cp)}/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"',
-            f"export PYTHONUSERBASE={q(env)} HPCLIB_ENV_LAYER={q(env)}",
-            "unset PYTHONNOUSERSITE",
-        ] + activate(cp) + activate(env) + [f"export CONDA_PREFIX={q(cp)}   # the interpreter's prefix"]
+        return envinfo.prelude(info, hint="sync it again (sync_environment / POST /envs/sync)")
 
     def job_images(self, info):
         """(image, mount point) pairs a job in this environment mounts: squashed environments (and its core's)."""

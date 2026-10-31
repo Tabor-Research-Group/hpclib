@@ -553,9 +553,9 @@ def workspace_shots(browser, only):
         page.locator("#files tr").first.wait_for()
         if what == "editor":
             page.locator("#files tr", has_text="train.py").click()
-            page.locator(".CodeMirror").wait_for()
+            page.locator(".cm-editor").wait_for()
             page.locator("#files tr", has_text="train-4242.out").click()
-            page.locator(".view:not([hidden]) .CodeMirror").wait_for()
+            page.locator(".view:not([hidden]) .cm-editor").wait_for()
             page.locator(".tabs .tab", has_text="train.py").click()
             page.get_by_role("button", name="Terminal here").click()
             page.locator(".xterm").wait_for()

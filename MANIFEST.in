@@ -3,7 +3,7 @@
 # (template.json, script.sh, guide.md, examples/*.json), and the worked
 # examples. setup.py's include_package_data puts these in the wheel too.
 include README.md
-recursive-include hpclib *.sh *.py *.json *.md *.txt
+recursive-include hpclib *.sh *.py *.json *.md *.txt *.js *.css
 recursive-include tests *.sh *.py *.md
 recursive-include agent-console *.html *.js *.css *.md
 recursive-include packages *

@@ -207,6 +207,44 @@ class TestConsoleUI(unittest.TestCase):
         self.assertEqual(self.page.evaluate("window.openRequests"), [])
         self.assertFalse(self.errors)
 
+    def test_a_file_link_opens_the_workspace_on_that_file(self):
+        apps = [{"id": "workspace", "title": "Workspace", "theme_link": True}]
+        state = {"cluster": "demo", "host": "demo", "port": 30933, "state": "up", "theme_link": True,
+                 "url": "http://127.0.0.1:41999/?token=t0k", "login": {"state": "connected"}, "install": {"state": "installed"}}
+        opened = []
+
+        def respond(route):
+            endpoint = route.request.url.split("/api/", 1)[1].split("?", 1)[0]
+            if endpoint == "apps":
+                out = {"apps": apps}
+            elif endpoint == "apps/workspace/demo/open":
+                opened.append(endpoint)
+                out = {"url": state["url"], "theme_link": True}
+            elif endpoint == "apps/workspace/demo":
+                out = state
+            elif endpoint in ("clusters/demo", "clusters"):
+                demo = {"name": "demo", "title": "demo", "host": "demo", "login": {"state": "connected"}, "set_up": True, "tunnel": {}}
+                out = demo if endpoint == "clusters/demo" else {"clusters": [demo]}
+            elif endpoint == "apps/workspace/demo/settings":
+                out = {"tunnel_args": [], "conda_env": None, "modules": [], "install_modules": [], "project": "",
+                       "python_env": False, "job": False, "installable": True, "settings": {}, "defaults": {},
+                       "fields": [], "secrets": [], "tokens": None}
+            else:
+                out = {"prompts": [], "running": False, "proposals": [], "clusters": []}
+            route.fulfill(body=json.dumps(out), content_type="application/json")
+
+        self.page.route("**/api/**", respond)
+        self.page.route("http://127.0.0.1:41999/**", lambda r: r.fulfill(body="<title>Workspace</title>", content_type="text/html"))
+        self.page.add_init_script("localStorage.setItem('agent-console-key', 'fixture-key')")
+        self.page.goto(self.base + "/index.html#/c/demo/apps/workspace?file=%2Fhome%2Fx%2Fa%20b.py&line=7")
+        self.page.wait_for_url("http://127.0.0.1:41999/**")
+        params = dict(p.split("=", 1) for p in self.page.url.split("#", 1)[1].split("&"))
+        import urllib.parse
+        self.assertEqual(urllib.parse.unquote_plus(params["file"]), "/home/x/a b.py")
+        self.assertEqual((params["line"], "console" in params, "theme" in params), ("7", True, True))
+        self.assertEqual(opened, ["apps/workspace/demo/open"])
+        self.assertFalse(self.errors)
+
     def test_package_services_are_tabs_beside_sessions_with_independent_controls(self):
         apps = [{"id": "cmccdb", "title": "CMCC DB (dev)"},
                 {"id": "cmccdb_preview", "title": "CMCCDB Preview",

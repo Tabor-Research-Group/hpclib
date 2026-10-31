@@ -1,6 +1,7 @@
-/* UI variable defaults live in default-styles.css; user.css is loaded last. */
+/* UI variable defaults live in default-styles.css; user.css is loaded last.
+   The rules every hpclib page shares (controls, tables, the custom elements in hpclib/ui) are in hpclib-ui/base.css. */
+@import url("./hpclib-ui/base.css");
 
-* { box-sizing: border-box; }
 body {
   margin: 0;
   background: var(--bg);
@@ -20,33 +21,6 @@ nav a.active { color: var(--fg); font-weight: var(--font-weight-semibold); }
 main { padding: var(--space-xl); max-width: var(--content-max-width); }
 h2 { font-size: var(--font-size-heading); margin: var(--space-xs) 0 var(--space-lg); }
 
-table { border-collapse: collapse; width: 100%; }
-th, td { text-align: left; padding: var(--cell-padding); border-bottom: 1px solid var(--line); vertical-align: top; }
-th { color: var(--muted); font-weight: var(--font-weight-medium); }
-td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
-
-button {
-  font: inherit;
-  padding: var(--control-padding);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-control);
-  background: var(--panel);
-  color: var(--fg);
-  cursor: pointer;
-}
-button:hover { border-color: var(--muted); }
-button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
-button:disabled { opacity: var(--disabled-opacity); cursor: default; }
-.actions { display: flex; gap: var(--action-gap); flex-wrap: wrap; }
-
-input, select {
-  font: inherit;
-  padding: var(--input-padding);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-control);
-  background: var(--bg);
-  color: var(--fg);
-}
 .toolbar { display: flex; gap: var(--space-lg); align-items: center; margin-bottom: var(--space-lg); flex-wrap: wrap; }
 
 /* Activity keeps wide job tables and output within their own scroll areas. */
@@ -64,106 +38,21 @@ input, select {
 .activity-details dt { color: var(--muted); }
 .activity-details dd { margin: 0; min-width: 0; }
 
-.state { font-weight: var(--font-weight-semibold); }
-.state.up { color: var(--good); }
-.state.starting { color: var(--warn); }
-.state.down { color: var(--muted); }
-.state.error { color: var(--bad); }
-.muted { color: var(--muted); }
-.error-box { color: var(--bad); margin: var(--space-md) 0; white-space: pre-wrap; }
-.badge {
-  display: inline-block;
-  min-width: 18px;
-  padding: 0 5px;
-  border-radius: var(--radius-badge);
-  background: var(--accent);
-  color: var(--accent-fg);
-  font-size: var(--font-size-small);
-  text-align: center;
-}
-
-pre {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-control);
-  padding: var(--space-md);
-  overflow: auto;
-  max-height: var(--code-max-height);
-  font: var(--font-size-code)/var(--line-height-code) var(--font-mono);
-  white-space: pre;
-}
-pre .add { color: var(--good); }
-pre .del { color: var(--bad); }
-pre .hunk { color: var(--accent); }
 .detail { margin: var(--space-xs) 0 var(--space-lg); }
 
-/* custom elements (components.js); hpc-panel and hpc-dialog draw their frame in shadow DOM from the variables above */
-hpc-panel, hpc-field, hpc-log { display: block; }
-hpc-panel pre, hpc-log pre { margin: 0; }
-hpc-panel > :first-child:not([slot]) { margin-top: 0; }
-hpc-panel > :last-child { margin-bottom: 0; }
-/* Prevent unbroken output from determining an auto-layout table's intrinsic width.
-   The panel includes its frame; the text scrolls inside it. */
-hpc-panel.log-panel {
-  contain: inline-size;
-  width: 100%;
-  min-width: 0;
-  max-width: min(100%, var(--log-max-width), calc(100vw - 2 * var(--space-xl)));
-}
-hpc-log { contain: inline-size; min-width: 0; max-width: 100%; }
-pre.log {
-  width: 100%;
-  min-width: 0;
-  max-width: 100%;
-  max-height: var(--log-max-height);
-  white-space: var(--log-white-space);
-  overflow-wrap: var(--log-overflow-wrap);
-  overflow: auto;
-}
-pre.log.error { color: var(--bad); }
-hpc-dialog p:first-child { margin-top: 0; }
-hpc-dialog input:not([type=checkbox]) { width: 100%; margin: var(--space-md) 0; }
-hpc-dialog .actions { margin-top: var(--space-md); }
 hpc-cluster-row, hpc-app-session { display: table-row-group; }
 hpc-cluster-row > tr:first-child > td, hpc-app-session > tr:first-child > td { border-top: 1px solid var(--line); }
 table.rows td { border-bottom: none; }
 table.rows .detail-row > td { padding-top: 0; }
-hpc-action-button { display: inline-flex; align-items: center; gap: var(--action-gap); flex-wrap: wrap; }
-.action-out { display: inline-flex; align-items: center; gap: 2px; font-size: var(--font-size-small); max-width: var(--action-result-max-width); }
-.action-out:empty { display: none; }
-.action-out .error { color: var(--bad); white-space: pre-wrap; }
-.action-out .saved { font-size: var(--font-size-base); }
-.action-out button.x { border: none; background: none; padding: 0 var(--space-xs); color: var(--muted); font-size: var(--font-size-subheading); line-height: 1; }
+
 hpc-cluster-picker select { min-width: 12em; }
-hpc-env-editor { display: block; }
-hpc-env-editor textarea[aria-invalid] { border-color: var(--bad); }
-ul.env-errors { margin: var(--space-xs) 0 0; padding-left: 18px; color: var(--bad); font-size: var(--font-size-small); }
-ul.env-errors:empty { display: none; }
 
 .card { border: 1px solid var(--line); border-radius: var(--radius-panel); padding: var(--card-padding); margin-bottom: var(--space-xl); }
 h3 { font-size: var(--font-size-subheading); margin: 0 0 var(--space-md); }
 h4 { font-size: var(--font-size-caption); margin: var(--space-xl) 0 var(--space-sm); }
-.field { display: flex; flex-direction: column; gap: 3px; margin-bottom: 10px; }
-.field > span { font-weight: var(--font-weight-medium); }
-.field small { font-size: var(--font-size-small); }
-.row { display: flex; flex-wrap: wrap; gap: var(--space-xs) 20px; }
-.row[hidden] { display: none; }
+
 .login-code[hidden] { display: none; }
-textarea {
-  font: var(--font-size-code)/var(--line-height-code) var(--font-mono);
-  width: 100%;
-  min-width: 280px;
-  padding: var(--space-sm);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-control);
-  background: var(--bg);
-  color: var(--fg);
-}
-.saved { color: var(--good); }
-.warning { color: var(--warn); }
-details { margin-top: var(--space-lg); }
-summary { cursor: pointer; color: var(--muted); }
-.field select, .field input:not([size]) { align-self: flex-start; }
+
 .badge[hidden] { display: none; }
 .actions.second { margin-top: var(--space-xs); }
 .toolbar h2 { margin: 0; }
@@ -186,17 +75,7 @@ a.dir { color: var(--accent); text-decoration: none; }
 #topbar nav a { color: var(--topbar-muted); text-decoration: none; padding: var(--space-xs) 10px; border-radius: var(--radius-control); }
 #topbar nav a:hover { background: var(--topbar-hover-bg); color: var(--topbar-active-fg); }
 #topbar nav a.active { background: var(--topbar-active-bg); color: var(--topbar-active-fg); font-weight: var(--font-weight-semibold); }
-a.button {
-  display: inline-block;
-  padding: var(--control-padding);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-control);
-  text-decoration: none;
-  color: var(--fg);
-  background: var(--panel);
-}
-a.button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
-.small { font-size: var(--font-size-small); }
+
 .install-line { margin-top: var(--space-sm); }
 .install-line .actions { margin-top: 3px; }
 /* in the settings panel: what the cluster says about the install, in normal type, then Check and Install */
@@ -356,7 +235,7 @@ pre.quota { max-height: 220px; }
   .overview-table td { border: none; padding: 2px var(--space-xs); }
   .overview-table td:first-child, .overview-table td.next { grid-column: 1 / -1; text-align: left; }
 }
-hpc-action-button[hidden] { display: none; }
+
 td.next .actions { justify-content: flex-end; }
 @media (max-width: 720px) {
   #topbar { flex-wrap: wrap; row-gap: var(--space-xs); gap: var(--space-sm, 6px); }

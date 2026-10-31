@@ -18,3 +18,5 @@ coverage*
 # Node.
 package-lock.json
 node_modules/
+agent-console/hpclib-ui
+packages/workspace/tunnels/workspace/ui/hpclib-ui

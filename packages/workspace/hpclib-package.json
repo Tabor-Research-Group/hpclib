@@ -1,7 +1,7 @@
 {
   "format": 1,
   "name": "workspace",
-  "version": "1.0.3",
+  "version": "1.7.0",
   "description": "The Workspace: your files on a cluster in the browser, with an editor, viewers for images, HTML, PDFs and movies, terminals, and job scripts built from templates (uv, pixi, a venv or conda) and submitted with sbatch. Runs on the login node as you.",
   "apps": {
     "workspace": {
@@ -25,7 +25,7 @@
         {
           "name": "WORKSPACE_EDIT_LIMIT_MB",
           "label": "Editor limit (MB)",
-          "hint": "the largest file the editor opens; default 800"
+          "hint": "the largest file the editor opens; default 64"
         },
         {
           "name": "WORKSPACE_CONFIRM_MB",
@@ -37,13 +37,21 @@
           "label": "CDN",
           "hint": "where CodeMirror and xterm.js load from (an npm mirror); default https://cdn.jsdelivr.net/npm"
         }
-      ]
+      ],
+      "theme_link": true
     }
   },
   "tunnels": {
     "workspace": "tunnels/workspace"
   },
   "core_helpers": {
-    "tunnels/workspace/token_auth.py": "token_auth"
+    "tunnels/workspace/token_auth.py": "token_auth",
+    "tunnels/workspace/envinfo.py": "envinfo",
+    "tunnels/workspace/clusterinfo.py": "clusterinfo"
+  },
+  "bundle": {
+    "tunnels/workspace/ui/hpclib-ui": "hpclib/ui",
+    "tunnels/workspace/ui/hpclib-ui/default-styles.css": "agent-console/default-styles.css",
+    "tunnels/workspace/ui/hpclib-ui/theme.js": "agent-console/theme.js"
   }
 }

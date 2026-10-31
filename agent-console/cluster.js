@@ -2,7 +2,7 @@
 // page (Overview, Jobs, Apps, Installed, Storage, Files, SSH keys, Agents, Settings); #/c/NAME/apps/APP is one app there, with
 // its controls, tools and settings, and a package's tabs for it. They use the console's existing API, plus
 // GET clusters/NAME/jobs, GET/POST clusters/NAME/storage[/scan] and GET clusters/NAME/quota. app.js passes what they share with it (init).
-import { el, action, confirmDialog, connectClients, ownerRecovery } from "./components.js";
+import { el, action, confirmDialog, connectClients, ownerRecovery, appUrl } from "./components.js";
 import * as widgets from "./widgets.js";
 
 // { api, errorBox, render, settingsCards: (c) => [cards], addCluster: () => [button, area], files: (name) => page,
@@ -302,7 +302,7 @@ async function overview(c, local) {
           : el("hpc-state", { state: s.state, label: s.state === "queued" ? `queued: ${s.status || ""}`
             : { up: "running", down: "stopped", starting: "starting", error: "error" }[s.state] || s.state })),
         el("td", { class: "next" }, s.state === "up" && s.url
-          ? el("a", { class: "button primary", href: s.url, target: "_blank", rel: "noopener noreferrer" }, "Open")
+          ? el("a", { class: "button primary", href: appUrl(s.url, s), target: "_blank", rel: "noopener noreferrer" }, "Open")
           : el("a", { class: "button", href: notInstalled ? href(c.name, "installed") : appHref(c.name, s.app) },
               notInstalled ? "Install…" : s.state === "down" ? "Start…" : "View…")));
     }))),
@@ -493,6 +493,22 @@ async function appPage(c, id) {
   const s = await api(`apps/${id}/${enc(c.name)}`);
   const row = el("hpc-app-session", { app: id, "app-title": a.title, cluster: c.name, "by-app": "", "app-page": "" });
   row.data = s;
+  // a link to a file (#/c/NAME/apps/workspace?file=/path/to/file[&line=N]) for an app that can open one: the Open
+  // button then goes to that file, and a running app is opened on it at once (not when coming back to this page)
+  const query = new URLSearchParams(location.hash.split("?")[1] || "");
+  const link = s.theme_link && query.get("file") ? { file: query.get("file"), line: Math.floor(Number(query.get("line"))) || 0 } : null;
+  let linkNote = null;
+  if (link) {
+    row.link = link;
+    linkNote = el("p", { class: "notice" }, `Opening ${link.file}${link.line ? ` at line ${link.line}` : ""} in ${a.title}. `,
+      s.state === "up" ? "If this page stays, press Open." : `${a.title} isn't running on ${c.name}: start it here, then press Open.`);
+    const back = (performance.getEntriesByType("navigation")[0] || {}).type === "back_forward";
+    if (s.state === "up" && s.url && !back) {
+      api(`apps/${id}/${enc(c.name)}/open`, { method: "POST" })
+        .then((out) => location.replace(appUrl(out.url, out, link)))
+        .catch((err) => linkNote.append(` ${err.message}`));
+    }
+  }
   // its settings, drawn as the row's settings panel would be, but in place on the page
   const settingsBox = el("div", { class: "app-settings" }, el("p", { class: "muted" }, "Loading settings…"));
   const inline = {
@@ -508,6 +524,7 @@ async function appPage(c, id) {
     family.length > 1 ? subTabs(family.map((x) => [appHref(c.name, x.id), x.tab ? x.tab.label : x.title, x.id]), id) : null,
     el("div", { class: "toolbar" }, el("h3", {}, a.title),
       el("a", { class: "muted small", href: `#/${parentId}` }, `${parent.title} on all clusters`)),
+    linkNote,
     el("p", { class: "muted" }, a.description || `${kindText} It runs as you, with your full permissions on ` +
       "the cluster (it is not the agents' sandbox)."),
     el("table", { class: "rows" }, el("thead", {}, el("tr", {}, ["App", "State", ""].map((h) => el("th", {}, h)))), row),

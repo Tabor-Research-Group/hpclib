@@ -16,6 +16,8 @@ A package is a zip file with hpclib-package.json at its top level:
                 "password_regex": null,      # optional: finds a password it prints there instead (Copy password)
                 "login_user": null,          # optional, with password_regex: the user name of its basic-auth
                                              #   login; Open then signs in with both (user:password@ in the URL)
+                "theme_link": false,         # optional: Open adds the console's theme and address to the link
+                                             #   (#theme=dark&console=http://127.0.0.1:PORT), for a page that follows them
                 "shared": false,             # optional: one running instance serves everyone (see below)
                 "instance_label": "database",   # with shared: what the instance is called in the console
                 "reinstall": {"label": "Update", "title": "what it does"},   # optional: what Install does once installed
@@ -151,7 +153,7 @@ MAX_FILES = 5000
 MAX_SETTINGS_FILE = 1 << 20
 APP_KEYS = {"title", "tunnel", "description", "open_path", "health_path", "token_regex", "password_regex", "login_user",
             "settings", "secrets", "downloads", "install_files", "install_modules",
-            "shared", "instance_label", "reinstall", "tokens", "tab"}
+            "shared", "instance_label", "reinstall", "tokens", "tab", "theme_link"}
 LOGIN_USER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 DOWNLOAD_KEYS = {"label", "description", "kinds"}
 DOWNLOAD_KIND_KEYS = {"id", "label", "placeholder", "pattern"}
@@ -160,7 +162,8 @@ DOWNLOAD_KIND_RE = re.compile(r"[a-z][a-z0-9_-]{0,19}")
 DOWNLOAD_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}")
 TOKEN_KEYS = {"label", "scopes", "default_scope", "days", "description"}
 SCOPE_RE = re.compile(r"[a-z][a-z0-9_-]{0,19}")
-TOP_KEYS = {"format", "name", "version", "description", "apps", "tunnels", "settings", "clusters", "widgets", "core_helpers"}
+TOP_KEYS = {"format", "name", "version", "description", "apps", "tunnels", "settings", "clusters", "widgets", "core_helpers", "bundle"}
+BUNDLE_SKIP = (".py", ".pyc", ".md")      # hpclib/ui is copied whole; its maintenance scripts and notes (and any _build/ directory) stay behind
 WIDGET_KEYS = {"id", "title", "slot", "entry", "reads", "height", "description"}
 WIDGET_SLOTS = ("home", "cluster.overview", "cluster.tab")
 WIDGET_TOPICS = ("clusters", "jobs", "storage", "apps")      # and "theme", which every widget gets
@@ -355,7 +358,7 @@ def _check_install_files(value, app_id, members):
 
 # Only these first-party modules may be embedded at build time. This is a
 # source-distribution feature, not an installer that reads arbitrary local files.
-CORE_HELPERS = {"token_auth": "token_auth.py"}
+CORE_HELPERS = {"token_auth": "token_auth.py", "envinfo": "envinfo.py", "clusterinfo": "clusterinfo.py"}
 
 
 def core_helpers(manifest):
@@ -370,6 +373,54 @@ def core_helpers(manifest):
                 or not any(isinstance(d, str) and dest.startswith(d.rstrip("/") + "/") for d in tunnels.values())):
             raise PackageError("invalid core helper destination or name")
     return requests
+
+
+def _bundle_path(value, what):
+    if not isinstance(value, str) or not value or value.startswith(("/", "\\")) or "\\" in value or \
+            any(p in ("", ".", "..") for p in value.split("/")):
+        raise PackageError(f"`bundle` {what} must be a relative path inside it: {value!r}")
+    return value
+
+
+def _check_bundle(bundle):
+    """`bundle`: {destination in the package: source in hpclib's clone}, copied into the zip when it is built (the
+    Workspace carries hpclib/ui this way, so it never depends on the hpclib version on a cluster)."""
+    if bundle is None:
+        return
+    if not isinstance(bundle, dict) or len(bundle) > 20:
+        raise PackageError("`bundle` maps destination paths to paths in hpclib's clone (at most 20)")
+    for dest, source in bundle.items():
+        _bundle_path(dest, "destination")
+        _bundle_path(source, "source")
+
+
+def bundle_files(bundle, root):
+    """[(destination, bytes)] for a manifest's `bundle`, read from hpclib's clone at `root` (a directory is copied
+    whole, without scripts and notes). Raises PackageError for a source that isn't there."""
+    out = {}
+    for dest, source in sorted((bundle or {}).items()):
+        path = os.path.join(root, *source.split("/"))
+        if os.path.islink(path) or not os.path.exists(path):
+            raise PackageError(f"`bundle` source {source} isn't in hpclib's clone")
+        if os.path.isfile(path):
+            pairs = [(dest, path)]
+        else:
+            pairs = []
+            for base, dirs, names in os.walk(path):
+                dirs[:] = sorted(d for d in dirs if d not in (".git", "__pycache__") and not d.startswith("_"))
+                for n in sorted(names):
+                    if n.startswith(".") or n.endswith(BUNDLE_SKIP):
+                        continue
+                    full = os.path.join(base, n)
+                    if os.path.islink(full):
+                        raise PackageError(f"{full} is a symbolic link; packages hold plain files only")
+                    pairs.append((dest + "/" + os.path.relpath(full, path).replace(os.sep, "/"), full))
+        for name, full in pairs:
+            if name in out:
+                raise PackageError(f"`bundle` puts {name} in the package twice")
+            with open(full, "rb") as f:
+                out[name] = f.read()
+    return sorted(out.items())
 
 
 def check_manifest(manifest, members, builtin_tunnels):
@@ -394,6 +445,7 @@ def check_manifest(manifest, members, builtin_tunnels):
            "description": _text(manifest.get("description"), "description", 2000, required=False) or "",
            "apps": {}, "tunnels": {}, "settings": {}, "clusters": {}, "widgets": []}
 
+    _check_bundle(manifest.get("bundle"))
     clusters = manifest.get("clusters") or {}
     if not isinstance(clusters, dict):
         raise PackageError("`clusters` maps preset IDs to cluster configuration objects")
@@ -486,7 +538,7 @@ def check_manifest(manifest, members, builtin_tunnels):
                "description": _text(spec.get("description"), f"apps.{app_id}.description", 2000, required=False),
                "open_path": spec.get("open_path", "/"), "health_path": spec.get("health_path", "/"),
                "token_regex": spec.get("token_regex"), "password_regex": spec.get("password_regex"),
-               "login_user": spec.get("login_user"),
+               "login_user": spec.get("login_user"), "theme_link": spec.get("theme_link", False),
                "settings": [], "secrets": [],
                "shared": spec.get("shared", False), "instance_label": None, "reinstall": None, "tokens": None,
                "downloads": None, "install_files": install_files,
@@ -552,6 +604,8 @@ def check_manifest(manifest, members, builtin_tunnels):
             app["downloads"] = _check_downloads(spec["downloads"], app_id)
             if tunnel in out["tunnels"] and f"{out['tunnels'][tunnel]['dir']}/downloads.sh" not in members:
                 raise PackageError(f"app {app_id}: downloads needs {out['tunnels'][tunnel]['dir']}/downloads.sh in the tunnel")
+        if not isinstance(app["theme_link"], bool):
+            raise PackageError(f"app {app_id}: theme_link is true or false")
         if app["login_user"] is not None:
             if not isinstance(app["login_user"], str) or not LOGIN_USER_RE.fullmatch(app["login_user"]):
                 raise PackageError(f"app {app_id}: login_user is a user name (letters, digits, . _ -)")
@@ -1000,7 +1054,7 @@ def build(directory, out=None):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for base, dirs, names in os.walk(directory):
-            dirs[:] = sorted(d for d in dirs if d not in (".git", "__pycache__"))
+            dirs[:] = sorted(d for d in dirs if d not in (".git", "__pycache__") and not d.startswith("_"))
             for n in sorted(names):
                 if n in (".DS_Store",) or n.startswith("._") or n.endswith(".zip"):
                     continue
@@ -1021,6 +1075,17 @@ def build(directory, out=None):
             info.compress_type = zipfile.ZIP_DEFLATED
             with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), CORE_HELPERS[helper]), "rb") as f:
                 zf.writestr(info, f.read())
+        wanted = raw_manifest.get("bundle")
+        _check_bundle(wanted)
+        taken = {i.filename for i in zf.infolist()}
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        for name, content in bundle_files(wanted, root):
+            if name in taken:
+                raise PackageError(f"`bundle` would replace {name}, which the package has already")
+            info = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
+            info.external_attr = 0o644 << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(info, content)
     data = buf.getvalue()
     raw, members = read_zip(data)
     builtin = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tunnels")

@@ -30,6 +30,11 @@ The front end depends only on the routes below; nothing here depends on it.
   PUT  /api/styles                            {"common", "light", "dark"}: write them into user.css (changed in
                                               place, defaults taken out, new ones in a block at the end;
                                               console_styles.py); the rest of user.css is left as it is
+  GET  /hpclib-ui/FILE                       the elements and styles hpclib's pages share (hpclib/ui: scripts,
+                                              styles, JSON and SVG only); the console's own files import them, and
+                                              the Workspace package carries its own copy of the same directory
+  GET  /user.css                             the user's Interface Settings stylesheet (no key: a page on another
+                                              port, the Workspace, loads it so it follows the same theme)
   GET  /api/diagnostics                      about, preferences and every cluster's state, for a bug report
                                               (token-like strings redacted)
   GET  /api/preferences                      this machine's preferences (console_prefs.py)
@@ -368,6 +373,8 @@ def load_package_apps(store=None):
             spec["password_re"] = re.compile(app["password_regex"], re.M)
         if app.get("login_user"):
             spec["login_user"] = app["login_user"]
+        if app.get("theme_link"):
+            spec["theme_link"] = True
         if app.get("secrets"):
             spec["secrets"] = [(f["name"], f["label"], f["hint"]) for f in app["secrets"]]
         if app.get("tokens"):
@@ -3256,6 +3263,8 @@ class Clusters:
                 if password:
                     q = urllib.parse.quote
                     url = url.replace("http://", f"http://{q(spec['login_user'], safe='')}:{q(password, safe='')}@", 1)
+        if spec.get("theme_link"):
+            extra["theme_link"] = True        # the console's page adds its theme and address to the link it opens
         return dict(out, state="up", version=info.get("version"), url=url,
                     token_known=token is not None or "token_re" not in spec, **extra)
 
@@ -3291,7 +3300,7 @@ class Clusters:
         if state["state"] != "up" or not state.get("url"):
             raise ConsoleError(409, f"start {spec['title']} on {profile['name']} before opening it")
         if not state.get("prepare_open"):
-            return {"url": state["url"], "cache_cleared": False}
+            return dict({"url": state["url"], "cache_cleared": False}, **({"theme_link": True} if state.get("theme_link") else {}))
         if not state.get("username") or not state.get("password"):
             raise ConsoleError(409, "Data transfer has not supplied its GUI login yet; see Log")
         auth = base64.b64encode(f"{state['username']}:{state['password']}".encode()).decode()
@@ -3322,7 +3331,7 @@ class Clusters:
             raise ConsoleError(409, "Data transfer is busy transferring or checking files; "
                                     "wait for it to finish, then Open again")
         rc("fscache/clear")
-        return {"url": state["url"], "cache_cleared": True}
+        return dict({"url": state["url"], "cache_cleared": True}, **({"theme_link": True} if state.get("theme_link") else {}))
 
     def app_sessions(self, app):
         self.app_spec(app)
@@ -4537,6 +4546,21 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 current = console_styles.read("", defaults)
         return {"path": path, "exists": os.path.isfile(path), "values": current}
 
+    HPCLIB_UI_TYPES = {".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+                       ".json": "application/json", ".svg": "image/svg+xml"}
+
+    def serve_hpclib_ui(self, path):
+        """/hpclib-ui/FILE: the elements and styles hpclib's pages share (hpclib/ui, beside this package's servers),
+        which the console's own files import. Only that directory's scripts, styles, JSON and SVG are served."""
+        ui = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ui")
+        target = os.path.realpath(os.path.join(ui, urllib.parse.unquote(path[len("/hpclib-ui/"):])))
+        ctype = self.HPCLIB_UI_TYPES.get(os.path.splitext(target)[1])
+        if not target.startswith(os.path.realpath(ui) + os.sep) or not ctype or not os.path.isfile(target):
+            raise ConsoleError(404, "not found")
+        with open(target, "rb") as f:
+            body = f.read()
+        self.send_bytes(200, ctype, body, cache=False)
+
     def serve_static(self, path):
         # One optional user file outside --static; never expose the console's other files.
         # Handle it before the SPA fallback, which would otherwise return HTML when it is absent.
@@ -4547,6 +4571,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             except FileNotFoundError:
                 body = b""
             return self.send_bytes(200, "text/css; charset=utf-8", body, cache=False)
+        if path.startswith("/hpclib-ui/"):
+            return self.serve_hpclib_ui(path)
         root = self.server.static_dir
         rel = urllib.parse.unquote(path).lstrip("/") or "index.html"
         target = os.path.realpath(os.path.join(root, rel))

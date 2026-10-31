@@ -137,32 +137,99 @@ nothing else (**Check** says which Python it will use).
 - **Files**: browse (**Places** has your home and scratch directories), **New file**, **New folder**,
   **Upload** (or drop files on the list), and from each entry's **⋯** menu: Rename, Delete (a file or an empty
   folder), Download, Copy path, Terminal here, and **Submit job…** for a Python or bash script.
-- **Editor**: text files open in CodeMirror, with syntax highlighting for Python, shell, YAML, TOML, JSON,
-  Markdown, C/C++, Fortran, R, Julia and more. **Save** (or Ctrl/⌘-S) refuses to overwrite a file someone
-  changed on the cluster since you opened it, and asks first. Files up to **Editor limit** (800 MB by default)
-  open; above **Ask above** (20 MB) it asks first.
+- **Editor**: text files open in CodeMirror 6, with syntax highlighting for Python, shell, YAML, TOML, JSON,
+  XML/HTML, CSS, C/C++, Java, Fortran, R, Julia, SQL and more. **Save** (or Ctrl/⌘-S) refuses to overwrite a file someone
+  changed on the cluster since you opened it, and asks first. Files up to **Editor limit** (64 MB by default)
+  open; above **Ask above** (20 MB) it asks first. Changes you haven't saved are kept in this browser and put back
+  when you open the file again (after a reload or a crash), unless the file changed on the cluster since, when it asks.
 - **Viewers**: images and SVG, HTML pages (their scripts run, sandboxed, and relative links to their images
   work), PDFs and movies (they seek). **Edit source** opens an HTML or SVG file in the editor.
 - **Terminals**: **Terminal here** opens your login shell in the current folder (xterm.js), as many as you like,
-  below the files. They end with the Workspace (Stop) or when you close their tab.
-- **My jobs**: your queued and running jobs (`squeue`), with Cancel; a job's name opens its folder.
+  in a panel under the work area (drag its edge to resize it; **Hide** puts it away). A terminal keeps running when
+  you reload the page or lose the connection: the page attaches again by itself and shows what it printed
+  meanwhile. It ends when you close its tab, its shell exits, or the Workspace stops.
+- **Layout and theme**: the file list, the work area and the terminal panel have draggable dividers (arrow keys
+  work on them too; sizes are remembered), tabs of open files come back after a reload, and the page follows the
+  console's theme, the dark switch and Interface Settings included, when you open it with the console's **Open**.
+- **Links to a file**: the console opens the Workspace on a file with
+  `#/c/CLUSTER/apps/workspace?file=/path/to/file&line=N` (`line` is optional), at the console's own address
+  (`http://127.0.0.1:PORT/index.html#…`, the same address as the Files page's links), so a model can hand you a link
+  like it does for the Files page. If the Workspace is running on that cluster, the link opens it straight away: the
+  file's folder is shown in the file browser and the file opens in the editor (at that line), in front of the tabs you
+  had. If it isn't running, the page says so, you start it there, and **Open** then goes to the file. Inside the
+  Workspace, its own address takes `#file=/path&line=N` (and `#dir=/path` for a folder alone). A relative path is read
+  from your home directory. A file that isn't there says so in its tab.
+- **Runs**: the jobs you submitted from the Workspace, newest first, under the file list: **From here** (this
+  folder and below) or **All**. Each shows its state and how long it ran, and has **Follow** (its output, live, in
+  the panel below), **Script**, **Output** and, while it is queued or running, **Cancel**; its name opens its
+  folder. Jobs submitted elsewhere are not listed (`squeue` in a terminal shows those). **Follow as it grows** in
+  a file's **⋯** menu does the same for any file, and notices when a log is replaced.
 - **Usage** (and **Disk usage** in a folder's **⋯** menu): the folder's folders by size (`du -k`) and by file count
   (`du --inodes`: files, folders and links, what a file quota counts), as the cluster's Storage tab shows them,
   for any folder; **By size** and **By files** sort them, and each row opens the folder or its own usage. It runs
   at low priority for up to two minutes (then it says it is partial).
 
-![The Workspace: files, an editor, a terminal and your jobs](../images/workspace.png)
+![The Workspace: files, an editor, a terminal and your runs](../images/workspace.png)
 
-**Submit job…** builds a job script from a **script template** and submits it with `sbatch` in the file's folder.
-The templates that come with it run a Python script with **uv** (`uv run` in the project with the
-`pyproject.toml`, or with the script's inline dependencies), with **pixi** (`pixi run` in a pixi project), with
-**modules, a venv or conda**, or run a **bash** script. Each has a form (time limit, nodes, tasks, CPUs, memory,
-GPUs, partition, account, modules, and its own fields). The job script beside it follows the form as you type,
-and you can edit it by hand before **Submit**. The values you used last on a cluster are filled in next time.
-Every template sources your `~/.bashrc` (jobs start with `--export=NONE`) and hpclib, and uses
-`slurm_job_info` and `slurm_job_footer`; output goes to `JOBNAME-JOBID.out` beside the script.
+The **Filter** box above the tree shows only the files and folders whose names match: `*` for any text, `?` for one
+character, `[abc]` or `[a-c]` for a set, several patterns separated by spaces or commas (`*.py run_?.sh`), case ignored.
+A folder stays only if its name matches and it isn't empty, or something inside it, at any depth, matches; the tree looks
+inside folders in the background, so one can disappear a moment after you type. Escape clears the filter.
 
-![Submit job: a template's form and the job script it makes](../images/workspace-submit.png)
+**Submit job…** asks for what the job needs and writes the script for you, so there are no `#SBATCH` lines to
+type. The form has the job's name, arguments and working directory; the **environment card**; the resources (a
+time as `6h` or `1d 2h`, memory per node or per CPU, GPUs and their type, partition, account, QOS, modules, each
+checked against what the cluster reports: a partition's time limit, its nodes' memory and GPUs); and the **job
+script** it makes, read-only until you choose **Edit by hand…** (**Back to the form** makes it again).
+
+- **The environment card** looks for a `pyproject.toml` (uv) or `pixi.toml` (pixi) at or above the script and says
+  whether its environment is **ready**, **not prepared**, **stale** (the manifest or lock file changed after the
+  last Prepare), **busy** (a Prepare or sync is at work), **failed**, or **tool missing**. **Prepare** runs
+  `uv sync` or `pixi install` for you on the login node and shows its output; **Install uv** or **Install pixi**
+  does what `hpclib_pytools install` does; the directories uv and pixi use for their caches and downloaded
+  Pythons can be set (**Use scratch…** moves them off your home directory). Preparing on the login node is what a
+  terminal there would do: the cluster's rules for login nodes apply.
+- **Submit** waits while the environment is not prepared, stale, busy or failed, so a job doesn't start on
+  yesterday's packages: prepare it, or choose **Let the job sync it first** (the job runs `uv run` or `pixi run`,
+  which needs internet on the compute node).
+- **Check** asks Slurm (`sbatch --test-only`) whether it would take the job and when it would start.
+  **Submit and follow** opens the job's output in the panel under the work area, with its state, until it ends.
+- The script traps `TERM` (Slurm sends it a minute before the time limit, with `--signal=B:TERM@60`, and
+  `scancel` sends it) and passes it to your program, so the program can save its state. It sources your `~/.bashrc`
+  (or your login profile; **Advanced** can turn this off) and hpclib when they are there, and carries its own form
+  as a `#HPCLIB-SPEC` comment. Each submission leaves a record (spec, script, environment, git commit) in
+  `~/.local/tunnels/workspace/runs/`.
+
+- **Many tasks** (under the resources) makes the job an array (`--array`, with how many may run at once) or a sweep:
+  name some variables and their values and every combination becomes a task. Each task sees the variables as
+  `$NAME`, and `{NAME}` in the arguments is replaced by the value; the combinations are written into the script. A
+  sweep of `LR` over `0.1 0.01` and `SEED` over `1 2 3` is six tasks, one output file each, and the Runs list counts
+  them ("4/6 done").
+- **Start after other jobs** waits for jobs you pick from the runs still going (or type job numbers): after they
+  finish well, after they end however, after they fail, or after they start. A job that can no longer run is
+  cancelled rather than left waiting.
+- **Profiles** keep the resources, modules and environment settings under a name (**Save as profile…**). The form
+  opens with the last one used (kept on the cluster, so any browser has it), or with the project's, when the script's
+  folder or one above it has a `.hpclib/job.json` holding the same keys (`resources`, `modules`, `environment`,
+  `output`, `extra_sbatch`), which a team can commit.
+
+- **A job script you already have.** **Open as job form…** on a `.slurm` or `.sbatch` file opens the same form with
+  the file's settings in it. A script the form made comes back as it was; one written by hand is read: the `#SBATCH`
+  options the form has fields for fill them in, any others (mail, constraints, …) are kept as extra lines, and the
+  commands are kept exactly as written. A diff (CodeMirror's merge view: changed lines marked, changed words marked inside them, long unchanged runs folded) shows what the form's version would change in the file. **Adopt the
+  form's version** rewrites the file (your original stays beside it as `NAME.bak`); **Keep mine** leaves it alone and
+  submits it as it is.
+- **Interactive session** asks for the resources on the form and opens a terminal at the bottom running
+  `srun … --pty bash`, with the line shown so you can see and change it. It gives you a shell on a compute node for as
+  long as the time you asked for; arrays, sweeps and "start after" don't apply to it.
+
+**Classic templates…** (a link on the form) is what Submit job… used to be: a **script template** you fill in and
+edit. They remain for what the form can't say, and for your own sbatch scripts. The templates that come with it run
+a Python script with **uv**, with **pixi**, with **modules, a venv or conda**, or run a **bash** script. Each has a
+form, the job script follows the form as you type, and the values you used last on a cluster are filled in next
+time.
+
+![Submit job: the form, the environment card and the job script it makes](../images/workspace-submit.png)
 
 **Edit (your copy)** copies a template to `~/.local/tunnels/script_templates/` on the cluster and opens it; yours
 replace the Workspace's of the same name, and **New template from this…** starts another. A template is the job
@@ -180,9 +247,9 @@ script with a header that declares its form, `{{name}}` for a field's value (or 
 python -u "{{input}}"
 ```
 
-The page loads CodeMirror and xterm.js from jsDelivr: your browser needs to reach it (the cluster doesn't). For a
-site without it, set **CDN** in the Workspace's settings to a mirror of npm packages; without them the editor is a
-plain text box and terminals don't open.
+The editor comes with the Workspace. The terminal (xterm.js) and the file tree (Wunderbaum) load from jsDelivr: your
+browser needs to reach it (the cluster doesn't). For a site without it, set **CDN** in the Workspace's settings to a
+mirror of npm packages; without them terminals don't open and the file tree is a plain list.
 
 ![A picture in the Workspace's viewer](../images/workspace-viewer.png)
 

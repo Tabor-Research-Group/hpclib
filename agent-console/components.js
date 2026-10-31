@@ -1,4 +1,8 @@
 // Custom elements for the console's front end: native Web Components, no library and no build step.
+// The ones every hpclib page shares (hpc-panel, hpc-log, hpc-dialog, hpc-state, hpc-field, hpc-action-button,
+// hpc-env-editor, and hpc-tabs, hpc-split, hpc-menu, hpc-toasts, hpc-code, hpc-terminal) live in hpclib/ui and are
+// re-exported here, so the console's pages keep importing them from this file. What stays here needs the console's
+// API: cluster pickers, cluster and app rows, the LLM-client connector.
 // Colours come from the page's CSS variables (--fg, --line, ...), which reach into shadow DOM, so light and dark
 // themes apply everywhere. app.js gives them its API function with configure({ api }).
 //
@@ -27,223 +31,19 @@
 // Rows ask the page for what only it can do with events that bubble to document: "hpc-login" {cluster, then},
 // "hpc-prompt" {label, answer, prompt}, "hpc-setup" {cluster, row} and "hpc-app-settings" {app, session, row}.
 
+import { configure as configureUI, el, action, confirmDialog } from "./hpclib-ui/index.js";
+
+export * from "./hpclib-ui/index.js";
+
 let fetcher = async () => { throw new Error("components.js: call configure({ api }) first"); };
 
 export function configure({ api }) {
   fetcher = api;
-}
-
-/** el("tag", {attr: value, onclick: fn}, ...children): a DOM element. */
-export function el(tag, attrs = {}, ...children) {
-  const node = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs)) {
-    if (v === undefined || v === null || v === false) continue;
-    if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
-    else if (k === "class") node.className = v;
-    else node.setAttribute(k, v === true ? "" : v);
-  }
-  for (const c of children.flat(Infinity)) {
-    if (c === null || c === undefined || c === false) continue;
-    node.append(c instanceof Node ? c : document.createTextNode(String(c)));
-  }
-  return node;
-}
-
-/** An <hpc-action-button> running `fn`. */
-export function action(label, fn, attrs = {}) {
-  const b = el("hpc-action-button", { label, ...attrs });
-  b.action = fn;
-  return b;
+  configureUI({ api });
 }
 
 const ask = (node, name, detail) => node.dispatchEvent(new CustomEvent(name, { bubbles: true, composed: true, detail }));
 const enc = encodeURIComponent;
-
-const css = (text) => {
-  const sheet = new CSSStyleSheet();
-  sheet.replaceSync(text);
-  return sheet;
-};
-
-// Close controls share their shape and typography; each component sets its position.
-const CLOSE_CSS = css(`
-  button.close {
-    position: absolute;
-    width: var(--close-size, 24px);
-    height: var(--close-size, 24px);
-    padding: 0;
-    border: none;
-    border-radius: var(--radius-control, 6px);
-    background: none;
-    color: var(--muted);
-    font: var(--close-font-size, 18px)/var(--close-size, 24px) var(--font-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
-    cursor: pointer;
-  }
-  button.close:hover { background: var(--panel); color: var(--fg); }
-  button.close[hidden] { display: none; }
-`);
-
-// ------------------------------------------------------------------ <hpc-panel>
-
-const PANEL_CSS = css(`
-  :host { display: block; min-width: 0; margin: var(--space-xs, 4px) 0 var(--space-lg, 12px); }
-  :host([hidden]) { display: none; }
-  section {
-    position: relative;
-    border: 1px solid var(--line);
-    border-radius: var(--radius-panel, 8px);
-    padding: var(--panel-padding, 10px 14px 12px);
-    box-sizing: border-box;
-    min-width: 0;
-    max-width: 100%;
-    background: var(--bg);
-  }
-  header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-height: var(--close-size, 24px); padding-right: calc(var(--close-size, 24px) + var(--space-xs, 4px)); }
-  header:not(.has-content) { display: none; }
-  .heading { font-weight: var(--font-weight-semibold, 600); }
-  .heading, .status { min-width: 0; overflow-wrap: anywhere; }
-  .status { color: var(--muted); }
-  .status.error { color: var(--bad); }
-  .status.ok { color: var(--good); }
-  .body { min-width: 0; max-width: 100%; margin-top: var(--space-md, 8px); }
-  header:not(.has-content) + .body { margin-top: 0; }
-  button.close { top: var(--space-sm, 6px); right: var(--space-md, 8px); }
-  ::slotted([slot="actions"]) { margin-left: 2px; }
-`);
-
-export class HpcPanel extends HTMLElement {
-  static observedAttributes = ["heading", "status", "tone", "dismissible"];
-
-  constructor() {
-    super();
-    const root = this.attachShadow({ mode: "open" });
-    root.adoptedStyleSheets = [CLOSE_CSS, PANEL_CSS];
-    root.innerHTML = `<section part="panel">
-        <header part="header"><span class="heading" part="heading"></span><span class="status" part="status"></span>
-          <slot name="actions"></slot></header>
-        <div class="body" part="body"><slot></slot></div>
-        <button class="close" part="close" type="button" aria-label="Dismiss" title="Dismiss" hidden>×</button>
-      </section>`;
-    this._parts = {
-      header: root.querySelector("header"),
-      heading: root.querySelector(".heading"),
-      status: root.querySelector(".status"),
-      close: root.querySelector(".close"),
-    };
-    this._parts.close.addEventListener("click", () => this.dismiss());
-    root.querySelector('slot[name="actions"]').addEventListener("slotchange", () => this._render());
-  }
-
-  connectedCallback() { this._render(); }
-  attributeChangedCallback() { this._render(); }
-
-  _render() {
-    const p = this._parts;
-    p.heading.textContent = this.getAttribute("heading") || "";
-    p.status.textContent = this.getAttribute("status") || "";
-    p.status.className = `status ${this.getAttribute("tone") || ""}`;
-    p.close.hidden = !this.hasAttribute("dismissible");
-    const hasActions = !!this.querySelector(':scope > [slot="actions"]');
-    p.header.classList.toggle("has-content", !!(p.heading.textContent || p.status.textContent || hasActions));
-  }
-
-  /** Hides the panel, unless a "dismiss" listener calls preventDefault(). */
-  dismiss() {
-    const event = new CustomEvent("dismiss", { cancelable: true, bubbles: true });
-    if (this.dispatchEvent(event)) this.hidden = true;
-  }
-}
-
-// ------------------------------------------------------------------ <hpc-log>
-
-export class HpcLog extends HTMLElement {
-  // src: an API path; field: the list of lines in its answer ("lines"); every: seconds between refreshes (0: once);
-  // empty: what to show when there is nothing yet. Emits "update" with the whole answer after each fetch.
-  static observedAttributes = ["src", "every"];
-
-  constructor() {
-    super();
-    this._pre = document.createElement("pre");
-    this._pre.className = "log";
-    this._pre.textContent = "…";
-    this._copy = action("Copy last block", async () => {
-      const src = this.getAttribute("src");
-      const text = fetcher(`${src}${src.includes("?") ? "&" : "?"}latest=1`).then(data => {
-        if (typeof data.copy_text !== "string") throw new Error("Update the console backend to copy the last log block.");
-        if (!data.copy_text) throw new Error("There is no log output to copy yet.");
-        return data.copy_text;
-      });
-      try {
-        if (typeof ClipboardItem === "function" && navigator.clipboard.write) {
-          // Start the clipboard write during the click, before fetching, to preserve Safari's user gesture.
-          const content = text.then(value => new Blob([value], { type: "text/plain" }));
-          content.catch(() => {});  // A browser may reject the write before consuming this promise.
-          await navigator.clipboard.write([new ClipboardItem({
-            "text/plain": content,
-          })]);
-        } else {
-          await navigator.clipboard.writeText(await text);
-        }
-      } catch (error) {
-        await text;  // Prefer the backend's useful error if fetching the block failed.
-        throw error;
-      }
-      return "Copied.";
-    }, { result: true });
-    this._controls = el("div", { class: "actions log-actions" }, this._copy);
-    this._stick = true;
-    this._pre.addEventListener("scroll", () => {
-      const p = this._pre;
-      this._stick = p.scrollHeight - p.scrollTop - p.clientHeight < 24;   // follow only while at the bottom
-    });
-  }
-
-  connectedCallback() {
-    if (!this._pre.isConnected) this.append(this._controls, this._pre);
-    this.refresh();
-    this._schedule();
-  }
-
-  disconnectedCallback() { clearTimeout(this._timer); }
-
-  attributeChangedCallback(name, old, value) {
-    if (!this.isConnected || old === value) return;
-    if (name === "src") this.refresh();
-    this._schedule();
-  }
-
-  _schedule() {
-    clearTimeout(this._timer);
-    const every = Number(this.getAttribute("every") || 0);
-    if (every > 0) {
-      this._timer = setTimeout(async () => {
-        await this.refresh();
-        this._schedule();
-      }, every * 1000);
-    }
-  }
-
-  async refresh() {
-    const src = this.getAttribute("src");
-    if (!src || !this.isConnected) return;
-    let data;
-    try {
-      data = await fetcher(src);
-    } catch (err) {
-      this._pre.textContent = err.message || String(err);
-      this._pre.classList.add("error");
-      return;
-    }
-    this._pre.classList.remove("error");
-    const lines = data[this.getAttribute("field") || "lines"] || [];
-    this._pre.textContent = lines.join("\n") || this.getAttribute("empty") || "(no output yet)";
-    if (this._stick) this._pre.scrollTop = this._pre.scrollHeight;
-    this.dispatchEvent(new CustomEvent("update", { detail: data }));
-  }
-
-  /** Stop refreshing (e.g. once an operation has finished). */
-  stop() { this.removeAttribute("every"); }
-}
 
 // ------------------------------------------------------------------ after setup: the LLM clients
 
@@ -330,173 +130,6 @@ function localForm(name, info, theirs, redraw) {
     el("div", { class: "actions" }, saveBtn, ...adopt));
 }
 
-// ------------------------------------------------------------------ <hpc-dialog>
-
-const DIALOG_CSS = css(`
-  dialog {
-    position: relative;
-    width: min(var(--dialog-max-width, 440px), calc(100vw - var(--dialog-viewport-gap, 32px)));
-    box-sizing: border-box;
-    border: 1px solid var(--line);
-    border-radius: var(--radius-dialog, 10px);
-    padding: var(--dialog-padding, 16px 18px);
-    background: var(--bg);
-    color: var(--fg);
-  }
-  dialog::backdrop { background: var(--dialog-backdrop, rgb(0 0 0 / 0.35)); }
-  h3 { font-size: var(--font-size-subheading, 15px); margin: 0 calc(var(--close-size, 24px) + var(--space-xs, 4px)) 10px 0; }
-  h3:empty { display: none; }
-  button.close { top: 10px; right: 10px; }
-`);
-
-export class HpcDialog extends HTMLElement {
-  // heading: its title; transient: remove the element once closed. Escape and × close it.
-  static observedAttributes = ["heading"];
-
-  constructor() {
-    super();
-    const root = this.attachShadow({ mode: "open" });
-    root.adoptedStyleSheets = [CLOSE_CSS, DIALOG_CSS];
-    root.innerHTML = `<dialog part="dialog"><button class="close" part="close" type="button" aria-label="Close" title="Close">×</button>
-      <h3 part="heading"></h3><slot></slot></dialog>`;
-    this._dialog = root.querySelector("dialog");
-    this._heading = root.querySelector("h3");
-    root.querySelector(".close").addEventListener("click", () => this.close());
-    this._dialog.addEventListener("close", () => {
-      this.dispatchEvent(new CustomEvent("close"));
-      if (this.hasAttribute("transient")) this.remove();
-    });
-  }
-
-  connectedCallback() { this._heading.textContent = this.getAttribute("heading") || ""; }
-  attributeChangedCallback() { this._heading.textContent = this.getAttribute("heading") || ""; }
-
-  get open() { return this._dialog.open; }
-
-  showModal() {
-    if (!this.isConnected) document.body.append(this);
-    if (!this._dialog.open) this._dialog.showModal();
-    const first = this.querySelector("[autofocus], input:not([type=hidden]), textarea, select, button");
-    if (first) first.focus();
-  }
-
-  close() {
-    if (this._dialog.open) this._dialog.close();
-  }
-}
-
-// ------------------------------------------------------------------ <hpc-state>
-
-// every state word the API uses, by how it should look
-const TONES = {
-  up: ["up", "connected", "running", "succeeded", "logged in"],
-  starting: ["starting", "queued", "password_sent", "push_sent", "waiting", "behind"],
-  down: ["down", "none", "stopped", "expired", "not set up"],
-  error: ["error", "failed"],
-};
-const TONE_OF = Object.fromEntries(Object.entries(TONES).flatMap(([tone, words]) => words.map((w) => [w, tone])));
-
-export class HpcState extends HTMLElement {
-  // state: the API's word (up, queued, failed, ...); label: the text to show (default: the state); tone: override
-  static observedAttributes = ["state", "label", "tone"];
-
-  connectedCallback() { this._render(); }
-  attributeChangedCallback() { this._render(); }
-
-  _render() {
-    const state = this.getAttribute("state") || "";
-    this.textContent = this.getAttribute("label") ?? state;
-    this.className = `state ${this.getAttribute("tone") || TONE_OF[state] || "down"}`;
-  }
-}
-
-// ------------------------------------------------------------------ <hpc-field>
-
-export class HpcField extends HTMLElement {
-  // label, hint: text around its one child control, wrapped in a real <label> so clicking the text focuses it
-  static observedAttributes = ["label", "hint"];
-
-  connectedCallback() {
-    if (!this._label) {
-      const control = this.firstElementChild;
-      this._label = document.createElement("label");
-      this._label.className = "field";
-      this._text = document.createElement("span");
-      this._hint = document.createElement("small");
-      this._hint.className = "muted";
-      this._label.append(this._text);
-      if (control) this._label.append(control);
-      this._label.append(this._hint);
-      this.replaceChildren(this._label);
-    }
-    this._render();
-  }
-
-  attributeChangedCallback() { if (this._label) this._render(); }
-
-  _render() {
-    this._text.textContent = this.getAttribute("label") || "";
-    this._hint.textContent = this.getAttribute("hint") || "";
-    this._hint.hidden = !this._hint.textContent;
-  }
-}
-
-// ------------------------------------------------------------------ <hpc-action-button>
-
-export class HpcActionButton extends HTMLElement {
-  // label, primary, disabled: the button's. .action = async () => ...: runs on click, with the button off until it
-  // finishes; an error shows beside the button (× clears it), so it stays next to what failed. result: also show
-  // the string the action returns ("Saved."). Fires "done" with the action's value.
-  static observedAttributes = ["label", "primary", "disabled"];
-
-  constructor() {
-    super();
-    this.button = el("button", { type: "button" });
-    this.out = el("span", { class: "action-out" });
-    this.button.addEventListener("click", () => this.run());
-    this._running = false;
-  }
-
-  connectedCallback() {
-    if (!this.button.isConnected) this.append(this.button, this.out);
-    this._render();
-  }
-  attributeChangedCallback() { this._render(); }
-
-  get disabled() { return this.hasAttribute("disabled"); }
-  set disabled(v) { this.toggleAttribute("disabled", !!v); }
-
-  _render() {
-    this.button.textContent = this.getAttribute("label") || "";
-    this.button.className = this.hasAttribute("primary") ? "primary" : "";
-    this.button.disabled = this._running || this.disabled;
-  }
-
-  async run() {
-    if (this._running || !this.action) return;
-    this._running = true;
-    this._render();
-    this.clear();
-    try {
-      const value = await this.action();
-      if (this.hasAttribute("result") && value) this.show(String(value), "saved");
-      this.dispatchEvent(new CustomEvent("done", { detail: value }));
-    } catch (err) {
-      this.show(err.message || String(err), "error");
-    } finally {
-      this._running = false;
-      this._render();
-    }
-  }
-
-  show(text, kind) {
-    const x = el("button", { type: "button", class: "x", title: "Dismiss", "aria-label": "Dismiss" }, "×");
-    x.addEventListener("click", () => this.clear());
-    this.out.replaceChildren(el("span", { class: kind }, text), x);
-  }
-  clear() { this.out.replaceChildren(); }
-}
-
 // ------------------------------------------------------------------ <hpc-cluster-picker>
 
 export class HpcClusterPicker extends HTMLElement {
@@ -543,68 +176,6 @@ export class HpcClusterPicker extends HTMLElement {
     const pick = this.selected;
     this.select.replaceChildren(...this.options.map((c) => el("option", { value: c.name, selected: c === pick }, c.name)));
     this.select.disabled = !this.options.length;
-  }
-}
-
-// ------------------------------------------------------------------ <hpc-env-editor>
-
-export class HpcEnvEditor extends HTMLElement {
-  // Environment variables as NAME=value lines (# comments allowed), checked as you type against .rules: the
-  // server's own (GET /admin/config's rules.environment: name_pattern, reserved, reserved_prefixes, max_value);
-  // without them only the NAME=value form is checked, and the server still decides on save.
-  // .value: {NAME: value} (throws, naming the line, if one is wrong); label: names it in those messages.
-  constructor() {
-    super();
-    this.textarea = el("textarea", { rows: 3, spellcheck: "false", placeholder: "NAME=value, one per line" });
-    this.messages = el("ul", { class: "env-errors" });
-    this.textarea.addEventListener("input", () => this._check());
-    this.rules = null;
-  }
-
-  connectedCallback() {
-    if (!this.textarea.isConnected) this.append(this.textarea, this.messages);
-    if (this.hasAttribute("rows")) this.textarea.rows = Number(this.getAttribute("rows"));
-    this._check();
-  }
-
-  set value(vars) {
-    this.textarea.value = Object.entries(vars || {}).map(([k, v]) => `${k}=${v}`).join("\n");
-    this._check();
-  }
-  get value() {
-    const { vars, errors } = this.parse();
-    if (errors.length) throw new Error(`${this.getAttribute("label") || "Environment"}: ${errors[0]}`);
-    return vars;
-  }
-  get errors() { return this.parse().errors; }
-
-  parse() {
-    const r = this.rules || {};
-    const pattern = new RegExp(`^(?:${r.name_pattern || "[A-Za-z_][A-Za-z0-9_]*"})$`);
-    const vars = {};
-    const errors = [];
-    this.textarea.value.split("\n").forEach((raw, i) => {
-      const line = raw.trim();
-      if (!line || line.startsWith("#")) return;
-      const at = `line ${i + 1}`;
-      const eq = line.indexOf("=");
-      if (eq < 1) return errors.push(`${at}: "${line}" is not NAME=value`);
-      const name = line.slice(0, eq).trim();
-      const value = line.slice(eq + 1).trim();
-      if (!pattern.test(name)) errors.push(`${at}: ${name} is not a variable name`);
-      else if ((r.reserved || []).includes(name) || (r.reserved_prefixes || []).some((p) => name.startsWith(p))) {
-        errors.push(`${at}: ${name} can't be set here (it would change PATH, the sandbox, hpclib or SLURM)`);
-      } else if (r.max_value && value.length > r.max_value) errors.push(`${at}: the value is over ${r.max_value} characters`);
-      else if (name in vars) errors.push(`${at}: ${name} is set twice`);
-      vars[name] = value;
-    });
-    return { vars, errors };
-  }
-
-  _check() {
-    const { errors } = this.parse();
-    this.messages.replaceChildren(...errors.map((e) => el("li", {}, e)));
-    this.textarea.toggleAttribute("aria-invalid", errors.length > 0);
   }
 }
 
@@ -669,20 +240,6 @@ export class HpclibControl extends HTMLElement {
   }
 }
 
-/** A yes/no question in an <hpc-dialog>; resolves true for `ok`, false for Cancel, Escape or ×. */
-export function confirmDialog(heading, text, ok = "OK") {
-  return new Promise((resolve) => {
-    const yes = el("button", { class: "primary", type: "button" }, ok);
-    const no = el("button", { type: "button" }, "Cancel");
-    const dialog = el("hpc-dialog", { heading, transient: true }, el("p", {}, text), el("div", { class: "actions" }, yes, no));
-    let answer = false;
-    yes.addEventListener("click", () => { answer = true; dialog.close(); });
-    no.addEventListener("click", () => dialog.close());
-    dialog.addEventListener("close", () => resolve(answer));
-    dialog.showModal();
-    no.focus();
-  });
-}
 
 // ------------------------------------------------------------------ rows: <hpc-cluster-row>, <hpc-app-session>
 
@@ -940,6 +497,18 @@ export function ownerRecovery(cluster, started = async () => {}) {
 }
 
 /** 19.5 GB: a size in bytes for people (decimal units, as Ollama and Hugging Face give them). */
+/** The address an app's Open should use: for an app that follows the console's theme (its `theme_link`), the console's
+ *  theme and address are added after a #, which no server sees. */
+// link: {file, line} for an app that can open a file (the Workspace: #file=/path&line=N), from a console link
+// (#/c/NAME/apps/workspace?file=/path&line=N)
+export function appUrl(url, state = {}, link = null) {
+  if (!state.theme_link || !url || url.includes("#")) return url;
+  const theme = document.documentElement.dataset.theme || "system";
+  const params = new URLSearchParams({ theme, console: location.origin });
+  if (link && link.file) { params.set("file", link.file); if (link.line) params.set("line", link.line); }
+  return `${url}#${params}`;
+}
+
 export function formatBytes(n) {
   if (typeof n !== "number") return "?";
   const units = ["B", "kB", "MB", "GB", "TB"];
@@ -1007,7 +576,7 @@ export class HpcAppSession extends TunnelRow {
     tab.opener = null;
     try {
       const out = await fetcher(this.base + "/open", { method: "POST" });
-      tab.location.replace(out.url);
+      tab.location.replace(appUrl(out.url, out, this.link));
     } catch (err) {
       tab.close();
       throw err;
@@ -1217,7 +786,7 @@ export class HpcAppSession extends TunnelRow {
     b.stop.disabled = s.state === "down" && !s.started_here;
     const up = s.state === "up";
     const open = up && s.url
-      ? (s.prepare_open ? b.open : el("a", { class: "button primary", href: s.url, target: "_blank", rel: "noopener noreferrer" },
+      ? (s.prepare_open ? b.open : el("a", { class: "button primary", href: appUrl(s.url, s, this.link), target: "_blank", rel: "noopener noreferrer" },
                                      `Open ${this.appTitle}`))
       : null;
     const notInstalled = missing && s.state === "down";       // nothing to start until Install (in Settings…)
@@ -1254,14 +823,7 @@ export class HpcAppSession extends TunnelRow {
 
 }
 
-customElements.define("hpc-panel", HpcPanel);
-customElements.define("hpc-log", HpcLog);
-customElements.define("hpc-dialog", HpcDialog);
-customElements.define("hpc-state", HpcState);
-customElements.define("hpc-field", HpcField);
-customElements.define("hpc-action-button", HpcActionButton);
 customElements.define("hpc-cluster-picker", HpcClusterPicker);
-customElements.define("hpc-env-editor", HpcEnvEditor);
 customElements.define("hpc-cluster-row", HpcClusterRow);
 customElements.define("hpc-app-session", HpcAppSession);
 customElements.define("hpclib-toolbar", HpclibToolbar);

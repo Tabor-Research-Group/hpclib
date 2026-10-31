@@ -335,6 +335,8 @@ our-lab/
 | `settings.TUNNEL.files` | files placed in `~/.local/tunnels/settings/TUNNEL.d/` on the cluster (e.g. extra rclone remotes, or a `NAME.gui.sh` for Data transfer's `SMB_GUI`) |
 | `secrets` | per app; each name must be in its tunnel's `TUNNEL_SECRETS` |
 | `apps.APP.install_files` | installation files copied from the zip into that app's packaged tunnel before Check, Install or Start; see below |
+| `apps.APP.theme_link` | `true`: **Open** adds the console's theme and address to the link (`#theme=dark&console=http://127.0.0.1:PORT`), for a page that follows them (the Workspace's `bridge.js` is the example); a page that ignores the fragment is unaffected |
+| `bundle` | `{destination in the zip: path in hpclib's clone}`, copied in when the package is built (`console_packages.py build`): a directory is copied whole, without `.py`, `.pyc` and `.md` files. The Workspace carries `hpclib/ui` this way, so its page never depends on the hpclib version on a cluster. A destination that already exists in the package, or a path that leaves it, is refused |
 | `apps.APP.install_modules` | default ordered list of modules loaded before the installer; users can replace or clear it in app Settings |
 
 Build and check it, then install it from **Packages**:

@@ -79,6 +79,7 @@ small files, such as a Python environment, is the one to squash (see the README'
 
 ## An app's page
 
+`#/c/NAME/apps/workspace?file=/path/to/file&line=N` opens that file in the Workspace (see [the Workspace](apps.md#workspace-a-package)).
 `#/c/NAME/apps/APP` is one app on one cluster: its row (Open, Start, Stop, Log, and its tools, such as PAI's
 tokens), then its settings in place (what is installed, with Check and Install or Update; the job's options;
 the app's own fields; its secrets). Install output appears under the row. When a package adds tabs to an app

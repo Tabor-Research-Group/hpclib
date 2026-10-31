@@ -1,0 +1,250 @@
+/* The rules hpclib's pages share: controls, tables, and the custom elements in hpclib/ui (hpc-panel, hpc-log, hpc-tabs,
+   hpc-split, hpc-menu, ...). They use the variables in default-styles.css, so a page that loads that first, then this,
+   follows the same theme, Interface Settings and user.css as the console. The console's own page rules are in its
+   style.css; the Workspace's are in its workspace.css. */
+
+* { box-sizing: border-box; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: var(--cell-padding); border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: var(--font-weight-medium); }
+td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+button {
+  font: inherit;
+  padding: var(--control-padding);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--panel);
+  color: var(--fg);
+  cursor: pointer;
+}
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+button:disabled { opacity: var(--disabled-opacity); cursor: default; }
+.actions { display: flex; gap: var(--action-gap); flex-wrap: wrap; }
+input, select {
+  font: inherit;
+  padding: var(--input-padding);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--bg);
+  color: var(--fg);
+}
+.state { font-weight: var(--font-weight-semibold); }
+.state.up { color: var(--good); }
+.state.starting { color: var(--warn); }
+.state.down { color: var(--muted); }
+.state.error { color: var(--bad); }
+.muted { color: var(--muted); }
+.error-box { color: var(--bad); margin: var(--space-md) 0; white-space: pre-wrap; }
+.badge {
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: var(--radius-badge);
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-size: var(--font-size-small);
+  text-align: center;
+}
+pre {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  padding: var(--space-md);
+  overflow: auto;
+  max-height: var(--code-max-height);
+  font: var(--font-size-code)/var(--line-height-code) var(--font-mono);
+  white-space: pre;
+}
+pre .add { color: var(--good); }
+pre .del { color: var(--bad); }
+pre .hunk { color: var(--accent); }
+hpc-panel, hpc-field, hpc-log, hpc-resources { display: block; }
+hpc-panel pre, hpc-log pre { margin: 0; }
+hpc-panel > :first-child:not([slot]) { margin-top: 0; }
+hpc-panel > :last-child { margin-bottom: 0; }
+/* Prevent unbroken output from determining an auto-layout table's intrinsic width.
+   The panel includes its frame; the text scrolls inside it. */
+hpc-panel.log-panel {
+  contain: inline-size;
+  width: 100%;
+  min-width: 0;
+  max-width: min(100%, var(--log-max-width), calc(100vw - 2 * var(--space-xl)));
+}
+hpc-log { contain: inline-size; min-width: 0; max-width: 100%; }
+pre.log {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  max-height: var(--log-max-height);
+  white-space: var(--log-white-space);
+  overflow-wrap: var(--log-overflow-wrap);
+  overflow: auto;
+}
+pre.log.error { color: var(--bad); }
+hpc-dialog p:first-child { margin-top: 0; }
+hpc-dialog input:not([type=checkbox]) { width: 100%; margin: var(--space-md) 0; }
+hpc-dialog .actions { margin-top: var(--space-md); }
+hpc-action-button { display: inline-flex; align-items: center; gap: var(--action-gap); flex-wrap: wrap; }
+.action-out { display: inline-flex; align-items: center; gap: 2px; font-size: var(--font-size-small); max-width: var(--action-result-max-width); }
+.action-out:empty { display: none; }
+.action-out .error { color: var(--bad); white-space: pre-wrap; }
+.action-out .saved { font-size: var(--font-size-base); }
+.action-out button.x { border: none; background: none; padding: 0 var(--space-xs); color: var(--muted); font-size: var(--font-size-subheading); line-height: 1; }
+hpc-env-editor { display: block; }
+hpc-env-editor textarea[aria-invalid] { border-color: var(--bad); }
+ul.env-errors { margin: var(--space-xs) 0 0; padding-left: 18px; color: var(--bad); font-size: var(--font-size-small); }
+ul.env-errors:empty { display: none; }
+.field { display: flex; flex-direction: column; gap: 3px; margin-bottom: 10px; }
+.field > span { font-weight: var(--font-weight-medium); }
+.field small { font-size: var(--font-size-small); }
+hpc-resources .resources-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 0 var(--space-lg); }
+hpc-resources .field input:not([type=checkbox]), hpc-resources .field select { width: 100%; box-sizing: border-box; align-self: stretch; }
+hpc-resources .inline { display: flex; gap: var(--space-xs); }
+hpc-resources .inline input { min-width: 0; }
+hpc-resources .resources-problems { color: var(--warn); margin: 0 0 var(--space-sm); }
+hpc-resources .resources-problems[hidden] { display: none; }
+.row { display: flex; flex-wrap: wrap; gap: var(--space-xs) 20px; }
+.row[hidden] { display: none; }
+textarea {
+  font: var(--font-size-code)/var(--line-height-code) var(--font-mono);
+  width: 100%;
+  min-width: 280px;
+  padding: var(--space-sm);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--bg);
+  color: var(--fg);
+}
+.saved { color: var(--good); }
+.warning { color: var(--warn); }
+details { margin-top: var(--space-lg); }
+summary { cursor: pointer; color: var(--muted); }
+.field select, .field input:not([size]) { align-self: flex-start; }
+a.button {
+  display: inline-block;
+  padding: var(--control-padding);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  text-decoration: none;
+  color: var(--fg);
+  background: var(--panel);
+}
+a.button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+.small { font-size: var(--font-size-small); }
+hpc-action-button[hidden] { display: none; }
+
+/* <hpc-tabs> */
+hpc-tabs { display: block; }
+.hpc-tablist { display: flex; gap: 2px; align-items: flex-end; overflow-x: auto; scrollbar-width: thin;
+               padding: var(--space-xs) var(--space-sm) 0; border-bottom: 1px solid var(--line); background: var(--panel); }
+.hpc-tab { display: inline-flex; align-items: center; gap: var(--space-sm); flex: none; max-width: 260px; white-space: nowrap;
+           padding: var(--space-xs) var(--space-md); border: 1px solid var(--line); border-bottom: none; cursor: pointer;
+           border-radius: var(--radius-control) var(--radius-control) 0 0; background: var(--panel); color: var(--muted); }
+.hpc-tab:hover { color: var(--fg); }
+.hpc-tab.active { background: var(--bg); color: var(--fg); position: relative; top: 1px; }
+.hpc-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.hpc-tab .label { overflow: hidden; text-overflow: ellipsis; }
+.hpc-tab .dirty-dot { color: var(--accent); font-size: 0.7em; }
+.hpc-tab button.tab-close { border: none; background: none; padding: 0 2px; color: var(--muted); line-height: 1; }
+.hpc-tab button.tab-close:hover { color: var(--fg); }
+
+/* <hpc-split>: the fixed pane has --split-size; the divider is a separator you can drag or move with arrow keys */
+hpc-split { display: flex; min-width: 0; min-height: 0; }
+hpc-split[data-direction="column"] { flex-direction: column; }
+hpc-split > :not(.hpc-split-divider) { min-width: 0; min-height: 0; }
+hpc-split[data-fixed="first"] > :first-child { flex: 0 0 var(--split-size); }
+hpc-split[data-fixed="first"] > :last-child { flex: 1 1 0; }
+hpc-split[data-fixed="last"] > :first-child { flex: 1 1 0; }
+hpc-split[data-fixed="last"] > :last-child { flex: 0 0 var(--split-size); }
+.hpc-split-divider { flex: none; position: relative; z-index: 2; background: transparent; }
+hpc-split[data-direction="row"] > .hpc-split-divider { width: 5px; margin: 0 -2px; cursor: col-resize; }
+hpc-split[data-direction="column"] > .hpc-split-divider { height: 5px; margin: -2px 0; cursor: row-resize; }
+.hpc-split-divider:hover, .hpc-split-divider:active, .hpc-split-divider:focus-visible {
+  background: color-mix(in srgb, var(--accent) 40%, transparent); outline: none; }
+
+/* <hpc-menu> (a popover) and <hpc-toasts> */
+hpc-menu { inset: auto; margin: 0; padding: var(--space-xs); min-width: 11rem; max-width: calc(100vw - 8px);
+           border: 1px solid var(--line); border-radius: var(--radius-panel); background: var(--bg); color: var(--fg);
+           box-shadow: 0 6px 24px rgb(0 0 0 / 0.2); }
+hpc-menu:popover-open { display: block; }
+hpc-menu .menu-item { display: block; width: 100%; text-align: left; border: none; border-radius: var(--radius-control);
+                      background: none; padding: var(--space-sm) var(--space-lg); white-space: nowrap; }
+hpc-menu .menu-item:hover, hpc-menu .menu-item:focus-visible { background: var(--panel); outline: none; }
+hpc-menu .menu-item.danger { color: var(--bad); }
+hpc-menu .menu-separator { border-top: 1px solid var(--line); margin: var(--space-xs) 0; }
+hpc-toasts { position: fixed; right: var(--space-xl); bottom: var(--space-xl); z-index: 1000; display: flex;
+             flex-direction: column; gap: var(--space-xs); max-width: min(60ch, 90vw); }
+hpc-toasts .toast { background: var(--fg); color: var(--bg); padding: var(--space-md) var(--space-lg); cursor: pointer;
+                    border-radius: var(--radius-control); white-space: pre-wrap; overflow-wrap: anywhere; }
+hpc-toasts .toast.error { background: var(--bad); color: #fff; }
+hpc-toasts .toast.ok { background: var(--good); color: #fff; }
+
+/* <hpc-code> and <hpc-terminal> */
+hpc-code { display: block; height: 100%; min-height: 0; }
+hpc-code .cm-editor { height: 100%; }
+hpc-code .cm-editor.cm-focused { outline: none; }
+hpc-diff { display: block; max-height: 480px; overflow: auto; border: 1px solid var(--line); border-radius: var(--radius-control); }
+hpc-diff .cm-editor { height: auto; }
+hpc-diff .cm-editor.cm-focused { outline: none; }
+hpc-diff pre.plain { margin: 0; padding: var(--space-md); font: 12px/1.45 var(--font-mono); }
+hpc-code textarea.plain { width: 100%; height: 100%; min-width: 0; border: none; border-radius: 0; resize: none; white-space: pre; }
+hpc-terminal { display: block; height: 100%; min-height: 0; padding: 4px; background: #111111; }
+hpc-terminal .terminal-note { margin: 0; padding: var(--space-lg); color: #cccccc; }
+input.prompt-input { width: 100%; box-sizing: border-box; margin: var(--space-sm) 0 var(--space-lg); font-family: var(--font-mono); }
+
+/* <hpc-file-browser> */
+hpc-file-browser { display: flex; flex-direction: column; min-width: 0; min-height: 0; color: var(--fg); }
+.file-controls { display: flex; gap: 4px; flex-wrap: wrap; padding: 6px; border-bottom: 1px solid var(--line); }
+.file-controls button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); }
+.file-crumbs { display: flex; flex-wrap: wrap; gap: 2px; padding: 4px 6px; margin: 0; border-bottom: 1px solid var(--line); }
+.file-controls, .file-crumbs, .file-status { flex: 0 0 auto; }
+.file-crumbs button { border: none; background: transparent; font-size: var(--font-size-small); padding: 2px 4px; max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+.file-crumbs button + button::before { content: "/ "; color: var(--muted); }
+.file-viewport { flex: 1; min-height: 160px; overflow: auto; position: relative; }
+.file-status { color: var(--muted); font-size: var(--font-size-small); padding: 5px 8px; border-top: 1px solid var(--line); }
+.file-viewport table { width: 100%; border-collapse: collapse; }
+.file-viewport th, .file-viewport td { padding: 4px 6px; vertical-align: middle; }
+.file-viewport td:first-child { width: 100%; overflow-wrap: anywhere; }
+.file-viewport .num { white-space: nowrap; color: var(--muted); font-size: var(--font-size-small); }
+.file-viewport th button, .file-name { background: transparent; border: none; padding: 0; text-align: left; }
+.file-name { overflow-wrap: anywhere; white-space: normal; }
+.file-viewport .selected > summary, .file-viewport .basic-file.selected, .file-viewport tr.selected { background: var(--row-hover, var(--panel)); }
+.basic-children { padding-left: 18px; }
+.file-viewport summary { cursor: pointer; padding: 4px 6px; overflow-wrap: anywhere; }
+.basic-file { padding: 2px 6px; }
+.basic-file button { border: none; background: transparent; text-align: left; padding: 2px; white-space: normal; overflow-wrap: anywhere; }
+.file-wunderbaum { position: absolute; inset: 0; min-height: 160px; }
+.file-wunderbaum.wunderbaum { font: inherit; background: var(--bg); color: var(--fg); border: none; }
+.file-wunderbaum .wb-title { color: var(--fg); }
+/* every part of a row has a fixed width, so levels step in evenly and a file's name sits under its folder's name */
+.file-wunderbaum { --file-step: 1.3em; }
+.file-wunderbaum .wb-node { display: flex; align-items: center; white-space: nowrap; }
+.file-wunderbaum .wb-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; margin-left: .25em; }
+.file-wunderbaum i.wb-indent { display: inline-block; flex: 0 0 var(--file-step); width: var(--file-step); }
+.file-wunderbaum i.wb-expander, .file-wunderbaum .file-expander { display: inline-block; flex: 0 0 1.1em; width: 1.1em; text-align: center; color: var(--muted); }
+.file-wunderbaum i.wb-expander.wb-indent { flex-basis: 1.1em; width: 1.1em; font-size: 0; }   /* a folder with nothing in it: whatever glyph was drawn before is blank */
+.file-wunderbaum .file-icon { display: inline-flex; flex: 0 0 1.3em; width: 1.3em; justify-content: center; color: var(--muted); }
+.file-wunderbaum .file-icon svg { display: block; }
+.file-wunderbaum .wb-expander > *, .file-wunderbaum .wb-icon > * { pointer-events: none; }
+/* the tree's own colours are a light theme: give it ours, so the chosen row reads in light and dark */
+.file-wunderbaum.wunderbaum {
+  --wb-active-color: color-mix(in srgb, var(--accent) 22%, var(--bg));
+  --wb-active-hover-color: color-mix(in srgb, var(--accent) 30%, var(--bg));
+  --wb-active-color-grayscale: color-mix(in srgb, var(--muted) 22%, var(--bg));
+  --wb-active-hover-color-grayscale: color-mix(in srgb, var(--muted) 30%, var(--bg));
+  --wb-hover-color: color-mix(in srgb, var(--fg) 8%, var(--bg));
+  --wb-active-border-color: transparent; --wb-active-hover-border-color: transparent;
+  --wb-active-border-color-grayscale: transparent;
+  --wb-focus-border-color: var(--accent);
+  --wb-error-background-color: color-mix(in srgb, var(--bad) 25%, var(--bg));
+}
+.file-wunderbaum .wb-row.wb-active .wb-title, .file-wunderbaum .wb-row.wb-selected .wb-title { color: var(--fg); }
+.file-browser-layout { display: grid; grid-template-columns: minmax(240px, 32%) minmax(0, 1fr); gap: 12px; height: min(78vh, 920px); min-height: 420px; }
+.file-browser-layout hpc-file-browser { border: 1px solid var(--line); border-radius: 6px; }
+.file-preview { min-width: 0; overflow: auto; }
+.file-preview:empty::before { content: "Select a file to preview it."; color: var(--muted); }
+@media (max-width: 760px) { .file-browser-layout { grid-template-columns: 1fr; height: auto; } .file-browser-layout hpc-file-browser { height: 360px; } }
+
+.file-path-form { flex: 1; min-width: 180px; }
+.file-path-form input { width: 100%; font-family: var(--font-mono); }

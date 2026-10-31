@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-The Workspace: your files on the cluster in the browser, an editor, viewers, terminals, and job scripts built from
-templates and submitted with sbatch. It runs on the login node as you (the workspace tunnel's sbatch_script.sh starts
+The Workspace: your files on the cluster in the browser, an editor, viewers, terminals that outlive the tab, guided job
+submission, and the runs you have made. It runs on the login node as you (the workspace tunnel's sbatch_script.sh starts
 it), listens on 127.0.0.1 only, and answers only with the token it prints at start (the console's Open adds it):
 a login node is shared, and anyone on it could reach the port.
 
@@ -14,8 +14,11 @@ header), and a request that names an Origin other than the page's own is refused
 
   workspace_server.py --port PORT [--root DIR] [--cdn URL] [--edit-limit-mb N] [--confirm-mb N]
 
-The page (ui/) loads CodeMirror (the editor) and xterm.js (the terminal) from --cdn, an npm mirror (jsDelivr's by
-default). Routes, all but /health and the page's own files needing the token (X-Workspace-Token):
+This file is the HTTP side: the token, the routes, the page's own files, the signed file URLs. The work is in ws/
+(common, shellenv, fs, terminal, cluster, envs, jobspec, jobs, profiles, templates), which know nothing of HTTP.
+
+The page (ui/) carries CodeMirror 6 (the editor) itself and loads xterm.js (the terminal) and Wunderbaum (the file tree) from --cdn, an npm
+mirror (jsDelivr's by default). Routes, all but /health and the page's own files needing the token (X-Workspace-Token):
 
   GET  /health                       {"ok", "version"}
   GET  /api/info                     home, user, host, hpclib.sh's path, places (home, scratch), limits, the CDN
@@ -25,45 +28,65 @@ default). Routes, all but /health and the page's own files needing the token (X-
   PUT  /api/file?path=[&mtime_ns=][&how=create|replace|any]   the body to the file through a temporary file and a
                                      rename, keeping its mode; refused when it changed since mtime_ns (409)
   POST /api/mkdir {path}  /api/rename {from, to}  /api/delete {path}   (delete: a file, link or empty directory)
-  GET  /api/templates                the script templates (the Workspace's and yours), parsed, with the values last used
-  POST /api/templates/edit {name, from?}   your copy to edit, in $HPCTUNNELS_DATA_DIR/script_templates
-  POST /api/render {template, text?, input, values}   -> {script, name, dir, values, fields}
-  POST /api/submit {script, name, dir, overwrite?, template?, values?}   write the job script, sbatch it -> {job_id}
+  GET  /api/fs/tail?path=[&offset=][&id=]   the bytes a file has gained since offset (the last 16 KiB first), with an
+                                     id that changes when the file is replaced: following a log, a job's output, a file
+                                     open in the editor
   GET  /api/usage?path=[&limit=]     a directory's folders by size (du -k) and file count (du --inodes, else a walk),
                                      at low priority, up to limit seconds (120; at most 600; then partial)
-  GET  /api/jobs                     your queued and running jobs (squeue): id, name, state, time, limit, directory
-  POST /api/cancel {job}             scancel one of them
   POST /api/raw-url {path}           {url}: a signed URL for the file (below), good for an hour, for the files in
                                      its directory
   GET  /raw/EXPIRES.DEPTH.SIGNATURE/PATH   a file for an <img>, <iframe> or <video>, with Range; HTML and SVG with a
                                      sandboxing Content-Security-Policy (an opaque origin: no access to the page).
                                      DEPTH is how many leading parts of PATH the signature covers: a page's own
                                      images and scripts load, other directories don't
-  POST /api/term/ticket              {ticket}: opens one terminal, within ten seconds
-  GET  /terminal?ticket=&cwd=&cols=&rows=   WebSocket: your login shell in a pseudo-terminal (binary frames both
-                                     ways; text frames JSON: {"type": "resize", "cols", "rows"} in, {"type": "exit"} out)
+  POST /api/term/ticket              {ticket}: opens one terminal connection, within ten seconds
+  GET  /api/terms                    the terminals that are running: [{id, cwd, title, created, alive, attached}]
+  POST /api/term/close {id}          hang one up
+  GET  /terminal?ticket=[&session=ID][&cwd=&cols=&rows=]   WebSocket: your login shell in a pseudo-terminal that keeps
+                                     running when the page leaves (binary frames both ways; text frames JSON: {"type":
+                                     "resize", "cols", "rows"} in, {"type": "session", "id"} first and {"type": "exit",
+                                     "code"} out). With session, it attaches to that terminal and replays its last 256 KiB
+  GET  /api/templates                the classic script templates (the Workspace's and yours), with the values last used
+  POST /api/templates/edit {name, from?}   your copy to edit, in $HPCTUNNELS_DATA_DIR/script_templates
+  POST /api/render {template, text?, input, values}   -> {script, name, dir, values, fields}
+  POST /api/submit {script, name, dir, overwrite?, template?, values?}   write the job script, sbatch it -> {job_id}
+  GET  /api/cluster[?refresh=1]      partitions, GPU types and accounts as Slurm reports them (cached five minutes)
+  GET  /api/modules?q=               module names containing q (module -t avail, cached ten minutes)
+  GET  /api/env?path=                the environment card for a file or directory: project, uv or pixi, status, tools
+  GET  /api/env/settings             uv's and pixi's directories (hpclib_pytools --json: slow, so the card asks when that part opens)
+  POST /api/env/prepare {project, update?}   uv sync / pixi install as you, in the background -> {id, ...}
+  POST /api/env/tool {tool}          install uv or pixi (hpclib_pytools install)
+  POST /api/env/dirs {var, dir}      remember uv's or pixi's cache/python directory for this cluster (or "default")
+  GET  /api/env/operation?id=        state and log of one of those
+  POST /api/jobs/render {spec}       the job spec -> {script, spec, errors, warnings, environment}
+  GET  /api/jobs/import?path=        a job script for the form: its spec (embedded, or read from the #SBATCH lines), the
+                                     form's version of it, and whether they differ
+  POST /api/jobs/adopt {path, spec}  write the form's version over the file (the original is kept as NAME.bak)
+  POST /api/jobs/interactive {spec}  the srun --pty line for an interactive session with these resources -> {command, workdir}
+  POST /api/jobs/check {spec | script, dir?}   sbatch --test-only: {ok, message, start}
+  POST /api/jobs/submit {spec | script, dir?, script_dir?, name?, overwrite?, as_is?, allow_blocked?}   writes the script, sbatch, keeps a run
+                                     record in $HPCTUNNELS_DATA_DIR/workspace/runs -> {job_id, path, output_path}; 409
+                                     while the environment is not prepared, stale, busy or failed
+  GET  /api/job?id=                  one job's state (squeue, else sacct)
+  GET  /api/runs[?dir=]              the runs the Workspace made, newest first, with state (one squeue, one sacct);
+                                     dir keeps those whose working directory is it or below it
+  GET  /api/profiles[?dir=]           the profiles: last used, the project's .hpclib/job.json, and the saved ones
+  POST /api/profiles {name, spec}     keep a profile;  POST /api/profiles/delete {name}
+  POST /api/runs/ID/cancel           scancel one of them
 
 Python 3.6+, standard library only.
 """
 import argparse
-import base64
-import hashlib
 import http.server
 import json
 import mimetypes
 import os
 import re
 import secrets
-import shlex
-import shutil
 import signal
 import socket
 import socketserver
-import stat
-import struct
-import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.parse
@@ -72,141 +95,44 @@ from token_auth import ServiceToken, CapabilityTickets, ResourceSigner
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import script_templates  # noqa: E402
+from ws import cluster, envs, fs, jobs, profiles, shellenv, templates, terminal  # noqa: E402
+from ws.common import MAX_JSON, Refused, data_dir, oserror, resolve, templates_dir  # noqa: E402,F401
+from ws.terminal import ws_accept, ws_read, ws_send  # noqa: E402,F401  (the tests speak the protocol)
 
-VERSION = "1.0.2"
+VERSION = "1.7.0"
 UI_DIR = os.path.join(HERE, "ui")
-MAX_ENTRIES = 5000
-MAX_JSON = 1 << 20
-MAX_TEMPLATE = 256 * 1024
 CHUNK = 1 << 16
-WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 # a page the viewer shows is somebody's file, not the Workspace's: it may run, open links and offer downloads,
 # and nothing more (no forms, no dialogs), in an origin of its own
 SANDBOX_CSP = "sandbox allow-scripts allow-popups allow-downloads"
 RAW_URL_SECONDS = 3600       # how long a viewer's file URL works (a movie keeps requesting ranges while it plays)
 TICKET_SECONDS = 10          # how long a terminal's ticket works: the page uses it at once
 SANDBOXED_TYPES = ("text/html", "image/svg+xml", "application/xhtml+xml", "text/xml", "application/xml")
-JOB_RE = re.compile(r"Submitted batch job (\d+)")
-TEMPLATE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
-SCRIPT_NAME_RE = re.compile(r"[A-Za-z0-9_.+@-][A-Za-z0-9_.+@ -]{0,200}")
+DEFAULT_EDIT_MB = 64
 for _type, _ext in (("text/markdown", ".md"), ("text/x-python", ".py"), ("application/x-sh", ".sh"),
                     ("video/mp4", ".m4v"), ("video/quicktime", ".mov"), ("image/webp", ".webp")):
     mimetypes.add_type(_type, _ext)
 
 
-class Refused(Exception):
-    def __init__(self, status, message):
-        Exception.__init__(self, message)
-        self.status = status
-
-
-def data_dir():
-    return os.path.expanduser(os.environ.get("HPCTUNNELS_DATA_DIR") or "~/.local/tunnels")
-
-
-def templates_dir():
-    return os.path.join(data_dir(), "script_templates")
-
-
-def resolve(path):
-    if not path or not isinstance(path, str):
-        raise Refused(400, "no path")
-    if "\0" in path or len(path) > 4096:
-        raise Refused(400, "that isn't a path")
-    path = os.path.expanduser(path)
-    if not os.path.isabs(path):
-        path = os.path.join(os.path.expanduser("~"), path)
-    return os.path.normpath(path)
-
-
-def kind(st):
-    if stat.S_ISDIR(st.st_mode):
-        return "directory"
-    if stat.S_ISREG(st.st_mode):
-        return "file"
-    return "other"
-
-
-def oserror(e, what):
-    if isinstance(e, FileNotFoundError):
-        return Refused(404, "{} doesn't exist".format(what))
-    if isinstance(e, PermissionError):
-        return Refused(403, "{}: permission denied".format(what))
-    if isinstance(e, NotADirectoryError):
-        return Refused(400, "{} isn't a directory".format(what))
-    if isinstance(e, IsADirectoryError):
-        return Refused(400, "{} is a directory".format(what))
-    if getattr(e, "errno", None) in (39, 66):
-        return Refused(409, "{} isn't empty".format(what))
-    return Refused(500, "{}: {}".format(what, e.strerror or e))
-
-
-def entry(path):
-    lst = os.lstat(path)
-    out = {"name": os.path.basename(path) or path, "size": lst.st_size, "mtime": lst.st_mtime,
-           "mode": stat.filemode(lst.st_mode)}
-    if stat.S_ISLNK(lst.st_mode):
-        out["type"] = "link"
-        try:
-            out["target"] = os.readlink(path)
-            st = os.stat(path)
-            out["target_type"] = kind(st)
-            out["size"] = st.st_size
-        except OSError:
-            out["target_type"] = "missing"
-    else:
-        out["type"] = kind(lst)
-    return out
-
-
-def _umask():
-    mask = os.umask(0)
-    os.umask(mask)
-    return mask
-
-
-def write_atomic(path, stream, length, mode=None):
-    """`length` bytes of `stream` to path through a temporary file beside it and a rename."""
-    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", suffix=".workspace-tmp",
-                               dir=os.path.dirname(path))
-    try:
-        with os.fdopen(fd, "wb") as f:
-            left = length
-            while left > 0:
-                data = stream.read(min(CHUNK, left))
-                if not data:
-                    raise Refused(400, "the upload ended early")
-                f.write(data)
-                left -= len(data)
-        os.chmod(tmp, mode if mode is not None else (0o666 & ~_umask()))
-        os.rename(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def login_shell_run(command, cwd=None, timeout=60):
-    """A command in a login shell (bash -l), where sites put sbatch and squeue on the PATH: (code, output)."""
-    try:
-        res = subprocess.run(["bash", "-lc", command], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             stdin=subprocess.DEVNULL, universal_newlines=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise Refused(504, "it took over {} s".format(timeout))
-    return res.returncode, res.stdout or ""
-
-
-# -- the workspace's operations ------------------------------------------------------------------------------------
-
 class Workspace:
-    def __init__(self, root=None, cdn="https://cdn.jsdelivr.net/npm", edit_limit_mb=800, confirm_mb=20):
+    """What the server serves: one object holding the parts in ws/ and the facts about this login node."""
+
+    def __init__(self, root=None, cdn="https://cdn.jsdelivr.net/npm", edit_limit_mb=DEFAULT_EDIT_MB, confirm_mb=20):
         self.root = resolve(root) if root else os.path.expanduser("~")
         self.cdn = cdn.rstrip("/")
         self.edit_limit = int(edit_limit_mb * (1 << 20))
         self.confirm = int(confirm_mb * (1 << 20))
+        home = os.path.expanduser("~")
+        self.shell = shellenv.ShellEnv()
+        info = self.info()
+        self.files = fs.Files(self.root, self.edit_limit, self.confirm)
+        self.terminals = terminal.Sessions()
+        self.cluster = cluster.Cluster(self.shell, info["user"], info["hpclib"])
+        self.envs = envs.Environments(self.shell.login, info["hpclib"], home, lambda: os.path.join(data_dir(), "workspace"), self.shell.env)
+        self.jobs = jobs.Jobs(self.shell, self.cluster, self.envs, home)
+        self.profiles = profiles.Profiles(home)
+        self.jobs.on_submit = self.profiles.remember
+        self.templates = templates.Templates(self.info, self.jobs)
 
     def info(self):
         home = os.path.expanduser("~")
@@ -229,487 +155,32 @@ class Workspace:
                 "limits": {"edit_bytes": self.edit_limit, "confirm_bytes": self.confirm}, "cdn": self.cdn,
                 "version": VERSION, "python": sys.version.split()[0]}
 
-    def list(self, path, hidden=False):
-        path = resolve(path)
+    def env_card(self, path):
         try:
-            names = os.listdir(path)
-        except OSError as e:
-            raise oserror(e, path)
-        entries, truncated = [], False
-        for name in sorted(names, key=lambda n: n.lower()):
-            if name.startswith(".") and not hidden:
-                continue
-            if len(entries) >= MAX_ENTRIES:
-                truncated = True
-                break
-            try:
-                entries.append(entry(os.path.join(path, name)))
-            except OSError:
-                continue
-        return {"path": path, "parent": os.path.dirname(path) if path != "/" else None, "entries": entries,
-                "truncated": truncated, "hidden": sum(1 for n in names if n.startswith(".")),
-                "writable": os.access(path, os.W_OK)}
+            return self.envs.card(resolve(path))
+        except envs.envinfo.EnvironmentError_ as e:
+            raise Refused(e.status, str(e))
 
-    def stat(self, path):
-        path = resolve(path)
+    def env_do(self, what, body):
+        error = envs.envinfo.EnvironmentError_
         try:
-            st = os.stat(path)
-        except OSError as e:
-            raise oserror(e, path)
-        return {"path": path, "type": kind(st), "size": st.st_size, "mtime": st.st_mtime,
-                "mtime_ns": str(st.st_mtime_ns), "writable": os.access(path, os.W_OK)}
-
-    def write(self, path, stream, length, mtime_ns=None, how="any"):
-        path = resolve(path)
-        if how not in ("create", "replace", "any"):
-            raise Refused(400, "how: create, replace or any")
-        try:
-            st = os.stat(path)
-        except FileNotFoundError:
-            st = None
-        except OSError as e:
-            raise oserror(e, path)
-        if st is not None and not stat.S_ISREG(st.st_mode):
-            raise Refused(400, "{} isn't a regular file".format(path))
-        if how == "create" and st is not None:
-            raise Refused(409, "{} already exists".format(path))
-        if how == "replace" and st is None:
-            raise Refused(404, "{} doesn't exist (any more)".format(path))
-        if mtime_ns and st is not None and str(st.st_mtime_ns) != mtime_ns:
-            raise Refused(409, "{} changed since it was opened".format(path))
-        if length > max(self.edit_limit, 1 << 30):
-            raise Refused(413, "that's larger than the Workspace takes")
-        target = os.path.realpath(path) if os.path.islink(path) else path    # keep a link, write its file
-        try:
-            write_atomic(target, stream, length, stat.S_IMODE(st.st_mode) if st is not None else None)
-        except OSError as e:
-            raise oserror(e, path)
-        return self.stat(path)
-
-    def mkdir(self, path):
-        path = resolve(path)
-        if os.path.lexists(path):
-            raise Refused(409, "{} already exists".format(path))
-        try:
-            os.makedirs(path)
-        except OSError as e:
-            raise oserror(e, path)
-        return self.stat(path)
-
-    def rename(self, src, dst):
-        src, dst = resolve(src), resolve(dst)
-        if os.path.lexists(dst):
-            raise Refused(409, "{} already exists".format(dst))
-        if not os.path.lexists(src):
-            raise Refused(404, "{} doesn't exist".format(src))
-        try:
-            os.rename(src, dst)
-        except OSError as e:
-            raise oserror(e, src)
-        return {"from": src, "to": dst}
-
-    def delete(self, path):
-        path = resolve(path)
-        if path in ("/", os.path.expanduser("~"), self.root):
-            raise Refused(400, "not that one")
-        try:
-            if stat.S_ISDIR(os.lstat(path).st_mode):
-                os.rmdir(path)
-            else:
-                os.unlink(path)
-        except OSError as e:
-            raise oserror(e, path)
-        return {"deleted": path}
-
-    # -- script templates ----------------------------------------------------------------------------------------
-
-    def _yours(self):
-        d, out = templates_dir(), {}
-        try:
-            names = sorted(os.listdir(d))
-        except OSError:
-            names = []
-        for name in names:
-            if not name.endswith(".sh") or not TEMPLATE_NAME_RE.fullmatch(name[:-3]):
-                continue
-            p = os.path.join(d, name)
-            try:
-                if os.path.getsize(p) > MAX_TEMPLATE:
-                    continue
-                with open(p, encoding="utf-8", errors="replace") as f:
-                    out[name[:-3]] = (p, f.read())
-            except OSError:
-                continue
-        return out
-
-    def _remembered_path(self):
-        return os.path.join(data_dir(), "workspace", "remembered.json")
-
-    def remembered(self):
-        try:
-            with open(self._remembered_path()) as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
-            return {}
-
-    def remember(self, template, values, fields):
-        data = self.remembered()
-        data.setdefault("templates", {})[template] = {k: v for k, v in values.items()
-                                                      if k in fields and k not in ("job_name", "args", "project")}
-        data["last_template"] = template
-        path = self._remembered_path()
-        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-        with open(path + ".tmp", "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(path + ".tmp", path)
-
-    def templates(self):
-        found = {}
-        for name, text in script_templates.builtins().items():
-            found[name] = {"text": text, "source": "workspace", "path": os.path.join(script_templates.BUILTIN_DIR, name + ".sh")}
-        for name, (path, text) in self._yours().items():
-            found[name] = {"text": text, "source": "yours", "path": path, "replaces": name in found}
-        out = [dict(script_templates.parse(t["text"], name), **t) for name, t in sorted(found.items())]
-        remembered = self.remembered()
-        return {"dir": templates_dir(), "templates": out, "remembered": remembered.get("templates") or {},
-                "last": remembered.get("last_template")}
-
-    def template_text(self, name, text=None):
-        if text is not None:
-            if not isinstance(text, str) or len(text) > MAX_TEMPLATE:
-                raise Refused(400, "text: a template, at most 256 KiB")
-            return text
-        for t in self.templates()["templates"]:
-            if t["name"] == name:
-                return t["text"]
-        raise Refused(404, "no script template {!r}".format(name))
-
-    def render(self, body):
-        name, given = body.get("template"), body.get("values") or {}
-        if not isinstance(given, dict) or not all(isinstance(v, str) for v in given.values()):
-            raise Refused(400, "values: {field: text}")
-        inp = body.get("input")
-        if not isinstance(inp, str) or not inp.startswith("/"):
-            raise Refused(400, "input: the file's absolute path")
-        text = self.template_text(name, body.get("text"))
-        context = script_templates.context_for(inp, self.info())
-        try:
-            script, values = script_templates.render(text, given, context, name or "")
-        except script_templates.TemplateError as e:
-            raise Refused(400, "the template: {}".format(e))
-        parsed = script_templates.parse(text, name or "")
-        return {"script": script, "name": script_templates.script_name(parsed, values), "values": values,
-                "dir": context["dir"], "fields": parsed["fields"]}
-
-    def submit(self, body):
-        script, name, directory = body.get("script"), body.get("name"), body.get("dir")
-        if not isinstance(script, str) or not script.strip() or len(script) > MAX_JSON:
-            raise Refused(400, "script: the job script")
-        if not isinstance(name, str) or not SCRIPT_NAME_RE.fullmatch(name) or name in (".", ".."):
-            raise Refused(400, "name: the job script's file name (letters, digits, spaces and _ . + @ -)")
-        directory = resolve(directory)
-        if not os.path.isdir(directory):
-            raise Refused(404, "{} isn't a directory".format(directory))
-        path = os.path.join(directory, name)
-        if os.path.lexists(path) and not body.get("overwrite"):
-            raise Refused(409, "{} already exists".format(path))
-        data = script.encode()
-        import io
-        try:
-            write_atomic(path, io.BytesIO(data), len(data), 0o777 & ~_umask() & 0o755)
-        except OSError as e:
-            raise oserror(e, path)
-        code, out = login_shell_run("sbatch " + shlex.quote(name), cwd=directory, timeout=120)
-        m = JOB_RE.search(out)
-        if code != 0 or not m:
-            raise Refused(400, "sbatch: " + (out.strip()[-1500:] or "exit {}".format(code)))
-        template, values = body.get("template"), body.get("values")
-        if isinstance(template, str) and isinstance(values, dict):
-            try:
-                fields = {f["name"] for f in script_templates.parse(self.template_text(template))["fields"]}
-                self.remember(template, {k: v for k, v in values.items() if isinstance(v, str)}, fields)
-            except (Refused, OSError):
-                pass
-        return {"path": path, "job_id": m.group(1), "output": out.strip()[-1500:]}
-
-    def edit_template(self, body):
-        name = body.get("name")
-        source = body.get("from") or name
-        if not isinstance(name, str) or not TEMPLATE_NAME_RE.fullmatch(name):
-            raise Refused(400, "name: letters, digits, _ . -")
-        mine = self._yours()
-        if name in mine:
-            return {"path": mine[name][0], "created": False}
-        text = self.template_text(source)
-        os.makedirs(templates_dir(), exist_ok=True)
-        path = os.path.join(templates_dir(), name + ".sh")
-        with open(path, "x") as f:
-            f.write(text)
-        return {"path": path, "created": True}
-
-    # -- disk usage ------------------------------------------------------------------------------------------------
-
-    USAGE_LIMIT = 600
-
-    @staticmethod
-    def _du(args, path, limit):
-        """{path: number} from du --max-depth=1 (and whether it finished), at low priority with a time limit."""
-        try:
-            res = subprocess.run(["timeout", str(limit), "nice", "-n", "19", "du", "--max-depth=1"] + args + ["--", path],
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                                 universal_newlines=True, timeout=limit + 30)
-        except (OSError, subprocess.TimeoutExpired):
-            return {}, False, ""
-        out = {}
-        for line in res.stdout.splitlines():
-            value, _, p = line.partition("\t")
-            if value.isdigit():
-                out[p] = int(value)
-        return out, res.returncode == 0, res.stderr
-
-    @staticmethod
-    def _count(path, deadline):
-        """{path: entries} for path and each folder in it by walking (du too old for --inodes): files, folders and
-        links, each folder counting itself, as du --inodes does."""
-        out, done = {}, True
-
-        def walk(top):
-            n = 1
-            for base, dirs, files in os.walk(top, onerror=lambda e: None):
-                n += len(dirs) + len(files)
-                if time.time() > deadline:
-                    return n, False
-            return n, True
-        total = 1
-        try:
-            names = os.listdir(path)
-        except OSError as e:
-            raise oserror(e, path)
-        for name in names:
-            p = os.path.join(path, name)
-            if os.path.isdir(p) and not os.path.islink(p):
-                n, ok = walk(p)
-                out[p] = n
-                total += n
-                done = done and ok
-            else:
-                total += 1
-            if not done:
-                break
-        out[path] = total
-        return out, done
-
-    def usage(self, path, limit=120):
-        """A directory's folders by size (du -k) and by file count (du --inodes, else a walk): the Storage tab's
-        scan, for any directory. {path, kb, files, partial, children: [{name, path, kb, files}], here: {...}}."""
-        path = resolve(path)
-        if not os.path.isdir(path):
-            raise Refused(404, "{} isn't a directory".format(path))
-        limit = max(5, min(int(limit), self.USAGE_LIMIT))
-        start = time.time()
-        sizes, sized, _ = self._du(["-k"], path, limit)
-        counts, counted, err = self._du(["--inodes"], path, max(5, int(limit - (time.time() - start))))
-        method = "du --inodes"
-        if not counts and ("inodes" in err or "unrecognized" in err or "invalid option" in err):
-            counts, counted = self._count(path, time.time() + max(5, limit - (time.time() - start)))
-            method = "walk"
-        children = []
-        for p in sorted(set(sizes) | set(counts)):
-            if os.path.normpath(p) == path:
-                continue
-            children.append({"name": os.path.basename(p), "path": os.path.normpath(p), "kb": sizes.get(p),
-                             "files": counts.get(p)})
-        kb, files = sizes.get(path), counts.get(path)
-        here = None
-        if kb is not None and files is not None:
-            # what is directly in the directory: the total less its folders (and the folder itself, for files)
-            here = {"kb": max(0, kb - sum(c["kb"] or 0 for c in children)),
-                    "files": max(0, files - 1 - sum(c["files"] or 0 for c in children))}
-        return {"path": path, "kb": kb, "files": files, "partial": not (sized and counted), "children": children,
-                "here": here, "count_method": method, "seconds": round(time.time() - start, 1), "limit": limit}
-
-    # -- jobs ------------------------------------------------------------------------------------------------------
-
-    def jobs(self):
-        code, out = login_shell_run("squeue -h -u \"$USER\" -o '%i|%j|%T|%M|%l|%R|%Z'", timeout=60)
-        if code != 0:
-            raise Refused(502, "squeue: " + (out.strip()[-500:] or "exit {}".format(code)))
-        jobs = []
-        for line in out.splitlines():
-            parts = line.split("|")
-            if len(parts) == 7 and parts[0].strip():
-                jobs.append(dict(zip(("id", "name", "state", "time", "limit", "reason", "dir"),
-                                     [p.strip() for p in parts])))
-        return {"jobs": jobs, "at": time.time()}
-
-    def cancel(self, job):
-        if not isinstance(job, str) or not re.fullmatch(r"\d+(_\d+)?", job):
-            raise Refused(400, "job: a job id")
-        code, out = login_shell_run("scancel " + job, timeout=60)
-        if code != 0:
-            raise Refused(400, "scancel: " + (out.strip()[-500:] or "exit {}".format(code)))
-        return {"cancelled": job}
-
-
-# -- the terminal ----------------------------------------------------------------------------------------------------
-
-class Terminal:
-    """Your login shell in a pseudo-terminal of its own (a session whose controlling terminal it is)."""
-
-    def __init__(self, cwd, cols, rows):
-        import fcntl
-        import pty
-        import termios
-        master, slave = pty.openpty()
-        self._resize(slave, cols, rows)
-        shell = os.environ.get("SHELL") or "/bin/bash"
-
-        def controlling_terminal():
-            os.setsid()
-            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-        env = dict(os.environ, TERM="xterm-256color", COLORTERM="truecolor")
-        for k in ("WORKSPACE_TOKEN",):
-            env.pop(k, None)
-        try:
-            self.proc = subprocess.Popen([shell, "-l"], stdin=slave, stdout=slave, stderr=slave, cwd=cwd, env=env,
-                                         close_fds=True, preexec_fn=controlling_terminal)
-        finally:
-            os.close(slave)
-        self.master = master
-
-    @staticmethod
-    def _resize(fd, cols, rows):
-        import fcntl
-        import termios
-        cols = max(10, min(int(cols), 1000))
-        rows = max(2, min(int(rows), 500))
-        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-
-    def resize(self, cols, rows):
-        try:
-            self._resize(self.master, cols, rows)
-        except (OSError, ValueError, TypeError):
-            pass
+            if what == "prepare":
+                return self.envs.prepare(resolve(body.get("project")), bool(body.get("update")))
+            if what == "tool":
+                return self.envs.install_tool(body.get("tool"))
+            if what == "dirs":
+                return self.envs.set_dir(body.get("var"), body.get("dir"))
+            if what == "operation":
+                return self.envs.operation(body.get("id"))
+        except error as e:
+            raise Refused(e.status, str(e))
+        raise Refused(404, "no such environment action")
 
     def close(self):
-        if self.proc.poll() is None:
-            try:
-                os.killpg(self.proc.pid, signal.SIGHUP)
-            except OSError:
-                pass
-            try:
-                self.proc.wait(3)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(self.proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-        try:
-            os.close(self.master)
-        except OSError:
-            pass
+        self.terminals.close_all()
 
 
-def ws_accept(key):
-    return base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
-
-
-def ws_send(wfile, opcode, payload, lock):
-    n = len(payload)
-    head = bytes([0x80 | opcode])
-    if n < 126:
-        head += bytes([n])
-    elif n < 1 << 16:
-        head += bytes([126]) + struct.pack(">H", n)
-    else:
-        head += bytes([127]) + struct.pack(">Q", n)
-    with lock:
-        wfile.write(head + payload)
-        wfile.flush()
-
-
-def _read_exact(rfile, n):
-    data = b""
-    while len(data) < n:
-        chunk = rfile.read(n - len(data))
-        if not chunk:
-            raise EOFError
-        data += chunk
-    return data
-
-
-def ws_read(rfile, limit=1 << 20):
-    """(opcode, payload) of the next whole message."""
-    opcode, parts = None, []
-    while True:
-        b0, b1 = _read_exact(rfile, 2)
-        n = b1 & 0x7F
-        if n == 126:
-            n = struct.unpack(">H", _read_exact(rfile, 2))[0]
-        elif n == 127:
-            n = struct.unpack(">Q", _read_exact(rfile, 8))[0]
-        if n > limit:
-            raise EOFError
-        mask = _read_exact(rfile, 4) if b1 & 0x80 else None
-        data = _read_exact(rfile, n)
-        if mask:
-            data = bytes(c ^ mask[i % 4] for i, c in enumerate(data))
-        op = b0 & 0x0F
-        if op >= 0x8:
-            return op, data
-        if op:
-            opcode = op
-        parts.append(data)
-        if b0 & 0x80:
-            return opcode, b"".join(parts)
-
-
-def bridge(term, rfile, wfile):
-    lock = threading.Lock()
-
-    def out():
-        while True:
-            try:
-                data = os.read(term.master, 65536)
-            except OSError:
-                break
-            if not data:
-                break
-            try:
-                ws_send(wfile, 0x2, data, lock)
-            except OSError:
-                return
-        code = term.proc.wait()
-        try:
-            ws_send(wfile, 0x1, json.dumps({"type": "exit", "code": code}).encode(), lock)
-            ws_send(wfile, 0x8, struct.pack(">H", 1000), lock)
-        except OSError:
-            pass
-    reader = threading.Thread(target=out, daemon=True)
-    reader.start()
-    try:
-        while True:
-            op, data = ws_read(rfile)
-            if op == 0x8:
-                break
-            if op == 0x9:
-                ws_send(wfile, 0xA, data, lock)
-            elif op == 0x2:
-                os.write(term.master, data)
-            elif op == 0x1:
-                try:
-                    msg = json.loads(data.decode())
-                except ValueError:
-                    continue
-                if msg.get("type") == "resize":
-                    term.resize(msg.get("cols", 100), msg.get("rows", 30))
-    except (EOFError, OSError):
-        pass
-    finally:
-        term.close()
-        reader.join(2)
-
+# -- HTTP ------------------------------------------------------------------------------------------------------------
 
 # -- HTTP ------------------------------------------------------------------------------------------------------------
 
@@ -872,46 +343,96 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def route(self, verb, path):
         ws = self.server.workspace
         q = lambda k, d=None: self.query.get(k, [d])[-1]      # noqa: E731
+
+        def number(name, what):
+            value = q(name)
+            if value in (None, ""):
+                return None
+            try:
+                return int(value)
+            except ValueError:
+                raise Refused(400, "{}: {}".format(name, what))
         if path == "/api/info" and verb == "GET":
             return 200, ws.info()
         if path == "/api/list" and verb == "GET":
-            return 200, ws.list(q("path") or ws.root, q("hidden") == "1")
+            return 200, ws.files.list(q("path") or ws.root, q("hidden") == "1")
         if path == "/api/stat" and verb == "GET":
-            return 200, ws.stat(q("path") or ws.root)
+            return 200, ws.files.stat(q("path") or ws.root)
         if path == "/api/file" and verb in ("GET", "HEAD"):
             return self.send_file(q("path") or "", editing=True)
         if path == "/api/file" and verb == "PUT":
             length = int(self.headers.get("Content-Length") or 0)
-            return 200, ws.write(q("path") or "", self.rfile, length, q("mtime_ns") or None, q("how") or "any")
+            return 200, ws.files.write(q("path") or "", self.rfile, length, q("mtime_ns") or None, q("how") or "any")
         if path == "/api/mkdir" and verb == "POST":
-            return 200, ws.mkdir(self.json_body().get("path"))
+            return 200, ws.files.mkdir(self.json_body().get("path"))
         if path == "/api/rename" and verb == "POST":
             body = self.json_body()
-            return 200, ws.rename(body.get("from"), body.get("to"))
+            return 200, ws.files.rename(body.get("from"), body.get("to"))
         if path == "/api/delete" and verb == "POST":
-            return 200, ws.delete(self.json_body().get("path"))
+            return 200, ws.files.delete(self.json_body().get("path"))
+        if path == "/api/fs/tail" and verb == "GET":
+            return 200, ws.files.tail(q("path") or "", number("offset", "a byte count"), q("id") or None)
+        if path == "/api/usage" and verb == "GET":
+            return 200, ws.files.usage(q("path") or ws.root, number("limit", "seconds") or 120)
         if path == "/api/raw-url" and verb == "POST":
-            return 200, {"url": self.server.raw_url(ws.stat(self.json_body().get("path"))["path"])}
+            return 200, {"url": self.server.raw_url(ws.files.stat(self.json_body().get("path"))["path"])}
         if path == "/api/term/ticket" and verb == "POST":
             return 200, {"ticket": self.server.new_ticket()}
+        if path == "/api/terms" and verb == "GET":
+            return 200, {"terminals": ws.terminals.listing()}
+        if path == "/api/term/close" and verb == "POST":
+            return 200, ws.terminals.close(self.json_body().get("id"))
         if path == "/api/templates" and verb == "GET":
-            return 200, ws.templates()
+            return 200, ws.templates.list()
         if path == "/api/templates/edit" and verb == "POST":
-            return 200, ws.edit_template(self.json_body())
+            return 200, ws.templates.edit(self.json_body())
         if path == "/api/render" and verb == "POST":
-            return 200, ws.render(self.json_body())
+            return 200, ws.templates.render(self.json_body())
         if path == "/api/submit" and verb == "POST":
-            return 200, ws.submit(self.json_body())
-        if path == "/api/usage" and verb == "GET":
-            try:
-                limit = int(q("limit") or 120)
-            except ValueError:
-                raise Refused(400, "limit: seconds")
-            return 200, ws.usage(q("path") or ws.root, limit)
-        if path == "/api/jobs" and verb == "GET":
-            return 200, ws.jobs()
-        if path == "/api/cancel" and verb == "POST":
-            return 200, ws.cancel(self.json_body().get("job"))
+            return 200, ws.templates.submit(self.json_body())
+        if path == "/api/cluster" and verb == "GET":
+            return 200, ws.cluster.get(q("refresh") == "1")
+        if path == "/api/modules" and verb == "GET":
+            return 200, ws.cluster.modules(q("q"))
+        if path == "/api/env" and verb == "GET":
+            return 200, ws.env_card(q("path") or ws.root)
+        if path == "/api/env/settings" and verb == "GET":
+            return 200, ws.envs.dirs(fresh=True)
+        if path == "/api/env/prepare" and verb == "POST":
+            return 200, ws.env_do("prepare", self.json_body())
+        if path == "/api/env/tool" and verb == "POST":
+            return 200, ws.env_do("tool", self.json_body())
+        if path == "/api/env/dirs" and verb == "POST":
+            return 200, ws.env_do("dirs", self.json_body())
+        if path == "/api/env/operation" and verb == "GET":
+            return 200, ws.env_do("operation", {"id": q("id")})
+        if path == "/api/jobs/render" and verb == "POST":
+            return 200, ws.jobs.render(self.json_body())
+        if path == "/api/jobs/import" and verb == "GET":
+            return 200, ws.jobs.import_script(q("path") or "")
+        if path == "/api/jobs/adopt" and verb == "POST":
+            return 200, ws.jobs.adopt(self.json_body())
+        if path == "/api/jobs/interactive" and verb == "POST":
+            return 200, ws.jobs.interactive(self.json_body())
+        if path == "/api/jobs/check" and verb == "POST":
+            return 200, ws.jobs.check(self.json_body())
+        if path == "/api/jobs/submit" and verb == "POST":
+            return 200, ws.jobs.submit(self.json_body())
+        if path == "/api/profiles" and verb == "GET":
+            return 200, ws.profiles.list(q("dir") or None)
+        if path == "/api/profiles" and verb == "POST":
+            body = self.json_body()
+            return 200, ws.profiles.save(body.get("name"), body.get("spec"))
+        if path == "/api/profiles/delete" and verb == "POST":
+            return 200, ws.profiles.delete(self.json_body().get("name"))
+        if path == "/api/job" and verb == "GET":
+            return 200, ws.jobs.state(q("id") or "")
+        if path == "/api/runs" and verb == "GET":
+            return 200, ws.jobs.runs(q("dir") or None)
+        cancel = re.fullmatch(r"/api/runs/(\d+)/cancel", path)
+        if cancel and verb == "POST":
+            self.json_body()
+            return 200, ws.jobs.cancel(cancel.group(1))
         raise Refused(404, "no route {} {}".format(verb, path))
 
     def static(self, path):
@@ -937,7 +458,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def send_file(self, path, editing):
         """A file, streamed: with Range (a video seeks); for the editor with its mtime_ns, up to the limit."""
         ws = self.server.workspace
-        st = ws.stat(path)
+        st = ws.files.stat(path)
         if st["type"] != "file":
             raise Refused(400, "{} isn't a file".format(st["path"]))
         size = st["size"]
@@ -997,31 +518,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return 200, None
 
     def terminal(self):
+        """Open or re-attach a session, then serve the WebSocket until the page leaves (the session stays)."""
         if (self.headers.get("Upgrade") or "").lower() != "websocket" or not self.headers.get("Sec-WebSocket-Key"):
             raise Refused(400, "the terminal is a WebSocket")
         origin = (self.headers.get("Origin") or "").lower()
         if origin and urllib.parse.urlsplit(origin).netloc != (self.headers.get("Host") or "").lower():
             raise Refused(403, "the terminal opens from the Workspace's own page")
+        ws = self.server.workspace
         q = lambda k, d: self.query.get(k, [d])[-1]          # noqa: E731
-        try:
-            cols, rows = int(q("cols", "100")), int(q("rows", "30"))
-        except ValueError:
-            cols, rows = 100, 30
-        cwd = q("cwd", "") or self.server.workspace.root
-        try:
-            cwd = resolve(cwd)
-            if not os.path.isdir(cwd):
+        if q("session", ""):
+            session = ws.terminals.get(q("session", ""))        # 404 before the upgrade: the page then starts a new one
+        else:
+            try:
+                cols, rows = int(q("cols", "100")), int(q("rows", "30"))
+            except ValueError:
+                cols, rows = 100, 30
+            cwd = q("cwd", "") or ws.root
+            try:
+                cwd = resolve(cwd)
+                if not os.path.isdir(cwd):
+                    cwd = os.path.expanduser("~")
+            except Refused:
                 cwd = os.path.expanduser("~")
-        except Refused:
-            cwd = os.path.expanduser("~")
-        term = Terminal(cwd, cols, rows)
+            session = ws.terminals.create(cwd, cols, rows)
         self.send_response(101)
         self.send_header("Upgrade", "websocket")
         self.send_header("Connection", "Upgrade")
         self.send_header("Sec-WebSocket-Accept", ws_accept(self.headers["Sec-WebSocket-Key"]))
         self.end_headers()
         self.wfile.flush()
-        bridge(term, self.rfile, self.wfile)
+        terminal.bridge(session, self.rfile, self.wfile)
         self.close_connection = True
         return None
 
@@ -1031,7 +557,7 @@ def main(argv=None):
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--root", default=os.environ.get("WORKSPACE_ROOT") or None)
     p.add_argument("--cdn", default=os.environ.get("WORKSPACE_CDN") or "https://cdn.jsdelivr.net/npm")
-    p.add_argument("--edit-limit-mb", type=float, default=float(os.environ.get("WORKSPACE_EDIT_LIMIT_MB") or 800))
+    p.add_argument("--edit-limit-mb", type=float, default=float(os.environ.get("WORKSPACE_EDIT_LIMIT_MB") or DEFAULT_EDIT_MB))
     p.add_argument("--confirm-mb", type=float, default=float(os.environ.get("WORKSPACE_CONFIRM_MB") or 20))
     p.add_argument("--token", default=os.environ.get("WORKSPACE_TOKEN") or None, help=argparse.SUPPRESS)
     args = p.parse_args(argv)
@@ -1054,6 +580,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         pass
     server.server_close()
+    workspace.close()
     return 0
 
 

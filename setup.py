@@ -45,6 +45,7 @@ setuptools.setup(
             "examples/*/*",  # worked examples, e.g. examples/orca_scan
             "docs/*.md",  # hpclib/docs: installation, usage, architecture
             "docs/*/*.md",  # ... and its interface/ and cli/ sections
+            "ui/*.js", "ui/*.css", "ui/*.json", "ui/components/*.js",  # hpclib/ui: the page elements the console and Workspace share
         ],
         "hpclib.job_queue": [
             "templates/*.sh",  # hpclib/job_queue/templates/*.sh - same non-package-subdir situation
