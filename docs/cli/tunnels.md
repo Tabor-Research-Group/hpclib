@@ -56,6 +56,14 @@ taken from, in order of preference:
 | `HPCLIB_JUPYTER_MODULES` | modules to load, colon-separated (e.g. `GCCcore/13.2.0:JupyterLab/4.2.0`) |
 | `CONDA_ENVIRONMENT` | a conda environment (conda must be available from `~/.bashrc` or `CONDA_MODULE`) |
 
+Where it runs and keeps things:
+
+| Setting | Effect |
+| --- | --- |
+| `HPCLIB_JUPYTER_START_DIR` | the file browser's starting folder (default `/`; a missing folder falls back to `/` with a warning) |
+| `HPCLIB_JUPYTER_DATA_DIR` | `JUPYTER_DATA_DIR`: kernels, extensions (created if missing) |
+| `HPCLIB_JUPYTER_CONFIG_DIR` | `JUPYTER_CONFIG_DIR`: Jupyter's settings (created if missing) |
+
 ```bash
 tunnel_setup user@login.example jupyter --set HPCLIB_JUPYTER_PROJECT=/scratch/user/me/analysis \
   --save --install --check        # installs jupyterlab into the project if it is missing
@@ -75,9 +83,16 @@ launch_tunnel -P 8900 user@login.example vscode
 
 | Setting | Default |
 | --- | --- |
-| `VSCODE_CONTAINER` | `/scratch/user/USER/vscode.sif` |
+| `VSCODE_CONTAINER` | `/scratch/user/USER/vscode.sif` (your home directory on a cluster without `/scratch/user`) |
 | `VSCODE_ROOT_DIR` | `/scratch/user/USER`: where VS Code opens and keeps its config |
 | `VSCODE_BIND_PATHS` | directories bound into the container (`singularity --bind` syntax) |
+| `VSCODE_DATA_DIR` | `VSCODE_ROOT_DIR/.code-server-data`: passed as `--user-data-dir DIR/user-data` and `--extensions-dir DIR/extensions`; bound into the container unless a bind covers it |
+| `VSCODE_START_FOLDER` | a folder to open every time (default: the one you had open last) |
+| `VSCODE_IMAGE_TAG` | `latest`: the `codercom/code-server` tag; `--install` pulls it and writes it to `VSCODE_CONTAINER.tag`, `--check` reports a different tag as not installed |
+
+`tunnel_setup HOST TUNNEL --saved` prints what the saved settings file holds (`HPCLIB_TUNNEL_SAVED NAME=BASE64`
+per setting, then `HPCLIB_TUNNEL_SAVED_END`) without changing anything; the console uses it to adopt settings it
+doesn't have.
 
 code-server asks for a password; the tunnel prints it (from `VSCODE_ROOT_DIR/.config/code-server/config.yaml`)
 once the job is up.

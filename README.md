@@ -208,7 +208,7 @@ once in a terminal. With ssh keys and no second factor, **Log in** works without
 | --- | --- |
 | `GET /api/clusters/NAME/login` | the login's state: `none`, `starting`, `password_sent`, `push_sent`, `connected`, `expired`, `failed` |
 | `POST /api/clusters/NAME/login` (`{"password": ...}`), `POST .../logout` | log in, log out (`ssh -O exit`) |
-| `GET /api/apps`, `GET /api/apps/APP`, `POST /api/apps/APP/NAME/start` / `stop`, `GET .../log`, `GET`/`PUT .../settings` | tunnel apps besides the agents' (JupyterLab, VS Code, PAI): each cluster's session (`down`, `starting`, `queued` with the job's queue status, `up` with the URL to open, token included, or VS Code's password), started with `launch_tunnel` over the console's login on ports of its own; settings are the job's sbatch options, where `jupyter` comes from (`conda_env`, `modules`, a uv/pixi `project`), and the tunnel's own `settings` (e.g. `VSCODE_CONTAINER`), saved on the cluster with the next check, install or start. PAI's state names the job serving the shared database (`instance`) |
+| `GET /api/apps`, `GET /api/apps/APP`, `POST /api/apps/APP/NAME/start` / `stop`, `GET .../log`, `GET`/`PUT .../settings` | tunnel apps besides the agents' (JupyterLab, VS Code, PAI): each cluster's session (`down`, `starting`, `queued` with the job's queue status, `up` with the URL to open, token included, or VS Code's password), started with `launch_tunnel` over the console's login on ports of its own; settings are the job's sbatch options, where `jupyter` comes from (`conda_env`, `modules`, a uv/pixi `project`), and the tunnel's own `settings` (e.g. `VSCODE_CONTAINER`), saved on the cluster with the next check, install or start (the first one also adopts what the cluster already has saved where the console has none); `GET .../settings` lists `presets`, and `PUT`/`DELETE .../presets/NAME` keep named sets of these choices. PAI's state names the job serving the shared database (`instance`) |
 | `POST /api/apps/APP/NAME/check`, `POST .../install` (`{"force"?}`) | whether the tunnel is installed on the cluster (`install`: `installed`, `missing`, `unknown`, `nothing`), and its `install.sh` as the cluster's operation (`GET /api/clusters/NAME/operation`), through `tunnels/setup_tunnel.sh`; Start is refused while it is known to be missing |
 | `POST /api/clusters` (`{"host": "user@host", "port"?, "jump"?}`) | a profile for a new cluster, to log in to and set up |
 | `POST /api/clusters/NAME/install` (`{"force"?}`), `POST .../setup` (`{"work_dirs", "binds", "templates", "rebuild"}`), `GET .../operation` | `install_hpclib` or `setup_agents` over the console's login, in the background, with its log; the cluster must be logged in |
@@ -683,7 +683,8 @@ bundled tunnel with `install_tunnel /path/to/hpclib/tunnels/vscode` runs its
 installation and tunnel launch to use another path, or save it with `tunnel_setup ... vscode --set
 VSCODE_CONTAINER=... --save` (as the console's VS Code settings do). Singularity (or Apptainer) must be
 available on the login node. code-server asks for the password in `VSCODE_ROOT_DIR/.config/code-server/config.yaml`,
-which the tunnel prints (and the console offers to copy).
+which the tunnel prints (and the console offers to copy). Extensions and user settings are kept in
+`VSCODE_DATA_DIR` (default `VSCODE_ROOT_DIR/.code-server-data`) and the image's tag is `VSCODE_IMAGE_TAG`.
 
 **Data transfer (SMB)**: `smbshell` moves files between a cluster and an SMB server with Kerberos and Samba from the
 data-transfer-tools image. It isn't a port-forwarding tunnel; `tunnels/data-transfer/` holds the command, its

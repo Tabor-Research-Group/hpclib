@@ -40,6 +40,22 @@ if ! command -v jupyter > /dev/null 2>&1; then
   exit 1
 fi
 
-echo "Launching Jupyter on $PROCESS_PORT"
+# Where Jupyter keeps its kernels, extensions and settings, if not in your home directory (the console's JupyterLab
+# settings set these), and the folder the file browser starts in (default /, the whole file system)
+if [ -n "${HPCLIB_JUPYTER_DATA_DIR:-}" ]; then
+  mkdir -p "$HPCLIB_JUPYTER_DATA_DIR" && export JUPYTER_DATA_DIR="$HPCLIB_JUPYTER_DATA_DIR" ||
+    echo "hpclib: could not create $HPCLIB_JUPYTER_DATA_DIR; using Jupyter's default data directory" >&2
+fi
+if [ -n "${HPCLIB_JUPYTER_CONFIG_DIR:-}" ]; then
+  mkdir -p "$HPCLIB_JUPYTER_CONFIG_DIR" && export JUPYTER_CONFIG_DIR="$HPCLIB_JUPYTER_CONFIG_DIR" ||
+    echo "hpclib: could not create $HPCLIB_JUPYTER_CONFIG_DIR; using Jupyter's default config directory" >&2
+fi
+start_dir="${HPCLIB_JUPYTER_START_DIR:-/}"
+if [ ! -d "$start_dir" ]; then
+  echo "hpclib: the start directory $start_dir doesn't exist; starting in /" >&2
+  start_dir=/
+fi
+
+echo "Launching Jupyter on $PROCESS_PORT, starting in $start_dir"
 # Run JupyterLab on specified port
-jupyter lab --port=$PROCESS_PORT --notebook-dir="/" --no-browser
+jupyter lab --port=$PROCESS_PORT --notebook-dir="$start_dir" --no-browser

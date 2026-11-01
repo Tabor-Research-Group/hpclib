@@ -385,6 +385,65 @@ class TestConsoleUI(unittest.TestCase):
         self.assertEqual(saved[-1]["tunnel_args"], ["--time=12:00:00"])
         self.assertEqual(self.errors, [])
 
+    def test_presets_fill_the_form_and_are_saved_and_deleted(self):
+        """Choosing a preset fills the form; Save as preset stores the form under the typed name; Delete removes it."""
+        calls = []
+        state = {"cluster": "demo", "host": "demo", "state": "down", "login": {"state": "none"},
+                 "install": {"state": "unchecked"}}
+        presets = {"Big": {"tunnel_args": ["--mem=64gb"], "settings": {"VSCODE_DATA_DIR": "/big"}, "install_modules": []}}
+        conf = {"tunnel_args": [], "conda_env": None, "modules": [], "project": "", "python_env": False, "job": True,
+                "installable": True, "install_modules": [], "settings": {}, "defaults": {}, "secrets": [], "tokens": None,
+                "fields": [{"name": "VSCODE_DATA_DIR", "label": "Extensions and settings", "hint": "", "choices": None}],
+                "adopted": {"VSCODE_START_FOLDER": "/x"}}
+
+        def respond(route):
+            path = route.request.url.split("/api/", 1)[1].split("?", 1)[0]
+            method = route.request.method
+            if "/presets/" in path:
+                name = path.rsplit("/", 1)[1].replace("%20", " ")
+                calls.append((method, name, route.request.post_data_json if method == "PUT" else None))
+                if method == "PUT":
+                    presets[name] = route.request.post_data_json
+                else:
+                    presets.pop(name, None)
+                out = dict(conf, presets=presets)
+            elif path.endswith("/settings"):
+                out = dict(conf, presets=presets)
+            elif path == "apps":
+                out = {"apps": [{"id": "vscode", "title": "VS Code"}]}
+            elif path == "apps/vscode":
+                out = {"title": "VS Code", "sessions": [state]}
+            elif path == "apps/vscode/demo":
+                out = state
+            else:
+                out = {"prompts": [], "proposals": [], "clusters": []}
+            route.fulfill(body=json.dumps(out), content_type="application/json")
+
+        self.page.route("**/api/**", respond)
+        self.page.add_init_script("localStorage.setItem('agent-console-key', 'fixture-key')")
+        self.page.goto(self.base + "/index.html#/vscode/sessions")
+        self.page.locator("hpc-app-session").wait_for()
+        self.page.evaluate("""() => document.dispatchEvent(new CustomEvent('hpc-app-settings', {
+          detail: {app: 'vscode', session: {cluster: 'demo'}, row: document.querySelector('hpc-app-session')}
+        }))""")
+        self.page.get_by_text("VSCODE_START_FOLDER").wait_for()                       # what the cluster already had
+        self.page.locator('hpc-field[label="Presets"] select').select_option("Big")
+        self.assertEqual(self.page.locator('hpc-field[label="Job: Memory"] input').input_value(), "64gb")
+        data = self.page.locator('hpc-field[label="Extensions and settings"] input')
+        self.assertEqual(data.input_value(), "/big")
+        self.assertEqual(self.page.locator('hpc-field[label="Name"] input').input_value(), "Big")
+        data.fill("/small")
+        self.page.locator('hpc-field[label="Name"] input').fill("Small one")
+        self.page.get_by_role("button", name="Save as preset", exact=True).click()
+        self.page.wait_for_function("document.querySelector('hpc-field[label=Presets] select').value === 'Small one'")
+        self.assertEqual(calls[-1][:2], ("PUT", "Small one"))
+        self.assertEqual(calls[-1][2]["settings"], {"VSCODE_DATA_DIR": "/small"})
+        self.assertEqual(calls[-1][2]["tunnel_args"], ["--mem=64gb"])
+        self.page.get_by_role("button", name="Delete preset", exact=True).click()
+        self.page.wait_for_function("document.querySelectorAll('hpc-field[label=Presets] option').length === 2")
+        self.assertEqual(calls[-1][:2], ("DELETE", "Small one"))
+        self.assertEqual(self.errors, [])
+
     def metrics(self):
         self.page.wait_for_function("document.querySelector('pre.log')?.textContent.startsWith('xxxx')")
         return self.page.evaluate("""() => {

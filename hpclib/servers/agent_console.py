@@ -276,7 +276,14 @@ APPS = {
         # Jupyter prints its URL with the token into the job's log, which the tunnel streams back over ssh
         "token_re": re.compile(r"[?&]token=([0-9A-Za-z]{16,})"),
         "env_settings": {"modules": "HPCLIB_JUPYTER_MODULES", "project": "HPCLIB_JUPYTER_PROJECT"},
-        "settings": [],
+        "settings": [
+            ("HPCLIB_JUPYTER_START_DIR", "Start directory", "the folder the file browser opens in; default / (the whole "
+                                                            "file system), e.g. /scratch/user/me"),
+            ("HPCLIB_JUPYTER_DATA_DIR", "Data directory", "where Jupyter keeps kernels, extensions and its runtime files "
+                                                          "(JUPYTER_DATA_DIR); default ~/.local/share/jupyter"),
+            ("HPCLIB_JUPYTER_CONFIG_DIR", "Config directory", "where Jupyter reads and writes its settings "
+                                                              "(JUPYTER_CONFIG_DIR); default ~/.jupyter"),
+        ],
     },
     "vscode": {
         "title": "VS Code",
@@ -291,6 +298,13 @@ APPS = {
             ("VSCODE_ROOT_DIR", "Start directory", "where VS Code opens and keeps its config; default /scratch/user/USER"),
             ("VSCODE_BIND_PATHS", "Directories in the container", "singularity --bind list, e.g. "
                                                                  "/scratch/user/me:/scratch/user/me,/home/me:/home/me"),
+            ("VSCODE_DATA_DIR", "Extensions and settings", "where VS Code keeps what you install and set (it is passed as "
+                                                           "--user-data-dir and --extensions-dir); default "
+                                                           "START_DIRECTORY/.code-server-data"),
+            ("VSCODE_START_FOLDER", "Folder to open", "opened every time VS Code starts; empty: the one you had open "
+                                                      "last, e.g. /scratch/user/me/project"),
+            ("VSCODE_IMAGE_TAG", "Image version", "the code-server image's tag, e.g. 4.96.4; default latest. Install "
+                                                  "pulls the tag when the image there is a different one"),
         ],
     },
     "transfer": {
@@ -1162,6 +1176,7 @@ class Clusters:
     def __init__(self, shell_runner=None, timeout=20, logins: Logins = None, tunnel_runner=None):
         self.timeout = timeout
         self.shell_runner = shell_runner or self.run_hpclib
+        self._adopt_tried = set()          # (cluster, app) whose saved settings were asked for in this run
         # tunnels run in a pseudo-terminal (PtySession), so a second login can be answered; a given
         # shell_runner (tests) is used as it is
         if tunnel_runner is None:
@@ -2390,6 +2405,9 @@ class Clusters:
                 "defaults": {k: {"value": v, "package": p} for k, (v, p) in self.packages.defaults(spec["tunnel"]).items()
                              if k in {f[0] for f in spec.get("settings", [])}},
                 "package": spec.get("package"),
+                "presets": self.presets_of(conf),
+                # what Check or Start found already saved on the cluster and took as the console's own
+                "adopted": dict(conf.get("adopted") or {}),
                 # secrets: whether each is set on the cluster (as of the last Check or send), never their values
                 "secrets": [{"name": f[0], "label": f[1], "hint": f[2],
                              "set": (conf.get("secrets") or {}).get(f[0])} for f in spec.get("secrets", [])],
@@ -2462,6 +2480,107 @@ class Clusters:
             conf["settings"] = settings
         conf["pushed"] = None              # the cluster's copy is out of date until the next Check, Install or Start
         return conf
+
+    # -- presets: named sets of an app's resource and settings choices (per cluster) -----------------
+
+    PRESET_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._+-]{0,39}")
+    PRESET_MAX = 20
+
+    @staticmethod
+    def presets_of(conf):
+        return {name: dict(p) for name, p in sorted((conf.get("presets") or {}).items())}
+
+    def save_preset(self, profile, app, name, body):
+        """Remember the form's values under a name; applying one is the page filling the form and Save."""
+        spec = self.app_spec(app)
+        if not self.PRESET_NAME_RE.fullmatch(name or "") or name != name.strip():
+            raise ConsoleError(422, "a preset's name is 1-40 letters, digits, spaces or . _ + -")
+        if not isinstance(body, dict):
+            raise ConsoleError(400, "a preset is an object of settings")
+        fresh, conf = self.app_config(profile, app, save=False)
+        presets = conf.setdefault("presets", {})
+        if name not in presets and len(presets) >= self.PRESET_MAX:
+            raise ConsoleError(409, f"at most {self.PRESET_MAX} presets per app; delete one first")
+        checked = self.checked_app_settings(spec, {}, body)
+        checked.pop("pushed", None)
+        presets[name] = checked
+        agent_profiles.save(fresh)
+        return self.app_settings(fresh, app)
+
+    def delete_preset(self, profile, app, name):
+        self.app_spec(app)
+        fresh, conf = self.app_config(profile, app, save=False)
+        if name not in (conf.get("presets") or {}):
+            raise ConsoleError(404, f"no preset {name!r}")
+        del conf["presets"][name]
+        agent_profiles.save(fresh)
+        return self.app_settings(fresh, app)
+
+    # -- what the cluster already has saved (a new computer, a console that lost its profile) -------
+
+    def adopt_saved(self, profile, app, wait=60):
+        """
+        Once per cluster and app: read what the cluster's settings file holds (setup_tunnel.sh --saved) and take
+        it as the console's own wherever the console has no value, so the first push doesn't overwrite it with
+        blanks. Best effort: a cluster whose hpclib is older than this console just doesn't answer.
+        """
+        spec = self.app_spec(app)
+        if not spec.get("settings") and "env_settings" not in spec and not self.app_installable(app):
+            return
+        key = (profile["name"], app)
+        _, conf = self.app_config(profile, app)
+        if conf.get("adopted") is not None or key in self._adopt_tried or not self.logins.alive(profile):
+            return
+        self._adopt_tried.add(key)
+        args = ["tunnel_setup"] + ssh_options(profile) + [profile["host"], spec["tunnel"], "--saved"]
+        try:
+            with tempfile.TemporaryFile() as out:
+                proc = self.shell_runner(args, out)
+                try:
+                    proc.wait(wait)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    return
+                out.seek(0)
+                text = out.read().decode(errors="replace")
+        except OSError:
+            return
+        if "HPCLIB_TUNNEL_SAVED_END" not in text:
+            return
+        saved = {}
+        for name, blob in re.findall(r"^HPCLIB_TUNNEL_SAVED ([A-Z_][A-Z0-9_]*)=([A-Za-z0-9+/=]*)$", text, re.M):
+            try:
+                saved[name] = base64.b64decode(blob).decode()
+            except ValueError:
+                continue
+        fresh, conf = self.app_config(profile, app, save=False)
+        taken = {}
+        fields = {f[0] for f in spec.get("settings", [])}
+        mine = conf.setdefault("settings", {})
+        for name, value in saved.items():
+            if name in fields and name not in mine and SETTING_VALUE_RE.fullmatch(value) and value.strip():
+                mine[name] = taken[name] = value.strip()
+        env = spec.get("env_settings")
+        if env:
+            if conf.get("conda_env") is None and "CONDA_ENVIRONMENT" in saved and (
+                    not saved["CONDA_ENVIRONMENT"] or CONDA_ENV_RE.fullmatch(saved["CONDA_ENVIRONMENT"])):
+                conf["conda_env"] = taken["CONDA_ENVIRONMENT"] = saved["CONDA_ENVIRONMENT"]
+            mods = [m for m in saved.get(env["modules"], "").split(":") if m]
+            if mods and not conf.get("modules") and all(APP_MODULE_RE.fullmatch(m) for m in mods):
+                conf["modules"] = mods
+                taken[env["modules"]] = ":".join(mods)
+            project = saved.get(env["project"], "")
+            if project and not conf.get("project") and APP_PROJECT_RE.fullmatch(project):
+                conf["project"] = taken[env["project"]] = project
+        if conf.get("install_modules") is None and "HPCLIB_INSTALL_MODULES" in saved:
+            try:
+                conf["install_modules"] = console_packages.check_install_modules(
+                    [m for m in saved["HPCLIB_INSTALL_MODULES"].split(":") if m])
+                taken["HPCLIB_INSTALL_MODULES"] = saved["HPCLIB_INSTALL_MODULES"]
+            except console_packages.PackageError:
+                pass
+        conf["adopted"] = taken
+        agent_profiles.save(fresh)
 
     def save_app_settings(self, profile, app, body):
         spec = self.app_spec(app)
@@ -2880,6 +2999,7 @@ class Clusters:
         spec = self.app_spec(app)
         if not self.logins.alive(profile):
             raise ConsoleError(409, f"log in to {profile['name']} first: the check runs over the console's ssh login")
+        self.adopt_saved(profile, app)
         args = self.setup_args(profile, app, "--check")
         with tempfile.TemporaryFile() as out:
             proc = self.shell_runner(args, out)
@@ -2905,6 +3025,7 @@ class Clusters:
             raise ConsoleError(400, "install takes {\"force\": true|false}")
         if not self.app_installable(app):
             raise ConsoleError(409, f"{spec['title']} has nothing to install")
+        self.adopt_saved(profile, app)
         args = self.setup_args(profile, app, "--install", *(["--force"] if force else []), "--check")
         verb = (spec.get("reinstall") or {}).get("label", "install").lower() if force else "install"
         record = self.run_operation(profile, "tunnel_install", args, title=f"{verb} {spec['title']}", app=app)
@@ -4336,6 +4457,10 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             return 200, dict(c.app_control(profile, app, action[1], self.json_body()), ok=True)
         if action == ["settings"] and verb == "GET":
             return 200, dict(c.app_settings(profile, app), ok=True)
+        if len(action) == 2 and action[0] == "presets" and verb == "PUT":
+            return 200, dict(c.save_preset(profile, app, action[1], self.json_body()), ok=True)
+        if len(action) == 2 and action[0] == "presets" and verb == "DELETE":
+            return 200, dict(c.delete_preset(profile, app, action[1]), ok=True)
         if action == ["tokens"] and verb == "GET":
             return 200, dict(c.app_tokens(profile, app), ok=True)
         if action == ["tokens"] and verb == "POST":

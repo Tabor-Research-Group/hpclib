@@ -3,6 +3,7 @@
 
 Run with:  python -m unittest tests.test_agent_console -v
 """
+import base64
 import contextlib
 import http.server
 import io
@@ -84,6 +85,7 @@ class FakeShell:
                            "rclone_kerberos": False, "ticket": None, "credentials": False, "image": True,
                            "transfer_backend": "smbclient", "smbclient": True}
         self.smb_check_error = None
+        self.saved = None            # what --saved says the cluster's settings file holds ({NAME: value}); None: too old
 
     def __call__(self, args, log):
         self.calls.append(list(args))
@@ -94,6 +96,10 @@ class FakeShell:
             if "--install" in args and self.install_elsewhere:
                 log.write(f"HPCLIB_INSTALL_ELSEWHERE {self.install_elsewhere}\n".encode())
                 return subprocess.Popen(["bash", "-c", "exit 3"], start_new_session=True)
+            if "--saved" in args and self.saved is not None:     # setup_tunnel.sh --saved
+                for k, v in self.saved.items():
+                    log.write(f"HPCLIB_TUNNEL_SAVED {k}={base64.b64encode(v.encode()).decode()}\n".encode())
+                log.write(b"HPCLIB_TUNNEL_SAVED_END\n")
             if "--check" in args:
                 log.write(f"HPCLIB_TUNNEL_STATUS {self.setup_status}\n".encode())
             if "--instances" in args:
@@ -1309,6 +1315,7 @@ class TestApps(ConsoleTestCase):
             self.assertIn(self.call("PUT", base, bad)[0], (400, 422), bad)
 
     def test_start_needs_login_then_launches(self):
+        self.shell.setup_status = "installed installed: jupyter"     # Start sends the settings first, with a check
         self.assertEqual(self.call("POST", f"/api/apps/jupyter/{self.dead}/start")[0], 409)
         self.call("PUT", f"/api/apps/jupyter/{self.dead}/settings",
                   {"tunnel_args": ["--time=4:00:00"], "conda_env": "jl", "modules": ["JupyterLab/4.2.0"],
@@ -1512,7 +1519,8 @@ class TestTunnelInstall(ConsoleTestCase):
                                                                         "VSCODE_ROOT_DIR": " "}})
         self.assertEqual(status, 200, out)
         self.assertEqual(out["settings"], {"VSCODE_CONTAINER": "/x/vscode.sif"})      # blank: the tunnel's default
-        self.assertEqual([f["name"] for f in out["fields"]], ["VSCODE_CONTAINER", "VSCODE_ROOT_DIR", "VSCODE_BIND_PATHS"])
+        self.assertEqual([f["name"] for f in out["fields"]], ["VSCODE_CONTAINER", "VSCODE_ROOT_DIR", "VSCODE_BIND_PATHS",
+                                                                         "VSCODE_DATA_DIR", "VSCODE_START_FOLDER", "VSCODE_IMAGE_TAG"])
         self.assertTrue(out["installable"])
         self.assertFalse(out["python_env"])
         for bad in ({"settings": {"PATH": "/evil"}}, {"settings": {"VSCODE_CONTAINER": "a\nb"}}, {"settings": []}):
@@ -1563,6 +1571,57 @@ class TestTunnelInstall(ConsoleTestCase):
             self.assertIn("VSCODE_CONTAINER=/y/vscode.sif", self.shell.calls[-2])
             self.assertEqual(self.shell.calls[-1][0], "launch_tunnel")
         self.assertEqual(self.call("POST", f"/api/apps/jupyter/{self.dead}/install", {"force": "x"})[0], 400)
+
+    def test_saved_cluster_settings_are_adopted_once_where_the_console_has_none(self):
+        base = f"/api/apps/jupyter/{self.dead}"
+        self.shell.saved = {"HPCLIB_JUPYTER_START_DIR": "/scratch/user/me", "HPCLIB_JUPYTER_DATA_DIR": "/d\nbad",
+                            "CONDA_ENVIRONMENT": "lab", "HPCLIB_JUPYTER_MODULES": "GCCcore/13.2.0:JupyterLab/4.2.0",
+                            "HPCLIB_JUPYTER_CONFIG_DIR": "/mine", "HPCLIB_INSTALL_MODULES": "WebProxy"}
+        self.call("PUT", base + "/settings", {"settings": {"HPCLIB_JUPYTER_CONFIG_DIR": "/console/config"}})
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.call("POST", base + "/check")
+            out = self.call("GET", base + "/settings")[1]
+            self.assertEqual(out["settings"], {"HPCLIB_JUPYTER_START_DIR": "/scratch/user/me",
+                                               "HPCLIB_JUPYTER_CONFIG_DIR": "/console/config"})   # its own value kept
+            self.assertEqual((out["conda_env"], out["modules"], out["install_modules"]),
+                             ("lab", ["GCCcore/13.2.0", "JupyterLab/4.2.0"], ["WebProxy"]))
+            self.assertEqual(sorted(out["adopted"]), ["CONDA_ENVIRONMENT", "HPCLIB_INSTALL_MODULES",
+                                                      "HPCLIB_JUPYTER_MODULES", "HPCLIB_JUPYTER_START_DIR"])
+            before = sum("--saved" in c for c in self.shell.calls)
+            self.assertEqual(before, 1)
+            self.call("POST", base + "/check")                       # asked once, not on every Check
+            self.assertEqual(sum("--saved" in c for c in self.shell.calls), 1)
+            # what was adopted is what the next push says, so nothing on the cluster is blanked
+            self.assertIn("HPCLIB_JUPYTER_START_DIR=/scratch/user/me", self.shell.calls[-1])
+        # a cluster with an older setup_tunnel.sh doesn't answer: nothing adopted, no error
+        self.shell.saved = None
+        base = f"/api/apps/vscode/{self.dead}"
+        with mock.patch.object(self.clusters.logins, "alive", return_value=True):
+            self.assertEqual(self.call("POST", base + "/check")[0], 200)
+        self.assertEqual(self.call("GET", base + "/settings")[1]["adopted"], {})
+
+    def test_presets_are_saved_listed_and_deleted_per_app(self):
+        base = f"/api/apps/jupyter/{self.dead}"
+        body = {"tunnel_args": ["--time=1-0:00:00", "--mem=64gb"], "conda_env": "lab", "modules": ["JupyterLab/4.2.0"],
+                "project": "", "install_modules": [], "settings": {"HPCLIB_JUPYTER_START_DIR": "/scratch/user/me",
+                                                                    "HPCLIB_JUPYTER_DATA_DIR": ""}}
+        status, out = self.call("PUT", base + "/presets/Big%20memory", body)
+        self.assertEqual(status, 200, out)
+        self.assertEqual(list(out["presets"]), ["Big memory"])
+        self.assertEqual(out["presets"]["Big memory"]["settings"], {"HPCLIB_JUPYTER_START_DIR": "/scratch/user/me"})
+        self.assertNotIn("pushed", out["presets"]["Big memory"])
+        self.assertEqual(out["settings"], {})                                   # a preset isn't the app's settings
+        self.assertEqual(self.call("GET", base + "/settings")[1]["presets"]["Big memory"]["conda_env"], "lab")
+        self.assertEqual(self.call("PUT", f"/api/apps/vscode/{self.dead}/presets/x", {"settings": {}})[0], 200)
+        self.assertEqual(self.call("GET", f"/api/apps/vscode/{self.dead}/settings")[1]["presets"].keys(), {"x"})
+        for name, bad in (("%20x", body), ("a%2Fb", body), ("ok", {"settings": {"PATH": "/evil"}}),
+                          ("ok", {"tunnel_args": ["--wrap=rm"]}), ("ok", {"nope": 1})):
+            self.assertIn(self.call("PUT", f"{base}/presets/{name}", bad)[0], (400, 404, 422), name)
+        self.assertEqual(self.call("DELETE", base + "/presets/nothing")[0], 404)
+        self.assertEqual(self.call("DELETE", base + "/presets/Big%20memory")[1]["presets"], {})
+        for i in range(agent_console.Clusters.PRESET_MAX):
+            self.call("PUT", f"{base}/presets/p{i}", {})
+        self.assertEqual(self.call("PUT", base + "/presets/one-too-many", {})[0], 409)
 
     def test_a_packaged_app_can_be_shared_and_updatable(self):
         apps = {a["id"]: a for a in self.call("GET", "/api/apps")[1]["apps"]}
@@ -2116,6 +2175,7 @@ class TestSecondLogin(ConsoleTestCase):
         self.assertIn("Permission denied (publickey,password)", self.log_text(self.dead))
 
     def test_jupyter_second_password(self):
+        self.shell.setup_status = "installed installed: jupyter"
         self.assertEqual(self.call("POST", f"/api/apps/jupyter/{self.dead}/start")[0], 202)
         prompt = self.prompt(f"/api/apps/jupyter/{self.dead}")
         self.assertEqual(prompt["kind"], "password")
@@ -2201,6 +2261,7 @@ class TestSecondLogin(ConsoleTestCase):
     def test_prompts_everywhere(self):
         # one local route lists every waiting prompt, so the page can ask from wherever it is
         self.assertEqual(self.call("GET", "/api/prompts")[1], {"ok": True, "prompts": [], "running": 0})
+        self.shell.setup_status = "installed installed: jupyter"
         self.call("POST", f"/api/clusters/{self.dead}/tunnel/start")
         self.call("POST", f"/api/apps/jupyter/{self.dead}/start")
         for _ in range(50):

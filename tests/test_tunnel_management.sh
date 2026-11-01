@@ -70,8 +70,8 @@ mkdir -p "$test_dir/bin"
 cat > "$test_dir/bin/singularity" <<'SCRIPT'
 #!/usr/bin/env bash
 [ "$1" = pull ] || exit 2
-[ "$3" = docker://codercom/code-server:latest ] || exit 3
-touch "$2"
+case "$3" in docker://codercom/code-server:*) ;; *) exit 3 ;; esac
+printf '%s\n' "$3" > "$2"
 SCRIPT
 chmod +x "$test_dir/bin/singularity"
 PATH="$test_dir/bin:$PATH"
@@ -535,6 +535,73 @@ case "$out" in *"HPCLIB_TUNNEL_STATUS installed installed: $image"*) ;; *) fail 
 if setup vscode --set PATH=/evil --save > /dev/null 2>&1; then fail 'accepted a setting the tunnel does not have'; fi
 grep -q "VSCODE_CONTAINER=" "$test_dir/setup-data/settings/vscode.sh" || fail 'a refused setting replaced the saved ones'
 case "$(setup flask --check)" in *"HPCLIB_TUNNEL_STATUS nothing"*) ;; *) fail 'flask has nothing to install' ;; esac
+# VS Code: the image's tag is a setting; a different tag counts as not installed, and Install pulls it
+[ "$(cat "$image.tag")" = latest ] || fail 'the tag was not written beside the image'
+out=$(setup vscode --set "VSCODE_CONTAINER=$image" --set VSCODE_IMAGE_TAG=4.96.4 --save --check) || true
+case "$out" in *"HPCLIB_TUNNEL_STATUS missing not installed: the image at $image is latest, the settings ask for 4.96.4"*) ;;
+  *) fail "a different tag counted as installed: $out" ;; esac
+out=$(setup vscode --install --check) || fail "install of a pinned tag failed: $out"
+case "$out" in *"installed: $image (4.96.4)"*) ;; *) fail "pinned tag: $out" ;; esac
+[ "$(cat "$image")" = docker://codercom/code-server:4.96.4 ] || fail 'the pinned tag was not the one pulled'
+rm -f "$image.tag"       # an image from before there were tags counts as latest only
+case "$(setup vscode --check)" in *"HPCLIB_TUNNEL_STATUS missing"*) ;; *) fail 'an untagged image counted as 4.96.4' ;; esac
+if setup vscode --set "VSCODE_CONTAINER=$image" --set 'VSCODE_IMAGE_TAG=a b;c' --save --install > /dev/null 2>&1; then
+  fail 'pulled an invalid image tag'; fi
+setup vscode --set "VSCODE_CONTAINER=$image" --save > /dev/null    # --save replaces the file's settings
+# --saved prints what the settings file sets (not the shell's environment), and changes nothing
+before=$(cat "$test_dir/setup-data/settings/vscode.sh")
+out=$(VSCODE_START_FOLDER=/from/environment setup vscode --saved)
+saved_container=$(printf '%s\n' "$out" | sed -n 's/^HPCLIB_TUNNEL_SAVED VSCODE_CONTAINER=//p' | base64 -d)
+[ "$saved_container" = "$image" ] || fail "--saved did not print the saved container: $out"
+case "$out" in *VSCODE_START_FOLDER*) fail "--saved printed the environment, not the file: $out" ;; esac
+case "$out" in *HPCLIB_TUNNEL_SAVED_END*) ;; *) fail "--saved has no end marker: $out" ;; esac
+[ "$before" = "$(cat "$test_dir/setup-data/settings/vscode.sh")" ] || fail '--saved changed the settings file'
+case "$(setup jupyter --saved)" in HPCLIB_TUNNEL_SAVED_END) ;; *) fail 'nothing saved should print only the end marker' ;; esac
+# the job passes the data and extension directories, binds the data directory unless a bind covers it, opens the folder
+mkdir -p "$test_dir/runbin" "$test_dir/run-data" "$test_dir/run-root"
+cat > "$test_dir/runbin/singularity" <<'SCRIPT'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$TEST_RUN_LOG"
+SCRIPT
+chmod +x "$test_dir/runbin/singularity"
+run_vscode() {
+  env HOME="$test_dir/setup-home" HPCTUNNELS_DIR="$HPCLIB_DIR/tunnels" TUNNEL_DIR="$HPCLIB_DIR/tunnels/vscode" \
+    PROCESS_PORT=3123 PATH="$test_dir/runbin:$CLEAN_PATH" TEST_RUN_LOG="$test_dir/run.log" \
+    VSCODE_USER=tester VSCODE_CONTAINER=/x/c.sif VSCODE_ROOT_DIR="$test_dir/run-root" "$@" \
+    bash "$HPCLIB_DIR/tunnels/vscode/sbatch_script.sh" > /dev/null
+  cat "$test_dir/run.log"
+}
+run=$(run_vscode VSCODE_BIND_PATHS="/home/tester:/home/tester" VSCODE_DATA_DIR="$test_dir/run-data/dd")
+case "$run" in *"--user-data-dir $test_dir/run-data/dd/user-data --extensions-dir $test_dir/run-data/dd/extensions"*) ;;
+  *) fail "no data and extension directories: $run" ;; esac
+case "$run" in *"$test_dir/run-data/dd:$test_dir/run-data/dd"*) ;; *) fail "data directory not bound: $run" ;; esac
+case "$run" in *"--bind-addr 127.0.0.1:3123"*) ;; *) fail "lost the bind address: $run" ;; esac
+[ -d "$test_dir/run-data/dd/user-data" ] && [ -d "$test_dir/run-data/dd/extensions" ] || fail 'data directories not created'
+case "$run" in *"$test_dir/run-root/proj"*) fail "opened a folder nobody asked for: $run" ;; esac
+run=$(run_vscode VSCODE_BIND_PATHS="$test_dir/run-root:$test_dir/run-root" VSCODE_DATA_DIR="$test_dir/run-root/.d" \
+        VSCODE_START_FOLDER="$test_dir/run-root/proj")
+case "$run" in *"$test_dir/run-root/.d:$test_dir/run-root/.d"*) fail "bound a directory a bind already covers: $run" ;; esac
+case "$run" in *"$test_dir/run-root/proj") ;; *) fail "did not open the start folder: $run" ;; esac
+# Jupyter: start directory (falls back to / with a warning when missing), data and config directories
+cat > "$test_dir/runbin/jupyter" <<'SCRIPT'
+#!/usr/bin/env bash
+printf '%s|%s|%s\n' "$*" "${JUPYTER_DATA_DIR:-}" "${JUPYTER_CONFIG_DIR:-}" > "$TEST_RUN_LOG"
+SCRIPT
+chmod +x "$test_dir/runbin/jupyter"
+run_jupyter() {
+  env HOME="$test_dir/setup-home" HPCTUNNELS_DIR="$HPCLIB_DIR/tunnels" TUNNEL_DIR="$HPCLIB_DIR/tunnels/jupyter" \
+    PROCESS_PORT=8123 PATH="$test_dir/runbin:$CLEAN_PATH" TEST_RUN_LOG="$test_dir/run.log" "$@" \
+    bash "$HPCLIB_DIR/tunnels/jupyter/sbatch_script.sh" 2> "$test_dir/run.err" > /dev/null
+  cat "$test_dir/run.log"
+}
+[ "$(run_jupyter)" = 'lab --port=8123 --notebook-dir=/ --no-browser||' ] || fail "jupyter's defaults changed: $(cat "$test_dir/run.log")"
+[ "$(run_jupyter HPCLIB_JUPYTER_START_DIR="$test_dir/run-root" HPCLIB_JUPYTER_DATA_DIR="$test_dir/jd" \
+    HPCLIB_JUPYTER_CONFIG_DIR="$test_dir/jc")" = "lab --port=8123 --notebook-dir=$test_dir/run-root --no-browser|$test_dir/jd|$test_dir/jc" ] ||
+  fail "jupyter's start, data and config directories: $(cat "$test_dir/run.log")"
+[ -d "$test_dir/jd" ] && [ -d "$test_dir/jc" ] || fail 'jupyter directories not created'
+[ "$(run_jupyter HPCLIB_JUPYTER_START_DIR="$test_dir/nowhere")" = 'lab --port=8123 --notebook-dir=/ --no-browser||' ] ||
+  fail 'a missing start directory did not fall back to /'
+grep -q "start directory $test_dir/nowhere doesn't exist" "$test_dir/run.err" || fail 'no warning for a missing start directory'
 # start_tunnel reads the saved settings
 grep -q 'TUNNEL_SETTINGS_FILE="$HPCTUNNELS_DATA_DIR/settings/$TUNNEL_NAME.sh"' "$HPCLIB_DIR/tunnels/start_tunnel.sh" ||
   fail 'start_tunnel does not read the settings file'

@@ -54,6 +54,18 @@ The settings form has up to three parts:
 
 Settings apply the next time the app starts.
 
+**Presets.** Under the form, **Presets** keeps named sets of these choices for this app on this cluster (for
+example "Big memory" with 64 GB and a longer time limit, or "Quick look" with one CPU). Choose one to fill the
+form, then **Save** to make it the app's settings. Type a name and **Save as preset** to store what the form
+holds now (an existing name is replaced); **Delete preset** removes the chosen one. At most 20 per app.
+
+**What the cluster already has.** The first time the console checks, installs or starts an app on a cluster
+(asked once per console run, until the cluster has answered), it reads what the cluster's settings file already
+holds and takes those values as its own wherever it has none, so a new computer or a lost profile doesn't blank
+them on the first save. Values the console already has are kept; the form lists what was taken. The job's
+options (time, memory, partition) are not saved on the cluster, so they can't be read back. It needs a cluster
+whose hpclib has `setup_tunnel.sh --saved` (Agents → Clusters → Update hpclib); an older one is just not asked.
+
 ### Second password prompts
 
 When the app's job starts, the login node connects to the compute node SLURM gave it. On some clusters that asks
@@ -70,13 +82,28 @@ environment has JupyterLab. **Check** looks for `jupyter` there. With a project 
 to it (`pixi add` in a pixi project, otherwise a uv environment in `PROJECT/.venv`); for a conda environment or
 modules, install JupyterLab there yourself.
 
+More settings: **Start directory** (what the file browser opens in; default `/`, and a missing folder falls
+back to `/` with a warning in the job's log), **Data directory** (`JUPYTER_DATA_DIR`: kernels, extensions) and
+**Config directory** (`JUPYTER_CONFIG_DIR`: Jupyter's settings), for keeping them off a small home quota.
+
 ## VS Code
 
 Runs code-server (VS Code in the browser) from a Singularity image in a SLURM job. **Install** pulls the image.
 code-server asks for a password: **Copy password** copies it, then **Open**.
 
 Settings: where the image is kept (`VSCODE_CONTAINER`), the start directory, and directories to bind into the
-container.
+container, plus:
+
+- **Extensions and settings** (`VSCODE_DATA_DIR`, default `START_DIRECTORY/.code-server-data`): passed to
+  code-server as `--user-data-dir DIR/user-data` and `--extensions-dir DIR/extensions`, so what you install and
+  set survives between jobs and lives where you chose. The directory is bound into the container unless a
+  bind already covers it.
+- **Folder to open** (`VSCODE_START_FOLDER`): opened every time; blank opens the one you had open last.
+- **Image version** (`VSCODE_IMAGE_TAG`, default `latest`): the `codercom/code-server` tag. Install pulls it and
+  records it beside the image (`vscode.sif.tag`); Check reports "not installed" when the image there is
+  another tag, and **Install** replaces it. An image from before tags counts as `latest`.
+
+Environment variables and other settings of the terminals inside VS Code are not managed here.
 
 ## PAI
 

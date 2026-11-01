@@ -23,6 +23,11 @@
 #                     HPCLIB_INSTALL_MODULES is accepted for every tunnel: an ordered colon-separated list of
 #                     modules to load before install.sh (including --check), e.g. WebProxy:GCC/12.2.0.
 #                     An empty value disables preloading. Saved modules also apply to REST installation.
+#   --saved           print what the settings file holds, without changing anything: a line
+#                       HPCLIB_TUNNEL_SAVED NAME=BASE64
+#                     for each of the tunnel's settings (TUNNEL_SETTINGS) that file sets, then HPCLIB_TUNNEL_SAVED_END.
+#                     The console reads it once to fill in settings it doesn't have (a new computer, say). Only what the
+#                     file sets: not what ~/.bashrc or this shell's environment happens to hold.
 #   --install         run the tunnel's install.sh (--force: its --force, e.g. pull an image again)
 #                     exit 3 means it cannot run on this node: HPCLIB_INSTALL_ELSEWHERE asks the console to
 #                     continue on the REST node through POST /admin/tunnel-install (owner only).
@@ -80,10 +85,10 @@ fi
 unset _hpclib_here _hpclib_loaded _hpclib_here_version
 HPCTUNNELS_DATA_DIR="${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}"
 
-usage='usage: setup_tunnel.sh TUNNEL [--set NAME=VALUE]... [--save] [--install [--force]] [--check]'
+usage='usage: setup_tunnel.sh TUNNEL [--set NAME=VALUE]... [--save] [--saved] [--install [--force]] [--check]'
 TUNNEL_NAME="$1"
 shift || true
-sets=() save=false install=false force=false check=false instances=false stop_job='' receive=false secrets=false
+sets=() save=false saved=false install=false force=false check=false instances=false stop_job='' receive=false secrets=false
 tokens=false tokens_action='' tokens_args=()
 downloads=false downloads_action='' downloads_args=()
 source "$HPCLIB_DIR/tunnels/instances.sh"
@@ -92,6 +97,7 @@ while [ "$#" -gt 0 ]; do
     --set) sets+=("$2"); shift 2 ;;
     --set=*) sets+=("${1#--set=}"); shift ;;
     --save) save=true; shift ;;
+    --saved) saved=true; shift ;;
     --install) install=true; shift ;;
     --force) force=true; shift ;;
     --check) check=true; shift ;;
@@ -200,6 +206,19 @@ if [ -f "$settings_file" ]; then
   source "$settings_file"
 fi
 for line in "${lines[@]}"; do eval "$line"; done
+
+if [ "$saved" = true ]; then
+  # in a subshell with the settings cleared first, so only what the file itself sets is printed
+  (
+    for name in $TUNNEL_SETTINGS; do unset "$name"; done
+    [ ! -f "$settings_file" ] || source "$settings_file"
+    for name in $TUNNEL_SETTINGS; do
+      [ -n "${!name:-}" ] || continue
+      printf 'HPCLIB_TUNNEL_SAVED %s=%s\n' "$name" "$(printf '%s' "${!name}" | base64 | tr -d '\n')"
+    done
+    echo HPCLIB_TUNNEL_SAVED_END
+  )
+fi
 
 installer="$TUNNEL_DIR/install.sh"
 can() { [ -f "$installer" ] && grep -q "^# hpclib-install:.*$1" "$installer"; }

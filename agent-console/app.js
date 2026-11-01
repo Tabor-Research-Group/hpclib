@@ -1501,6 +1501,14 @@ async function appSettingsForm(app, s, row) {
         f.choices.map((c) => el("option", { value: c, selected: conf.settings[f.name] === c }, c)))
     : el("input", { value: conf.settings[f.name] || "", placeholder: fallback(f.name), size: 44 })]));
   const save = saveButton("Save", async () => {
+    await api(path, { method: "PUT", body: formBody() });
+    return conf.fields.length || conf.installable
+      ? "Saved. They go to the cluster with the next Check, Install or Start."
+      : "Saved. Applies the next time it starts.";
+  });
+  // presets: named sets of these choices (per cluster and app). Choosing one fills the form; Save makes it the
+  // app's settings. "Save as preset" stores the form as it is now under the name typed.
+  const formBody = () => {
     const tunnel_args = APP_TUNNEL_FIELDS.filter(([k]) => inputs[k].value.trim())
       .map(([k]) => `--${k}=${inputs[k].value.trim()}`).concat(other);
     const body = { tunnel_args };
@@ -1511,11 +1519,50 @@ async function appSettingsForm(app, s, row) {
                             project: project.value.trim() });
     }
     if (conf.fields.length) body.settings = Object.fromEntries(conf.fields.map((f) => [f.name, own[f.name].value.trim()]));
-    await api(path, { method: "PUT", body });
-    return conf.fields.length || conf.installable
-      ? "Saved. They go to the cluster with the next Check, Install or Start."
-      : "Saved. Applies the next time it starts.";
+    return body;
+  };
+  const fillForm = (p) => {
+    const args = Object.fromEntries((p.tunnel_args || []).map((a) => a.replace(/^--/, "").split(/=(.*)/s).slice(0, 2)));
+    for (const [k] of APP_TUNNEL_FIELDS) inputs[k].value = args[k] || "";
+    if (conf.installable) installModules.value = (p.install_modules || []).join(" ");
+    if (conf.python_env) {
+      conda.value = p.conda_env == null ? "" : (p.conda_env === "" ? "none" : p.conda_env);
+      modules.value = (p.modules || []).join(" ");
+      project.value = p.project || "";
+    }
+    for (const f of conf.fields) own[f.name].value = (p.settings || {})[f.name] || "";
+  };
+  let presets = conf.presets || {};
+  const presetSelect = el("select", {});
+  const presetName = el("input", { placeholder: "name", size: 18 });
+  const drawPresets = () => {
+    presetSelect.replaceChildren(el("option", { value: "" }, Object.keys(presets).length ? "choose…" : "none yet"),
+      ...Object.keys(presets).map((n) => el("option", { value: n }, n)));
+  };
+  drawPresets();
+  presetSelect.addEventListener("change", () => {
+    if (!presetSelect.value) return;
+    fillForm(presets[presetSelect.value]);
+    presetName.value = presetSelect.value;
   });
+  const savePreset = saveButton("Save as preset", async () => {
+    const name = presetName.value.trim();
+    if (!name) throw new Error("Type a name for the preset.");
+    presets = (await api(`${path.replace(/settings$/, "presets")}/${encodeURIComponent(name)}`,
+                         { method: "PUT", body: formBody() })).presets;
+    drawPresets();
+    presetSelect.value = name;
+    return `Saved as "${name}". Choose it later to fill the form, then Save.`;
+  });
+  const deletePreset = action("Delete preset", async () => {
+    const name = presetSelect.value;
+    if (!name) throw new Error("Choose a preset to delete.");
+    presets = (await api(`${path.replace(/settings$/, "presets")}/${encodeURIComponent(name)}`,
+                         { method: "DELETE" })).presets;
+    drawPresets();
+    return `Deleted "${name}".`;
+  }, { result: true });
+  const adopted = Object.keys(conf.adopted || {});
   // secrets (a packaged app's tokens, OAuth client secrets): typed here, sent to the cluster over ssh, never kept
   // by the console or shown again; the panel only says whether each is set there
   const secrets = conf.secrets || [];
@@ -1558,6 +1605,12 @@ async function appSettingsForm(app, s, row) {
         (conf.job === false ? "Install and Start both use these." : "Install and the job both use these.")),
       el("div", { class: "row" }, conf.fields.map((f) => field(f.label, own[f.name], f.hint)))] : null,
     el("div", { class: "actions" }, save),
+    el("div", { class: "row presets" },
+      field("Presets", presetSelect, "choose one to fill the form above, then Save"),
+      field("Name", presetName, "for Save as preset"),
+      el("div", { class: "actions" }, savePreset, deletePreset)),
+    adopted.length ? el("p", { class: "muted" }, `Taken from what ${s.cluster} already had saved (nothing there was ` +
+      `overwritten): ${adopted.join(", ")}.`) : null,
     secrets.length ? el("section", { class: "secrets" },
       el("h4", {}, "Secrets"),
       el("p", { class: "muted" }, `Sent to ${s.cluster} over your login and kept there in a file readable by your ` +
