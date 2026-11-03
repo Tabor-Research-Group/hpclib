@@ -151,6 +151,52 @@ try the short service name once after a definite unknown-principal response on a
 the original server's network destination. Explicit settings take precedence. Existing encryption policy remains
 in force; client changes do not repair missing service identities or AES configuration on the storage/domain side.
 
+## Filesystem diagnostics (a package)
+
+Finds out why tunnels are slow. Tunnel requests are slow when the file system calls behind them are: the REST server
+stat-s, opens and lists files on a shared file system, and each call can wait on a busy server. It comes with hpclib
+as a package (`packages/fsdiag`) but, unlike the Workspace, nothing installs it until you want it: **Packages → Come
+with hpclib → Filesystem diagnostics → Install…**, then **Install**. It needs Python 3.6 or newer on the login node.
+Like the Workspace it runs on the login node as you, listens on 127.0.0.1 only and answers only with the token
+**Open** adds.
+
+- **Probe**: choose **Where** (the login node, a compute node, or both) and **What to measure**. For compute nodes
+  it submits one short SLURM job per target; leave the node list empty to let the scheduler pick, or choose nodes
+  from the list (or from where your running jobs are, which is where a tunnel's REST server is) to test a node you
+  suspect. Measuring is call latency at each place (home, scratch, the hpclib data directory, `/tmp` and
+  `/dev/shm` as a node-local control, or places you list), how much your folders hold, and quota and inode use.
+- **Results**: each run's findings first, in plain words with what to do, then the median time per call at each place
+  with a column per node, so a node that differs from the others stands out, and what else was going on (load, I/O
+  pressure, processes stuck on I/O). On NFS the findings say whether the server or this node's own queue is slow.
+  **Download report** saves the text to attach to a message to your cluster's support.
+- **Slow requests**: from the REST server's audit log and stack dumps (hpclib 1.13.13 and later, 1.13.14 for stacks):
+  which routes are slow, how much of their time was waiting rather than computing, and which kind of call the stuck
+  requests were inside (a file-system call, the job registry's SQLite file, searching `PATH`, writing the log).
+- **Directories**: the survey of the folders you chose (entries per top-level folder, the largest directories, the
+  slowest listings), inodes and space per place, and what the cluster's quota commands print.
+
+**Agents can run it.** The package declares four [tunnel actions](../extending.md#tunnel-actions), so a model with
+your REST token can run the diagnostics for you and read the findings (`list_tunnel_actions`, `run_tunnel_action`).
+They are off until you turn them on: the cluster's **Agents** tab → **Tunnel actions** → Filesystem diagnostics. Each
+runs as you, outside the agent's sandbox, and is in the Activity log.
+
+| Action | What it does |
+| --- | --- |
+| `probe` | times file system calls on the node the REST server runs on (a compute node when it is a job: where tunnel requests are slow), about a minute; takes `repeats` |
+| `survey` | counts the entries in a folder of the agent's work directories and reads the quota commands; takes `folder` and `seconds` |
+| `requests` | what slow REST requests were waiting for, from the audit log; takes `hours` and `slow_ms` |
+| `probe_node` | submits a short job doing `probe` on `node` (a name, or `any`); follow it with `job_status` or `wait_for_job`; its output is the report. Needs the `submit` scope |
+
+Each answers with the findings (severity, title, detail, what to do) and the text report. The job's partition,
+account, time limit and memory are the app's settings.
+
+From a shell, the same measurements are `python3 ~/.local/share/hpclib/tunnels/fsdiag/fsdiag_cli.py probe`, `requests`
+or `all`; `probe` measures the node it runs on, so run it inside a job to measure a compute node.
+
+**Settings** (the app's row on the Apps tab): the places to time, the folders to count, and the partition, account,
+time limit and memory of the compute-node jobs. A probe creates files only inside a directory named
+`.hpclib-fsdiag-HOST-PID` in each place and removes it again.
+
 ## Workspace (a package)
 
 Your files on a cluster in the browser: a file list, an editor, viewers, terminals and job submission. It comes

@@ -1,0 +1,38 @@
+{
+  "format": 1,
+  "name": "fsdiag",
+  "version": "1.1.0",
+  "description": "Filesystem diagnostics: why are my tunnels slow? Times file system calls on the login node and on compute nodes (any, or the ones you name), counts what your folders hold and reads your quotas, and says what the REST server's slow requests were waiting for. Runs on the login node as you.",
+  "apps": {
+    "fsdiag": {
+      "title": "Filesystem diagnostics",
+      "tunnel": "fsdiag",
+      "description": "Finds out why tunnel requests are slow: per-call file system latency on the login node and on compute nodes, how many files your folders hold and your quota, and what slow requests were waiting for. It runs on the login node as you; compute-node probes are short SLURM jobs. Only the console's Open (which carries its token) gets in.",
+      "open_path": "/",
+      "health_path": "/health",
+      "token_regex": "[?&]token=([A-Za-z0-9_-]{20,})",
+      "settings": [
+        {"name": "FSDIAG_PATHS", "label": "Places to time", "hint": "colon-separated, LABEL=PATH or PATH; empty: your home, hpclib's data directory, scratch, /tmp and /dev/shm where they exist"},
+        {"name": "FSDIAG_SURVEY_ROOTS", "label": "Folders to count", "hint": "colon-separated; empty: your home directory"},
+        {"name": "FSDIAG_PARTITION", "label": "Partition", "hint": "for the compute-node probes; empty: the cluster's default"},
+        {"name": "FSDIAG_ACCOUNT", "label": "Account", "hint": "for the compute-node probes; empty: your default"},
+        {"name": "FSDIAG_TIME_LIMIT", "label": "Probe time limit", "hint": "of each compute-node job; default 00:20:00"},
+        {"name": "FSDIAG_MEM", "label": "Probe memory", "hint": "of each compute-node job; default 1G"},
+        {"name": "FSDIAG_PYTHON", "label": "Python", "hint": "Python 3.6 or newer on the login node; default python3"},
+        {"name": "FSDIAG_COMPUTE_PYTHON", "label": "Python on compute nodes", "hint": "Python 3.6 or newer there; default python3"}
+      ],
+      "theme_link": true
+    }
+  },
+  "tunnels": {
+    "fsdiag": "tunnels/fsdiag"
+  },
+  "core_helpers": {
+    "tunnels/fsdiag/token_auth.py": "token_auth"
+  },
+  "bundle": {
+    "tunnels/fsdiag/ui/hpclib-ui": "hpclib/ui",
+    "tunnels/fsdiag/ui/hpclib-ui/default-styles.css": "agent-console/default-styles.css",
+    "tunnels/fsdiag/ui/hpclib-ui/theme.js": "agent-console/theme.js"
+  }
+}

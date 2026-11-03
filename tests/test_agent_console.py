@@ -736,6 +736,62 @@ class TestClusterJobsAndStorage(ConsoleTestCase):
         self.assertEqual(out["finished"][0]["peak_memory_mb"], 5120.0)
         self.assertEqual(out["counts"], {"queued": 1, "running": 3, "finished": 2, "failed": 1})   # the VS Code timeout isn't
 
+    def test_job_detail_reads_what_slurm_and_the_files_still_have(self):
+        """The real JOB_DETAIL_SCRIPT, here, against fake scontrol and sacct and files in a work directory."""
+        work = Path(self.tmp) / "work"
+        work.mkdir()
+        (work / "run.sh").write_text("#!/bin/bash\n#SBATCH --mem=16G\npython go.py\n")
+        (work / "slurm-162530.out").write_text("hello\nworld\n")
+        bin_dir = Path(self.tmp) / "slurm-bin"
+        bin_dir.mkdir()
+        me = os.environ.get("USER") or subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()
+        (bin_dir / "scontrol").write_text(f"""#!/bin/bash
+case "$*" in
+  "show job -o 162532") echo "JobId=162532 JobName=live UserId={me}(1000) JobState=RUNNING Reason=None Partition=cpu TimeLimit=04:00:00 NumNodes=1 NumCPUs=1 MinMemoryNode=64G WorkDir={work} Command={work}/run.sh StdOut={work}/live-%j.out Comment=hpclib-rest:llm:py"; ;;
+  "show job -o 777") echo "JobId=777 JobName=x UserId=someoneelse(1) JobState=RUNNING"; ;;
+  "write batch_script 162532 -") echo "#!/bin/bash"; echo "#SBATCH --time=4:00:00"; echo "echo live"; ;;
+  *) exit 1 ;;
+esac
+""")
+        (bin_dir / "sacct").write_text(f"""#!/bin/bash
+args="$*"
+case "$args" in
+  *"-j 162530"*) case "$args" in *WorkDir*) echo "162530|hpcrest-python_project|FAILED|1:0|00:01:28|04:00:00|2026-11-01T17:35:00|2026-11-01T17:35:10|2026-11-01T17:37:03|cpu|acct|normal|1|cpu=1,mem=16G|cpu=1,mem=16G|c01|hpclib-rest:llm:python_project|{work}|sbatch --mem=16G run.sh" ;; esac ;;
+  *"-j 162532"*) exit 1 ;;
+  *) exit 1 ;;
+esac
+""")
+        for f in ("scontrol", "sacct"):
+            (bin_dir / f).chmod(0o755)
+
+        def runner(profile, script, args=(), wait=60):
+            res = subprocess.run(["bash", "-s", "--", *args], input=script, capture_output=True, text=True,
+                                 env={"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(self.tmp)}, cwd=str(work))
+            return res.returncode, res.stdout, res.stderr
+        self.clusters.script_runner = runner
+        base = f"/api/clusters/{self.dead}/jobs"
+        # a finished job: only accounting knows it; the script file and the default output file are still there
+        status, out = self.call("GET", base + "/162530")
+        self.assertEqual(status, 200, out)
+        info = dict(out["info"])
+        self.assertEqual((info["JobState"], info["Partition"], info["SubmitLine"]), ("FAILED", "cpu", "sbatch --mem=16G run.sh"))
+        self.assertEqual(out["source"]["kind"], "agent")
+        self.assertEqual(out["files"]["stdout"]["path"], str(work / "slurm-162530.out"))
+        self.assertEqual(out["files"]["stdout"]["text"], "hello\nworld\n")
+        self.assertFalse(out["files"]["script"]["found"])                    # accounting kept no script, and no Command
+        # a running job: Slurm's copy of the script, the output pattern expanded, a missing output file reported
+        status, out = self.call("GET", base + "/162532")
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["files"]["script"]["from"], "slurm")
+        self.assertIn("echo live", out["files"]["script"]["text"])
+        self.assertEqual(out["files"]["stdout"]["path"], str(work / "live-162532.out"))
+        self.assertFalse(out["files"]["stdout"]["found"])
+        self.assertEqual(dict(out["info"])["MinMemoryNode"], "64G")
+        # other people's jobs, unknown jobs and bad ids
+        self.assertEqual(self.call("GET", base + "/777")[0], 403)
+        self.assertEqual(self.call("GET", base + "/555")[0], 404)
+        self.assertEqual(self.call("GET", base + "/1;rm")[0], 400)
+
     def test_cancel_only_agent_and_other_jobs(self):
         self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/jobs/cancel", {"job": "103"})[0], 409)   # an app
         self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/jobs/cancel", {"job": "102"})[0], 409)   # the tunnel
@@ -806,7 +862,8 @@ class TestClusterJobsAndStorage(ConsoleTestCase):
             self.assertEqual(self.call("PUT", f"/api/clusters/{self.dead}/app-view", bad)[0], 400, bad)
 
     def test_scripts_parse(self):
-        for script in (agent_console.CLUSTER_JOBS_SCRIPT, agent_console.CLUSTER_STORAGE_SCRIPT):
+        for script in (agent_console.CLUSTER_JOBS_SCRIPT, agent_console.CLUSTER_STORAGE_SCRIPT,
+                       agent_console.JOB_DETAIL_SCRIPT):
             self.assertEqual(subprocess.run(["bash", "-n"], input=script, text=True).returncode, 0)
 
 

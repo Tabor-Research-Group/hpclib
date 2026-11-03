@@ -189,8 +189,10 @@ def setup_parent_terminated_listener(PARENT_PID):
     thread.start()
     return thread
 
+@functools.lru_cache(maxsize=1)
 def hpclib_version():
-    """HPCLIB_VERSION from the hpclib.sh this server was installed with (None if it can't be read)."""
+    """HPCLIB_VERSION from the hpclib.sh this server was installed with (None if it can't be read). Read once: the
+    file changes only when hpclib is updated, which restarts the server."""
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hpclib.sh")
     try:
         with open(path) as f:
@@ -264,7 +266,12 @@ class PathWhitelist:
             return self
         roots = [os.path.realpath(os.path.expanduser(r)) for r in roots]
         kept = [r for r in roots if self.contains(r)]
-        return PathWhitelist(kept, base_dir=kept[0] if kept else self.base_dir, deny=self.deny)
+        # the roots kept and the deny list are already resolved: resolving them again would cost an lstat for every
+        # component of every path, on every request, which on a slow network file system is seconds
+        wl = PathWhitelist.__new__(PathWhitelist)
+        wl.roots, wl.deny = tuple(r for r in kept if r), self.deny
+        wl.base_dir = kept[0] if kept else self.base_dir
+        return wl
 
     def resolve(self, path):
         """
@@ -290,6 +297,77 @@ try:
     from .token_auth import TokenAuth, TokenIdentity, TokenRegistry
 except ImportError:
     from token_auth import TokenAuth, TokenIdentity, TokenRegistry
+
+
+_IMPORTED_AT = time.monotonic()
+# a request slower than this many milliseconds also gets a line on stderr (the server's log), not only an audit entry
+SLOW_REQUEST_MS = int(os.environ.get("HPCLIB_REST_SLOW_MS", "1000") or 1000)
+# a request still running after this many milliseconds has its stack written to stderr (0 turns this off)
+SLOW_STACK_MS = int(os.environ.get("HPCLIB_REST_STACK_MS", "5000") or 5000)
+
+
+def rss_mb():
+    """This process's resident memory in MB (current, from /proc; else the peak, which is all other systems give)."""
+    try:
+        with open("/proc/self/statm") as f:
+            return round(int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576, 1)
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        import resource
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # kB on Linux, bytes on macOS
+        return round(peak / (1048576 if sys.platform == "darwin" else 1024), 1)
+    except (ImportError, OSError):
+        return None
+
+
+class SlowRequestWatch:
+    """
+    Writes the stack of a request that is still running after `after` seconds to stderr, once per request, so a
+    request that waits (on a filesystem that has stalled, say) shows the call it is waiting in. Requests are noted as
+    they start and dropped as they end; a daemon thread looks at the running ones every `interval` seconds.
+    """
+    def __init__(self, after, interval=1.0, out=None):
+        self.after, self.interval, self.out = after, interval, out
+        self._lock = threading.Lock()
+        self._running = {}  # thread id -> [start on the monotonic clock, description, already written]
+        self._thread = None
+
+    def begin(self, description):
+        if self.after <= 0:
+            return
+        with self._lock:
+            self._running[threading.get_ident()] = [time.monotonic(), description, False]
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._watch, name="slow-request-watch", daemon=True)
+                self._thread.start()
+
+    def end(self):
+        with self._lock:
+            self._running.pop(threading.get_ident(), None)
+
+    def check(self, now=None):
+        now = time.monotonic() if now is None else now
+        frames = sys._current_frames()
+        with self._lock:
+            late = [(tid, entry) for tid, entry in self._running.items() if not entry[2] and now - entry[0] >= self.after]
+            for _, entry in late:
+                entry[2] = True
+        out = self.out or sys.stderr
+        for tid, (started, description, _) in late:
+            frame = frames.get(tid)
+            stack = "".join(traceback.format_stack(frame, limit=12)) if frame else "  (the thread has ended)\n"
+            out.write(f"[{time.strftime('%d/%b/%Y %H:%M:%S')}] request still running after {now - started:.1f} s: "
+                      f"{description} (thread {tid}); it is waiting here:\n{stack}")
+            out.flush()
+
+    def _watch(self):
+        while True:
+            time.sleep(self.interval)
+            self.check()
+
+
+SLOW_WATCH = SlowRequestWatch(SLOW_STACK_MS / 1000)
 
 
 class AuditLog:
@@ -409,6 +487,7 @@ class RESTHandler(http.server.BaseHTTPRequestHandler):
     FILE_CHANGE_ROUTES = ()
     ROUTE_SCOPES = {}
     server: RESTServer
+    _whitelist = None  # (identity, whitelist): worked out once per request
 
     @abc.abstractmethod
     def get_routes(self) -> 'dict[tuple[str,str],method]':
@@ -426,11 +505,18 @@ class RESTHandler(http.server.BaseHTTPRequestHandler):
         out of what runs unsandboxed as you later (hpclib, installed tunnels, shell startup files, ~/.ssh): writing
         there would turn a scoped token into your own powers the next time you install or start an app.
         """
+        if self._whitelist is not None and self._whitelist[0] is self.identity:
+            return self._whitelist[1]
         if self.identity is not None and self.identity.has_scope("*"):
-            return self.server.whitelist.restrict(self.identity.allow)
-        return self.server.agent_whitelist.restrict(self.identity.allow if self.identity else None)
+            found = self.server.whitelist.restrict(self.identity.allow)
+        else:
+            found = self.server.agent_whitelist.restrict(self.identity.allow if self.identity else None)
+        self._whitelist = (self.identity, found)
+        return found
 
     def handle_rest_request(self, verb):
+        started, cpu_started = time.monotonic(), time.thread_time()
+        SLOW_WATCH.begin(f"{verb} {self.path[:200]}")
         self.responded = False
         self.response_status = None
         self.identity = None
@@ -470,9 +556,20 @@ class RESTHandler(http.server.BaseHTTPRequestHandler):
             traceback.print_exc(limit=3)
             self.send_error_json(500, {"error": f"internal error ({type(e).__name__}); see the REST server's log"})
         finally:
-            self.write_audit(verb)
+            SLOW_WATCH.end()
+            # wall time is everything the client waited for (waiting on subprocesses and disk included); cpu time is
+            # only what this thread computed. A large gap between the two means the request was waiting, not working.
+            timing = {"duration_ms": round((time.monotonic() - started) * 1000, 1),
+                      "cpu_ms": round((time.thread_time() - cpu_started) * 1000, 1),
+                      "rss_mb": rss_mb(), "threads": threading.active_count()}
+            if timing["duration_ms"] >= SLOW_REQUEST_MS:
+                sys.stderr.write(f"[{self.log_date_time_string()}] slow request: {verb} {self.path[:200]} -> "
+                                 f"{self.response_status} in {timing['duration_ms']} ms "
+                                 f"(cpu {timing['cpu_ms']} ms, rss {timing['rss_mb']} MB, "
+                                 f"{timing['threads']} threads)\n")
+            self.write_audit(verb, timing)
 
-    def write_audit(self, verb):
+    def write_audit(self, verb, timing=None):
         if self.server.audit is None:
             return
         entry = {
@@ -483,6 +580,8 @@ class RESTHandler(http.server.BaseHTTPRequestHandler):
             "path": self.path if len(self.path) <= self.AUDIT_PATH_MAX else self.path[:self.AUDIT_PATH_MAX] + "...",
             "status": self.response_status,
         }
+        if timing:
+            entry.update(timing)
         if getattr(self.identity, "session_id", None):
             entry["session_id"] = self.identity.session_id
             entry["grant_id"] = self.identity.grant_id
@@ -574,6 +673,8 @@ class RESTHandler(http.server.BaseHTTPRequestHandler):
     @classmethod
     def start_server(cls, host="127.0.0.1", port=5000, **server_opts):
         with RESTServer((host, port), cls, **server_opts) as server:
+            print(f"hpclib REST server listening on {host}:{port} "
+                  f"{round(time.monotonic() - _IMPORTED_AT, 2)} s after it started, rss {rss_mb()} MB", flush=True)
             server.serve_forever()
 
 

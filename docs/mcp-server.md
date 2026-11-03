@@ -51,7 +51,7 @@ can write only to the token's directories and private scratch, sees system direc
 nothing else of your account: not your home directory, other projects, or hpclib's own state.
 
 **Everything is recorded.** Every request, allowed or refused, goes to an audit log with the token name, route,
-status and the job or file involved. The console's Activity → Requests view shows it. Activity → Jobs
+status and the job or file involved. Each entry also records how long the request took (`duration_ms`, wall time; `cpu_ms`, the time its thread computed), the server's resident memory (`rss_mb`) and its thread count, so you can tell slow work from waiting: a large gap between `duration_ms` and `cpu_ms` means the request waited on SLURM, a subprocess or the disk. Requests over a second (`HPCLIB_REST_SLOW_MS`) are also written to the server's log, and one still running after five seconds (`HPCLIB_REST_STACK_MS`, `0` to turn off) has the stack of the call it is waiting in written there too, and the server logs how long it took to start listening. The console's Activity → Requests view shows it. Activity → Jobs
 shows recent submissions, current and finished states, array tasks, and output previews. The job registry
 retains observed accounting details after completion, so later reads keep the exit code and elapsed time.
 Old terminal records get one recovery attempt when accounting is still available; expired accounting

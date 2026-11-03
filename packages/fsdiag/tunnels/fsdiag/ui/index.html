@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Filesystem diagnostics</title>
+  <!-- the console's theme and stylesheet come in the address (bridge.js); its variables sit under the page's own -->
+  <link rel="stylesheet" href="ui/hpclib-ui/default-styles.css">
+  <script src="ui/bridge.js"></script>
+  <link rel="stylesheet" href="ui/hpclib-ui/base.css">
+  <link rel="stylesheet" href="ui/fsdiag.css">
+  <!-- hpclib-ui/ is the package's copy of hpclib/ui; pointing it at a CDN later is a change to this line -->
+  <script type="importmap">{"imports": {"hpclib-ui/": "./ui/hpclib-ui/"}}</script>
+  <script type="module" src="ui/app.js"></script>
+</head>
+<body>
+  <header class="top">
+    <strong class="brand">Filesystem diagnostics</strong>
+    <span class="host muted" id="host"></span>
+  </header>
+  <hpc-tabs id="tabs" label="Diagnostics"></hpc-tabs>
+  <main id="views">
+    <section id="panel-probe" role="tabpanel" class="view"></section>
+    <section id="panel-results" role="tabpanel" class="view" hidden></section>
+    <section id="panel-requests" role="tabpanel" class="view" hidden></section>
+    <section id="panel-directories" role="tabpanel" class="view" hidden></section>
+  </main>
+</body>
+</html>

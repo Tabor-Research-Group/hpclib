@@ -547,17 +547,33 @@ class Sandbox:
         self.hidden, self.read_only_paths = (), ()
         self._help_cache = {}
         self._podman_cache = {}
+        self._found = {}
         self._lock = threading.Lock()
 
     # -- what will actually run -------------------------------------------
 
+    FIND_TTL = 30  # seconds a runtime that was found is remembered
+
     def _find(self, names):
+        """
+        The first of `names` that is an executable, as a path. A runtime that was found is remembered for FIND_TTL
+        seconds: looking means a stat for every directory on PATH, and /cluster and /admin/proposals ask on each call.
+        Not finding one is never remembered, so an install is noticed at once.
+        """
+        key, now = tuple(names), time.monotonic()
+        with self._lock:
+            hit = self._found.get(key)
+        if hit is not None and now - hit[0] < self.FIND_TTL:
+            return hit[1]
         for name in names:
             managed = os.path.join(MANAGED_BIN, name) if name in ("bwrap", "ch-run") else None
             path = (managed if managed and os.access(managed, os.X_OK) else
                     name if os.path.isabs(os.path.expanduser(name)) else self.which(name))
             if path and os.access(os.path.expanduser(path), os.X_OK):
-                return os.path.expanduser(path)
+                found = os.path.expanduser(path)
+                with self._lock:
+                    self._found[key] = (now, found)
+                return found
         return None
 
     def find_runtime(self):

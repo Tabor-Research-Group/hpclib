@@ -341,6 +341,29 @@ class TokenRegistry:
     def records(self):
         return TokenAuth.read_tokens_file(self.path) if os.path.exists(self.path) else []
 
+    _cache = {}  # path -> (what the file looked like, its records)
+    _cache_lock = threading.Lock()
+
+    def cached_records(self):
+        """
+        records(), read again only when the file has changed (one stat per request instead of a stat, an open, a
+        read and a parse). Any change, including a chmod, shows in the signature; the caller must not alter what
+        it gets back.
+        """
+        try:
+            info = os.stat(self.path)
+        except FileNotFoundError:
+            return []
+        signature = (info.st_mtime_ns, info.st_ctime_ns, info.st_size, info.st_ino)
+        with self._cache_lock:
+            hit = self._cache.get(self.path)
+        if hit is not None and hit[0] == signature:
+            return hit[1]
+        records = TokenAuth.read_tokens_file(self.path)
+        with self._cache_lock:
+            self._cache[self.path] = (signature, records)
+        return records
+
     @contextlib.contextmanager
     def edit(self):
         os.makedirs(os.path.dirname(os.path.abspath(self.path)), mode=0o700, exist_ok=True)
@@ -424,7 +447,7 @@ class TokenRegistry:
         return None, None
 
     def identify(self, token):
-        return self._find(self.records(), token)[1]
+        return self._find(self.cached_records(), token)[1]
 
     def _issue(self, records, grant_id, ttl, lease, scopes, allow, parent=None, device_id=None):
         ttl, lease = _duration(ttl), _duration(lease, self.MAX_LEASE)

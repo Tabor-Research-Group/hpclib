@@ -811,6 +811,45 @@ class TestConsoleUI(unittest.TestCase):
         self.assertEqual(puts[-1], {'pinned': ['jupyter', 'workspace'], 'hidden': ['pai']})
         self.assertEqual(self.errors, [])
 
+    def test_a_job_name_and_overview_open_the_job_page(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
+             'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up'}}
+        base = {'partition': 'cpu', 'elapsed': '0:10', 'time_limit': '1:00:00', 'cpus': '1', 'memory': '1G', 'gres': '',
+                'node_list': 'c01', 'start': '', 'reason': 'None', 'end': '2026-10-28T10:00:00', 'exit_code': '0:0',
+                'peak_memory_mb': None, 'source': {'kind': 'agent-tunnel', 'label': 'agent tunnel'}}
+        jobs = {'at': 0, 'queued': [], 'running': [dict(base, id='10', name='rest-abc', state='RUNNING')],
+                'finished': [dict(base, id='11', name='hpcrest-py', state='FAILED', exit_code='1:0',
+                                  source={'kind': 'agent', 'label': 'agent: py', 'token': 'llm'})],
+                'counts': {'queued': 0, 'running': 1, 'finished': 1, 'failed': 1}}
+        gone = {'from': 'file', 'path': '/scratch/me/run.sh', 'found': False, 'size': 0, 'mtime': 0, 'text': None,
+                'truncated': False}
+        detail = {'cluster': 'demo', 'id': '11', 'name': 'hpcrest-py', 'state': 'FAILED', 'at': 0, 'limit': 131072,
+                  'source': {'kind': 'agent', 'label': 'agent: py', 'token': 'llm'},
+                  'info': [['Partition', 'cpu'], ['SubmitLine', 'sbatch --mem=16G run.sh']],
+                  'files': {'script': gone, 'stdout': {'from': 'slurm', 'path': '/scratch/me/slurm-11.out', 'found': True,
+                                                        'size': 12, 'mtime': 1, 'text': 'hello world\n', 'truncated': False}}}
+        answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c, 'health': {'hpclib_version': '1.11.1'},
+                   'apps': {'apps': [{'id': 'agents', 'title': 'Agents'}]}, 'clusters/demo/jobs': jobs,
+                   'clusters/demo/jobs/11': detail}
+        def handler(route, path):
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/c/demo/jobs")
+        main = self.page.locator('main')
+        self.assertEqual(main.get_by_role('link', name='Overview').get_attribute('href'), '#/c/demo/jobs/10')
+        main.get_by_role('link', name='hpcrest-py').click()
+        main.get_by_text('hello world').wait_for()
+        self.assertTrue(self.page.url.endswith('#/c/demo/jobs/11'), self.page.url)
+        text = main.inner_text()
+        for want in ('sbatch --mem=16G run.sh', '/scratch/me/run.sh no longer exists', 'Script', 'Output'):
+            self.assertIn(want, text)
+        main.get_by_role('link', name='← Jobs').click()
+        main.get_by_text('Finished in the last 24 hours').wait_for()
+        self.assertEqual(self.errors, [])
+
     def test_job_counts_filter_the_jobs_tab(self):
         c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
              'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up'}}

@@ -96,6 +96,14 @@ A package's tabs for an app (here CMCC DB's Preview) are tabs at the top of the 
 the app's **Stop**, PAI's database with **End database job**, and the agent tunnel with **Stop** on the
 Overview.
 
+**A job's overview.** Click a job's name, or **Overview** on its row, for one page about it
+(`#/c/CLUSTER/jobs/JOBID`): the settings Slurm has for it (partition, time limit, CPUs, memory, GPUs, work
+directory, and the `sbatch` command line where the site's accounting keeps it), its batch script, its output
+file and its error file (if separate). Each is shown where it still exists: the script comes from Slurm's own
+copy while Slurm has the job, then the accounting's copy where the site stores scripts, then the file `sbatch` was
+given, as it is now (it may have changed). The output shows the last 128 KB. What is gone says so, with the path
+it looked at. Only your own jobs; read over the console's login, so the cluster needs to be logged in.
+
 Jobs are labelled from what hpclib puts on them: `hpcrest-TEMPLATE` names and the `hpclib-rest:TOKEN:TEMPLATE`
 comment for agents' jobs, `TUNNEL-ID` names for tunnels. A job `job-queue` or you submitted yourself is "other".
 

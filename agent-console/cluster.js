@@ -1,7 +1,7 @@
 // The cluster-first pages: #/c lists the clusters with what each needs, and #/c/NAME/TAB[/SUB] is one cluster's
 // page (Overview, Jobs, Apps, Installed, Storage, Files, SSH keys, Agents, Settings); #/c/NAME/apps/APP is one app there, with
 // its controls, tools and settings, and a package's tabs for it. They use the console's existing API, plus
-// GET clusters/NAME/jobs, GET/POST clusters/NAME/storage[/scan] and GET clusters/NAME/quota. app.js passes what they share with it (init).
+// GET clusters/NAME/jobs[/ID], GET/POST clusters/NAME/storage[/scan] and GET clusters/NAME/quota. app.js passes what they share with it (init).
 import { el, action, confirmDialog, connectClients, ownerRecovery, appUrl } from "./components.js";
 import * as widgets from "./widgets.js";
 
@@ -312,9 +312,10 @@ async function overview(c, local) {
 
 // ---------------------------------------------------------------- Jobs
 
-async function jobsTab(c) {
+async function jobsTab(c, _local, sub = "") {
   const { api } = ctx;
   if (!login(c)) return el("p", { class: "muted" }, "Log in to see this cluster's jobs.");
+  if (sub) return jobPage(c, sub);
   let j;
   try { j = await api(path(c.name, "jobs")); } catch (err) { return ctx.errorBox(err); }
   const n = j.counts;
@@ -323,7 +324,12 @@ async function jobsTab(c) {
                              "output so far stays where it is.", "Cancel job")) return;
     await api(path(c.name, "jobs/cancel"), { method: "POST", body: { job: job.id } });
     ctx.render();
-  }) : el("a", { class: "button", href: `#/c/${enc(c.name)}/apps` }, job.source.kind === "agent-tunnel" ? "Overview" : "Apps"));
+  }) : null);
+  // every job has an overview page (its settings, script and output); an app's or the tunnel's job also links to its app
+  const overview = (job) => el("a", { class: "button", href: href(c.name, "jobs", job.id) }, "Overview");
+  const jobCell = (job) => el("td", {}, el("a", { class: "job-link", href: href(c.name, "jobs", job.id) }, job.name),
+    el("div", { class: "muted small" }, job.id));
+  const actions = (job) => el("td", { class: "next" }, overview(job), cancel(job));
   const source = (job) => chip(job.source.label, SOURCE_TONE[job.source.kind] || "down", job.source.token ? `token ${job.source.token}` : null);
   const requested = (job) => [job.cpus && `${job.cpus} CPU`, job.memory && job.memory !== "0" && `${job.memory}`, job.gres]
     .filter(Boolean).join(" · ");
@@ -332,7 +338,7 @@ async function jobsTab(c) {
     : el("p", { class: "muted" }, empty);
   const failedState = (job) => job.state !== "COMPLETED";
   const finishedRows = (only) => j.finished.filter((job) => !only || failedState(job)).map((job) => el("tr", {},
-    el("td", {}, el("strong", {}, job.name), el("div", { class: "muted small" }, job.id)), el("td", {}, source(job)),
+    jobCell(job), el("td", {}, source(job)),
     el("td", {}, job.state === "COMPLETED" ? chip("completed", "up")
       : chip(`${job.state.toLowerCase().replaceAll("_", " ")}${job.exit_code && job.exit_code !== "0:0" ? ` (${job.exit_code})` : ""}`, "error")),
     el("td", {}, job.elapsed),
@@ -343,16 +349,16 @@ async function jobsTab(c) {
   const sections = {
     queued: () => [el("h3", { id: "queued" }, `Queued (${n.queued})`),
       table(["Job", "From", "Partition", "Asked for", "Waiting because", "Expected start", ""], j.queued.map((job) => el("tr", {},
-        el("td", {}, el("strong", {}, job.name), el("div", { class: "muted small" }, job.id)), el("td", {}, source(job)),
+        jobCell(job), el("td", {}, source(job)),
         el("td", {}, job.partition), el("td", {}, requested(job)),
         el("td", { title: job.reason }, REASONS[job.reason] || job.reason),
         el("td", {}, job.start ? job.start.replace("T", " ") : el("span", { class: "muted" }, "not estimated")),
-        el("td", { class: "next" }, cancel(job)))), "Nothing is waiting.")],
+        actions(job))), "Nothing is waiting.")],
     running: () => [el("h3", { id: "running" }, `Running (${n.running})`),
       table(["Job", "From", "Node", "Time used", "Asked for", ""], j.running.map((job) => el("tr", {},
-        el("td", {}, el("strong", {}, job.name), el("div", { class: "muted small" }, job.id)), el("td", {}, source(job)),
+        jobCell(job), el("td", {}, source(job)),
         el("td", {}, job.node_list), el("td", {}, `${job.elapsed} of ${job.time_limit}`), el("td", {}, requested(job)),
-        el("td", { class: "next" }, cancel(job)))), "Nothing is running.")],
+        actions(job))), "Nothing is running.")],
     finished: () => [el("h3", { id: "finished" }, `Finished in the last 24 hours (${n.finished})`),
       table(["Job", "From", "Result", "Took", "Peak memory", "Ended"], finishedRows(false), "Nothing finished in the last day.")],
     failed: () => [el("h3", { id: "failed" }, `Failed in the last 24 hours (${n.failed})`),
@@ -386,6 +392,46 @@ async function jobsTab(c) {
       el("span", { class: "muted" }, `as of ${new Date(j.at * 1000).toLocaleTimeString()}`),
       action("Refresh", () => ctx.render())),
     body);
+}
+
+// One job: what was asked of Slurm, the batch script, and what the job wrote, wherever each still exists
+async function jobPage(c, id) {
+  const { api } = ctx;
+  let d;
+  try { d = await api(path(c.name, `jobs/${enc(id)}`)); } catch (err) {
+    return el("div", {}, el("p", {}, el("a", { href: href(c.name, "jobs") }, "← Jobs")), ctx.errorBox(err));
+  }
+  const when = (t) => (t ? new Date(t * 1000).toLocaleString() : "");
+  const appLink = d.source.kind === "agent-tunnel" ? el("a", { class: "button", href: href(c.name, "agents") }, "Agent tunnel")
+    : d.source.app ? el("a", { class: "button", href: href(c.name, "apps", d.source.app) }, d.source.label) : null;
+  const file = (heading, f, missing) => {
+    if (!f) return missing ? [el("h3", {}, heading), el("p", { class: "muted" }, missing)] : [];
+    const where = f.from === "file" ? `${f.path} (the file as it is now; it may have changed since the job)`
+      : f.from === "slurm" && f.path === "(kept by Slurm)" ? "the copy Slurm kept" : f.from === "accounting" ? "the copy Slurm's accounting kept" : f.path;
+    if (!f.found) return [el("h3", {}, heading), el("p", { class: "muted" },
+      f.path && f.path !== "(kept by Slurm)" ? `${f.path} no longer exists, or isn't readable.` : (missing || "Not available."))];
+    return [el("h3", {}, heading),
+      el("p", { class: "muted small" }, `${where}${f.size ? ` · ${size(f.size / 1024)}` : ""}${f.mtime ? ` · written ${when(f.mtime)}` : ""}` +
+        (f.truncated ? ` · showing the last ${size(d.limit / 1024)}` : "")),
+      el("pre", { class: "log" }, f.text || "(empty)")];
+  };
+  const stateTone = d.state === "COMPLETED" ? "up" : ["RUNNING", "PENDING"].includes(d.state) ? "starting" : d.state ? "error" : "down";
+  return el("div", { class: "job-page" },
+    el("p", {}, el("a", { href: href(c.name, "jobs") }, "← Jobs")),
+    el("div", { class: "toolbar" },
+      el("h3", {}, d.name || `Job ${d.id}`, " ", el("span", { class: "muted small" }, d.id)),
+      d.state ? chip(d.state.toLowerCase().replaceAll("_", " "), stateTone) : null,
+      chip(d.source.label, SOURCE_TONE[d.source.kind] || "down"),
+      appLink,
+      el("span", { class: "muted" }, `as of ${new Date(d.at * 1000).toLocaleTimeString()}`),
+      action("Refresh", () => ctx.render())),
+    el("h3", {}, "Settings"),
+    d.info.length ? el("table", { class: "compact job-info" }, el("tbody", {}, d.info.map(([k, v]) =>
+      el("tr", {}, el("td", { class: "muted" }, k), el("td", {}, v)))))
+      : el("p", { class: "muted" }, "Slurm no longer has this job's settings."),
+    ...file("Script", d.files.script, "Slurm kept no copy of the script, and the file it was submitted from is gone."),
+    ...file("Output", d.files.stdout, "No output file was found."),
+    ...file("Error output", d.files.stderr, null));
 }
 const jobFilter = {};      // cluster -> the kind of job its Jobs tab shows (null: all), while the page is open
 

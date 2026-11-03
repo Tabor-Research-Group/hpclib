@@ -1,0 +1,54 @@
+{
+  "title": "Filesystem diagnostics",
+  "description": "Why tunnel requests are slow: times file system calls (stat, open, create, fsync, a SQLite commit) where the REST server runs, counts what a folder holds, reads the REST server's slow-request log, and probes other compute nodes in a short job. Each answers with findings in plain words (what is slow, and what to do) and a text report.",
+  "actions": {
+    "probe": {
+      "title": "Time file system calls on the REST server's node",
+      "description": "Measures the node this REST server runs on (a compute node when the server is a job, else the login node): per-call latency at your home, hpclib's data directory, scratch, /tmp and /dev/shm as a control, the mount and NFS statistics, load and I/O pressure. Takes about a minute. Returns findings (severity, title, detail, advice) and a text report. Run it while tunnel requests are slow.",
+      "mode": "sync",
+      "scope": "read",
+      "params": {
+        "repeats": {"type": "integer", "minimum": 3, "maximum": 30, "default": 10, "description": "samples per call; more is steadier and slower"}
+      },
+      "run": ["fsdiag_action.sh", "probe", "{repeats}"],
+      "timeout": 300
+    },
+    "survey": {
+      "title": "Count the files in a folder",
+      "description": "Walks FOLDER (for at most SECONDS) counting entries per directory without opening files: the largest directories, how long each took to list, and what each top-level folder holds; also runs the cluster's quota commands. Large directories slow every call that lists them. Returns findings and a text report.",
+      "mode": "sync",
+      "scope": "read",
+      "params": {
+        "folder": {"type": "cluster-path", "access": "read", "description": "a directory in your work directories"},
+        "seconds": {"type": "integer", "minimum": 5, "maximum": 300, "default": 60, "description": "stop after this long; the counts are then lower bounds"}
+      },
+      "run": ["fsdiag_action.sh", "survey", "{folder}", "{seconds}"],
+      "timeout": 400
+    },
+    "requests": {
+      "title": "What slow REST requests were waiting for",
+      "description": "Reads this server's audit log and stack dumps for the last HOURS: which routes are slow, how much of their time was waiting rather than computing, and which kind of call stuck requests were inside (a file system call, the job registry's SQLite file, a PATH search, a log write). Needs hpclib 1.13.13 or newer on the cluster (stack dumps: 1.13.14). Returns findings and a text report.",
+      "mode": "sync",
+      "scope": "read",
+      "params": {
+        "hours": {"type": "integer", "minimum": 1, "maximum": 168, "default": 24, "description": "how far back to read"},
+        "slow_ms": {"type": "integer", "minimum": 10, "maximum": 600000, "default": 1000, "description": "a request over this many milliseconds is slow"}
+      },
+      "run": ["fsdiag_action.sh", "requests", "{hours}", "{slow_ms}"],
+      "timeout": 120
+    },
+    "probe_node": {
+      "title": "Time file system calls on a compute node",
+      "description": "Submits a short job that does what probe does, on NODE (a node name, to test one you suspect) or any node ('any'). Compare nodes: a file system that is fast on one and slow on another points at that node. Follow it with job_status or wait_for_job; its output file is the text report.",
+      "mode": "job",
+      "scope": "submit",
+      "params": {
+        "node": {"type": "string", "pattern": "any|[A-Za-z0-9][A-Za-z0-9._-]{0,63}", "default": "any", "description": "a node name, or 'any'"},
+        "repeats": {"type": "integer", "minimum": 3, "maximum": 30, "default": 10, "description": "samples per call"}
+      },
+      "run": ["fsdiag_action.sh", "submit", "{job_options}", "{node}", "{repeats}"],
+      "output": "{data_dir}/sessions/fsdiag/probe-{job_id}.txt",
+      "timeout": 60
+    }
+  }
+}

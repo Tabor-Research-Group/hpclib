@@ -1136,6 +1136,77 @@ sacct -n -P -u "$USER" -S now-1day -o JobID,JobName,State,ExitCode,Elapsed,End,P
   2>/dev/null | sed 's/^/A|/'
 """
 
+# Runs ON the login node: JOB: what Slurm still knows about one of your jobs, and the files it names, as marked
+# lines: `S|key|value` (scontrol, while the job is in its memory), `A|key|value` (sacct, once it isn't), and for the
+# batch script, the output and the error file `F|kind|source|path|state|size|mtime` then `D|kind|base64` (the last
+# LIMIT bytes). Only your own jobs; what no longer exists is reported, not an error.
+JOB_DETAIL_SCRIPT = r"""
+job="$1"; limit="${2:-131072}"
+me=$(id -un)
+info=$(scontrol show job -o "$job" 2>/dev/null | head -n 1)
+pick() { printf '%s\n' "$info" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -n 1; }
+if [ -n "$info" ]; then
+  owner=$(pick UserId)
+  case "$owner" in "$me("*) ;; *) echo "N|not yours"; exit 3 ;; esac
+  for k in JobName JobState Reason Partition Account QOS TimeLimit NumNodes NumCPUs NumTasks CPUs/Task MinMemoryNode \
+           MinMemoryCPU ReqTRES AllocTRES TresPerNode Features Dependency Reservation Nice Requeue SubmitTime \
+           StartTime EndTime NodeList ExitCode Comment WorkDir Command StdOut StdErr; do
+    v=$(pick "$k"); [ -z "$v" ] || printf 'S|%s|%s\n' "$k" "$v"
+  done
+fi
+fields=JobID,JobName,State,ExitCode,Elapsed,Timelimit,Submit,Start,End,Partition,Account,QOS,AllocCPUS,ReqTRES,AllocTRES,NodeList,Comment
+names="$fields"
+row=$(sacct -X -P -n -j "$job" -o "$fields,WorkDir,SubmitLine" 2>/dev/null | head -n 1) && names="$fields,WorkDir,SubmitLine"
+[ -n "$row" ] || { row=$(sacct -X -P -n -j "$job" -o "$fields" 2>/dev/null | head -n 1); names="$fields"; }
+if [ -z "$info" ] && [ -z "$row" ]; then echo "N|unknown"; exit 4; fi
+if [ -n "$row" ]; then
+  printf '%s\n' "$row" | awk -F'|' -v names="$names" 'BEGIN { n = split(names, k, ",") }
+    { for (i = 1; i <= n; i++) if ($i != "") printf "A|%s|%s\n", k[i], $i }'
+  so=$(sacct -X -P -n -j "$job" -o StdOut,StdErr 2>/dev/null | head -n 1)
+  [ -z "$so" ] || { printf 'A|StdOut|%s\n' "${so%%|*}"; printf 'A|StdErr|%s\n' "${so#*|}"; }
+fi
+want() { # first value of KEY from scontrol, else sacct
+  v=$(pick "$1"); [ -n "$v" ] || v=$(printf '%s\n' "$row" | awk -F'|' -v names="$names" -v key="$1" \
+    'BEGIN { n = split(names, k, ",") } { for (i = 1; i <= n; i++) if (k[i] == key) print $i }')
+  printf '%s' "$v"
+}
+name=$(want JobName); workdir=$(want WorkDir); [ -n "$workdir" ] || workdir="$PWD"
+expand() { # Slurm's filename patterns
+  printf '%s' "$1" | sed -e "s/%j/$job/g; s/%J/$job/g; s/%A/${job%%_*}/g; s/%a/${job#*_}/g; s/%x/$name/g; s/%u/$me/g; s/%%/%/g"
+}
+emit() { # kind source path
+  kind="$1"; src="$2"; path="$3"
+  case "$path" in "") printf 'F|%s|%s||missing|0|0\n' "$kind" "$src"; return ;; /*) ;; *) path="$workdir/$path" ;; esac
+  if [ -f "$path" ] && [ -r "$path" ]; then
+    size=$(wc -c < "$path" | tr -d ' '); mtime=$(stat -c %Y "$path" 2>/dev/null || echo 0)
+    printf 'F|%s|%s|%s|found|%s|%s\n' "$kind" "$src" "$path" "$size" "$mtime"
+    printf 'D|%s|%s\n' "$kind" "$(tail -c "$limit" "$path" | base64 | tr -d '\n')"
+  else
+    printf 'F|%s|%s|%s|missing|0|0\n' "$kind" "$src" "$path"
+  fi
+}
+# the batch script: Slurm's own copy while it has the job, then the accounting's copy (when the site stores it),
+# then the file sbatch was given, as it is now
+tmp=$(mktemp) || exit 1
+trap 'rm -f "$tmp"' EXIT
+src=''
+if [ -n "$info" ] && scontrol write batch_script "$job" - > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then src=slurm
+elif sacct -j "$job" -B -X > "$tmp" 2>/dev/null && [ -s "$tmp" ] && ! grep -qiE '^sacct: (error|fatal)|unrecognized option|invalid option' "$tmp"; then src=accounting
+fi
+if [ -n "$src" ]; then
+  size=$(wc -c < "$tmp" | tr -d ' ')
+  printf 'F|script|%s|(kept by Slurm)|found|%s|0\n' "$src" "$size"
+  printf 'D|script|%s\n' "$(tail -c "$limit" "$tmp" | base64 | tr -d '\n')"
+else
+  emit script file "$(want Command)"
+fi
+out=$(want StdOut); [ -n "$out" ] || out="slurm-${job}.out"
+out=$(expand "$out")
+emit stdout slurm "$out"
+err=$(want StdErr)
+if [ -n "$err" ]; then err=$(expand "$err"); [ "$err" = "$out" ] || emit stderr slurm "$err"; fi
+"""
+
 # Runs ON the login node: STORAGE_TIMEOUT DIR...: each directory's size by its children (du -k --max-depth=1) and
 # their file counts (du --inodes --max-depth=1: files, folders and links, what a file quota counts; find where du is
 # too old for --inodes), at low priority and each with a time limit (then marked partial). The scan adds the quota
@@ -1676,6 +1747,66 @@ class Clusters:
         return {"cluster": profile["name"], "at": time.time(), "queued": queued, "running": running,
                 "finished": done, "counts": {"queued": len(queued), "running": len(running),
                                              "finished": len(done), "failed": failed}}
+
+    JOB_DETAIL_LIMIT = 131072            # the last bytes of the script, output and error file that are sent
+
+    # the settings worth showing (Slurm's names), in this order; the rest of what Slurm said stays out of the way
+    JOB_INFO_KEYS = ("JobName", "JobState", "Reason", "ExitCode", "Partition", "Account", "QOS", "TimeLimit", "NumNodes",
+                     "NumCPUs", "NumTasks", "CPUs/Task", "MinMemoryNode", "MinMemoryCPU", "ReqTRES", "AllocTRES",
+                     "TresPerNode", "Features", "Dependency", "Reservation", "Nice", "Requeue", "SubmitTime",
+                     "StartTime", "EndTime", "Elapsed", "NodeList", "WorkDir", "SubmitLine", "Command", "StdOut",
+                     "StdErr", "Comment")
+    JOB_INFO_ALIASES = {"State": "JobState", "Timelimit": "TimeLimit", "Submit": "SubmitTime", "Start": "StartTime",
+                        "End": "EndTime", "AllocCPUS": "NumCPUs"}
+    JOB_EMPTY = ("", "N/A", "(null)", "Unknown", "None", "0:0")
+
+    def job_detail(self, profile, job):
+        """One job: its sbatch settings, and its script, output and error file where they still exist."""
+        if not re.fullmatch(r"[0-9]+(_[0-9]+)?", job or ""):
+            raise ConsoleError(400, "a job ID is digits, with _N for an array task")
+        if not self.logins.alive(profile):
+            raise ConsoleError(409, f"log in to {profile['name']} first: the job is read over the console's login")
+        code, out, err = self.script_runner(profile, JOB_DETAIL_SCRIPT, (job, str(self.JOB_DETAIL_LIMIT)), 60)
+        if code == 3:
+            raise ConsoleError(403, f"job {job} isn't yours")
+        if code == 4 or out.startswith("N|unknown"):
+            raise ConsoleError(404, f"{profile['name']} no longer knows job {job} (Slurm's accounting keeps jobs "
+                                    "for as long as the site sets)")
+        if code != 0 and "F|" not in out:
+            raise ConsoleError(502, f"reading job {job} failed: "
+                                    f"{self._one_line((err or out).strip().splitlines()[-1] if (err or out).strip() else code)}")
+        info, files = {}, {}
+        for line in out.splitlines():
+            kind, _, rest = line.partition("|")
+            if kind in ("S", "A"):
+                key, _, value = rest.partition("|")
+                key = self.JOB_INFO_ALIASES.get(key, key)
+                # scontrol (S) speaks first; accounting (A) fills in what it left out
+                if value not in self.JOB_EMPTY and key not in info:
+                    info[key] = value
+                elif key == "ExitCode" and key not in info:
+                    info[key] = value
+            elif kind == "F":
+                f = rest.split("|", 5)
+                if len(f) == 6:
+                    files[f[0]] = {"from": f[1], "path": f[2], "found": f[3] == "found",
+                                   "size": int(f[4]) if f[4].isdigit() else 0,
+                                   "mtime": int(f[5]) if f[5].isdigit() else 0, "text": None}
+            elif kind == "D":
+                name, _, blob = rest.partition("|")
+                if name in files:
+                    try:
+                        files[name]["text"] = base64.b64decode(blob).decode(errors="replace")
+                    except ValueError:
+                        pass
+        for f in files.values():
+            f["truncated"] = f["found"] and f["size"] > self.JOB_DETAIL_LIMIT
+        ordered = [[k, info[k]] for k in self.JOB_INFO_KEYS if k in info]
+        # the sbatch command line is also what was passed to sbatch; it comes from accounting where the site has it
+        return {"cluster": profile["name"], "id": job, "name": info.get("JobName", ""),
+                "state": (info.get("JobState") or "").split()[0] if info.get("JobState") else "",
+                "source": self.job_source(info.get("JobName"), info.get("Comment")),
+                "info": ordered, "files": files, "at": time.time(), "limit": self.JOB_DETAIL_LIMIT}
 
     def cancel_job(self, profile, body):
         """scancel one job of yours that an agent or something else started; an app's job stops with the app."""
@@ -4353,6 +4484,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 return 202, dict(c.setup(profile, self.json_body()), ok=True)
             if rest == ["jobs"] and verb == "GET":
                 return 200, dict(c.cluster_jobs(profile), ok=True)
+            if len(rest) == 2 and rest[0] == "jobs" and rest[1] != "cancel" and verb == "GET":
+                return 200, dict(c.job_detail(profile, rest[1]), ok=True)
             if rest == ["jobs", "cancel"] and verb == "POST":
                 return 200, dict(c.cancel_job(profile, self.json_body()), ok=True)
             if rest == ["storage"] and verb == "GET":

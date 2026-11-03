@@ -25,7 +25,8 @@ TEMPLATES = Path(__file__).resolve().parents[1] / "hpclib" / "tunnels" / "rest" 
 sys.path.insert(0, str(SERVERS))
 import rest_jobs  # noqa: E402
 from rest_client import RESTClient, RESTClientError  # noqa: E402
-from rest_server import AuditLog, HPCRESTHandler, PathWhitelist, RESTServer, TokenAuth  # noqa: E402
+from rest_server import (AuditLog, HPCRESTHandler, PathWhitelist, RESTServer, SlowRequestWatch,  # noqa: E402
+                         TokenAuth, TokenRegistry, hpclib_version)
 
 OWNER = "owner-token"
 
@@ -456,6 +457,92 @@ class TestSubmit(JobServerTestCase):
 
 
 
+class TestRequestFileSystemCost(unittest.TestCase):
+    """What every request needs from the file system is kept small: they are seconds apiece on a slow network mount."""
+
+    def test_restrict_resolves_only_the_requested_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base, inner = Path(tmp, "base").resolve(), Path(tmp, "base", "inner").resolve()
+            inner.mkdir(parents=True)
+            whole = PathWhitelist([str(base)], deny=[str(Path(tmp, "private"))])
+            real = os.path.realpath
+            with mock.patch("os.path.realpath", side_effect=real) as spy:
+                narrow = whole.restrict([str(inner), str(Path(tmp, "elsewhere"))])
+            self.assertEqual(spy.call_count, 2)  # the two roots asked for; nothing already resolved is resolved again
+            self.assertEqual((narrow.roots, narrow.base_dir, narrow.deny), ((str(inner),), str(inner), whole.deny))
+            self.assertIs(whole.restrict(None), whole)
+            self.assertEqual(whole.restrict([str(Path(tmp, "elsewhere"))]).roots, ())
+
+    def test_version_is_read_once(self):
+        hpclib_version.cache_clear()
+        with mock.patch("builtins.open", side_effect=open) as spy:
+            first, second = hpclib_version(), hpclib_version()
+        self.assertEqual(first, second)
+        self.assertEqual(spy.call_count, 1)
+
+    def test_token_registry_rereads_only_when_the_file_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = TokenRegistry(os.path.join(tmp, "tokens.json"))
+            registry.create_grant("first", ["read"], [tmp])
+            real = TokenAuth.read_tokens_file
+            with mock.patch.object(TokenAuth, "read_tokens_file", side_effect=real) as spy:
+                for _ in range(3):
+                    self.assertIsNone(registry.identify("not-a-token"))
+                self.assertEqual(spy.call_count, 1)
+                registry.create_grant("second", ["read"], [tmp])  # rewrites the file
+                spy.reset_mock()
+                registry.identify("not-a-token")
+                registry.identify("not-a-token")
+                self.assertEqual(spy.call_count, 1)  # re-read once after the change, not on every call
+            self.assertEqual(len(registry.cached_records()), 2)
+
+
+class TestSlowRequestWatch(unittest.TestCase):
+    """A request that has run too long gets its stack written out, once, and only while it is running."""
+
+    def run_blocked(self, watch, release):
+        started = threading.Event()
+
+        def waiting_in_here():
+            watch.begin("GET /slow")
+            started.set()
+            release.wait(10)
+            watch.end()
+
+        worker = threading.Thread(target=waiting_in_here)
+        worker.start()
+        self.assertTrue(started.wait(10))
+        return worker
+
+    def test_stack_written_once_for_a_request_that_runs_long(self):
+        class Out:
+            text = ""
+            def write(self, s): self.text += s
+            def flush(self): pass
+        out, release = Out(), threading.Event()
+        watch = SlowRequestWatch(5, out=out)
+        worker = self.run_blocked(watch, release)
+        try:
+            watch.check(now=time.monotonic() + 1)
+            self.assertEqual(out.text, "")  # not long enough yet
+            watch.check(now=time.monotonic() + 6)
+            watch.check(now=time.monotonic() + 7)
+            self.assertEqual(out.text.count("request still running"), 1)
+            self.assertIn("GET /slow", out.text)
+            self.assertIn("waiting_in_here", out.text)
+        finally:
+            release.set()
+            worker.join()
+        out.text = ""
+        watch.check(now=time.monotonic() + 60)
+        self.assertEqual(out.text, "")  # the request ended
+
+    def test_off_when_after_is_zero(self):
+        watch = SlowRequestWatch(0)
+        watch.begin("GET /x")
+        self.assertIsNone(watch._thread)
+
+
 class TestCapacityReservations(unittest.TestCase):
     """Capacity admission should not require a large per-task status scan."""
 
@@ -650,6 +737,10 @@ class TestScopes(JobServerTestCase):
         submit = [e for e in entries if e["verb"] == "POST" and e["path"] == "/jobs"][-1]
         self.assertEqual((submit["token"], submit["status"]), ("llm", 201))
         self.assertEqual(submit["detail"]["job_id"], job_id)
+        self.assertGreaterEqual(submit["duration_ms"], 0)
+        self.assertGreaterEqual(submit["cpu_ms"], 0)
+        self.assertGreaterEqual(submit["threads"], 1)
+        self.assertTrue(submit["rss_mb"] is None or submit["rss_mb"] > 0)
         self.assertEqual((entries[-1]["token"], entries[-1]["status"]), (None, 401))
         self.assertNotIn(OWNER, self.audit_path.read_text())
         self.assertNotIn(self.llm_token, self.audit_path.read_text())

@@ -306,3 +306,9 @@ details.more-apps { margin-top: var(--space-lg); }
 details.more-apps > summary { cursor: pointer; font-weight: var(--font-weight-semibold); padding: var(--space-xs) 0; }
 .view-controls { display: flex; gap: var(--space-md); margin-top: 2px; }
 details.more-apps > summary .muted { font-weight: 400; }
+a.job-link { font-weight: var(--font-weight-semibold); color: var(--fg); text-decoration: none; }
+a.job-link:hover { color: var(--accent); text-decoration: underline; }
+table.job-info td:first-child { white-space: nowrap; padding-right: 1.5em; vertical-align: top; }
+table.job-info td { overflow-wrap: anywhere; }
+td.next { white-space: nowrap; }
+td.next > * + * { margin-left: 0.4em; }
