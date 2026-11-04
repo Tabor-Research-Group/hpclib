@@ -226,6 +226,22 @@ table.bars td.bar-cell { width: 46%; }
 table.bars .bar { height: 10px; border-radius: 3px; background: var(--accent); opacity: 0.75; }
 table.bars td.num, table.bars th.num { text-align: right; }
 table.bars th { font-weight: 400; color: var(--muted); font-size: var(--font-size-small); }
+/* a running storage scan: a moving bar on the card, a pulse on the folder being scanned, a spinner by the status */
+.inline-check { display: inline-flex; align-items: center; gap: var(--space-xs); cursor: pointer; }
+.root-controls { display: flex; align-items: center; gap: var(--space-md); flex-wrap: wrap; margin: var(--space-xs) 0 var(--space-sm); }
+.add-root { display: flex; align-items: center; gap: var(--space-md); flex-wrap: wrap; margin: var(--space-sm) 0; }
+.scan-status { display: inline-flex; align-items: center; gap: var(--space-sm); }
+.spinner { width: 12px; height: 12px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.9s linear infinite; }
+.scan-progress { display: flex; align-items: center; gap: var(--space-md); margin: var(--space-sm) 0; font-size: var(--font-size-small); color: var(--muted); }
+.scan-bar { position: relative; flex: 0 0 160px; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.scan-bar::after { content: ""; position: absolute; inset: 0 auto 0 0; width: 40%; border-radius: 2px; background: var(--accent); animation: scan-slide 1.4s ease-in-out infinite; }
+.scanning { color: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+tr.scanning-row td { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.timed-out { color: var(--warn); }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes scan-slide { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+@keyframes pulse { 50% { opacity: 0.45; } }
+@media (prefers-reduced-motion: reduce) { .spinner, .scan-bar::after, .scanning { animation: none; } .scan-bar::after { width: 100%; opacity: 0.5; } }
 pre.quota { max-height: 220px; }
 .quota-check h4 { margin: var(--space-md, 8px) 0 var(--space-xs, 4px); font-size: 0.95em; }
 .quota-check pre.quota { margin: 0; }

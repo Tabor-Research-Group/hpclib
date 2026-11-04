@@ -711,14 +711,38 @@ class TestClusterJobsAndStorage(ConsoleTestCase):
         self.clusters.logins.alive = lambda profile: True
         self.ran = []
 
+        self.folder_calls = []                    # the folders the scan asked about, in order
+        self.folder_gate = None                   # an Event the first folder waits for, to look at a running scan
+        self.folder_answers = {"/scratch/me/llm/models": (2048, 700), "/scratch/me/llm/runs": (512, 500)}
+        self.timed_out = set()
+        self.extra_roots = {"/scratch/shared/data": ["raw", "clean"]}      # directories a user may add, with their folders
+
         def runner(profile, script, args=(), wait=60):
             self.ran.append((script, tuple(args)))
             if "squeue" in script:
                 return 0, self.SQUEUE, ""
             if "scancel" in script:
                 return 0, "", ""
-            return 0, ("D|ok|/scratch/me/llm\nS|2048|/scratch/me/llm/models\nS|512|/scratch/me/llm/runs\n"
-                       "S|2600|/scratch/me/llm\nI|1234|/scratch/me/llm\nM|/home/me/.local/tunnels\n"
+            if script == agent_console.CLUSTER_STORAGE_LIST_SCRIPT:
+                out = ""
+                for root in args[1:]:                 # one record group per directory asked, in order
+                    if root == "/scratch/me/llm":
+                        out += "D|/scratch/me/llm\0d|4|/scratch/me/llm/models\0d|4|/scratch/me/llm/runs\0f|8|/scratch/me/llm/notes.txt\0"
+                    elif root in self.extra_roots:
+                        out += f"D|{root}\0" + "".join(f"d|4|{root}/{name}\0" for name in self.extra_roots[root])
+                    else:
+                        out += f"M|{root.replace('~', '/home/me')}\0"
+                return 0, out, ""
+            if script == agent_console.CLUSTER_STORAGE_FOLDER_SCRIPT:
+                folder = args[1]
+                self.folder_calls.append(folder)
+                if self.folder_gate is not None:
+                    self.folder_gate.wait(10)
+                if folder in self.timed_out:
+                    return 0, "S|timeout|\nF|timeout|\n", ""
+                kb, files = self.folder_answers[folder]
+                return 0, f"S|ok|{kb}\nF|ok|{files}\n", ""
+            return 0, (
                        'HPCLIB_QUOTA {"host": "login1", "settings_file": "/home/me/.local/tunnels/settings/quota.sh", '
                        '"storage": {"command": "showquota", "source": "default", "exit_code": 0, '
                        '"output": ["Disk  Usage  Limit", "/scratch  612G  1T"], "saved": null}, '
@@ -801,47 +825,215 @@ esac
         self.assertEqual((status, out["cancelled"]), (200, "104"))
         self.assertEqual(self.ran[-1][1], ("104",))
 
-    def test_storage_scan_and_cache(self):
-        self.assertIsNone(self.call("GET", f"/api/clusters/{self.dead}/storage")[1]["scanned"])
-        self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/storage/scan")[0], 202)
-        for _ in range(50):
+    def scan(self, body=None, wait=True):
+        status, out = self.call("POST", f"/api/clusters/{self.dead}/storage/scan", body)
+        self.assertEqual(status, 202, out)
+        return self.wait_scan() if wait else out
+
+    def wait_scan(self):
+        for _ in range(200):
             out = self.call("GET", f"/api/clusters/{self.dead}/storage")[1]
             if out["scan"]["state"] != "running":
-                break
+                return out
             time.sleep(0.05)
+        self.fail("the scan did not finish")
+
+    def test_storage_scan_and_cache(self):
+        self.assertIsNone(self.call("GET", f"/api/clusters/{self.dead}/storage")[1]["scanned"])
+        out = self.scan()
         self.assertEqual(out["scan"]["state"], "done", out)
         llm, tunnels = out["dirs"]
-        self.assertEqual((llm["path"], llm["kb"], llm["files"], llm["partial"]), ("/scratch/me/llm", 2600, 1234, False))
-        self.assertEqual([c["kb"] for c in llm["children"]], [2048, 512])
+        # the folders' sizes and file counts, and the loose file beside them
+        self.assertEqual((llm["path"], llm["kb"], llm["files"], llm["partial"]), ("/scratch/me/llm", 2048 + 512 + 8, 700 + 500 + 1, False))
+        self.assertEqual(sorted((c["kb"], c["files"]) for c in llm["children"]), [(512, 500), (2048, 700)])
+        self.assertTrue(all(c["scanned"] and c["state"] == "ok" for c in llm["children"]))
+        self.assertEqual(llm["folder_counts"], {"total": 2, "sized": 2, "timed_out": 0, "unscanned": 0})
         self.assertTrue(tunnels["missing"])
         self.assertEqual(out["quota"], {"command": "showquota", "lines": ["Disk  Usage  Limit", "/scratch  612G  1T"]})
         self.assertEqual(out["quotas"]["project"]["output"], ["Project 122800 5000 SU"])
-        self.assertIn("hpclib_quota all --json", self.ran[-1][0])         # lib/quota.sh goes along
-        self.assertEqual(self.ran[-1][1][1:], ("/scratch/me/llm", "~/.local/tunnels"))
+        self.assertTrue(any("hpclib_quota" in script for script, _ in self.ran))             # lib/quota.sh goes along
+        listing = next(a for a in self.ran if a[0] == agent_console.CLUSTER_STORAGE_LIST_SCRIPT)
+        self.assertEqual(listing[1], ("300", "/scratch/me/llm", "~/.local/tunnels"))        # 5 minutes a folder
+        self.assertEqual(out["last_scan"]["folders"], 2)
         self.assertEqual(stat.S_IMODE(os.stat(self.clusters.storage_path(self.dead)).st_mode), 0o600)
 
-    def test_storage_script_counts_files_per_folder(self):
-        """The scan script itself, run here: each folder's size and file count (du --inodes, else find)."""
+    def test_recent_folders_are_skipped_unless_asked(self):
+        self.scan()
+        self.assertEqual(sorted(self.folder_calls), ["/scratch/me/llm/models", "/scratch/me/llm/runs"])
+        out = self.scan()                                              # a minute later: nothing to do
+        self.assertEqual(len(self.folder_calls), 2)
+        self.assertEqual((out["last_scan"]["folders"], out["last_scan"]["skipped"]), (0, 2))
+        self.assertEqual(out["dirs"][0]["kb"], 2568)                   # what the first scan found is still there
+        out = self.scan({"rescan_recent": True})
+        self.assertEqual(len(self.folder_calls), 4)
+        self.assertTrue(out["last_scan"]["rescan_recent"])
+        # five minutes on, they are due again
+        with mock.patch.object(self.clusters, "STORAGE_RECENT", 0):
+            self.scan()
+        self.assertEqual(len(self.folder_calls), 6)
+
+    def test_the_oldest_folders_are_scanned_first(self):
+        self.scan()
+        stored = json.loads(Path(self.clusters.storage_path(self.dead)).read_text())
+        for child in stored["dirs"][0]["children"]:
+            child["scanned"] = time.time() - (3000 if child["path"].endswith("runs") else 400)     # runs is the older
+        Path(self.clusters.storage_path(self.dead)).write_text(json.dumps(stored))
+        self.folder_calls.clear()
+        self.scan()
+        self.assertEqual(self.folder_calls, ["/scratch/me/llm/runs", "/scratch/me/llm/models"])
+
+    def test_a_folder_that_times_out_is_marked_and_the_total_says_so(self):
+        self.timed_out = {"/scratch/me/llm/runs"}
+        out = self.scan()
+        llm = out["dirs"][0]
+        runs = next(c for c in llm["children"] if c["path"].endswith("runs"))
+        self.assertEqual((runs["kb"], runs["files"], runs["state"], runs["files_state"]), (None, None, "timeout", "timeout"))
+        self.assertTrue(llm["partial"])
+        self.assertEqual((llm["kb"], llm["folder_counts"]["timed_out"], llm["folder_counts"]["sized"]), (2048 + 8, 1, 1))
+        self.assertEqual(out["scan"]["state"], "done")                 # the others still finished
+
+    def test_the_whole_scan_stops_at_its_time_limit_and_the_next_one_carries_on(self):
+        with mock.patch.object(self.clusters, "STORAGE_TOTAL_TIMEOUT", 10):      # less than a folder is worth starting
+            out = self.scan()
+        self.assertEqual(self.folder_calls, [])
+        self.assertEqual(out["last_scan"]["stopped"], "time limit")
+        llm = out["dirs"][0]
+        self.assertEqual((llm["kb"], llm["partial"], llm["folder_counts"]["unscanned"]), (None, True, 2))   # listed, not sized: no total yet
+        out = self.scan()
+        self.assertEqual(sorted(self.folder_calls), ["/scratch/me/llm/models", "/scratch/me/llm/runs"])
+        self.assertEqual((out["dirs"][0]["kb"], out["dirs"][0]["partial"], out["last_scan"]["stopped"]), (2568, False, None))
+
+    def test_a_new_listing_keeps_the_last_results(self):
+        self.scan()
+        with mock.patch.object(self.clusters, "STORAGE_TOTAL_TIMEOUT", 10):
+            out = self.scan({"rescan_recent": True})                   # stopped before any folder: nothing is lost
+        self.assertEqual((out["dirs"][0]["kb"], out["dirs"][0]["partial"]), (2568, False))
+
+    def test_a_running_scan_says_where_it_is(self):
+        self.folder_gate = threading.Event()
+        self.addCleanup(self.folder_gate.set)
+        self.scan(wait=False)
+        for _ in range(100):
+            out = self.call("GET", f"/api/clusters/{self.dead}/storage")[1]
+            if out["scan"].get("current"):
+                break
+            time.sleep(0.05)
+        scan = out["scan"]
+        self.assertEqual((scan["state"], scan["total"], scan["done"], scan["listing"]), ("running", 2, 0, False))
+        self.assertEqual(len(scan["queued"]), 1)                       # the folder it is on is not in the queue
+        self.assertIn(scan["current"], ("/scratch/me/llm/models", "/scratch/me/llm/runs"))
+        self.assertTrue(out["dirs"][0]["partial"])                     # listed, not yet sized
+        self.folder_gate.set()
+        self.assertEqual(self.wait_scan()["scan"]["state"], "done")
+
+    def roots_url(self):
+        return f"/api/clusters/{self.dead}/storage/roots"
+
+    def test_the_defaults_are_the_roots_and_added_folders_follow(self):
+        out = self.call("GET", f"/api/clusters/{self.dead}/storage")[1]
+        self.assertEqual(out["roots"], [{"path": "/scratch/me/llm", "kind": "work"}, {"path": "~/.local/tunnels", "kind": "tunnels"}])
+        status, out = self.call("PUT", self.roots_url(), {"custom": ["/scratch/shared/data/", "~/notes", "/scratch/shared/data", "~/.local/tunnels"]})
+        self.assertEqual(status, 200, out)
+        self.assertEqual([(r["path"], r["kind"]) for r in out["roots"]][2:], [("/scratch/shared/data", "custom"), ("~/notes", "custom")])
+        self.assertEqual(out["custom_roots"], ["/scratch/shared/data", "~/notes"])       # repeats and a default are not added twice
+        self.assertEqual(stat.S_IMODE(os.stat(self.clusters.storage_path(self.dead)).st_mode), 0o600)
+
+    def test_added_folders_are_checked(self):
+        for bad in (["relative/dir"], ["/"], [""], ["/a\nb"], ["/a/../b"], [3], "/scratch", [f"/d{i}" for i in range(21)]):
+            self.assertEqual(self.call("PUT", self.roots_url(), {"custom": bad})[0], 400, bad)
+        self.assertEqual(self.call("PUT", self.roots_url(), {"folders": []})[0], 400)
+        self.assertEqual(self.call("PUT", self.roots_url(), {"custom": ["~"]})[0], 200)              # the home directory is fine
+
+    def test_a_scan_can_cover_some_roots_and_the_others_keep_their_results(self):
+        self.call("PUT", self.roots_url(), {"custom": ["/scratch/shared/data"]})
+        self.folder_answers.update({"/scratch/shared/data/raw": (900, 90), "/scratch/shared/data/clean": (100, 10)})
+        out = self.scan({"roots": ["/scratch/shared/data"]})                  # skip the work directory this round
+        self.assertEqual(out["scan"]["roots"], ["/scratch/shared/data"])
+        self.assertEqual([d["root"] for d in out["dirs"]], ["/scratch/shared/data"])
+        self.assertEqual((out["dirs"][0]["kb"], out["dirs"][0]["custom"]), (1000, True))
+        self.assertEqual(sorted(self.folder_calls), ["/scratch/shared/data/clean", "/scratch/shared/data/raw"])
+        listing = [a for a in self.ran if a[0] == agent_console.CLUSTER_STORAGE_LIST_SCRIPT][-1]
+        self.assertEqual(listing[1], ("300", "/scratch/shared/data"))        # the skipped roots aren't even listed
+        out = self.scan({"roots": ["/scratch/me/llm"]})                      # now the other way round
+        self.assertEqual([(d["root"], d["kb"]) for d in out["dirs"]], [("/scratch/me/llm", 2568), ("/scratch/shared/data", 1000)])
+        self.assertEqual(len(self.folder_calls), 4)
+        out = self.scan({"rescan_recent": True})                             # no roots: all of them
+        self.assertEqual(len(out["dirs"]), 3)
+        self.assertEqual(out["scan"]["roots"], ["/scratch/me/llm", "~/.local/tunnels", "/scratch/shared/data"])
+
+    def test_removing_an_added_folder_drops_its_results_and_the_defaults_stay(self):
+        self.call("PUT", self.roots_url(), {"custom": ["/scratch/shared/data"]})
+        self.folder_answers.update({"/scratch/shared/data/raw": (900, 90), "/scratch/shared/data/clean": (100, 10)})
+        self.scan()
+        status, out = self.call("PUT", self.roots_url(), {"custom": []})
+        self.assertEqual(status, 200, out)
+        self.assertEqual([d["root"] for d in out["dirs"]], ["/scratch/me/llm", "~/.local/tunnels"])
+        self.assertEqual(out["dirs"][0]["kb"], 2568)
+        self.assertEqual(out["custom_roots"], [])
+
+    def test_roots_in_the_scan_body_must_be_ones_the_tab_shows(self):
+        url = f"/api/clusters/{self.dead}/storage/scan"
+        for roots in ([], ["/etc"], "/scratch/me/llm", [4]):
+            self.assertEqual(self.call("POST", url, {"roots": roots})[0], 400, roots)
+        self.assertEqual(self.folder_calls, [])
+
+    def test_the_roots_can_not_change_during_a_scan(self):
+        self.folder_gate = threading.Event()
+        self.addCleanup(self.folder_gate.set)
+        self.scan(wait=False)
+        for _ in range(100):
+            if self.call("GET", f"/api/clusters/{self.dead}/storage")[1]["scan"].get("current"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(self.call("PUT", self.roots_url(), {"custom": ["/scratch/x"]})[0], 409)
+        self.folder_gate.set()
+        self.wait_scan()
+
+    def test_the_scan_body_is_checked(self):
+        for body in ({"rescan_recent": "yes"}, {"folders": ["/"]}):
+            self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/storage/scan", body)[0], 400, body)
+
+    def test_storage_scripts_list_and_measure_folders_here(self):
+        """The two scan scripts, run here: the listing (folders and loose files), and one folder's size and file count
+        (du --inodes, else find), side by side."""
         tree = Path(self.tmp) / "work"
         for sub, n in (("big", 30), ("small", 3)):
             (tree / sub / "deep").mkdir(parents=True)
             for i in range(n):
                 (tree / sub / "deep" / f"f{i}").write_text("x" * 5000)
-        (tree / "top.txt").write_text("x")
+        (tree / "top.txt").write_text("x" * 3000)
 
-        def scan(path_env):
-            res = subprocess.run(["bash", "-c", agent_console.CLUSTER_STORAGE_SCRIPT, "scan", "60", str(tree),
-                                  str(tree / "gone")], capture_output=True, text=True, timeout=60,
-                                 env=dict(os.environ, PATH=path_env))
-            return agent_console.parse_storage(res.stdout)
-        for label, path_env in (("du --inodes", os.environ["PATH"]), ("find", self.old_du())):
-            out = scan(path_env)
-            work, gone = out["dirs"]
-            self.assertTrue(gone["missing"], label)
-            self.assertEqual((work["files"], work["files_partial"]), (39, False), label)
-            kids = {Path(c["path"]).name: c for c in work["children"]}
-            self.assertEqual((kids["big"]["files"], kids["small"]["files"]), (32, 5), label)   # files and folders
-            self.assertGreater(kids["big"]["kb"], kids["small"]["kb"], label)
+        def run(script, *args, path_env=None, limit=60):
+            res = subprocess.run(["bash", "-c", script, "scan", *map(str, args)], capture_output=True, text=True, timeout=limit,
+                                 env=dict(os.environ, PATH=path_env or os.environ["PATH"]))
+            return res.stdout
+        listing = agent_console.parse_storage_list(run(agent_console.CLUSTER_STORAGE_LIST_SCRIPT, 60, tree, tree / "gone"))
+        work, gone = listing
+        home = agent_console.parse_storage_list(subprocess.run(
+            ["bash", "-c", agent_console.CLUSTER_STORAGE_LIST_SCRIPT, "scan", "60", "~", "~/work"], capture_output=True, text=True,
+            env=dict(os.environ, HOME=str(Path(self.tmp)))).stdout)         # ~ alone is the home directory too
+        self.assertEqual([(d["path"], d.get("missing", False)) for d in home], [(str(Path(self.tmp)), False), (str(tree), False)])
+        self.assertTrue(gone["missing"])
+        self.assertEqual(sorted(Path(f).name for f in work["folders"]), ["big", "small"])
+        self.assertEqual((work["loose_files"], work["loose_kb"] > 0, work["listing_partial"]), (1, True, False))
+        for label, path_env in (("du --inodes", None), ("find", self.old_du())):
+            big = agent_console.parse_storage_folder(run(agent_console.CLUSTER_STORAGE_FOLDER_SCRIPT, 60, tree / "big", path_env=path_env))
+            small = agent_console.parse_storage_folder(run(agent_console.CLUSTER_STORAGE_FOLDER_SCRIPT, 60, tree / "small", path_env=path_env))
+            self.assertEqual((big["state"], big["files_state"], big["files"], small["files"]), ("ok", "ok", 32, 5), label)   # files and folders
+            self.assertGreater(big["kb"], small["kb"], label)
+        # a folder that won't finish gets the limit, no more, and says so
+        slow = Path(self.tmp) / "slow-du"
+        slow.mkdir()
+        (slow / "du").write_text("#!/bin/bash\nexec sleep 30\n")
+        (slow / "du").chmod(0o755)
+        started = time.time()
+        out = agent_console.parse_storage_folder(run(agent_console.CLUSTER_STORAGE_FOLDER_SCRIPT, 1, tree / "big",
+                                                     path_env=f"{slow}:{os.environ['PATH']}", limit=20))
+        self.assertLess(time.time() - started, 10)
+        self.assertEqual((out["state"], out["files_state"], out["kb"], out["files"]), ("timeout", "timeout", None, None))
+        # a folder that isn't there is an error, not zero
+        gone = agent_console.parse_storage_folder(run(agent_console.CLUSTER_STORAGE_FOLDER_SCRIPT, 60, tree / "nothing"))
+        self.assertEqual((gone["state"], gone["kb"]), ("error", None))
 
     def old_du(self):
         """A PATH whose du has no --inodes (coreutils before 8.22)."""
@@ -862,8 +1054,8 @@ esac
             self.assertEqual(self.call("PUT", f"/api/clusters/{self.dead}/app-view", bad)[0], 400, bad)
 
     def test_scripts_parse(self):
-        for script in (agent_console.CLUSTER_JOBS_SCRIPT, agent_console.CLUSTER_STORAGE_SCRIPT,
-                       agent_console.JOB_DETAIL_SCRIPT):
+        for script in (agent_console.CLUSTER_JOBS_SCRIPT, agent_console.CLUSTER_STORAGE_LIST_SCRIPT,
+                       agent_console.CLUSTER_STORAGE_FOLDER_SCRIPT, agent_console.JOB_DETAIL_SCRIPT):
             self.assertEqual(subprocess.run(["bash", "-n"], input=script, text=True).returncode, 0)
 
 

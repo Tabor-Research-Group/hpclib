@@ -180,16 +180,19 @@ function countsText(n) {
 }
 
 function storageTotal(st) {
-  const dirs = (st && st.dirs || []).filter((d) => !d.missing && !d.path.includes("/.local/tunnels"));
+  const dirs = (st && st.dirs || []).filter((d) => !d.missing && !d.custom && !d.path.includes("/.local/tunnels"));
   if (!st || !st.scanned || !dirs.length) return null;
-  return `${size(dirs.reduce((a, d) => a + (d.kb || 0), 0))} · ${count(dirs.reduce((a, d) => a + (d.files || 0), 0))} files`;
+  const some = dirs.some((d) => d.partial);       // folders still unscanned or timed out: the totals are a lower bound
+  return `${some ? "≥ " : ""}${size(dirs.reduce((a, d) => a + (d.kb || 0), 0))} · ${count(dirs.reduce((a, d) => a + (d.files || 0), 0))} files`;
 }
 
 function storageText(st) {
-  const dirs = (st && st.dirs || []).filter((d) => !d.missing && !d.path.includes("/.local/tunnels"));
+  const dirs = (st && st.dirs || []).filter((d) => !d.missing && !d.custom && !d.path.includes("/.local/tunnels"));
   if (!st || !st.scanned || !dirs.length) return el("span", { class: "muted" }, "not scanned");
   const kb = dirs.reduce((a, d) => a + (d.kb || 0), 0), files = dirs.reduce((a, d) => a + (d.files || 0), 0);
-  return el("span", {}, `${size(kb)} · ${count(files)} files`, el("span", { class: "muted" }, ` · ${ago(st.scanned)}`));
+  const some = dirs.some((d) => d.partial);
+  return el("span", {}, `${some ? "≥ " : ""}${size(kb)} · ${count(files)} files`,
+    el("span", { class: "muted" }, ` · ${some ? "partial, " : ""}${ago(st.scanned)}`));
 }
 
 // ---------------------------------------------------------------- #/c: the clusters
@@ -631,53 +634,139 @@ async function installed(c, local) {
 
 // ---------------------------------------------------------------- Storage
 
+let rescanRecent = false;       // "Rescan recent folders", kept while the console page is open
+// The roots left out of the next scan, as "CLUSTER\nPATH": for this round only (starting a scan clears them), kept
+// while the console page is open.
+const skipRoots = new Set();
+const rootKey = (c, root) => `${c.name}\n${root.path}`;
+
+// What the scan is doing, in words: where it is, what it skipped, and how much of its time is gone.
+function scanStatus(st, scan) {
+  const minutes = (seconds) => Math.max(0, Math.floor(seconds / 60));
+  if (scan.state === "running") {
+    if (scan.listing) return "Listing the folders…";
+    const elapsed = Date.now() / 1000 - scan.started, allowed = (scan.deadline || scan.started) - scan.started;
+    const some = scan.roots && st.roots && scan.roots.length < st.roots.length;     // not every root this round
+    return `Scanning folder ${Math.min(scan.done + 1, scan.total)} of ${scan.total}` +
+      (some ? ` in ${scan.roots.length} of ${st.roots.length} directories` : "") +
+      (scan.skipped ? ` (${scan.skipped} scanned in the last 5 min skipped)` : "") +
+      ` · ${minutes(elapsed)} of ${minutes(allowed)} min`;
+  }
+  const last = st.last_scan;
+  if (!last) return st.scanned ? `Scanned ${ago(st.scanned)}` : "Not scanned yet";
+  return `Last scan ended ${ago(last.finished)}: ${last.scanned} of ${last.folders} folders` +
+    (last.skipped ? `, ${last.skipped} skipped as recent` : "") +
+    (last.stopped ? `, stopped at its time limit: Scan now carries on with the rest` : "");
+}
+
 async function storageTab(c) {
   const { api } = ctx;
   let st;
   try { st = await api(path(c.name, "storage")); } catch (err) { return ctx.errorBox(err); }
-  const scanning = (st.scan || {}).state === "running";
-  const scan = action(scanning ? "Scanning…" : "Scan now", async () => {
-    await api(path(c.name, "storage/scan"), { method: "POST" });
+  const scan = st.scan || {};
+  const scanning = scan.state === "running";
+  const roots = st.roots || [];
+  const custom = st.custom_roots || [];
+  const scanRoots = new Set(scan.roots || []);
+  const chosen = () => roots.filter((r) => !skipRoots.has(rootKey(c, r))).map((r) => r.path);
+  const scanWith = async (paths) => {
+    await api(path(c.name, "storage/scan"), { method: "POST", body: { rescan_recent: rescanRecent, roots: paths } });
+    for (const r of roots) skipRoots.delete(rootKey(c, r));      // a skip lasts one round
     ctx.render();
-  }, { primary: !st.scanned, disabled: scanning || !login(c) });
-  if (scanning) setTimeout(() => { if (location.hash.endsWith("/storage")) ctx.render(); }, 5000);
-  const dirs = st.dirs || [];
-  const cards = dirs.map((d) => {
-    if (d.missing) return el("section", { class: "card" }, el("h3", {}, d.path), el("p", { class: "muted" }, "doesn't exist"));
-    return storageCard(d);
+  };
+  const button = action(scanning ? "Scanning…" : "Scan now", () => scanWith(chosen()),
+    { primary: !st.scanned, disabled: scanning || !login(c) || !chosen().length });
+  const syncButton = () => {
+    const none = !chosen().length;
+    button.disabled = scanning || !login(c) || none;
+    if (none && !scanning) button.title = "Tick at least one folder to scan"; else button.removeAttribute("title");
+  };
+  syncButton();
+  const toggle = el("label", { class: "inline-check", title: "A folder scanned in the last 5 minutes is skipped; tick this to scan it again" },
+    el("input", { type: "checkbox", checked: rescanRecent, disabled: scanning,
+                  onchange: (e) => { rescanRecent = e.target.checked; } }), " Rescan recent folders");
+  // follow a running scan: the page fills in as folders finish
+  if (scanning) setTimeout(() => { if (location.hash.endsWith("/storage")) ctx.render(); }, 3000);
+  // add a directory to the scan: any full path on the cluster, or one from its home directory (~/...)
+  const newRoot = el("input", { type: "text", placeholder: "/scratch/shared/data or ~/projects", size: 36,
+                                "aria-label": "Folder to add to the scan", disabled: scanning });
+  const add = action("Add folder", async () => {
+    if (!newRoot.value.trim()) throw new Error("type the folder's full path, or ~/ for your home directory there");
+    await api(path(c.name, "storage/roots"), { method: "PUT", body: { custom: [...custom, newRoot.value] } });
+    ctx.render();
+  }, { disabled: scanning });
+  newRoot.addEventListener("keydown", (e) => { if (e.key === "Enter") add.button.click(); });
+  // each directory's own controls: leave it out of this round, scan just it, take an added one away
+  const controls = (r) => el("div", { class: "root-controls" },
+    el("label", { class: "inline-check", title: "Scan this directory in the next scan; unticked, it is skipped this round and keeps its last results" },
+      el("input", { type: "checkbox", checked: scanning ? scanRoots.has(r.path) : !skipRoots.has(rootKey(c, r)), disabled: scanning,
+                    "aria-label": `Scan ${r.path}`,
+                    onchange: (e) => { if (e.target.checked) skipRoots.delete(rootKey(c, r)); else skipRoots.add(rootKey(c, r)); syncButton(); } }),
+      " Scan"),
+    action("Scan only this", () => scanWith([r.path]), { disabled: scanning || !login(c) }),
+    r.kind === "custom" ? action("Remove", async () => {
+      await api(path(c.name, "storage/roots"), { method: "PUT", body: { custom: custom.filter((p) => p !== r.path) } });
+      ctx.render();
+    }, { disabled: scanning, title: "Stop scanning this directory and forget its results" }) : null,
+    r.kind === "custom" ? el("span", { class: "muted small" }, "added by you") : null);
+  const byRoot = new Map((st.dirs || []).map((d) => [d.root || d.path, d]));
+  const cards = roots.map((r) => {
+    const d = byRoot.get(r.path);
+    if (!d) return el("section", { class: "card" }, el("h3", {}, r.path), controls(r), el("p", { class: "muted" }, "Not scanned yet."));
+    if (d.missing) return el("section", { class: "card" }, el("h3", {}, d.path), controls(r), el("p", { class: "muted" }, "doesn't exist"));
+    return storageCard(d, scan, controls(r));
   });
   return el("div", {},
     el("div", { class: "toolbar" },
-      el("span", {}, st.scanned ? `Scanned ${ago(st.scanned)}` : "Not scanned yet", (st.scan || {}).state === "failed"
-        ? el("span", { class: "error-box" }, ` · the last scan failed: ${st.scan.error}`) : null),
-      scan, el("span", { class: "muted small" }, "du (sizes and file counts) over your login, at low priority, up to 5 minutes each per directory")),
+      el("span", { class: "scan-status", "aria-live": "polite" }, scanning ? el("span", { class: "spinner", "aria-hidden": "true" }) : null,
+        scanStatus(st, scan), scan.state === "failed"
+          ? el("span", { class: "error-box" }, ` · the last scan failed: ${scan.error}`) : null),
+      button, toggle,
+      el("span", { class: "muted small" }, "du over your login at low priority: 5 minutes a folder, 30 for the whole scan; results are saved as each folder finishes")),
+    el("div", { class: "add-root" }, el("label", {}, "Add a directory to scan ", newRoot), add),
     quotaCard(c, st),
-    cards.length ? cards : el("p", { class: "muted" }, `Work directories: ${(st.work_dirs || []).join(", ") || "none set"}.`));
+    cards);
 }
 
 // One work directory's scan: its folders by size (du) or by file count (du --inodes: files, folders and links, what
-// a file quota counts), with bars against the largest; the top 12, or all that were kept.
+// a file quota counts), with bars against the largest; the top 12, or all that were kept. Folders the running scan
+// is on or has queued are marked, and the card says it is being scanned.
 const storageSort = {};          // path -> "kb" | "files", kept while the console page is open
-function storageCard(d) {
+const storageAll = {};           // path -> whether every folder is shown
+function storageCard(d, scan = {}, controls = null) {
   const has = (key) => d.children.some((ch) => ch[key] !== null && ch[key] !== undefined);
-  let key = storageSort[d.path] || "kb", all = false;
+  let key = storageSort[d.path] || "kb";
+  const running = scan.state === "running";
+  const queued = new Set(scan.queued || []);
+  const busy = (ch) => running && (ch.path === scan.current || queued.has(ch.path));
   const table = el("table", { class: "bars" });
   const sortBy = el("div", { class: "segmented", role: "radiogroup", "aria-label": `Sort ${d.path}` });
   const more = el("button", { type: "button", class: "link-button small" });
+  // a number, or what stands in for it: scanning, queued, timed out, not scanned
+  const value = (ch, k) => {
+    const v = ch[k], shown = v === null || v === undefined ? "—" : k === "kb" ? size(v) : count(v);
+    if (running && ch.path === scan.current) return el("span", { class: "scanning" }, v === null || v === undefined ? "scanning…" : shown);
+    if (busy(ch) && (v === null || v === undefined)) return el("span", { class: "muted" }, "queued");
+    const timedOut = (k === "kb" ? ch.state : ch.files_state) === "timeout" && (k === "kb" || ch.state !== "timeout");   // said once
+    if (timedOut && (v === null || v === undefined)) return el("span", { class: "timed-out", title: "no answer within the time limit; the next scan tries again" }, "timed out");
+    return shown;
+  };
   const draw = () => {
+    const all = Boolean(storageAll[d.path]);
     const kids = d.children.slice().sort((a, b) => (b[key] || 0) - (a[key] || 0));
-    const shown = all ? kids : kids.slice(0, 12);
+    // the folders being scanned always show, whatever their size so far
+    const shown = all ? kids : kids.slice(0, 12).concat(kids.slice(12).filter((ch) => running && ch.path === scan.current));
     const top = shown[0] ? shown[0][key] || 0 : 0;
     const total = key === "kb" ? d.kb : d.files;
-    const value = (ch, k) => (ch[k] === null || ch[k] === undefined ? "—" : k === "kb" ? size(ch[k]) : count(ch[k]));
     table.replaceChildren(
       el("thead", {}, el("tr", {}, el("th", {}, "Folder"), el("th", {}), el("th", { class: "num" }, "Size"),
-        el("th", { class: "num" }, "Files"), el("th", { class: "num" }, ""))),
-      el("tbody", {}, shown.map((ch) => el("tr", {},
+        el("th", { class: "num" }, "Files"), el("th", { class: "num" }, "Scanned"), el("th", { class: "num" }, ""))),
+      el("tbody", {}, shown.map((ch) => el("tr", { class: running && ch.path === scan.current ? "scanning-row" : null },
         el("td", { class: "bar-name" }, ch.path.slice(d.path.replace(/\/$/, "").length + 1) || ch.path),
         el("td", { class: "bar-cell" }, el("div", { class: "bar", style: `width: ${top ? Math.max(1, 100 * (ch[key] || 0) / top) : 0}%` })),
         el("td", { class: `num${key === "kb" ? "" : " muted"}` }, value(ch, "kb")),
         el("td", { class: `num${key === "files" ? "" : " muted"}` }, value(ch, "files")),
+        el("td", { class: "num muted", title: ch.scanned ? new Date(ch.scanned * 1000).toLocaleString() : "" }, ch.scanned ? ago(ch.scanned) : "never"),
         el("td", { class: "num muted" }, total && ch[key] ? `${Math.round(100 * ch[key] / total)}%` : "")))));
     sortBy.replaceChildren(...[["kb", "By size"], ["files", "By files"]].map(([k, label]) => el("button", {
       type: "button", role: "radio", "aria-checked": String(k === key), disabled: !has(k),
@@ -685,15 +774,28 @@ function storageCard(d) {
     more.hidden = kids.length <= 12;
     more.textContent = all ? "Show the top 12" : `Show all ${kids.length}`;
   };
-  more.addEventListener("click", () => { all = !all; draw(); });
+  more.addEventListener("click", () => { storageAll[d.path] = !storageAll[d.path]; draw(); });
   draw();
-  return el("section", { class: "card storage" },
+  const counts = d.folder_counts || { total: d.children.length, sized: d.children.length, timed_out: 0, unscanned: 0 };
+  const waiting = d.children.filter(busy).length;
+  const scanningHere = running && (scan.listing || waiting > 0);
+  const where = scan.current && d.children.some((ch) => ch.path === scan.current) ? scan.current.split("/").pop() : null;
+  return el("section", { class: `card storage${scanningHere ? " is-scanning" : ""}`, "aria-busy": String(scanningHere) },
     el("div", { class: "storage-head" }, el("h3", {}, d.path),
-      el("div", { class: "storage-total" }, el("strong", {}, size(d.kb)), el("span", { class: "muted" }, ` · ${count(d.files)} files`),
-        d.partial ? chip("partial: the scan hit its time limit", "starting") : null,
-        d.files_partial && !d.partial ? chip("file counts partial: the count hit its time limit", "starting") : null),
+      el("div", { class: "storage-total" },
+        el("strong", {}, `${d.partial && d.kb !== null ? "≥ " : ""}${size(d.kb)}`),
+        el("span", { class: "muted" }, ` · ${d.partial && d.files !== null ? "≥ " : ""}${count(d.files)} files`),
+        d.partial ? chip(`${counts.sized} of ${counts.total} folders sized${counts.timed_out ? `, ${counts.timed_out} timed out` : ""}`, "starting",
+          "The totals add up the folders scanned so far; the rest are queued, timed out or not scanned yet.") : null,
+        d.files_partial && !d.partial ? chip("file counts partial", "starting", "Some folders have a size but no file count yet.") : null),
       sortBy),
-    !has("files") && d.children.length ? el("p", { class: "muted small" }, "Scan again for each folder's file count.") : null,
+    controls,
+    scanningHere ? el("div", { class: "scan-progress", role: "progressbar", "aria-label": `Scanning ${d.path}` },
+      el("span", { class: "scan-bar" }),
+      el("span", { class: "scan-text" }, scan.listing ? "Listing folders…" : `Scanning${where ? ` ${where}` : ""} · ${waiting} folder${waiting === 1 ? "" : "s"} left here`)) : null,
+    d.oldest && d.scanned && d.scanned - d.oldest > 3600
+      ? el("p", { class: "muted small" }, `Folder results range from ${ago(d.oldest)} to ${ago(d.scanned)}.`) : null,
+    !has("files") && d.children.length && !running ? el("p", { class: "muted small" }, "Scan again for each folder's file count.") : null,
     table, more);
 }
 

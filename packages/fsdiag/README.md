@@ -19,7 +19,7 @@ python3 hpclib/servers/console_packages.py build packages/fsdiag
 | `tunnels/fsdiag/fsrequests.py` | reads the REST server's audit log and stack dumps: slow routes, waiting against CPU time, what stuck requests were inside |
 | `tunnels/fsdiag/fsfindings.py` | the rules: what the numbers mean, and the text report |
 | `tunnels/fsdiag/fsdiag_cli.py` | the same from a shell: `probe`, `requests`, `all` (`--json` for the findings as data) |
-| `tunnels/fsdiag/actions.json`, `fsdiag_action.sh` | the [tunnel actions](../../docs/extending.md#tunnel-actions) agents run through the REST server: `probe`, `survey`, `requests` and `probe_node` (a job) |
+| `tunnels/fsdiag/actions.json`, `fsdiag_action.sh` | the [tunnel actions](../../docs/extending.md#tunnel-actions) agents run through the REST server: `probe`, `survey`, `requests` and `probe_node` (a job) and `probe_report` (its report) |
 | `tunnels/fsdiag/ui/` | the page: `index.html`, `app.js`, `client.js`, `views/` (probe, results, requests, directories), `bridge.js` |
 | `tunnels/fsdiag/ui/hpclib-ui/` | not in the repository: a copy of `hpclib/ui/` that `bundle` puts in the zip when it is built |
 

@@ -1,7 +1,7 @@
 {
   "format": 1,
   "name": "fsdiag",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Filesystem diagnostics: why are my tunnels slow? Times file system calls on the login node and on compute nodes (any, or the ones you name), counts what your folders hold and reads your quotas, and says what the REST server's slow requests were waiting for. Runs on the login node as you.",
   "apps": {
     "fsdiag": {

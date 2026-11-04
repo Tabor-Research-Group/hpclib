@@ -175,7 +175,7 @@ Like the Workspace it runs on the login node as you, listens on 127.0.0.1 only a
 - **Directories**: the survey of the folders you chose (entries per top-level folder, the largest directories, the
   slowest listings), inodes and space per place, and what the cluster's quota commands print.
 
-**Agents can run it.** The package declares four [tunnel actions](../extending.md#tunnel-actions), so a model with
+**Agents can run it.** The package declares five [tunnel actions](../extending.md#tunnel-actions), so a model with
 your REST token can run the diagnostics for you and read the findings (`list_tunnel_actions`, `run_tunnel_action`).
 They are off until you turn them on: the cluster's **Agents** tab → **Tunnel actions** → Filesystem diagnostics. Each
 runs as you, outside the agent's sandbox, and is in the Activity log.
@@ -186,6 +186,7 @@ runs as you, outside the agent's sandbox, and is in the Activity log.
 | `survey` | counts the entries in a folder of the agent's work directories and reads the quota commands; takes `folder` and `seconds` |
 | `requests` | what slow REST requests were waiting for, from the audit log; takes `hours` and `slow_ms` |
 | `probe_node` | submits a short job doing `probe` on `node` (a name, or `any`); follow it with `job_status` or `wait_for_job`; its output is the report. Needs the `submit` scope |
+| `probe_report` | prints a `probe_node` job's report by its job ID (the output file is in hpclib's protected data directory, which agents can't read) |
 
 Each answers with the findings (severity, title, detail, what to do) and the text report. The job's partition,
 account, time limit and memory are the app's settings.

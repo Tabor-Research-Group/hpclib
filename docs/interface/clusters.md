@@ -28,7 +28,7 @@ Its address is `#/c/NAME/TAB`, so a tab can be bookmarked.
 | Jobs | every job of yours on the cluster, read with `squeue` and `sacct` over your login (the counts at the top show only that kind, queued, running, finished or failed; click again for all): queued (with Slurm's reason in plain words and the expected start), running, and finished in the last 24 hours (result, time taken, peak memory against what was asked for). Each job is labelled with what started it: an agent's template, the agent tunnel, an app, or something else |
 | Apps | each app's row (Start, Open, Stop, Log), showing only the buttons that apply; a package's apps too. Click an app's name for its page. **Pin** keeps an app in view on this cluster; the others wait under **More apps** (collapsed; a running one shows anyway); **Hide** drops one from the list (**Hidden apps** brings it back). The Overview lists the pinned and running ones |
 | Installed | hpclib, the agent setup and each app: whether it is installed, what the cluster reported, and Check / Install / Update; **Check all** checks every app |
-| Storage | the work directories' sizes and file counts, their folders by size or by file count, and your storage quota and project balance (**Check quotas**). **Scan now** runs `du` over your login at low priority, at most 5 minutes per directory (a longer scan is marked partial); the result is kept on this machine |
+| Storage | the scan directories' sizes and file counts, their folders by size or by file count, and your storage quota and project balance (**Check quotas**). **Scan now** runs `du` over your login at low priority, one folder at a time: each folder gets 5 minutes and the whole scan 30, and the tab fills in as each folder finishes (a moving bar on the card and a mark on the folder being scanned show it is running). A folder that doesn't finish shows **timed out**, and a directory's total then reads **≥** (it adds up the folders that did). Folders scanned in the last 5 minutes are skipped unless **Rescan recent folders** is ticked, and a scan that hits its 30 minutes picks up the unscanned and oldest folders next time; each folder shows when it was scanned, and an earlier result stays until a new one replaces it. The result is kept on this machine |
 | Files | the cluster's files through its REST server (needs the agent tunnel), as the Files page was |
 | SSH keys | **This computer → cluster**: install an existing local public key, or create and install a dedicated login key, using the first active login; **Login node → compute nodes**: set up the shared-home compute key. Both work before starting agents. General management of keys stored on the cluster still needs its agent tunnel and owner token |
 | Agents | **Tunnel and setup**: the agent profile's row (start and stop the agent tunnel, its log, Update hpclib, Setup…, Set up SSH), the MCP server's name, and **Tunnel actions** (what tunnels may do for agents with your access: on or off per tunnel and per action, and whether each can run now); **Activity**: what agents did here |
@@ -72,6 +72,16 @@ Each work directory lists its folders with their size (`du -k`) and their file c
 folders and links, what a file quota counts; `find` where `du` is older than coreutils 8.22). **By size** and
 **By files** sort them and scale the bars; the top 12 show, **Show all** the rest (up to 200). A folder of many
 small files, such as a Python environment, is the one to squash (see the README's *Squashed environments*).
+
+**Which directories are scanned.** The defaults are the cluster's work directories and the tunnels' own folder
+(`~/.local/tunnels`). **Add a directory to scan** takes any full path on the cluster, or one from its home
+directory (`~/projects`, or `~` for all of it), up to 20; an added directory gets a card of its own with
+**Remove**, which also forgets its results, and its size is left out of the Overview's storage total. Each card
+has a **Scan** checkbox: untick it to skip that directory in the next **Scan now**. It keeps its last results,
+and the box is ticked again once a scan starts (a skip lasts one round). **Scan only this** scans one directory
+whatever the boxes say. The REST calls are `PUT clusters/NAME/storage/roots` with `{"custom": ["/path", ...]}`
+and `POST clusters/NAME/storage/scan` with `{"roots": ["/path", ...], "rescan_recent": false}` (any of the
+directories the tab shows; all of them when `roots` is left out).
 
 ![The Storage tab sorted by file count](../images/cluster-storage-files.png)
 

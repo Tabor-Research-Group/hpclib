@@ -8,9 +8,19 @@
       "mode": "sync",
       "scope": "read",
       "params": {
-        "repeats": {"type": "integer", "minimum": 3, "maximum": 30, "default": 10, "description": "samples per call; more is steadier and slower"}
+        "repeats": {
+          "type": "integer",
+          "minimum": 3,
+          "maximum": 30,
+          "default": 10,
+          "description": "samples per call; more is steadier and slower"
+        }
       },
-      "run": ["fsdiag_action.sh", "probe", "{repeats}"],
+      "run": [
+        "fsdiag_action.sh",
+        "probe",
+        "{repeats}"
+      ],
       "timeout": 300
     },
     "survey": {
@@ -19,10 +29,25 @@
       "mode": "sync",
       "scope": "read",
       "params": {
-        "folder": {"type": "cluster-path", "access": "read", "description": "a directory in your work directories"},
-        "seconds": {"type": "integer", "minimum": 5, "maximum": 300, "default": 60, "description": "stop after this long; the counts are then lower bounds"}
+        "folder": {
+          "type": "cluster-path",
+          "access": "read",
+          "description": "a directory in your work directories"
+        },
+        "seconds": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 300,
+          "default": 60,
+          "description": "stop after this long; the counts are then lower bounds"
+        }
       },
-      "run": ["fsdiag_action.sh", "survey", "{folder}", "{seconds}"],
+      "run": [
+        "fsdiag_action.sh",
+        "survey",
+        "{folder}",
+        "{seconds}"
+      ],
       "timeout": 400
     },
     "requests": {
@@ -31,10 +56,27 @@
       "mode": "sync",
       "scope": "read",
       "params": {
-        "hours": {"type": "integer", "minimum": 1, "maximum": 168, "default": 24, "description": "how far back to read"},
-        "slow_ms": {"type": "integer", "minimum": 10, "maximum": 600000, "default": 1000, "description": "a request over this many milliseconds is slow"}
+        "hours": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 168,
+          "default": 24,
+          "description": "how far back to read"
+        },
+        "slow_ms": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 600000,
+          "default": 1000,
+          "description": "a request over this many milliseconds is slow"
+        }
       },
-      "run": ["fsdiag_action.sh", "requests", "{hours}", "{slow_ms}"],
+      "run": [
+        "fsdiag_action.sh",
+        "requests",
+        "{hours}",
+        "{slow_ms}"
+      ],
       "timeout": 120
     },
     "probe_node": {
@@ -43,12 +85,49 @@
       "mode": "job",
       "scope": "submit",
       "params": {
-        "node": {"type": "string", "pattern": "any|[A-Za-z0-9][A-Za-z0-9._-]{0,63}", "default": "any", "description": "a node name, or 'any'"},
-        "repeats": {"type": "integer", "minimum": 3, "maximum": 30, "default": 10, "description": "samples per call"}
+        "node": {
+          "type": "string",
+          "pattern": "any|[A-Za-z0-9][A-Za-z0-9._-]{0,63}",
+          "default": "any",
+          "description": "a node name, or 'any'"
+        },
+        "repeats": {
+          "type": "integer",
+          "minimum": 3,
+          "maximum": 30,
+          "default": 10,
+          "description": "samples per call"
+        }
       },
-      "run": ["fsdiag_action.sh", "submit", "{job_options}", "{node}", "{repeats}"],
+      "run": [
+        "fsdiag_action.sh",
+        "submit",
+        "{job_options}",
+        "{node}",
+        "{repeats}"
+      ],
       "output": "{data_dir}/sessions/fsdiag/probe-{job_id}.txt",
       "timeout": 60
+    },
+    "probe_report": {
+      "title": "Read a probe_node job's report",
+      "description": "The text report a probe_node job wrote (its output file is in hpclib's protected data directory, so read_file can't open it): the findings and the per-call timings of the node it ran on. Takes the job's ID; says if the job hasn't finished writing it.",
+      "mode": "sync",
+      "scope": "read",
+      "params": {
+        "job_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 999999999,
+          "description": "the ID probe_node returned"
+        }
+      },
+      "run": [
+        "fsdiag_action.sh",
+        "report",
+        "{job_id}"
+      ],
+      "timeout": 30
     }
   }
 }

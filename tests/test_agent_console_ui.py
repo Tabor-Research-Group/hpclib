@@ -7,6 +7,7 @@ import os
 import json
 import sys
 import tempfile
+import time
 import threading
 import unittest
 from pathlib import Path
@@ -933,6 +934,154 @@ class TestConsoleUI(unittest.TestCase):
         self.page.goto(self.base + "/#/files?cluster=other")
         self.page.get_by_text('start its agent tunnel', exact=False).wait_for()
         self.assertEqual(self.page.locator('#pages a.active').inner_text(), 'Files')
+        self.assertEqual(self.errors, [])
+
+    def test_storage_tab_shows_a_running_scan_and_posts_the_rescan_toggle(self):
+        now = time.time()
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
+             'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up', 'hpclib_version': '0.2.70'}}
+        child = lambda name, kb, files, scanned, state='ok': {'path': f'/scratch/me/llm/{name}', 'kb': kb, 'files': files,
+                                                              'scanned': scanned, 'state': state, 'files_state': state}
+        kids = [child('models', 4 * 1024 * 1024, 156000, now - 120), child('runs', 512, 40, now - 7200),
+                child('scratchpad', None, None, None, None), child('huge', None, None, now - 60, 'timeout'),
+                child('later', None, None, None, None)]
+        sized = [k for k in kids if k['kb'] is not None]
+        storage = {'scanned': now - 60, 'quota': None, 'work_dirs': ['/scratch/me/llm'],
+                   'roots': [{'path': '/scratch/me/llm', 'kind': 'work'}, {'path': '~/.local/tunnels', 'kind': 'tunnels'}],
+                   'scan': {'state': 'running', 'roots': ['/scratch/me/llm', '~/.local/tunnels'], 'started': now - 600, 'deadline': now + 1200, 'listing': False, 'rescan_recent': False,
+                            'done': 2, 'total': 5, 'skipped': 1, 'current': '/scratch/me/llm/scratchpad',
+                            'queued': ['/scratch/me/llm/later']},
+                   'dirs': [{'path': '/scratch/me/llm', 'root': '/scratch/me/llm', 'kb': sum(k['kb'] for k in sized), 'files': 156040, 'partial': True,
+                             'files_partial': True, 'scanned': now - 60, 'oldest': None,
+                             'folder_counts': {'total': 5, 'sized': 2, 'timed_out': 1, 'unscanned': 2}, 'children': kids}]}
+        posts = []
+        answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c, 'health': {'hpclib_version': '0.2.70'},
+                   'apps': {'apps': [{'id': 'agents', 'title': 'Agents'}]}, 'clusters/demo/storage': storage}
+
+        def handler(route, path):
+            if path == 'clusters/demo/storage/scan':
+                posts.append(route.request.post_data_json)
+                route.fulfill(status=202, body=json.dumps({'state': 'running'}), content_type='application/json')
+                return True
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/c/demo/storage")
+        self.page.locator('.scan-progress').wait_for()
+        # a running scan is visible: in the toolbar, on the card, and on the folder being scanned and the one queued
+        self.assertIn('Scanning folder 3 of 5', self.page.locator('.scan-status').inner_text())
+        self.assertIn('1 scanned in the last 5 min skipped', self.page.locator('.scan-status').inner_text())
+        self.assertEqual(self.page.locator('section.storage').get_attribute('aria-busy'), 'true')
+        self.assertEqual(self.page.locator('.scan-progress').get_attribute('role'), 'progressbar')
+        self.assertEqual(self.page.locator('tr.scanning-row').count(), 1)
+        self.assertIn('scanning', self.page.locator('td .scanning').first.inner_text())
+        self.assertEqual(self.page.locator('table.bars td span.muted', has_text='queued').count(), 2)    # its size and its file count
+        self.assertEqual(self.page.locator('.timed-out').inner_text(), 'timed out')
+        # a partial total says it is a lower bound, and how many folders it covers
+        self.assertTrue(self.page.locator('.storage-total strong').inner_text().startswith('≥'))
+        self.assertIn('2 of 5 folders sized, 1 timed out', self.page.locator('.storage-total .chip').first.inner_text())
+        self.assertEqual(self.page.locator('table.bars th').all_text_contents(), ['Folder', '', 'Size', 'Files', 'Scanned', ''])
+        self.assertEqual(self.page.locator('table.bars tbody tr').first.locator('td').nth(4).inner_text(), '2 min ago')
+        # while it runs, the button, the toggle and the folder choices are off
+        self.assertTrue(self.page.get_by_label('Rescan recent folders').is_disabled())
+        self.assertTrue(self.page.get_by_label('Scan /scratch/me/llm', exact=True).is_disabled())
+        self.assertTrue(self.page.get_by_label('Scan /scratch/me/llm', exact=True).is_checked())
+        # idle again: the toggle is a choice the scan is started with
+        storage['scan'] = {'state': 'idle'}
+        self.page.goto(self.base + "/#/c/demo/overview")
+        self.page.goto(self.base + "/#/c/demo/storage")
+        self.page.get_by_label('Rescan recent folders').wait_for()
+        self.assertEqual(self.page.locator('.scan-progress').count(), 0)
+        self.assertEqual(self.page.locator('section.storage').get_attribute('aria-busy'), 'false')
+        self.page.get_by_role('button', name='Scan now', exact=True).click()
+        self.page.wait_for_function('true')
+        for _ in range(50):
+            if posts:
+                break
+            self.page.wait_for_timeout(100)
+        self.assertEqual(posts, [{'rescan_recent': False, 'roots': ['/scratch/me/llm', '~/.local/tunnels']}])
+        self.page.get_by_label('Rescan recent folders').check()
+        self.page.get_by_role('button', name='Scan now', exact=True).click()
+        for _ in range(50):
+            if len(posts) == 2:
+                break
+            self.page.wait_for_timeout(100)
+        self.assertEqual(posts[1], {'rescan_recent': True, 'roots': ['/scratch/me/llm', '~/.local/tunnels']})
+        self.assertEqual(self.errors, [])
+
+    def test_storage_tab_adds_roots_and_skips_them_for_a_round(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
+             'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up', 'hpclib_version': '0.2.70'}}
+        roots = [{'path': '/scratch/me/llm', 'kind': 'work'}, {'path': '~/.local/tunnels', 'kind': 'tunnels'}]
+        storage = {'scanned': None, 'quota': None, 'work_dirs': ['/scratch/me/llm'], 'roots': roots, 'custom_roots': [],
+                   'scan': {'state': 'idle'}, 'dirs': []}
+        posts, puts = [], []
+        answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c, 'health': {'hpclib_version': '0.2.70'},
+                   'apps': {'apps': [{'id': 'agents', 'title': 'Agents'}]}, 'clusters/demo/storage': storage}
+
+        def handler(route, path):
+            if path == 'clusters/demo/storage/scan':
+                posts.append(route.request.post_data_json)
+                route.fulfill(status=202, body=json.dumps({'state': 'running'}), content_type='application/json')
+                return True
+            if path == 'clusters/demo/storage/roots':
+                puts.append(route.request.post_data_json)
+                custom = [p for p in route.request.post_data_json['custom']]
+                storage['custom_roots'] = custom
+                storage['roots'] = roots + [{'path': p, 'kind': 'custom'} for p in custom]
+                route.fulfill(body=json.dumps(dict(storage, ok=True)), content_type='application/json')
+                return True
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+
+        def sent(n):
+            for _ in range(50):
+                if len(posts) >= n:
+                    break
+                self.page.wait_for_timeout(100)
+            return posts[n - 1]
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/c/demo/storage")
+        self.page.get_by_label('Folder to add to the scan').wait_for()
+        # the defaults are there, with a choice each and nothing to remove
+        self.assertEqual(self.page.locator('section.card:has(.root-controls) h3').all_text_contents(), ['/scratch/me/llm', '~/.local/tunnels'])
+        self.assertEqual(self.page.get_by_role('button', name='Remove').count(), 0)
+        # add a directory: it gets a card of its own, with a Remove
+        self.page.get_by_label('Folder to add to the scan').fill('/scratch/shared/data')
+        self.page.get_by_role('button', name='Add folder', exact=True).click()
+        self.page.get_by_label('Scan /scratch/shared/data', exact=True).wait_for()
+        self.assertEqual(puts, [{'custom': ['/scratch/shared/data']}])
+        self.assertEqual(self.page.get_by_role('button', name='Remove').count(), 1)
+        self.assertEqual(self.page.get_by_text('Not scanned yet.').count(), 3)
+        # skip two of the three for this round: only the one left goes in the scan
+        self.page.get_by_label('Scan /scratch/me/llm', exact=True).uncheck()
+        self.page.get_by_label('Scan ~/.local/tunnels', exact=True).uncheck()
+        self.page.get_by_role('button', name='Scan now', exact=True).click()
+        self.assertEqual(sent(1), {'rescan_recent': False, 'roots': ['/scratch/shared/data']})
+        # the skip was for that round: everything is ticked again
+        for _ in range(50):                      # the page draws again once the scan is posted
+            if self.page.get_by_label('Scan /scratch/me/llm', exact=True).is_checked():
+                break
+            self.page.wait_for_timeout(100)
+        self.assertTrue(self.page.get_by_label('Scan /scratch/me/llm', exact=True).is_checked())
+        self.assertTrue(self.page.get_by_label('Scan ~/.local/tunnels', exact=True).is_checked())
+        # with nothing ticked there is nothing to scan
+        for path in ('/scratch/me/llm', '~/.local/tunnels', '/scratch/shared/data'):
+            self.page.get_by_label(f'Scan {path}', exact=True).uncheck()
+        self.assertTrue(self.page.get_by_role('button', name='Scan now', exact=True).is_disabled())
+        self.page.get_by_label('Scan ~/.local/tunnels', exact=True).check()
+        self.assertFalse(self.page.get_by_role('button', name='Scan now', exact=True).is_disabled())
+        # Scan only this ignores the ticks
+        self.page.get_by_role('button', name='Scan only this').first.click()
+        self.assertEqual(sent(2), {'rescan_recent': False, 'roots': ['/scratch/me/llm']})
+        # remove the added directory
+        self.page.get_by_role('button', name='Remove').click()
+        self.page.get_by_label('Scan /scratch/shared/data', exact=True).wait_for(state='detached')
+        self.assertEqual(puts[-1], {'custom': []})
         self.assertEqual(self.errors, [])
 
     def test_start_agent_tunnel_waits_while_it_starts(self):

@@ -92,7 +92,9 @@ The front end depends only on the routes below; nothing here depends on it.
                                               the login: queued, running and finished, each labelled with what started it
   POST /api/clusters/NAME/jobs/cancel         {"job": ID}: scancel an agent's or another job (apps stop with their Stop)
   GET  /api/clusters/NAME/storage             the last storage scan of the work directories (du), and the quota
-  POST /api/clusters/NAME/storage/scan        start a new scan over the login (in the background), with the quotas
+  POST /api/clusters/NAME/storage/scan        start a scan over the login in the background, folder by folder, saved as it
+                                              goes: 5 minutes a folder, 30 in all, folders scanned in the last 5 minutes
+                                              skipped unless {"rescan_recent": true}; the quotas are checked beside it
   GET  /api/clusters/NAME/quota[?kind=]       the quota checks (lib/quota.sh: storage and project) over the login,
                                               kept with the storage scan
   PUT  /api/clusters/NAME/quota/settings      {"storage"?, "project"?}: the cluster's checks (a command; "" for
@@ -1040,48 +1042,157 @@ def parse_rss(value):
     return float(m.group(1)) * {"": 1 / 1024, "K": 1, "M": 1024, "G": 1024 ** 2, "T": 1024 ** 3}[m.group(2)]
 
 
-def parse_storage(text):
-    """CLUSTER_STORAGE_SCRIPT's lines: {"dirs": [{path, kb, files, partial, files_partial, missing, children:
-    [{path, kb, files}]}], "quota"}. Children are kept largest first, at most STORAGE_CHILDREN of them."""
+def parse_storage_list(text):
+    """CLUSTER_STORAGE_LIST_SCRIPT's records (NUL-separated): [{path, missing} or {path, folders: [path], loose_kb,
+    loose_files, listing_partial}] in the order asked. Loose files are the entries that aren't directories."""
     dirs, current = [], None
-    for line in text.splitlines():
-        kind, _, rest = line.partition("|")
+    for record in text.split("\0"):
+        kind, _, rest = record.partition("|")
         if kind == "M":
-            dirs.append({"path": rest, "missing": True, "kb": None, "files": None, "children": []})
+            dirs.append({"path": rest, "missing": True})
             current = None
         elif kind == "D":
-            state, _, path = rest.partition("|")
-            current = {"path": path, "partial": state != "ok", "kb": None, "files": None, "children": []}
+            current = {"path": rest, "folders": [], "loose_kb": 0, "loose_files": 0, "listing_partial": False}
             dirs.append(current)
-        elif kind in ("S", "F") and current is not None:
-            value, _, path = rest.partition("|")
-            if not value.isdigit():
-                continue
-            key = "kb" if kind == "S" else "files"
-            if path.rstrip("/") == current["path"].rstrip("/"):
-                current[key] = int(value)
-                continue
-            child = next((ch for ch in current["children"] if ch["path"] == path), None)
-            if child is None:
-                child = {"path": path, "kb": None, "files": None}
-                current["children"].append(child)
-            child[key] = int(value)
-        elif kind == "C" and current is not None:
-            state, _, _ = rest.partition("|")
-            current["files_partial"] = state != "ok"
-        elif kind == "I":           # a scan by an older console: the total file count only
-            count, _, path = rest.partition("|")
-            for d in dirs:
-                if d["path"] == path and count.isdigit():
-                    d["files"] = int(count)
+        elif kind == "T" and current is not None:
+            current["listing_partial"] = True           # find hit its time limit: some folders are missing
+        elif current is not None and len(kind) == 1 and kind.islower():
+            kb, _, path = rest.partition("|")
+            if kind == "d":
+                current["folders"].append(path)
+            elif kb.isdigit():
+                current["loose_kb"] += int(kb)
+                current["loose_files"] += 1
+    return dirs
+
+
+def parse_storage_folder(text):
+    """CLUSTER_STORAGE_FOLDER_SCRIPT's lines: {kb, files, state, files_state}; a state is ok, timeout or error."""
+    out = {"kb": None, "files": None, "state": "error", "files_state": "error"}
+    for line in text.splitlines():
+        kind, _, rest = line.partition("|")
+        state, _, value = rest.partition("|")
+        if kind in ("S", "F") and state in ("ok", "timeout", "error"):
+            key, state_key = ("kb", "state") if kind == "S" else ("files", "files_state")
+            out[state_key] = state
+            out[key] = int(value) if value.strip().isdigit() else None
+    return out
+
+
+STORAGE_MAX_FOLDERS = 500    # the folders kept and scanned per directory (more are counted, not listed)
+
+
+STORAGE_MAX_CUSTOM_ROOTS = 20
+STORAGE_DEFAULT_ROOT = "~/.local/tunnels"
+
+
+def storage_roots(work_dirs, custom):
+    """The directories the Storage tab scans, [{path, kind}]: the cluster's work directories and the tunnels' own
+    folder (the defaults), then the ones added by hand. `path` is as written (`~` is the cluster home)."""
+    roots = [{"path": p, "kind": "work"} for p in work_dirs or []]
+    roots.append({"path": STORAGE_DEFAULT_ROOT, "kind": "tunnels"})
+    seen = {r["path"] for r in roots}
+    for path in custom or []:
+        if path not in seen:
+            roots.append({"path": path, "kind": "custom"})
+            seen.add(path)
+    return roots
+
+
+def clean_storage_roots(value):
+    """A list of directories to add as scan roots, checked and tidied (trailing slashes dropped, repeats removed):
+    absolute, or starting with ~ for the cluster home. ConsoleError(400) says what is wrong."""
+    if not isinstance(value, list) or not all(isinstance(p, str) for p in value):
+        raise ConsoleError(400, 'send {"custom": ["/path", "~/path", ...]}')
+    out = []
+    for text in value:
+        path = text.strip()
+        if not path or len(path) > 1000 or any(c in path for c in "\0\r\n"):
+            raise ConsoleError(400, f"not a directory path: {text[:80]!r}")
+        if not (path.startswith("/") or path == "~" or path.startswith("~/")):
+            raise ConsoleError(400, f"{path!r}: use a full path (/scratch/...) or one from the home directory (~/...)")
+        path = path.rstrip("/") or "/"
+        if path == "/":
+            raise ConsoleError(400, "pick a folder below /: scanning the whole file system would not finish")
+        if "/../" in path + "/" or path.endswith("/.."):
+            raise ConsoleError(400, f"{path!r}: leave out the .. parts")
+        if path not in out:
+            out.append(path)
+    if len(out) > STORAGE_MAX_CUSTOM_ROOTS:
+        raise ConsoleError(400, f"at most {STORAGE_MAX_CUSTOM_ROOTS} added folders")
+    return out
+
+
+def merge_storage_listing(previous, listing, roots=None):
+    """The stored directories after a listing: each folder keeps what an earlier scan found (its size, file count and
+    when), new folders start unscanned, folders that are gone are dropped. With `roots` ([{path, kind}], in the order
+    to show) the listing may cover only some of them: the others keep their stored results as they were, and a stored
+    directory that is no longer a root is dropped. Each listing entry names its root in `root`."""
+    before = {}
+    for d in previous or []:
+        before.setdefault(d.get("root") or d["path"], d)
+        before.setdefault(d["path"], d)
+    fresh = {e["root"]: e for e in listing if e.get("root")}
+    if roots is None:
+        wanted = [(e, e.get("root") or e["path"], False) for e in listing]
+    else:
+        wanted = [(fresh.get(r["path"]), r["path"], r["kind"] == "custom") for r in roots]
+    out = []
+    for entry, root, custom in wanted:
+        old_dir = before.get(root) or (before.get(entry["path"]) if entry else None)
+        if entry is None:                    # not scanned this round: as it was
+            if old_dir:
+                out.append(dict(old_dir, root=root, custom=custom))
+            continue
+        if entry.get("missing"):
+            out.append({"path": entry["path"], "root": root, "custom": custom, "missing": True, "kb": None,
+                        "files": None, "children": []})
+            continue
+        old = {c["path"]: c for c in (old_dir or {}).get("children", [])}
+        folders = entry["folders"]
+        omitted = max(0, len(folders) - STORAGE_MAX_FOLDERS)
+        if omitted:
+            folders = sorted(folders, key=lambda f: -((old.get(f) or {}).get("kb") or 0))[:STORAGE_MAX_FOLDERS]
+        d = {"path": entry["path"], "root": root, "custom": custom, "loose_kb": entry["loose_kb"],
+             "loose_files": entry["loose_files"], "listing_partial": entry["listing_partial"],
+             "folders_omitted": omitted,
+             "children": [dict(old.get(f) or {"path": f, "kb": None, "files": None, "scanned": None,
+                                               "state": None, "files_state": None}) for f in folders]}
+        out.append(fold_storage_dir(d))
+    return out
+
+
+def fold_storage_dir(d):
+    """The directory's totals from its folders and loose files: what is known so far and how complete it is. kb and
+    files add up the folders that have a result, so they only grow as the scan goes on; `partial` says some don't."""
+    kids = d["children"]
+    sized = [k for k in kids if k.get("kb") is not None]
+    counted = [k for k in kids if k.get("files") is not None]
+    d["kb"] = (d.get("loose_kb") or 0) + sum(k["kb"] for k in sized) if sized or not kids else None
+    d["files"] = (d.get("loose_files") or 0) + sum(k["files"] for k in counted) if counted or not kids else None
+    d["partial"] = len(sized) < len(kids) or bool(d.get("listing_partial"))
+    d["files_partial"] = len(counted) < len(kids) or bool(d.get("listing_partial"))
+    times = [k["scanned"] for k in kids if k.get("scanned")]
+    d["scanned"] = max(times) if times else None
+    d["oldest"] = min(times) if len(times) == len(kids) and times else None
+    d["folder_counts"] = {"total": len(kids), "sized": len(sized),
+                          "timed_out": sum(1 for k in kids if "timeout" in (k.get("state"), k.get("files_state"))),
+                          "unscanned": sum(1 for k in kids if not k.get("scanned"))}
+    return d
+
+
+def storage_tasks(dirs, now, recent, rescan_recent):
+    """([(directory, folder)] to scan, how many were skipped): the folders never scanned first, then the oldest; a
+    folder scanned in the last `recent` seconds is skipped unless rescan_recent."""
+    tasks, skipped = [], 0
     for d in dirs:
-        d["children"] = sorted(d["children"], key=lambda c: (c["kb"] or 0, c["files"] or 0),
-                               reverse=True)[:STORAGE_CHILDREN]
-    quotas = parse_quota(text)
-    return {"dirs": dirs, "quotas": quotas, "quota": storage_quota(quotas)}
-
-
-STORAGE_CHILDREN = 200       # the folders kept per directory (the page shows the top ones, by size or by files)
+        for c in d.get("children") or []:
+            if not rescan_recent and c.get("scanned") and now - c["scanned"] < recent:
+                skipped += 1
+                continue
+            tasks.append((c.get("scanned") or 0, len(tasks), d["path"], c["path"]))
+    tasks.sort()
+    return [(d, c) for _, _, d, c in tasks], skipped
 
 
 def parse_quota(text):
@@ -1207,37 +1318,52 @@ err=$(want StdErr)
 if [ -n "$err" ]; then err=$(expand "$err"); [ "$err" = "$out" ] || emit stderr slurm "$err"; fi
 """
 
-# Runs ON the login node: STORAGE_TIMEOUT DIR...: each directory's size by its children (du -k --max-depth=1) and
-# their file counts (du --inodes --max-depth=1: files, folders and links, what a file quota counts; find where du is
-# too old for --inodes), at low priority and each with a time limit (then marked partial). The scan adds the quota
-# checks (quota_script) after it.
-CLUSTER_STORAGE_SCRIPT = r"""
+# Runs ON the login node: LIMIT DIR...: what is directly in each directory, as NUL-separated records: `D|DIR`, then
+# `TYPE|KB|PATH` for each entry (d for a directory; the rest are loose files, KB their disk use) and `T|timeout` if
+# find hit LIMIT seconds; `M|DIR` for a directory that isn't there. One listing each, no walk below.
+CLUSTER_STORAGE_LIST_SCRIPT = r"""
 limit="$1"; shift
-tmp=$(mktemp) || exit 1
-trap 'rm -f "$tmp"' EXIT
 for d in "$@"; do
-  case "$d" in "~/"*) d="$HOME/${d#\~/}" ;; esac
-  if [ ! -d "$d" ]; then printf 'M|%s\n' "$d"; continue; fi
-  state=ok
-  timeout "$limit" nice -n 19 du -k --max-depth=1 -- "$d" > "$tmp" 2>/dev/null || state=partial
-  printf 'D|%s|%s\n' "$state" "$d"
-  sed 's/^\([0-9]*\)\t/S|\1|/' "$tmp"
-  counted=ok
-  : > "$tmp"
-  if ! timeout "$limit" nice -n 19 du --inodes --max-depth=1 -- "$d" > "$tmp" 2>/dev/null; then
-    counted=partial
-    if [ ! -s "$tmp" ]; then
-      # du without --inodes (coreutils before 8.22): find, folder by folder
-      timeout "$limit" nice -n 19 bash -c '
-        find "$1" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | while IFS= read -r -d "" c; do
-          printf "%s\t%s\n" "$(find "$c" 2>/dev/null | wc -l)" "$c"
-        done
-        printf "%s\t%s\n" "$(find "$1" 2>/dev/null | wc -l)" "$1"' hpclib-count "$d" > "$tmp" && counted=ok
-    fi
-  fi
-  printf 'C|%s|%s\n' "$counted" "$d"
-  sed 's/^\([0-9]*\)\t/F|\1|/' "$tmp"
+  case "$d" in "~") d="$HOME" ;; "~/"*) d="$HOME/${d#\~/}" ;; esac
+  if [ ! -d "$d" ]; then printf 'M|%s\0' "$d"; continue; fi
+  printf 'D|%s\0' "$d"
+  timeout "$limit" nice -n 19 find "$d" -mindepth 1 -maxdepth 1 -printf '%y|%k|%p\0' 2>/dev/null
+  [ $? -eq 124 ] && printf 'T|timeout\0'
 done
+exit 0
+"""
+
+# Runs ON the login node: LIMIT FOLDER: one folder's size (du -sk) and file count (du -s --inodes: files, folders and
+# links, what a file quota counts; find where du is too old for --inodes), side by side so the folder has LIMIT
+# seconds in all, at low priority. Prints `S|STATE|KB` and `F|STATE|COUNT`: STATE is ok, timeout (no answer in time)
+# or error (the value is empty then).
+CLUSTER_STORAGE_FOLDER_SCRIPT = r"""
+limit="$1"; d="$2"
+case "$d" in "~") d="$HOME" ;; "~/"*) d="$HOME/${d#\~/}" ;; esac
+sizes=$(mktemp) || exit 1
+files=$(mktemp) || exit 1
+trap 'rm -f "$sizes" "$files"' EXIT
+start=$SECONDS
+( timeout "$limit" nice -n 19 du -sk -- "$d" > "$sizes" 2>/dev/null ) & sized=$!
+(
+  timeout "$limit" nice -n 19 du -s --inodes -- "$d" > "$files" 2>/dev/null
+  rc=$?
+  if [ "$rc" -ne 124 ] && [ ! -s "$files" ]; then
+    left=$((limit - (SECONDS - start))); [ "$left" -ge 1 ] || left=1
+    timeout "$left" nice -n 19 bash -c 'find "$1" 2>/dev/null | wc -l' hpclib-count "$d" > "$files"
+    rc=$?
+  fi
+  exit "$rc"
+) & counted=$!
+wait "$sized"; rs=$?
+wait "$counted"; rf=$?
+report() {      # KIND EXIT FILE
+  if [ "$2" -eq 124 ]; then state=timeout; elif [ -s "$3" ]; then state=ok; else state=error; fi
+  printf '%s|%s|%s\n' "$1" "$state" "$(awk '{print $1; exit}' "$3" 2>/dev/null)"
+}
+report S "$rs" "$sizes"
+report F "$rf" "$files"
+exit 0
 """
 
 
@@ -1827,7 +1953,10 @@ class Clusters:
             raise ConsoleError(502, f"scancel {job} failed: {self._one_line(err or out)}")
         return {"cancelled": job}
 
-    STORAGE_TIMEOUT = 300
+    STORAGE_FOLDER_TIMEOUT = 300     # seconds each folder gets (its size and file count run side by side)
+    STORAGE_TOTAL_TIMEOUT = 1800     # seconds a whole scan gets; folders it didn't reach wait for the next scan
+    STORAGE_RECENT = 300             # a folder scanned this recently is skipped unless "Rescan recent folders"
+    STORAGE_QUEUE_SHOWN = 500        # queued folders listed to the page, for its progress marks
 
     def storage_path(self, name):
         return os.path.join(console_dir(), "storage", f"{name}.json")
@@ -1844,40 +1973,133 @@ class Clusters:
             scan = self.storage_scans.get(name)
         out["scan"] = dict(scan) if scan else {"state": "idle"}
         out["work_dirs"] = list(profile.get("work_dirs") or [])
+        out["custom_roots"] = list(out.get("custom_roots") or [])
+        out["roots"] = storage_roots(out["work_dirs"], out["custom_roots"])
         return out
 
-    def start_storage_scan(self, profile):
+    def set_storage_roots(self, profile, body):
+        """{"custom": [directory, ...]}: the folders added to the scan, replacing the ones before. The results of a
+        folder that is dropped go with it; the defaults (work directories, the tunnels' folder) can't be removed."""
         name = profile["name"]
+        if not isinstance(body, dict) or set(body) != {"custom"}:
+            raise ConsoleError(400, 'send {"custom": ["/path", "~/path", ...]}')
+        custom = clean_storage_roots(body["custom"])
+        with self.lock:
+            if (self.storage_scans.get(name) or {}).get("state") == "running":
+                raise ConsoleError(409, "a scan is running: change the folders when it is done")
+        roots = storage_roots(profile.get("work_dirs"), custom)
+
+        def change(stored):
+            stored["custom_roots"] = [r["path"] for r in roots if r["kind"] == "custom"]
+            stored["dirs"] = merge_storage_listing(stored.get("dirs"), [], roots)
+        self._update_storage(name, change)
+        return self.storage(profile)
+
+    def start_storage_scan(self, profile, body=None):
+        """Starts a scan in the background: {"rescan_recent": true} scans folders scanned in the last few minutes
+        too; {"roots": [directory, ...]} scans only those (of the ones the Storage tab lists), the others keep what
+        they have. The scan runs folder by folder and saves after each, so the Storage tab fills in as it goes."""
+        name = profile["name"]
+        body = body or {}
+        if set(body) - {"rescan_recent", "roots"} or not isinstance(body.get("rescan_recent", False), bool):
+            raise ConsoleError(400, 'send {"rescan_recent": true|false, "roots": [directory, ...]} or nothing')
+        known = self.storage(profile)["roots"]
+        chosen = body.get("roots")
+        if chosen is None:
+            chosen = [r["path"] for r in known]
+        elif (not isinstance(chosen, list) or not chosen or not all(isinstance(p, str) for p in chosen)
+                or any(p not in {r["path"] for r in known} for p in chosen)):
+            raise ConsoleError(400, "roots: a list of one or more of the folders the Storage tab shows")
         if not self.logins.alive(profile):
             raise ConsoleError(409, f"log in to {name} first: the scan runs over the console's login")
-        dirs = list(profile.get("work_dirs") or []) + ["~/.local/tunnels"]
+        dirs = [r["path"] for r in known if r["path"] in chosen]
         with self.lock:
             if (self.storage_scans.get(name) or {}).get("state") == "running":
                 return dict(self.storage_scans[name])
-            scan = self.storage_scans[name] = {"state": "running", "started": time.time()}
+            scan = self.storage_scans[name] = {"state": "running", "started": time.time(), "listing": True,
+                                               "rescan_recent": bool(body.get("rescan_recent")), "roots": list(dirs), "done": 0, "total": 0,
+                                               "skipped": 0, "queued": [], "current": None,
+                                               "deadline": time.time() + self.STORAGE_TOTAL_TIMEOUT}
         threading.Thread(target=self._storage_scan, args=(profile, dirs, scan), daemon=True).start()
         return dict(scan)
 
     def _storage_scan(self, profile, dirs, scan):
+        name = profile["name"]
+        quotas = threading.Thread(target=self._scan_quotas, args=(profile,), daemon=True)
+        quotas.start()                       # the site's quota commands can be slow: they don't hold the folders up
         try:
-            script = CLUSTER_STORAGE_SCRIPT + quota_script("hpclib_quota all --json")
-            code, out, err = self.script_runner(profile, script, (str(self.STORAGE_TIMEOUT), *dirs),
-                                                2 * self.STORAGE_TIMEOUT + 240)
-            result = parse_storage(out)
-            result["scanned"] = time.time()
-            if result["quotas"]:
-                result["quotas"]["checked"] = result["scanned"]
-            self._save_storage(profile["name"], result)
+            code, out, err = self.script_runner(profile, CLUSTER_STORAGE_LIST_SCRIPT, (str(self.STORAGE_FOLDER_TIMEOUT), *dirs),
+                                                self.STORAGE_FOLDER_TIMEOUT + 60)
+            listing = parse_storage_list(out)
+            if not listing or len(listing) != len(dirs):
+                raise ConsoleError(502, f"listing the folders gave no answer: {self._one_line(err or out) or f'exit {code}'}")
+            for entry, root in zip(listing, dirs):
+                entry["root"] = root
+            roots = self.storage(profile)["roots"]
+            self._update_storage(name, lambda stored: stored.update(
+                dirs=merge_storage_listing(stored.get("dirs"), listing, roots), scanned=stored.get("scanned")))
+            tasks, skipped = storage_tasks([d for d in self.storage(profile)["dirs"] if d.get("root") in dirs],
+                                           time.time(), self.STORAGE_RECENT, scan["rescan_recent"])
+            queue = [folder for _, folder in tasks]
+            scan.update(listing=False, total=len(tasks), skipped=skipped, queued=queue[:self.STORAGE_QUEUE_SHOWN])
+            failures = 0
+            for number, (directory, folder) in enumerate(tasks):
+                left = scan["deadline"] - time.time()
+                if left < 15:                # not worth starting: it would be cut off at once
+                    scan["stopped"] = "time limit"
+                    break
+                limit = int(min(self.STORAGE_FOLDER_TIMEOUT, left))
+                scan.update(current=folder, queued=queue[number + 1:number + 1 + self.STORAGE_QUEUE_SHOWN])
+                try:
+                    code, out, err = self.script_runner(profile, CLUSTER_STORAGE_FOLDER_SCRIPT, (str(limit), folder), limit + 60)
+                except ConsoleError:
+                    failures += 1
+                    if failures >= 3:        # the login is gone, not one folder: stop rather than try them all
+                        raise
+                    continue
+                failures = 0
+                found = parse_storage_folder(out)
+                found["scanned"] = time.time()
+                self._update_storage(name, lambda stored, d=directory, f=folder, r=found: self._store_folder(stored, d, f, r))
+                scan["done"] = number + 1
+            summary = {"started": scan["started"], "finished": time.time(), "folders": scan["total"], "scanned": scan["done"],
+                       "skipped": skipped, "stopped": scan.get("stopped"), "rescan_recent": scan["rescan_recent"], "roots": len(dirs)}
+            self._update_storage(name, lambda stored: stored.update(last_scan=summary, scanned=time.time()))
             state = {"state": "done", "finished": time.time()}
         except Exception as e:
             state = {"state": "failed", "finished": time.time(), "error": self._one_line(getattr(e, "payload", {}).get("error") or e)}
+        quotas.join(timeout=5)
         with self.lock:
-            scan.update(state)
+            scan.update(state, current=None, queued=[])
 
-    def _save_storage(self, name, result):
+    def _scan_quotas(self, profile):
+        try:
+            self._quota_call(profile, 'hpclib_quota "$@"', ("all", "--json"))
+        except Exception:
+            pass                             # the Quotas card has its own Check quotas, and says what failed
+
+    @staticmethod
+    def _store_folder(stored, directory, folder, found):
+        for d in stored.get("dirs") or []:
+            if d["path"] != directory:
+                continue
+            for child in d["children"]:
+                if child["path"] == folder:
+                    child.update(found)
+            fold_storage_dir(d)
+        stored["scanned"] = found["scanned"]
+
+    def _update_storage(self, name, change):
+        """Reads the stored scan, applies `change` to it and writes it back, under the lock a quota check also takes."""
         with self.storage_lock:
+            try:
+                with open(self.storage_path(name)) as f:
+                    stored = json.load(f)
+            except (OSError, ValueError):
+                stored = {"scanned": None, "dirs": [], "quota": None}
+            change(stored)
             os.makedirs(os.path.dirname(self.storage_path(name)), mode=0o700, exist_ok=True)
-            write_private(self.storage_path(name), json.dumps(result))
+            write_private(self.storage_path(name), json.dumps(stored))
 
     # -- quota checks (lib/quota.sh), with the cluster's own settings ------------
 
@@ -4490,8 +4712,10 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 return 200, dict(c.cancel_job(profile, self.json_body()), ok=True)
             if rest == ["storage"] and verb == "GET":
                 return 200, dict(c.storage(profile), ok=True)
+            if rest == ["storage", "roots"] and verb == "PUT":
+                return 200, dict(c.set_storage_roots(profile, self.json_body()), ok=True)
             if rest == ["storage", "scan"] and verb == "POST":
-                return 202, dict(c.start_storage_scan(profile), ok=True)
+                return 202, dict(c.start_storage_scan(profile, self.json_body()), ok=True)
             if rest == ["quota"] and verb == "GET":
                 return 200, dict(c.quota(profile, self.query.get("kind", ["all"])[-1]), ok=True)
             if rest == ["quota", "settings"] and verb == "PUT":

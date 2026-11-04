@@ -388,10 +388,10 @@ class TestActions(unittest.TestCase):
     def test_the_manifest_is_valid_and_listed(self):
         import rest_actions
         manifest = rest_actions.check_manifest(json.loads((TUNNEL / "actions.json").read_text()), "fsdiag")
-        self.assertEqual(sorted(manifest["actions"]), ["probe", "probe_node", "requests", "survey"])
+        self.assertEqual(sorted(manifest["actions"]), ["probe", "probe_node", "probe_report", "requests", "survey"])
         self.assertEqual(manifest["actions"]["probe_node"]["mode"], "job")
         listing = self.actions().describe(self.Identity(), owner=False)
-        self.assertEqual(sorted(a["name"] for a in listing["tunnels"][0]["actions"]), ["probe", "probe_node", "requests", "survey"])
+        self.assertEqual(sorted(a["name"] for a in listing["tunnels"][0]["actions"]), ["probe", "probe_node", "probe_report", "requests", "survey"])
         # off until the owner turns the tunnel on
         self.assertEqual(self.actions(enabled=False).describe(self.Identity(), owner=False)["tunnels"], [])
 
@@ -460,6 +460,18 @@ class TestActions(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {"PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}):
             subprocess.run(["bash", str(script), "submit", "--comment=c", "any", "5"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertFalse([a for a in (Path(self.data) / "sbatch.args").read_text().splitlines() if a.startswith("--nodelist")])
+
+
+    def test_a_jobs_report_is_read_by_its_id_only(self):
+        import rest_actions
+        out_dir = Path(self.data) / "sessions" / "fsdiag"
+        out_dir.mkdir(parents=True)
+        (out_dir / "probe-4242.txt").write_text("# the report\n")
+        status, out = self.actions().run(self.Identity(), "fsdiag", "probe_report", {"job_id": 4242}, self.Whitelist(), True)
+        self.assertEqual((status, out["result"]), (200, "# the report"))
+        for bad in ({"job_id": 4243}, {"job_id": "../x"}, {"job_id": -1}):
+            with self.assertRaises(rest_actions.RESTError, msg=str(bad)):
+                self.actions().run(self.Identity(), "fsdiag", "probe_report", bad, self.Whitelist(), True)
 
 
 from test_agent_console import ConsoleTestCase  # noqa: E402
