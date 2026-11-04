@@ -989,6 +989,31 @@ esac
         self.folder_gate.set()
         self.wait_scan()
 
+    def test_the_time_limits_can_be_raised_and_timed_out_folders_retried(self):
+        self.timed_out = {"/scratch/me/llm/runs"}
+        out = self.scan()
+        self.assertEqual(out["scan"]["folder_timeout"], 300)
+        listing = [a for a in self.ran if a[0] == agent_console.CLUSTER_STORAGE_LIST_SCRIPT][-1]
+        self.assertEqual(listing[1][0], "300")
+        self.timed_out = set()
+        self.folder_calls.clear()
+        out = self.scan({"retry_timed_out": True, "folder_timeout": 3600, "total_timeout": 7200})
+        self.assertEqual(self.folder_calls, ["/scratch/me/llm/runs"])         # only the problem folder, though the others are recent
+        folder = [a for a in self.ran if a[0] == agent_console.CLUSTER_STORAGE_FOLDER_SCRIPT][-1]
+        self.assertEqual(folder[1][0], "3600")                                  # with the longer limit
+        listing = [a for a in self.ran if a[0] == agent_console.CLUSTER_STORAGE_LIST_SCRIPT][-1]
+        self.assertEqual(listing[1][0], "3600")
+        self.assertEqual((out["scan"]["folder_timeout"], out["last_scan"]["folders"]), (3600, 1))
+        self.assertEqual((out["dirs"][0]["kb"], out["dirs"][0]["partial"]), (2568, False))
+        self.assertEqual(self.scan({"retry_timed_out": True})["last_scan"]["folders"], 0)   # nothing is left to retry
+
+    def test_the_time_limits_are_checked(self):
+        url = f"/api/clusters/{self.dead}/storage/scan"
+        for body in ({"folder_timeout": 5}, {"folder_timeout": "300"}, {"folder_timeout": True}, {"total_timeout": 10 ** 7},
+                     {"folder_timeout": 3600, "total_timeout": 600}, {"retry_timed_out": "yes"}):
+            self.assertEqual(self.call("POST", url, body)[0], 400, body)
+        self.assertEqual(self.folder_calls, [])
+
     def test_the_scan_body_is_checked(self):
         for body in ({"rescan_recent": "yes"}, {"folders": ["/"]}):
             self.assertEqual(self.call("POST", f"/api/clusters/{self.dead}/storage/scan", body)[0], 400, body)

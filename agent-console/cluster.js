@@ -635,6 +635,7 @@ async function installed(c, local) {
 // ---------------------------------------------------------------- Storage
 
 let rescanRecent = false;       // "Rescan recent folders", kept while the console page is open
+let folderMinutes = 5, totalMinutes = 30;     // the scan's time limits (a folder, the whole scan), kept the same way
 // The roots left out of the next scan, as "CLUSTER\nPATH": for this round only (starting a scan clears them), kept
 // while the console page is open.
 const skipRoots = new Set();
@@ -669,8 +670,10 @@ async function storageTab(c) {
   const custom = st.custom_roots || [];
   const scanRoots = new Set(scan.roots || []);
   const chosen = () => roots.filter((r) => !skipRoots.has(rootKey(c, r))).map((r) => r.path);
-  const scanWith = async (paths) => {
-    await api(path(c.name, "storage/scan"), { method: "POST", body: { rescan_recent: rescanRecent, roots: paths } });
+  const scanWith = async (paths, retry = false) => {
+    const folder = Math.round(folderMinutes * 60), total = Math.max(folder, Math.round(totalMinutes * 60));
+    await api(path(c.name, "storage/scan"), { method: "POST", body: {
+      rescan_recent: rescanRecent, roots: paths, folder_timeout: folder, total_timeout: total, ...(retry ? { retry_timed_out: true } : {}) } });
     for (const r of roots) skipRoots.delete(rootKey(c, r));      // a skip lasts one round
     ctx.render();
   };
@@ -685,6 +688,17 @@ async function storageTab(c) {
   const toggle = el("label", { class: "inline-check", title: "A folder scanned in the last 5 minutes is skipped; tick this to scan it again" },
     el("input", { type: "checkbox", checked: rescanRecent, disabled: scanning,
                   onchange: (e) => { rescanRecent = e.target.checked; } }), " Rescan recent folders");
+  // the time limits: a folder that doesn't finish in its limit is marked timed out; raise it, then retry those folders
+  const minutes = (label, get, max, set) => el("label", { class: "inline-check" }, label,
+    el("input", { type: "number", min: 1, max, step: 1, value: get(), disabled: scanning, class: "minutes", "aria-label": `${label} (minutes)`,
+                  onchange: (e) => { const v = Number(e.target.value); if (v >= 1 && v <= max) set(v); else e.target.value = get(); } }), " min");
+  const limits = el("span", { class: "scan-limits" },
+    minutes("Per folder", () => folderMinutes, 240, (v) => { folderMinutes = v; if (totalMinutes < v) totalMinutes = v; }),
+    minutes("Whole scan", () => totalMinutes, 1440, (v) => { totalMinutes = v; }));
+  const timedOut = (st.dirs || []).reduce((n, d) => n + ((d.folder_counts || {}).timed_out || 0), 0);
+  const retry = timedOut ? action(`Retry ${timedOut} timed-out folder${timedOut === 1 ? "" : "s"}`,
+    () => scanWith(roots.map((r) => r.path), true),
+    { disabled: scanning || !login(c), title: "Scan just the folders that ran out of time, with the limits set here: raise Per folder first" }) : null;
   // follow a running scan: the page fills in as folders finish
   if (scanning) setTimeout(() => { if (location.hash.endsWith("/storage")) ctx.render(); }, 3000);
   // add a directory to the scan: any full path on the cluster, or one from its home directory (~/...)
@@ -721,8 +735,8 @@ async function storageTab(c) {
       el("span", { class: "scan-status", "aria-live": "polite" }, scanning ? el("span", { class: "spinner", "aria-hidden": "true" }) : null,
         scanStatus(st, scan), scan.state === "failed"
           ? el("span", { class: "error-box" }, ` · the last scan failed: ${scan.error}`) : null),
-      button, toggle,
-      el("span", { class: "muted small" }, "du over your login at low priority: 5 minutes a folder, 30 for the whole scan; results are saved as each folder finishes")),
+      button, retry, toggle, limits,
+      el("span", { class: "muted small" }, "du over your login at low priority; results are saved as each folder finishes")),
     el("div", { class: "add-root" }, el("label", {}, "Add a directory to scan ", newRoot), add),
     quotaCard(c, st),
     cards);
@@ -748,7 +762,7 @@ function storageCard(d, scan = {}, controls = null) {
     if (running && ch.path === scan.current) return el("span", { class: "scanning" }, v === null || v === undefined ? "scanning…" : shown);
     if (busy(ch) && (v === null || v === undefined)) return el("span", { class: "muted" }, "queued");
     const timedOut = (k === "kb" ? ch.state : ch.files_state) === "timeout" && (k === "kb" || ch.state !== "timeout");   // said once
-    if (timedOut && (v === null || v === undefined)) return el("span", { class: "timed-out", title: "no answer within the time limit; the next scan tries again" }, "timed out");
+    if (timedOut && (v === null || v === undefined)) return el("span", { class: "timed-out", title: "no answer within the time limit: raise Per folder and use Retry timed-out folders (or Scan now, which tries it again)" }, "timed out");
     return shown;
   };
   const draw = () => {

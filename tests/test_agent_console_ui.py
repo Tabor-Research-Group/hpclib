@@ -1001,14 +1001,60 @@ class TestConsoleUI(unittest.TestCase):
             if posts:
                 break
             self.page.wait_for_timeout(100)
-        self.assertEqual(posts, [{'rescan_recent': False, 'roots': ['/scratch/me/llm', '~/.local/tunnels']}])
+        self.assertEqual(posts, [{'rescan_recent': False, 'roots': ['/scratch/me/llm', '~/.local/tunnels'], 'folder_timeout': 300, 'total_timeout': 1800}])
         self.page.get_by_label('Rescan recent folders').check()
         self.page.get_by_role('button', name='Scan now', exact=True).click()
         for _ in range(50):
             if len(posts) == 2:
                 break
             self.page.wait_for_timeout(100)
-        self.assertEqual(posts[1], {'rescan_recent': True, 'roots': ['/scratch/me/llm', '~/.local/tunnels']})
+        self.assertEqual(posts[1], {'rescan_recent': True, 'roots': ['/scratch/me/llm', '~/.local/tunnels'], 'folder_timeout': 300, 'total_timeout': 1800})
+        self.assertEqual(self.errors, [])
+
+    def test_storage_tab_raises_the_time_limits_and_retries_timed_out_folders(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
+             'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up', 'hpclib_version': '0.2.70'}}
+        roots = [{'path': '/scratch/me/llm', 'kind': 'work'}, {'path': '~/.local/tunnels', 'kind': 'tunnels'}]
+        kid = {'path': '/scratch/me/llm/huge', 'kb': None, 'files': None, 'scanned': time.time(), 'state': 'timeout', 'files_state': 'timeout'}
+        storage = {'scanned': time.time(), 'quota': None, 'work_dirs': ['/scratch/me/llm'], 'roots': roots, 'custom_roots': [],
+                   'scan': {'state': 'idle'},
+                   'dirs': [{'path': '/scratch/me/llm', 'root': '/scratch/me/llm', 'kb': None, 'files': None, 'partial': True,
+                             'files_partial': True, 'scanned': time.time(), 'oldest': None,
+                             'folder_counts': {'total': 1, 'sized': 0, 'timed_out': 1, 'unscanned': 0}, 'children': [kid]}]}
+        posts = []
+        answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c, 'health': {'hpclib_version': '0.2.70'},
+                   'apps': {'apps': [{'id': 'agents', 'title': 'Agents'}]}, 'clusters/demo/storage': storage}
+
+        def handler(route, path):
+            if path == 'clusters/demo/storage/scan':
+                posts.append(route.request.post_data_json)
+                route.fulfill(status=202, body=json.dumps({'state': 'running'}), content_type='application/json')
+                return True
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/c/demo/storage")
+        retry = self.page.get_by_role('button', name='Retry 1 timed-out folder', exact=True)
+        retry.wait_for()
+        self.assertEqual(self.page.get_by_label('Per folder (minutes)').input_value(), '5')
+        self.assertEqual(self.page.get_by_label('Whole scan (minutes)').input_value(), '30')
+        self.page.get_by_label('Per folder (minutes)').fill('90')
+        self.page.get_by_label('Per folder (minutes)').dispatch_event('change')
+        self.page.get_by_label('Whole scan (minutes)').fill('120')
+        self.page.get_by_label('Whole scan (minutes)').dispatch_event('change')
+        retry.click()
+        for _ in range(50):
+            if posts:
+                break
+            self.page.wait_for_timeout(100)
+        self.assertEqual(posts, [{'rescan_recent': False, 'roots': ['/scratch/me/llm', '~/.local/tunnels'],
+                                  'folder_timeout': 5400, 'total_timeout': 7200, 'retry_timed_out': True}])
+        # a value out of range goes back to what it was
+        self.page.get_by_label('Per folder (minutes)').fill('9999')
+        self.page.get_by_label('Per folder (minutes)').dispatch_event('change')
+        self.assertEqual(self.page.get_by_label('Per folder (minutes)').input_value(), '90')
         self.assertEqual(self.errors, [])
 
     def test_storage_tab_adds_roots_and_skips_them_for_a_round(self):
@@ -1061,7 +1107,7 @@ class TestConsoleUI(unittest.TestCase):
         self.page.get_by_label('Scan /scratch/me/llm', exact=True).uncheck()
         self.page.get_by_label('Scan ~/.local/tunnels', exact=True).uncheck()
         self.page.get_by_role('button', name='Scan now', exact=True).click()
-        self.assertEqual(sent(1), {'rescan_recent': False, 'roots': ['/scratch/shared/data']})
+        self.assertEqual(sent(1), {'rescan_recent': False, 'roots': ['/scratch/shared/data'], 'folder_timeout': 300, 'total_timeout': 1800})
         # the skip was for that round: everything is ticked again
         for _ in range(50):                      # the page draws again once the scan is posted
             if self.page.get_by_label('Scan /scratch/me/llm', exact=True).is_checked():
@@ -1077,7 +1123,7 @@ class TestConsoleUI(unittest.TestCase):
         self.assertFalse(self.page.get_by_role('button', name='Scan now', exact=True).is_disabled())
         # Scan only this ignores the ticks
         self.page.get_by_role('button', name='Scan only this').first.click()
-        self.assertEqual(sent(2), {'rescan_recent': False, 'roots': ['/scratch/me/llm']})
+        self.assertEqual(sent(2), {'rescan_recent': False, 'roots': ['/scratch/me/llm'], 'folder_timeout': 300, 'total_timeout': 1800})
         # remove the added directory
         self.page.get_by_role('button', name='Remove').click()
         self.page.get_by_label('Scan /scratch/shared/data', exact=True).wait_for(state='detached')

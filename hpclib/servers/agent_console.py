@@ -1083,6 +1083,7 @@ STORAGE_MAX_FOLDERS = 500    # the folders kept and scanned per directory (more 
 
 
 STORAGE_MAX_CUSTOM_ROOTS = 20
+STORAGE_TIME_LIMITS = {"folder_timeout": (30, 4 * 3600), "total_timeout": (60, 24 * 3600)}   # seconds, lowest and highest
 STORAGE_DEFAULT_ROOT = "~/.local/tunnels"
 
 
@@ -1181,12 +1182,17 @@ def fold_storage_dir(d):
     return d
 
 
-def storage_tasks(dirs, now, recent, rescan_recent):
+def storage_tasks(dirs, now, recent, rescan_recent, only_timed_out=False):
     """([(directory, folder)] to scan, how many were skipped): the folders never scanned first, then the oldest; a
-    folder scanned in the last `recent` seconds is skipped unless rescan_recent."""
+    folder scanned in the last `recent` seconds is skipped unless rescan_recent. only_timed_out: just the folders
+    whose last scan ran out of time (the recent rule doesn't apply: they have no result to protect)."""
     tasks, skipped = [], 0
     for d in dirs:
         for c in d.get("children") or []:
+            if only_timed_out:
+                if "timeout" in (c.get("state"), c.get("files_state")):
+                    tasks.append((c.get("scanned") or 0, len(tasks), d["path"], c["path"]))
+                continue
             if not rescan_recent and c.get("scanned") and now - c["scanned"] < recent:
                 skipped += 1
                 continue
@@ -1997,12 +2003,24 @@ class Clusters:
 
     def start_storage_scan(self, profile, body=None):
         """Starts a scan in the background: {"rescan_recent": true} scans folders scanned in the last few minutes
-        too; {"roots": [directory, ...]} scans only those (of the ones the Storage tab lists), the others keep what
+        too; {"retry_timed_out": true} scans only the folders that ran out of time; "folder_timeout" and
+        "total_timeout" (seconds, 300 and 1800 unless sent) are the time each folder and the whole scan get; {"roots": [directory, ...]} scans only those (of the ones the Storage tab lists), the others keep what
         they have. The scan runs folder by folder and saves after each, so the Storage tab fills in as it goes."""
         name = profile["name"]
         body = body or {}
-        if set(body) - {"rescan_recent", "roots"} or not isinstance(body.get("rescan_recent", False), bool):
-            raise ConsoleError(400, 'send {"rescan_recent": true|false, "roots": [directory, ...]} or nothing')
+        if (set(body) - {"rescan_recent", "roots", "retry_timed_out", "folder_timeout", "total_timeout"}
+                or not isinstance(body.get("rescan_recent", False), bool)
+                or not isinstance(body.get("retry_timed_out", False), bool)):
+            raise ConsoleError(400, 'send {"rescan_recent": bool, "roots": [directory, ...], "retry_timed_out": bool, '
+                                    '"folder_timeout": seconds, "total_timeout": seconds} or nothing')
+        limits = {}
+        for key, (low, high) in STORAGE_TIME_LIMITS.items():
+            value = body.get(key, getattr(self, "STORAGE_" + key.upper()))
+            if key in body and (isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high):
+                raise ConsoleError(400, f"{key}: seconds, from {low} to {high}")
+            limits[key] = int(value)
+        if ("folder_timeout" in body or "total_timeout" in body) and limits["folder_timeout"] > limits["total_timeout"]:
+            raise ConsoleError(400, "folder_timeout is longer than total_timeout")
         known = self.storage(profile)["roots"]
         chosen = body.get("roots")
         if chosen is None:
@@ -2017,9 +2035,10 @@ class Clusters:
             if (self.storage_scans.get(name) or {}).get("state") == "running":
                 return dict(self.storage_scans[name])
             scan = self.storage_scans[name] = {"state": "running", "started": time.time(), "listing": True,
-                                               "rescan_recent": bool(body.get("rescan_recent")), "roots": list(dirs), "done": 0, "total": 0,
+                                               "rescan_recent": bool(body.get("rescan_recent")), "roots": list(dirs), "retry_timed_out": bool(body.get("retry_timed_out")),
+                                               "folder_timeout": limits["folder_timeout"], "done": 0, "total": 0,
                                                "skipped": 0, "queued": [], "current": None,
-                                               "deadline": time.time() + self.STORAGE_TOTAL_TIMEOUT}
+                                               "deadline": time.time() + limits["total_timeout"]}
         threading.Thread(target=self._storage_scan, args=(profile, dirs, scan), daemon=True).start()
         return dict(scan)
 
@@ -2028,8 +2047,8 @@ class Clusters:
         quotas = threading.Thread(target=self._scan_quotas, args=(profile,), daemon=True)
         quotas.start()                       # the site's quota commands can be slow: they don't hold the folders up
         try:
-            code, out, err = self.script_runner(profile, CLUSTER_STORAGE_LIST_SCRIPT, (str(self.STORAGE_FOLDER_TIMEOUT), *dirs),
-                                                self.STORAGE_FOLDER_TIMEOUT + 60)
+            code, out, err = self.script_runner(profile, CLUSTER_STORAGE_LIST_SCRIPT, (str(scan["folder_timeout"]), *dirs),
+                                                scan["folder_timeout"] + 60)
             listing = parse_storage_list(out)
             if not listing or len(listing) != len(dirs):
                 raise ConsoleError(502, f"listing the folders gave no answer: {self._one_line(err or out) or f'exit {code}'}")
@@ -2039,7 +2058,7 @@ class Clusters:
             self._update_storage(name, lambda stored: stored.update(
                 dirs=merge_storage_listing(stored.get("dirs"), listing, roots), scanned=stored.get("scanned")))
             tasks, skipped = storage_tasks([d for d in self.storage(profile)["dirs"] if d.get("root") in dirs],
-                                           time.time(), self.STORAGE_RECENT, scan["rescan_recent"])
+                                           time.time(), self.STORAGE_RECENT, scan["rescan_recent"], scan["retry_timed_out"])
             queue = [folder for _, folder in tasks]
             scan.update(listing=False, total=len(tasks), skipped=skipped, queued=queue[:self.STORAGE_QUEUE_SHOWN])
             failures = 0
@@ -2048,7 +2067,7 @@ class Clusters:
                 if left < 15:                # not worth starting: it would be cut off at once
                     scan["stopped"] = "time limit"
                     break
-                limit = int(min(self.STORAGE_FOLDER_TIMEOUT, left))
+                limit = int(min(scan["folder_timeout"], left))
                 scan.update(current=folder, queued=queue[number + 1:number + 1 + self.STORAGE_QUEUE_SHOWN])
                 try:
                     code, out, err = self.script_runner(profile, CLUSTER_STORAGE_FOLDER_SCRIPT, (str(limit), folder), limit + 60)
@@ -2063,7 +2082,8 @@ class Clusters:
                 self._update_storage(name, lambda stored, d=directory, f=folder, r=found: self._store_folder(stored, d, f, r))
                 scan["done"] = number + 1
             summary = {"started": scan["started"], "finished": time.time(), "folders": scan["total"], "scanned": scan["done"],
-                       "skipped": skipped, "stopped": scan.get("stopped"), "rescan_recent": scan["rescan_recent"], "roots": len(dirs)}
+                       "skipped": skipped, "stopped": scan.get("stopped"), "rescan_recent": scan["rescan_recent"], "roots": len(dirs),
+                       "folder_timeout": scan["folder_timeout"], "retry_timed_out": scan["retry_timed_out"]}
             self._update_storage(name, lambda stored: stored.update(last_scan=summary, scanned=time.time()))
             state = {"state": "done", "finished": time.time()}
         except Exception as e:
