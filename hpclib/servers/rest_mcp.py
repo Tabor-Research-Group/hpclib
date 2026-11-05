@@ -58,7 +58,8 @@ guides, allowed directories, notes) -> read_guide for any template or
 guide that fits the task -> list_templates (parameter schemas) ->
 prepare inputs (push_files copies local inputs to the cluster when
 enabled) -> submit_job with dry_run=true to validate and see the start
-estimate -> submit_job for real with an idempotency_key and a label ->
+estimate -> submit_job for real with an idempotency_key and a descriptive label (it
+becomes part of the job's name in the queue) ->
 job_status / wait_for_job -> tail_file on the output -> pull_files.
 Array templates run one task per input: pass `tasks`, or `tasks_from` to
 read them from a JSON manifest on the cluster; resubmit only failed
@@ -154,8 +155,10 @@ def build_server(client: RESTClient, enable_file_writes=False, local_roots=None)
         throttle: Annotated[Optional[int], Field(
             ge=1, description="array templates only: tasks allowed to run at once")] = None,
         label: Annotated[Optional[str], Field(
-            max_length=128, description="your own name for this job, e.g. the scan it belongs to; "
-                                        "list_jobs can filter by it")] = None,
+            max_length=128, description="a short name for what this job is for, e.g. "
+                                        "\"zpe_sampling_controls_20261104\": it is added to the SLURM job name "
+                                        "(PREFIX+template+\"-\"+label, letters, digits, . _ - kept) so the queue and "
+                                        "the console say what the job is, and list_jobs can filter by it")] = None,
     ) -> dict[str, Any]:
         return await call(client.submit_job, template, params, resources, workdir, idempotency_key, dry_run,
                           tasks, tasks_from, throttle, label)

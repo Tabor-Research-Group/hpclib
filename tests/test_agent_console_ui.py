@@ -889,6 +889,197 @@ class TestConsoleUI(unittest.TestCase):
         self.assertIn('good-job', main.inner_text())
         self.assertEqual(self.errors, [])
 
+    def test_jobs_tab_has_a_whole_queue_of_other_peoples_jobs(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
+             'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up'}}
+        job = lambda i, user, name, state, reason, partition='cpu', start='': {
+            'id': str(i), 'user': user, 'name': name, 'state': state, 'reason': reason, 'partition': partition, 'elapsed': '1:02:03',
+            'time_limit': '1-00:00:00', 'nodes': '1', 'cpus': '48', 'memory': '100G', 'node_list': 'c[01-02]' if state == 'RUNNING' else '',
+            'start': start, 'submitted': '2026-11-04T09:30:00', 'priority': '900',
+            'source': {'kind': 'agent', 'label': 'agent: orca', 'token': 'llm'} if name.startswith('hpcrest-') else {'kind': 'other', 'label': 'other'}}
+        queue = {'ok': True, 'me': 'mark', 'at': time.time(), 'list_limit': 300,
+                 'partitions': [{'name': 'cpu', 'cpus': {'allocated': 880, 'idle': 40, 'other': 0, 'total': 920}, 'nodes': 23,
+                                 'running': 2, 'queued': 2, 'running_cpus': 100, 'queued_cpus': 52},
+                                {'name': 'gpu', 'cpus': None, 'nodes': None, 'running': 0, 'queued': 1, 'running_cpus': 0, 'queued_cpus': 8}],
+                 'users': [{'user': 'alice', 'running': 1, 'queued': 1, 'running_cpus': 96, 'queued_cpus': 48, 'hpclib': 1},
+                           {'user': 'bob', 'running': 0, 'queued': 1, 'running_cpus': 0, 'queued_cpus': 8, 'hpclib': 0}],
+                 'reasons': {'Priority': 1, 'AssocGrpGRES': 1},
+                 'queued': [job(202, 'alice', 'ml_train', 'PENDING', 'Priority'),
+                            job(203, 'bob', 'torch_ft', 'PENDING', 'AssocGrpGRES', 'gpu', '2026-11-05T01:00:00')],
+                 'running': [job(201, 'alice', 'hpcrest-orca_big', 'RUNNING', 'None')],
+                 'counts': {'queued': 2, 'running': 1, 'users': 2, 'queued_cpus': 56, 'running_cpus': 96, 'hpclib': 1}}
+        answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c, 'health': {'hpclib_version': '1.11.1'},
+                   'apps': {'apps': [{'id': 'agents', 'title': 'Agents'}]}, 'clusters/demo/queue': queue,
+                   'clusters/demo/jobs/777': {'cluster': 'demo', 'id': '777', 'name': 'hpcrest-orca-scan', 'state': 'RUNNING',
+                                              'source': {'kind': 'agent', 'label': 'agent: orca', 'token': 'llm'}, 'owner': 'someoneelse',
+                                              'mine': False, 'at': time.time(), 'limit': 131072, 'files': {},
+                                              'info': [['JobName', 'hpcrest-orca-scan'], ['User', 'someoneelse'], ['JobState', 'RUNNING']]},
+                   'clusters/demo/jobs': {'at': 0, 'queued': [], 'running': [], 'finished': [],
+                                          'counts': {'queued': 0, 'running': 0, 'finished': 0, 'failed': 0}}}
+        def handler(route, path):
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/c/demo/jobs")
+        main = self.page.locator('main')
+        main.locator('nav.subtabs').wait_for()
+        self.assertEqual(main.locator('nav.subtabs a').all_text_contents(), ['My jobs', 'Whole queue'])
+        main.get_by_role('link', name='Whole queue').click()
+        main.get_by_text('Waiting (2)').wait_for()
+        self.assertTrue(self.page.url.endswith('#/c/demo/jobs/queue'), self.page.url)
+        self.assertEqual(self.page.locator('#pages a.active').inner_text(), 'Jobs')
+        text = main.inner_text()
+        for shown in ('880 of 920 · 40 idle', 'alice', 'hpcrest-orca_big', 'agent: orca', 'ml_train', 'behind higher-priority jobs', 'at an account GPU limit',
+                      '2026-11-05 01:00:00', 'not estimated', 'unknown'):
+            self.assertIn(shown, text)
+        self.assertEqual(main.locator('.util').first.get_attribute('aria-label'), "96% of cpu's CPUs in use")
+        # filtering narrows the lists, not the summaries
+        main.get_by_label('Filter jobs').fill('bob')
+        main.get_by_text('No running job matches.').wait_for()
+        self.assertIn('torch_ft', main.inner_text())
+        self.assertNotIn('ml_train', main.inner_text())
+        self.assertIn('alice', main.locator('table.jobs').nth(1).inner_text())      # still in who is using the cluster
+        # a node in a host list, and only what hpclib started
+        main.get_by_label('Filter jobs').fill('c02')
+        main.get_by_text('hpcrest-orca_big').wait_for()
+        self.assertNotIn('torch_ft', main.inner_text())                       # c[01-02] holds c02
+        main.get_by_label('Filter jobs').fill('')
+        main.get_by_label('Only jobs started by hpclib').check()
+        main.get_by_text('No waiting job matches.').wait_for()
+        self.assertIn('hpcrest-orca_big', main.inner_text())
+        main.get_by_label('Only jobs started by hpclib').uncheck()
+        # a user's name in the table is a filter
+        main.get_by_role('button', name='bob', exact=True).click()
+        self.assertEqual(main.get_by_label('Filter jobs').input_value(), 'bob')
+        main.get_by_text('No running job matches.').wait_for()
+        # open a job by its ID: a bad one says so, a good one opens its page
+        main.get_by_label('Job ID').fill('12x')
+        main.get_by_role('button', name='Open', exact=True).click()
+        main.get_by_text('A job ID is digits').wait_for()
+        main.get_by_label('Job ID').fill('777')
+        main.get_by_label('Job ID').press('Enter')
+        main.get_by_text("someoneelse's job: this is what Slurm shows about it.").wait_for()
+        self.assertTrue(self.page.url.endswith('#/c/demo/jobs/777'), self.page.url)
+        self.assertNotIn('Script', main.inner_text())
+        self.assertIn('someoneelse', main.locator('table.job-info').inner_text())
+        main.get_by_role('link', name='← Jobs').click()
+        main.get_by_label('Filter jobs').wait_for()
+        self.assertEqual(self.errors, [])
+
+    def test_whole_queue_says_when_squeue_failed_instead_of_showing_an_empty_queue(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
+             'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up'}}
+        queue = {'ok': True, 'me': 'mark', 'at': time.time(), 'list_limit': 300, 'error': 'Slurm RPC rate limit exceeded', 'stale': False,
+                 'partitions': [{'name': 'cpu', 'cpus': {'allocated': 10, 'idle': 90, 'other': 0, 'total': 100}, 'nodes': 5,
+                                 'running': None, 'queued': None, 'running_cpus': None, 'queued_cpus': None}],
+                 'users': [], 'reasons': {}, 'queued': [], 'running': [],
+                 'counts': {'queued': None, 'running': None, 'users': None, 'queued_cpus': None, 'running_cpus': None, 'hpclib': None}}
+        answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c, 'health': {'hpclib_version': '1.11.1'},
+                   'apps': {'apps': [{'id': 'agents', 'title': 'Agents'}]}, 'clusters/demo/queue': queue}
+        def handler(route, path):
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/c/demo/jobs/queue")
+        main = self.page.locator('main')
+        main.get_by_role('alert').wait_for()
+        text = main.inner_text()
+        self.assertIn('squeue failed: Slurm RPC rate limit exceeded', text)
+        self.assertIn('not the same as an empty queue', text)
+        self.assertIn('10 of 100 · 90 idle', text)
+        for wrong in ('No one else has jobs', 'Nothing is running', '0 other users'):
+            self.assertNotIn(wrong, text)
+        # the last good answer, kept: its lists show, with the error above them
+        queue.update(stale=True, users=[{'user': 'alice', 'running': 1, 'queued': 0, 'running_cpus': 4, 'queued_cpus': 0, 'hpclib': 0}],
+                     counts={'queued': 0, 'running': 1, 'users': 1, 'queued_cpus': 0, 'running_cpus': 4, 'hpclib': 0},
+                     running=[{'id': '9', 'user': 'alice', 'name': 'old-job', 'state': 'RUNNING', 'reason': 'None', 'partition': 'cpu',
+                               'elapsed': '0:01', 'time_limit': '1:00', 'nodes': '1', 'cpus': '4', 'memory': '1G', 'node_list': 'c01',
+                               'start': '', 'submitted': '', 'priority': '1', 'source': {'kind': 'other', 'label': 'other'}}])
+        main.get_by_role('button', name='Refresh').click()
+        main.get_by_text('old-job').wait_for()
+        self.assertIn('Showing the last answer it gave', main.inner_text())
+        self.assertEqual(self.errors, [])
+
+    def test_my_jobs_can_be_filtered_by_node_and_name(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
+             'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up'}}
+        base = {'partition': 'cpu', 'elapsed': '0:10', 'time_limit': '1:00:00', 'cpus': '4', 'memory': '8G', 'gres': '',
+                'node_list': '', 'start': '', 'reason': 'Priority', 'end': '2026-10-28T10:00:00', 'exit_code': '0:0',
+                'peak_memory_mb': None, 'source': {'kind': 'agent', 'label': 'agent: orca', 'token': 'llm'}}
+        jobs = {'at': 0, 'queued': [dict(base, id='1', name='waiting-job', state='PENDING')],
+                'running': [dict(base, id='2', name='zpe-run', state='RUNNING', node_list='chem-entr-c[03-04]'),
+                            dict(base, id='5', name='other-run', state='RUNNING', node_list='chem-entr-c05')],
+                'finished': [dict(base, id='3', name='good-job', state='COMPLETED')],
+                'counts': {'queued': 1, 'running': 2, 'finished': 1, 'failed': 0}}
+        answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c, 'health': {'hpclib_version': '1.11.1'},
+                   'apps': {'apps': [{'id': 'agents', 'title': 'Agents'}]}, 'clusters/demo/jobs': jobs}
+        def handler(route, path):
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/c/demo/jobs")
+        main = self.page.locator('main')
+        main.get_by_text('zpe-run').wait_for()
+        main.get_by_label('Filter jobs').fill('c04')
+        main.get_by_text('other-run').wait_for(state='detached')
+        text = main.inner_text()
+        self.assertIn('zpe-run', text)
+        for gone in ('waiting-job', 'good-job'):
+            self.assertNotIn(gone, text)
+        main.get_by_label('Filter jobs').fill('good')
+        main.get_by_text('good-job').wait_for()
+        self.assertNotIn('zpe-run', main.inner_text())
+        self.assertEqual(self.errors, [])
+
+    def test_server_settings_save_the_job_name_prefix(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
+             'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up', 'hpclib_version': '1.13.22'}}
+        config = {'path': '/home/me/.local/tunnels/rest/config.json', 'config': {}, 'editable': ['limits', 'job_name_prefix'],
+                  'rules': {}, 'effective': {'limits': {}, 'cluster_notes': None, 'job_name_prefix': 'hpcrest-', 'poll_interval': 10,
+                                             'environment': {'jobs': {}, 'syncs': {}}, 'sandbox': {}, 'extra_path': [],
+                                             'server_modules': [], 'slurm_modules': [], 'slurm_found': True}}
+        puts = []
+        answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c, 'health': {'hpclib_version': '1.13.22'},
+                   'apps': {'apps': [{'id': 'agents', 'title': 'Agents'}]}, 'clusters/demo/rest/admin/config': config,
+                   'clusters/demo/settings': {'modes': ['new'], 'auto_approve_templates': 'new', 'tunnel_args': [], 'connection_hours': 24},
+                   'clusters/demo/sandbox-tools': {'tools': []}, 'clusters/demo/python-tools': {'tools': {}},
+                   'clusters/demo/ports': {'ports': [], 'range': {}}}
+
+        def handler(route, path):
+            if path == 'clusters/demo/rest/admin/config' and route.request.method == 'PUT':
+                puts.append(route.request.post_data_json)
+                route.fulfill(body=json.dumps({'ok': True, 'changed': ['job_name_prefix'], 'backup': None}), content_type='application/json')
+                return True
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/c/demo/settings")
+        box = self.page.get_by_label('Job name prefix')
+        box.wait_for()
+        self.assertEqual((box.input_value(), box.get_attribute('placeholder')), ('', 'hpcrest-'))
+        box.fill('hpc-')
+        self.page.get_by_role('button', name='Save server settings').click()
+        for _ in range(50):
+            if puts:
+                break
+            self.page.wait_for_timeout(100)
+        self.assertEqual(puts, [{'changes': {'job_name_prefix': 'hpc-'}}])
+        box.fill('none')                                      # no prefix at all
+        self.page.get_by_role('button', name='Save server settings').click()
+        for _ in range(50):
+            if len(puts) == 2:
+                break
+            self.page.wait_for_timeout(100)
+        self.assertEqual(puts[1], {'changes': {'job_name_prefix': ''}})
+
     def test_cluster_pages_show_state_jobs_and_next_step(self):
         c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
              'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up', 'hpclib_version': '0.2.70'}}

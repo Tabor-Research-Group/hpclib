@@ -1235,6 +1235,7 @@ class HPCRESTHandler(RESTHandler):
             "effective": {
                 "limits": jobs.limits.to_json(),
                 "cluster_notes": jobs.cluster_notes,
+                "job_name_prefix": jobs.job_name_prefix,
                 "poll_interval": jobs.poll_interval,
                 "environment": {"jobs": jobs.job_env,
                                 "syncs": jobs.environments.sync_env if jobs.environments is not None else {}},
@@ -1489,7 +1490,7 @@ class HPCRESTHandler(RESTHandler):
 
 CONFIG_KEYS = {"limits", "templates_dir", "jobs_db", "audit_log", "tokens_file", "cluster_notes",
                "poll_interval", "proposals_dir", "module_command", "sandbox", "environments", "environment",
-               "scheduler", "tunnel_actions", "extra_path", "server_modules"}
+               "scheduler", "tunnel_actions", "extra_path", "server_modules", "job_name_prefix"}
 
 def load_config(path):
     """
@@ -1497,6 +1498,7 @@ def load_config(path):
       {"limits": {...ResourceLimits...}, "templates_dir": DIR, "jobs_db": FILE,
        "audit_log": FILE or null, "tokens_file": FILE, "cluster_notes": TEXT,
        "poll_interval": SECONDS, "proposals_dir": DIR,
+       "job_name_prefix": TEXT the SLURM job names start with ("hpcrest-" unless set; "" for none),
        "module_command": ["bash", "-lc", "module \"$@\" 2>&1", "hpclib-module"],
        "extra_path": [DIR, ...] added to the end of PATH, for the server and what it starts (where SLURM is,
                      on clusters that only put it on a login shell's PATH; setup and startup add it),
@@ -1542,7 +1544,7 @@ def load_config(path):
 # Sections of config.json the owner may change while the server runs (PUT /admin/config);
 # paths, the module command and tokens stay as setup_agents wrote them.
 EDITABLE_CONFIG = ("limits", "cluster_notes", "environments", "environment", "sandbox", "poll_interval",
-                   "tunnel_actions", "extra_path", "server_modules")
+                   "tunnel_actions", "extra_path", "server_modules", "job_name_prefix")
 CONFIG_LOCK = threading.Lock()
 
 
@@ -1749,6 +1751,7 @@ def updated_config(raw, changes):
         "job_env": env["jobs"],
         "limits": _check_limits(new.get("limits", {})),
         "cluster_notes": notes,
+        "job_name_prefix": rest_jobs.check_job_name_prefix(new.get("job_name_prefix")),
         "poll_interval": poll,
         "sandbox": sandbox,
         "extra_path": check_extra_path(new.get("extra_path")),
@@ -1782,6 +1785,7 @@ def apply_config(server, built):
     jobs = server.jobs
     jobs.limits = built["limits"]
     jobs.cluster_notes = built["cluster_notes"]
+    jobs.job_name_prefix = built["job_name_prefix"]
     jobs.poll_interval = built["poll_interval"]
     jobs.job_env = built["job_env"]
     # the paths a job must not see or change (protect_sandbox) don't depend on the sandbox's settings: the new
@@ -2171,6 +2175,7 @@ def build_jobs(config, command_timeout, auto_approve=None):
         limits=rest_jobs.ResourceLimits(**config.get("limits", {})),
         runner=runner,
         cluster_notes=config.get("cluster_notes"),
+        job_name_prefix=config.get("job_name_prefix"),
         poll_interval=config.get("poll_interval", 10),
         sandbox=sandbox,
         auto_approve=auto_approve,

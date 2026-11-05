@@ -276,6 +276,33 @@ class TestTemplates(JobServerTestCase):
 
 class TestSubmit(JobServerTestCase):
 
+    def job_name(self, **request):
+        out = self.llm.submit_job("hello", {"message": "hi"}, dry_run=True, **request)
+        return next(a.split("=", 1)[1] for a in out["sbatch_args"] if a.startswith("--job-name="))
+
+    def test_the_job_name_is_the_prefix_the_template_and_the_label(self):
+        self.assertEqual(self.job_name(), "hpcrest-hello")
+        self.assertEqual(self.job_name(label="zpe_sampling_controls_20261104"), "hpcrest-hello-zpe_sampling_controls_20261104")
+        # anything SLURM or a file name wouldn't like becomes _, and a long label is cut
+        self.assertEqual(self.job_name(label="ZPE sampling: OH/malonaldehyde (v2)"), "hpcrest-hello-ZPE_sampling_OH_malonaldehyde_v2")
+        self.assertEqual(self.job_name(label="x" * 100), "hpcrest-hello-" + "x" * rest_jobs.JOB_NAME_LABEL_MAX)
+        self.assertEqual(self.job_name(label="***"), "hpcrest-hello")              # nothing usable in it
+
+    def test_the_prefix_is_configurable_and_can_be_empty(self):
+        import rest_server
+        for prefix, expected in (("hpc-", "hpc-hello-scan"), ("", "hello-scan"), (None, "hpcrest-hello-scan")):
+            built = rest_server.updated_config({}, {"job_name_prefix": prefix})[1]
+            rest_server.apply_config(self.server, built)                         # in effect without a restart
+            self.assertEqual(self.job_name(label="scan"), expected, prefix)
+        for bad in ("a b", "x" * 17, 5, "dir/"):
+            with self.assertRaises(ValueError, msg=bad):
+                rest_server.updated_config({}, {"job_name_prefix": bad})
+        self.assertEqual(self.jobs.job_name_prefix, "hpcrest-")
+
+    def test_the_label_is_the_same_label_list_jobs_filters_by(self):
+        self.llm.submit_job("hello", {"message": "hi"}, label="Zpe Scan")
+        self.assertEqual(len(self.llm.jobs(label="Zpe Scan")["jobs"]), 1)           # kept as written, not the slug
+
     def test_dry_run(self):
         out = self.llm.submit_job("hello", {"message": "hi"}, dry_run=True)
         self.assertTrue(out["dry_run"])

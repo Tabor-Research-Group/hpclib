@@ -706,6 +706,16 @@ class TestClusterJobsAndStorage(ConsoleTestCase):
               "A|91|vscode-a1|TIMEOUT|0:15|08:00:12|2026-10-23T06:12:40|cpu||16G|\n"
               "A|101|hpcrest-xtb_opt|PENDING|0:0|00:00:00|Unknown|cpu||8G|\n")
 
+    # the whole queue: me (mark), then partitions (allocated/idle/other/total CPUs, nodes) and every user's jobs
+    QUEUE = ("U|mark\n"
+             "P|cpu|880/40/0/920|23\nP|gpu|64/0/0/64|2\n"
+             "Q|201|alice|RUNNING|None|cpu|1:02:03|2-00:00:00|2|96|384G|c[01-02]|2026-11-04T10:00:00|2026-11-04T09:00:00|1000|hpclib-rest:llm:orca|hpcrest-orca-big\n"
+             "Q|202|alice|PENDING|Priority|cpu|0:00|1-00:00:00|1|48|100G||N/A|2026-11-04T09:30:00|900||ml_train\n"
+             "Q|203|bob|PENDING|AssocGrpGRES|gpu|0:00|04:00:00|1|8|32G||2026-11-05T01:00:00|2026-11-04T11:00:00|800||torch|ft\n"
+             "Q|204|bob|RUNNING|None|gpu|0:10:00|04:00:00|1|8|32G|gpu1|2026-11-04T12:00:00|2026-11-04T11:00:00|800||a|b|c\n"
+             "Q|205|mark|RUNNING|None|cpu|0:10:00|04:00:00|1|4|8G|c03|2026-11-04T12:00:00|2026-11-04T11:00:00|800||mine\n"
+             "Q|206|carol|PENDING|Priority|cpu|0:00|1:00:00|1|4|8G||N/A|2026-11-04T11:10:00|700|hpclib-rest:llm:xtb|hpcrest-xtb\n")
+
     def setUp(self):
         super().setUp()
         self.clusters.logins.alive = lambda profile: True
@@ -719,6 +729,8 @@ class TestClusterJobsAndStorage(ConsoleTestCase):
 
         def runner(profile, script, args=(), wait=60):
             self.ran.append((script, tuple(args)))
+            if script == agent_console.CLUSTER_QUEUE_SCRIPT:
+                return 0, self.QUEUE, ""
             if "squeue" in script:
                 return 0, self.SQUEUE, ""
             if "scancel" in script:
@@ -772,7 +784,8 @@ class TestClusterJobsAndStorage(ConsoleTestCase):
         (bin_dir / "scontrol").write_text(f"""#!/bin/bash
 case "$*" in
   "show job -o 162532") echo "JobId=162532 JobName=live UserId={me}(1000) JobState=RUNNING Reason=None Partition=cpu TimeLimit=04:00:00 NumNodes=1 NumCPUs=1 MinMemoryNode=64G WorkDir={work} Command={work}/run.sh StdOut={work}/live-%j.out Comment=hpclib-rest:llm:py"; ;;
-  "show job -o 777") echo "JobId=777 JobName=x UserId=someoneelse(1) JobState=RUNNING"; ;;
+  "show job -o 777") echo "JobId=777 JobName=hpcrest-orca-scan UserId=someoneelse(1) JobState=RUNNING Reason=None Partition=cpu Account=lab NumCPUs=8 Comment=hpclib-rest:llm:orca WorkDir={work} StdOut={work}/theirs.out"; ;;
+  "write batch_script 777 -") echo "echo secret"; ;;
   "write batch_script 162532 -") echo "#!/bin/bash"; echo "#SBATCH --time=4:00:00"; echo "echo live"; ;;
   *) exit 1 ;;
 esac
@@ -780,7 +793,7 @@ esac
         (bin_dir / "sacct").write_text(f"""#!/bin/bash
 args="$*"
 case "$args" in
-  *"-j 162530"*) case "$args" in *WorkDir*) echo "162530|hpcrest-python_project|FAILED|1:0|00:01:28|04:00:00|2026-11-01T17:35:00|2026-11-01T17:35:10|2026-11-01T17:37:03|cpu|acct|normal|1|cpu=1,mem=16G|cpu=1,mem=16G|c01|hpclib-rest:llm:python_project|{work}|sbatch --mem=16G run.sh" ;; esac ;;
+  *"-j 162530"*) case "$args" in *WorkDir*) echo "162530|hpcrest-python_project|{me}|FAILED|1:0|00:01:28|04:00:00|2026-11-01T17:35:00|2026-11-01T17:35:10|2026-11-01T17:37:03|cpu|acct|normal|1|cpu=1,mem=16G|cpu=1,mem=16G|c01|hpclib-rest:llm:python_project|{work}|sbatch --mem=16G run.sh" ;; esac ;;
   *"-j 162532"*) exit 1 ;;
   *) exit 1 ;;
 esac
@@ -811,8 +824,15 @@ esac
         self.assertEqual(out["files"]["stdout"]["path"], str(work / "live-162532.out"))
         self.assertFalse(out["files"]["stdout"]["found"])
         self.assertEqual(dict(out["info"])["MinMemoryNode"], "64G")
-        # other people's jobs, unknown jobs and bad ids
-        self.assertEqual(self.call("GET", base + "/777")[0], 403)
+        self.assertTrue(out["mine"])
+        # someone else's job: what Slurm says about it, but not their script or output (even where they're readable)
+        (work / "theirs.out").write_text("their results\n")
+        status, out = self.call("GET", base + "/777")
+        self.assertEqual(status, 200, out)
+        self.assertEqual((out["mine"], out["owner"], out["name"], out["source"]["kind"]), (False, "someoneelse", "hpcrest-orca-scan", "agent"))
+        self.assertEqual((dict(out["info"])["User"], dict(out["info"])["Account"], dict(out["info"])["WorkDir"]), ("someoneelse", "lab", str(work)))
+        self.assertEqual(out["files"], {})
+        # unknown jobs and bad ids
         self.assertEqual(self.call("GET", base + "/555")[0], 404)
         self.assertEqual(self.call("GET", base + "/1;rm")[0], 400)
 
@@ -1078,8 +1098,150 @@ esac
         for bad in ({"pinned": "pai"}, {"pinned": ["a b"]}, {"other": []}, {"pinned": ["x"], "hidden": ["x"]}):
             self.assertEqual(self.call("PUT", f"/api/clusters/{self.dead}/app-view", bad)[0], 400, bad)
 
+    def test_the_whole_queue_is_everyone_elses_jobs_and_how_busy_the_partitions_are(self):
+        status, out = self.call("GET", f"/api/clusters/{self.dead}/queue")
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["me"], "mark")
+        self.assertEqual(out["counts"], {"queued": 3, "running": 2, "users": 3, "queued_cpus": 48 + 8 + 4, "running_cpus": 96 + 8, "hpclib": 2})
+        self.assertEqual([j["id"] for j in out["queued"]], ["202", "203", "206"])          # mine (205) is on the Jobs page
+        self.assertEqual([j["id"] for j in out["running"]], ["201", "204"])
+        self.assertEqual(out["running"][1]["name"], "a|b|c")                               # a name may hold the separator
+        self.assertEqual(out["queued"][1]["start"], "2026-11-05T01:00:00")
+        self.assertEqual(out["queued"][0]["start"], "")                                    # N/A: not estimated
+        self.assertEqual(out["reasons"], {"Priority": 2, "AssocGrpGRES": 1})
+        cpu = next(p for p in out["partitions"] if p["name"] == "cpu")
+        self.assertEqual(cpu["cpus"], {"allocated": 880, "idle": 40, "other": 0, "total": 920})
+        self.assertEqual((cpu["running"], cpu["queued"], cpu["running_cpus"], cpu["queued_cpus"]), (2, 2, 100, 52))   # counts mine too
+        self.assertEqual([(u["user"], u["running"], u["queued"]) for u in out["users"]], [("alice", 1, 1), ("bob", 1, 1), ("carol", 0, 1)])
+        # what started each job, from its comment: who is using hpclib
+        self.assertEqual([j["source"]["kind"] for j in out["running"]], ["agent", "other"])
+        self.assertEqual(out["running"][0]["source"], {"kind": "agent", "label": "agent: orca", "token": "llm"})
+        self.assertEqual({u["user"]: u["hpclib"] for u in out["users"]}, {"alice": 1, "bob": 0, "carol": 1})
+        self.assertEqual(out["counts"]["hpclib"], 2)
+        self.assertNotIn("comment", out["running"][0])
+        self.assertEqual(self.ran[-1][0], agent_console.CLUSTER_QUEUE_SCRIPT)
+
+    def test_the_whole_queue_is_capped_but_counted(self):
+        rows = "".join(f"Q|{i}|u{i % 7}|PENDING|Priority|cpu|0:00|1:00:00|1|1|1G||N/A|2026-11-04T11:10:00|5||n{i}\n" for i in range(450))
+        parsed = agent_console.parse_cluster_queue("U|mark\n" + rows)
+        self.assertEqual((len(parsed["queued"]), parsed["counts"]["queued"]), (agent_console.QUEUE_LIST_LIMIT, 450))
+        self.assertEqual(len(parsed["users"]), 7)
+
+    def test_the_whole_queue_needs_the_login_and_reports_squeue_errors(self):
+        self.clusters.logins.alive = lambda profile: False
+        self.assertEqual(self.call("GET", f"/api/clusters/{self.dead}/queue")[0], 409)
+        self.clusters.logins.alive = lambda profile: True
+        self.clusters.script_runner = lambda *a, **k: (1, "squeue: error: Unable to contact slurm controller\n", "")
+        with mock.patch.object(self.clusters, "QUEUE_RETRY_WAIT", 0):
+            status, out = self.call("GET", f"/api/clusters/{self.dead}/queue")
+        self.assertEqual(status, 502)
+        self.assertIn("slurm controller", out["error"])
+
+    def test_a_squeue_failure_is_not_an_empty_queue(self):
+        """sinfo answers but squeue doesn't (a busy or rate-limiting controller): the answer says so, and gives no job counts."""
+        runs = []
+        busy = "U|mark\nP|cpu|10/90/0/100|5\nE|slurm_load_jobs error: Slurm RPC rate limit exceeded\n"
+        self.clusters.script_runner = lambda profile, script, args=(), wait=60: (runs.append(1) or (0, busy, ""))
+        with mock.patch.object(self.clusters, "QUEUE_RETRY_WAIT", 0):
+            status, out = self.call("GET", f"/api/clusters/{self.dead}/queue")
+        self.assertEqual(status, 200, out)
+        self.assertEqual(len(runs), 2)                                           # it tried again
+        self.assertIn("rate limit", out["error"])
+        self.assertFalse(out["stale"])
+        self.assertIsNone(out["counts"]["running"])
+        self.assertEqual((out["partitions"][0]["cpus"]["allocated"], out["partitions"][0]["running"]), (10, None))
+        self.assertEqual((out["queued"], out["running"], out["users"]), ([], [], []))
+
+    def test_a_transient_squeue_failure_is_retried_and_the_last_good_answer_is_kept(self):
+        answers = [("U|mark\nP|cpu|10/90/0/100|5\nE|Socket timed out\n"), self.QUEUE, "U|mark\nE|busy\n", "U|mark\nE|busy\n"]
+        runs = []
+        def runner(profile, script, args=(), wait=60):
+            runs.append(1)
+            return 0, answers.pop(0), ""
+        self.clusters.script_runner = runner
+        with mock.patch.object(self.clusters, "QUEUE_RETRY_WAIT", 0), mock.patch.object(self.clusters, "QUEUE_CACHE", 0):
+            out = self.call("GET", f"/api/clusters/{self.dead}/queue")[1]
+            self.assertEqual((len(runs), out["error"], out["counts"]["running"]), (2, None, 2))     # the retry worked
+            out = self.call("GET", f"/api/clusters/{self.dead}/queue")[1]                            # now it keeps failing
+        self.assertEqual((out["error"], out["stale"], out["counts"]["running"]), ("busy", True, 2))
+        self.assertEqual(len(out["running"]), 2)
+
+    def test_the_queue_script_marks_a_failed_squeue(self):
+        """The real script, here, with a fake squeue that fails or works: E| carries the failure, Q| lines the jobs."""
+        bin_dir = Path(self.tmp) / "queue-bin"
+        bin_dir.mkdir()
+        (bin_dir / "sinfo").write_text("#!/bin/bash\necho 'P|cpu|1/2/0/3|1'\n")
+        (bin_dir / "squeue").write_text('#!/bin/bash\nif [ -e "$FAIL" ]; then echo "squeue: error: Slurm RPC rate limit exceeded" >&2; echo second line; exit 1; fi\n'
+                                       'echo "Q|1|bob|RUNNING|None|cpu|0:01|1:00|1|1|1G|n1|N/A|2026-11-04T09:00:00|5||job"\n')
+        for f in ("sinfo", "squeue"):
+            (bin_dir / f).chmod(0o755)
+
+        def run(fail):
+            marker = Path(self.tmp) / "fail"
+            marker.unlink(missing_ok=True)
+            if fail:
+                marker.write_text("")
+            return subprocess.run(["bash", "-s"], input=agent_console.CLUSTER_QUEUE_SCRIPT, capture_output=True, text=True,
+                                  env={"PATH": f"{bin_dir}:/usr/bin:/bin", "FAIL": str(marker)}).stdout.splitlines()
+        good, bad = run(False), run(True)
+        self.assertEqual([l[:2] for l in good], ["U|", "P|", "Q|"])
+        self.assertEqual([l[:2] for l in bad], ["U|", "P|", "E|"])
+        self.assertIn("rate limit", bad[2])
+
+    def test_a_squeue_that_prints_what_cant_be_read_is_reported(self):
+        for output, expect in (("U|mark\nP|cpu|1/2/0/3|1\nQ|1|short\nQ|2|lines\n", "2 lines the console couldn't read"),
+                               ("U|mark\nP|cpu|1/2/0/3|1\nsqueue: something odd\n", "something else: squeue: something odd")):
+            self.clusters.script_runner = lambda *a, o=output, **k: (0, o, "")
+            self.clusters.queue_cache.clear()
+            with mock.patch.object(self.clusters, "QUEUE_RETRY_WAIT", 0):
+                out = self.call("GET", f"/api/clusters/{self.dead}/queue")[1]
+            self.assertIn(expect, out["error"])
+            self.assertIsNone(out["counts"]["running"])
+        self.clusters.queue_cache.clear()
+        self.clusters.script_runner = lambda *a, **k: (0, "U|mark\nP|cpu|1/2/0/3|1\n", "")      # an empty queue is not an error
+        out = self.call("GET", f"/api/clusters/{self.dead}/queue")[1]
+        self.assertEqual((out["error"], out["counts"]["running"]), (None, 0))
+
+    def test_a_comment_over_several_lines_is_still_one_job(self):
+        bin_dir = Path(self.tmp) / "multi-squeue"
+        bin_dir.mkdir()
+        (bin_dir / "sinfo").write_text("#!/bin/bash\necho 'P|cpu|1/2/0/3|1'\n")
+        (bin_dir / "squeue").write_text('#!/bin/bash\n'
+                                       'echo "Q|7|siheng|PENDING|Priority|cpu|0:00|1:00|1|80|2900G||N/A|2026-11-02T12:40:52|11392|(from job_submit) your job is charged as"\n'
+                                       'echo "below|big_run"\n'
+                                       'echo "Q|8|bob|RUNNING|None|cpu|0:01|1:00|1|1|1G|n1|N/A|2026-11-04T09:00:00|5||job"\n')
+        for f in ("sinfo", "squeue"):
+            (bin_dir / f).chmod(0o755)
+        res = subprocess.run(["bash", "-s"], input=agent_console.CLUSTER_QUEUE_SCRIPT, capture_output=True, text=True,
+                             env={"PATH": f"{bin_dir}:/usr/bin:/bin"})
+        parsed = agent_console.parse_cluster_queue(res.stdout)
+        self.assertEqual((parsed["counts"]["queued"], parsed["counts"]["running"]), (1, 1))
+        self.assertEqual([j["name"] for j in parsed["queued"]], ["big_run"])
+
+    def test_the_queue_script_falls_back_to_a_squeue_without_the_comment_field(self):
+        bin_dir = Path(self.tmp) / "old-squeue"
+        bin_dir.mkdir()
+        (bin_dir / "sinfo").write_text("#!/bin/bash\necho 'P|cpu|1/2/0/3|1'\n")
+        (bin_dir / "squeue").write_text('#!/bin/bash\ncase "$*" in *"%k"*) echo "squeue: error: Invalid job format specification: k" >&2; exit 1 ;; esac\n'
+                                       'echo "Q|1|bob|RUNNING|None|cpu|0:01|1:00|1|1|1G|n1|N/A|2026-11-04T09:00:00|5||job"\n')
+        for f in ("sinfo", "squeue"):
+            (bin_dir / f).chmod(0o755)
+        res = subprocess.run(["bash", "-s"], input=agent_console.CLUSTER_QUEUE_SCRIPT, capture_output=True, text=True,
+                             env={"PATH": f"{bin_dir}:/usr/bin:/bin"})
+        parsed = agent_console.parse_cluster_queue(res.stdout)
+        self.assertEqual([l[:2] for l in res.stdout.splitlines()], ["U|", "P|", "Q|"])
+        self.assertEqual((parsed["counts"]["running"], parsed["running"][0]["name"]), (1, "job"))
+
+    def test_the_whole_queue_is_reused_for_a_few_seconds(self):
+        runs = []
+        runner = self.clusters.script_runner
+        self.clusters.script_runner = lambda *a, **k: (runs.append(1) or runner(*a, **k))
+        self.call("GET", f"/api/clusters/{self.dead}/queue")
+        out = self.call("GET", f"/api/clusters/{self.dead}/queue")[1]
+        self.assertEqual((len(runs), out["counts"]["running"]), (1, 2))
+
     def test_scripts_parse(self):
-        for script in (agent_console.CLUSTER_JOBS_SCRIPT, agent_console.CLUSTER_STORAGE_LIST_SCRIPT,
+        for script in (agent_console.CLUSTER_QUEUE_SCRIPT, agent_console.CLUSTER_JOBS_SCRIPT, agent_console.CLUSTER_STORAGE_LIST_SCRIPT,
                        agent_console.CLUSTER_STORAGE_FOLDER_SCRIPT, agent_console.JOB_DETAIL_SCRIPT):
             self.assertEqual(subprocess.run(["bash", "-n"], input=script, text=True).returncode, 0)
 

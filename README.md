@@ -553,7 +553,8 @@ on your machine as MCP tools.
     concurrent-job slots.
   - `limits.max_array_tasks` (default 1000) caps the array size.
   - `GET /jobs/status?id=&tasks=1` gives every task's state, its manifest entry and its log file, and arrays report
-    `task_counts` and `failed_tasks`. `label` tags a submission, and `GET /jobs?label=` filters by it.
+    `task_counts` and `failed_tasks`. `label` tags a submission, `GET /jobs?label=` filters by it, and it is added to the job's SLURM name
+    (`hpcrest-orca-sample_scan`; the prefix is `job_name_prefix` in the REST config).
 - **Module discovery.** `GET /modules/avail?query=` and `GET /modules/spider?query=` run `module avail` and
   `module spider` through a login shell. Queries are module names only, and results are cached for 10 minutes. A
   `name/version` spider explains what must be loaded first. If `module` needs a different setup on your cluster,

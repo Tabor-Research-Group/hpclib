@@ -216,6 +216,20 @@ PLACEMENT_VALUE = {
 PLACEMENT = tuple(PLACEMENT_VALUE)
 
 
+DEFAULT_JOB_NAME_PREFIX = "hpcrest-"
+JOB_NAME_LABEL_MAX = 48        # characters of a job's label that go into its SLURM name
+
+
+def check_job_name_prefix(value):
+    """The config's `job_name_prefix`, checked: what every SLURM job name starts with ("" for nothing)."""
+    if value is None:
+        return DEFAULT_JOB_NAME_PREFIX
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9._-]{0,16}", value):
+        raise ValueError('`job_name_prefix` must be up to 16 letters, digits, ".", "_" or "-" (empty for none), '
+                         'e.g. "hpc-"')
+    return value
+
+
 class ResourceLimits:
     """
     Caps applied to every template job. `None` means no cap (for the
@@ -1434,8 +1448,9 @@ class JobManager:
     def __init__(self, templates: TemplateStore, registry: JobRegistry, limits: ResourceLimits,
                  runner: SlurmRunner, cluster_notes=None, poll_interval=10, proposals: ProposalStore = None,
                  modules: ModuleSystem = None, sandbox: 'rest_sandbox.Sandbox' = None, auto_approve=None,
-                 environments: 'rest_envs.EnvironmentManager' = None, job_env=None):
+                 environments: 'rest_envs.EnvironmentManager' = None, job_env=None, job_name_prefix=None):
         self.templates = templates
+        self.job_name_prefix = check_job_name_prefix(job_name_prefix)
         self.registry = registry
         self.limits = limits
         self.runner = runner
@@ -1690,6 +1705,13 @@ class JobManager:
             return active
         return [j for j in self.refresh(active) if not j["terminal"]]
 
+    def job_name(self, template, label=None):
+        """The SLURM job name: the prefix, the template and, when the job has a label, that label (letters, digits,
+        `.`, `_` and `-` kept, the rest turned into `_`, the first few dozen characters), so the queue says
+        what a job is for: `hpcrest-python_project-zpe_sampling_controls`."""
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", label or "").strip("_.-")[:JOB_NAME_LABEL_MAX].rstrip("_.-")
+        return f"{self.job_name_prefix}{template}" + (f"-{slug}" if slug else "")
+
     def _output_path(self, job):
         if job.get("array_size"):
             return os.path.join(job["workdir"], self.ARRAY_OUTPUT_PATTERN.replace("%A", str(job["job_id"])))
@@ -1800,7 +1822,7 @@ class JobManager:
         if not os.path.isdir(workdir):
             raise RESTError(422, f"workdir {workdir} is not an existing directory")
 
-        job_name = f"hpcrest-{template.name}"
+        job_name = self.job_name(template.name, label)
         # A sandboxed job may write where its token may: the token's directories (narrowed
         # by the server's --allow list), or just the workdir if neither restricts it.
         writable = list(whitelist.roots) if whitelist.restricted else [workdir]

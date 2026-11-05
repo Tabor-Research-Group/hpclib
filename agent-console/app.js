@@ -1005,6 +1005,9 @@ async function serverSettings(c) {
   });
   const serverModules = el("textarea", { rows: 2, placeholder: "slurm/25.05" }, (raw.server_modules || []).join("\n"));
   const notes = el("textarea", { rows: 4 }, raw.cluster_notes || "");
+  // blank is the default ("hpcrest-"); "none" is no prefix at all
+  const namePrefix = el("input", { value: raw.job_name_prefix === "" ? "none" : (raw.job_name_prefix || ""), size: 14,
+                                   placeholder: "hpcrest-", maxlength: 16, "aria-label": "Job name prefix" });
   const envBoxes = Object.fromEntries(ENV_SCOPES.map(([k, label]) => {
     const box = el("hpc-env-editor", { label });
     box.rules = (conf.rules || {}).environment || null;   // older servers don't send them; they still check on save
@@ -1055,6 +1058,7 @@ async function serverSettings(c) {
       extra_path: lines(extraPath.value).length ? lines(extraPath.value) : null,
       server_modules: lines(serverModules.value).length ? lines(serverModules.value) : null,
       cluster_notes: notes.value.trim() || null,
+      job_name_prefix: namePrefix.value.trim() === "none" ? "" : (namePrefix.value.trim() || null),
     };
   };
   let shown = collect();   // only sections edited since then are sent
@@ -1168,6 +1172,9 @@ async function serverSettings(c) {
       "Agents see the names in cluster_info, and a job can print the values; don't put secrets here that " +
       "agents shouldn't read. PATH, LD_*, SINGULARITY*, SLURM_*, HPC_* and the like are refused."),
     el("div", { class: "row" }, ENV_SCOPES.map(([k, label, hint]) => field(label, envBoxes[k], hint))),
+    el("h4", {}, "Job names"),
+    field("Job name prefix", namePrefix, "what agents' SLURM jobs are named from: PREFIX + template + label, e.g. hpcrest-python_project-zpe_scan. " +
+      "Blank is hpcrest-; a shorter one such as hpc- saves room in squeue; none leaves it off. Jobs already queued keep their names"),
     el("h4", {}, "Notes for agents"),
     field("Cluster notes", notes, "shown to agents in cluster_info"),
     el("div", { class: "actions" }, save),

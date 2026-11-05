@@ -318,6 +318,7 @@ async function overview(c, local) {
 async function jobsTab(c, _local, sub = "") {
   const { api } = ctx;
   if (!login(c)) return el("p", { class: "muted" }, "Log in to see this cluster's jobs.");
+  if (sub === "queue") return queuePage(c);
   if (sub) return jobPage(c, sub);
   let j;
   try { j = await api(path(c.name, "jobs")); } catch (err) { return ctx.errorBox(err); }
@@ -340,7 +341,8 @@ async function jobsTab(c, _local, sub = "") {
     el("thead", {}, el("tr", {}, heads.map((h) => el("th", {}, h)))), el("tbody", {}, rows))
     : el("p", { class: "muted" }, empty);
   const failedState = (job) => job.state !== "COMPLETED";
-  const finishedRows = (only) => j.finished.filter((job) => !only || failedState(job)).map((job) => el("tr", {},
+  let v = j;                                         // the jobs that match the filter
+  const finishedRows = (only) => v.finished.filter((job) => !only || failedState(job)).map((job) => el("tr", {},
     jobCell(job), el("td", {}, source(job)),
     el("td", {}, job.state === "COMPLETED" ? chip("completed", "up")
       : chip(`${job.state.toLowerCase().replaceAll("_", " ")}${job.exit_code && job.exit_code !== "0:0" ? ` (${job.exit_code})` : ""}`, "error")),
@@ -351,14 +353,14 @@ async function jobsTab(c, _local, sub = "") {
     el("td", {}, (job.end || "").replace("T", " "))));
   const sections = {
     queued: () => [el("h3", { id: "queued" }, `Queued (${n.queued})`),
-      table(["Job", "From", "Partition", "Asked for", "Waiting because", "Expected start", ""], j.queued.map((job) => el("tr", {},
+      table(["Job", "From", "Partition", "Asked for", "Waiting because", "Expected start", ""], v.queued.map((job) => el("tr", {},
         jobCell(job), el("td", {}, source(job)),
         el("td", {}, job.partition), el("td", {}, requested(job)),
         el("td", { title: job.reason }, REASONS[job.reason] || job.reason),
         el("td", {}, job.start ? job.start.replace("T", " ") : el("span", { class: "muted" }, "not estimated")),
         actions(job))), "Nothing is waiting.")],
     running: () => [el("h3", { id: "running" }, `Running (${n.running})`),
-      table(["Job", "From", "Node", "Time used", "Asked for", ""], j.running.map((job) => el("tr", {},
+      table(["Job", "From", "Node", "Time used", "Asked for", ""], v.running.map((job) => el("tr", {},
         jobCell(job), el("td", {}, source(job)),
         el("td", {}, job.node_list), el("td", {}, `${job.elapsed} of ${job.time_limit}`), el("td", {}, requested(job)),
         actions(job))), "Nothing is running.")],
@@ -373,6 +375,8 @@ async function jobsTab(c, _local, sub = "") {
   const buttons = [];
   const draw = () => {
     const only = jobFilter[c.name];
+    const keep = jobMatcher(jobText[c.name] || "");
+    v = { queued: j.queued.filter(keep), running: j.running.filter(keep), finished: j.finished.filter(keep) };
     body.replaceChildren(...(only ? sections[only]() : ["queued", "running", "finished"].flatMap((k) => sections[k]())));
     for (const b of buttons) b.setAttribute("aria-pressed", String(b.dataset.kind === only));
   };
@@ -384,17 +388,175 @@ async function jobsTab(c, _local, sub = "") {
     buttons.push(b);
     return b;
   };
+  const filter = el("input", { type: "search", size: 36, value: jobText[c.name] || "", "aria-label": "Filter jobs",
+                               placeholder: "Filter by job name, node, partition or what started it" });
+  filter.addEventListener("input", () => { jobText[c.name] = filter.value; draw(); });
   draw();
-  return el("div", {},
+  return el("div", {}, jobViews(c, "mine"), jobOpener(c),
     el("div", { class: "toolbar" },
       el("div", { class: "counts", role: "group", "aria-label": "Show jobs" },
         count("queued", "starting", " queued", n.queued),
         count("running", "up", " running", n.running),
         count("finished", "", " finished today", n.finished),
         n.failed ? count("failed", "error", " failed", n.failed) : null),
+      filter,
       el("span", { class: "muted" }, `as of ${new Date(j.at * 1000).toLocaleTimeString()}`),
       action("Refresh", () => ctx.render())),
     body);
+}
+
+// Slurm's host lists, written out: "c[01-03,05],gpu1" -> c01 c02 c03 c05 gpu1, so a filter for one node finds the jobs on it
+function expandHosts(list) {
+  const out = [];
+  const walk = (text) => {
+    if (out.length > 500) return;
+    const open = text.indexOf("["), close = text.indexOf("]", open);
+    if (open < 0 || close < 0) { if (text) out.push(text); return; }
+    const head = text.slice(0, open), tail = text.slice(close + 1);
+    for (const part of text.slice(open + 1, close).split(",")) {
+      const [a, b = a] = part.split("-"), from = Number(a), to = Number(b);
+      if (!/^\d+$/.test(a) || !/^\d+$/.test(b) || to < from || to - from > 500) { walk(head + part + tail); continue; }
+      for (let i = from; i <= to && out.length <= 500; i++) walk(head + String(i).padStart(a.length, "0") + tail);
+    }
+  };
+  let depth = 0, start = 0;
+  for (let i = 0; i <= list.length; i++) {          // commas inside [] belong to the range, the others separate hosts
+    const ch = list[i];
+    if (ch === "[") depth++;
+    else if (ch === "]") depth--;
+    else if (i === list.length || (ch === "," && depth === 0)) { walk(list.slice(start, i)); start = i + 1; }
+  }
+  return out;
+}
+
+// A filter over jobs: every word typed must be somewhere in the job's user, name, ID, partition, nodes (host lists
+// written out) or what started it (an agent's template and token, an app's name)
+function jobMatcher(text) {
+  const words = text.toLowerCase().split(/\s+/).filter(Boolean);
+  return (job) => {
+    if (!words.length) return true;
+    const hay = [job.user, job.name, job.id, job.partition, job.node_list, job.node_list ? expandHosts(job.node_list).join(" ") : "",
+      job.source && job.source.label, job.source && job.source.token].filter(Boolean).join(" ").toLowerCase();
+    return words.every((w) => hay.includes(w));
+  };
+}
+const jobText = {};        // cluster -> the Jobs tab's filter text, kept while the page is open
+const queueText = {};      // the same for the whole queue
+const queueHpclib = {};    // cluster -> only the jobs hpclib started, in the whole queue
+
+// Open any job's page by its ID, yours or someone else's (what Slurm shows about it; their script and output stay unread)
+function jobOpener(c) {
+  const input = el("input", { type: "text", size: 14, placeholder: "e.g. 164071", "aria-label": "Job ID", inputmode: "numeric" });
+  const problem = el("span", { class: "error-text small", "aria-live": "polite" });
+  const open = () => {
+    const id = input.value.trim();
+    if (!/^[0-9]+(_[0-9]+)?$/.test(id)) { problem.textContent = "A job ID is digits (an array task: 123_4)."; return; }
+    problem.textContent = "";
+    location.hash = href(c.name, "jobs", id);
+  };
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); open(); } });
+  return el("div", { class: "job-open" }, el("label", {}, "Open job info ", input),
+    el("button", { type: "button", class: "primary", onclick: open }, "Open"), problem,
+    el("span", { class: "muted small" }, "any job on the cluster, someone else's too"));
+}
+
+// Your jobs, or the whole queue (everyone else's)
+const jobViews = (c, active) => subTabs([[href(c.name, "jobs"), "My jobs", "mine"], [href(c.name, "jobs", "queue"), "Whole queue", "queue"]], active);
+
+// Why other people's jobs wait, in general terms (the account and QOS limits are theirs, not yours)
+const QUEUE_REASONS = {
+  Priority: "behind higher-priority jobs", Resources: "waiting for free nodes", None: "about to start",
+  Dependency: "waiting for another job", BeginTime: "scheduled for later", ReqNodeNotAvail: "requested node unavailable",
+  JobHeldUser: "held by its owner", JobHeldAdmin: "held by an administrator", PartitionTimeLimit: "over the partition's time limit",
+  AssocGrpGRES: "at an account GPU limit", AssocMaxJobsLimit: "at an account job limit",
+  QOSMaxJobsPerUserLimit: "at a QOS job limit", QOSMaxCpuPerUserLimit: "at a QOS CPU limit",
+};
+
+// Everyone else's jobs on the cluster: how busy each partition is, who is using it, why jobs wait, and the jobs
+// themselves (the first few hundred of each); your own are on My jobs. One squeue over your login.
+async function queuePage(c) {
+  const { api } = ctx;
+  let q;
+  try { q = await api(path(c.name, "queue")); } catch (err) { return ctx.errorBox(err); }
+  const n = q.counts;
+  const cpus = (v) => `${count(v)} CPU${v === 1 ? "" : "s"}`;
+  const table = (heads, rows, empty) => rows.length ? el("table", { class: "jobs" },
+    el("thead", {}, el("tr", {}, heads.map((h) => el("th", {}, h)))), el("tbody", {}, rows))
+    : el("p", { class: "muted" }, empty);
+  const reason = (r) => el("span", { title: r }, QUEUE_REASONS[r] || r);
+  // the name opens the job's page (what Slurm shows about it; not their script or output)
+  const jobName = (j) => el("td", {}, el("a", { class: "job-link", href: href(c.name, "jobs", j.id) }, j.name), el("div", { class: "muted small" }, j.id));
+  const source = (j) => (j.source.kind === "other" ? el("span", { class: "muted" }, "—")
+    : chip(j.source.label, SOURCE_TONE[j.source.kind] || "down", j.source.token ? `token ${j.source.token}` : null));
+  const partitions = table(["Partition", "CPUs in use", "", "Running", "Waiting"], q.partitions.map((p) => {
+    const t = p.cpus, busy = t && t.total ? 100 * t.allocated / t.total : 0;
+    return el("tr", {}, el("td", {}, p.name),
+      el("td", {}, t ? `${count(t.allocated)} of ${count(t.total)} · ${count(t.idle)} idle` : el("span", { class: "muted" }, "unknown")),
+      el("td", { class: "bar-cell" }, el("div", { class: "util", role: "img", "aria-label": `${Math.round(busy)}% of ${p.name}'s CPUs in use` },
+        el("span", { style: `width: ${busy}%` }))),
+      el("td", {}, p.running === null ? el("span", { class: "muted" }, "—") : `${p.running} job${p.running === 1 ? "" : "s"} · ${cpus(p.running_cpus)}`),
+      el("td", {}, p.queued === null ? el("span", { class: "muted" }, "—") : `${p.queued} job${p.queued === 1 ? "" : "s"} · ${cpus(p.queued_cpus)}`));
+  }), "Slurm listed no partitions.");
+  const filter = el("input", { type: "search", size: 36, value: queueText[c.name] || "", "aria-label": "Filter jobs",
+                               placeholder: "Filter by user, job name, node or partition" });
+  const hpclibOnly = el("input", { type: "checkbox", checked: Boolean(queueHpclib[c.name]), "aria-label": "Only jobs started by hpclib" });
+  const users = table(["User", "Running", "Waiting", "Started by hpclib"], q.users.map((u) => el("tr", {},
+    el("td", {}, el("button", { type: "button", class: "link-button", title: `Show only ${u.user}'s jobs`,
+      onclick: () => { filter.value = queueText[c.name] = u.user; draw(); } }, u.user)),
+    el("td", {}, u.running ? `${u.running} · ${cpus(u.running_cpus)}` : el("span", { class: "muted" }, "—")),
+    el("td", {}, u.queued ? `${u.queued} · ${cpus(u.queued_cpus)}` : el("span", { class: "muted" }, "—")),
+    el("td", {}, u.hpclib ? chip(`${u.hpclib} job${u.hpclib === 1 ? "" : "s"}`, "agent", "agents, apps and tunnels hpclib started") : el("span", { class: "muted" }, "—")))),
+    "No one else has jobs.");
+  const reasons = Object.keys(q.reasons).length ? el("p", { class: "chips" }, Object.entries(q.reasons).map(
+    ([r, k]) => chip(`${k} ${QUEUE_REASONS[r] || r}`, "starting", r))) : el("p", { class: "muted" }, "Nothing is waiting.");
+  const lists = el("div", {});
+  const draw = () => {
+    const words = filter.value.trim() || hpclibOnly.checked;
+    const match = jobMatcher(filter.value);
+    const keep = (j) => match(j) && (!hpclibOnly.checked || j.source.kind !== "other");
+    const queued = q.queued.filter(keep), running = q.running.filter(keep);
+    const cut = (total, list) => (total > list.length ? ` (the first ${list.length} of ${total})` : "");
+    lists.replaceChildren(
+      el("h3", { id: "queue-running" }, `Running (${n.running})${cut(n.running, q.running)}`),
+      table(["Job", "User", "From", "Partition", "Node", "Time used", "Asked for"], running.map((j) => el("tr", {},
+        jobName(j), el("td", {}, j.user), el("td", {}, source(j)), el("td", {}, j.partition),
+        el("td", {}, j.node_list), el("td", {}, `${j.elapsed} of ${j.time_limit}`),
+        el("td", {}, [`${j.cpus} CPU`, j.memory && j.memory !== "0" && j.memory].filter(Boolean).join(" · ")))),
+        words ? "No running job matches." : "Nothing is running."),
+      el("h3", { id: "queue-waiting" }, `Waiting (${n.queued})${cut(n.queued, q.queued)}`),
+      table(["Job", "User", "From", "Partition", "Asked for", "Waiting because", "Submitted", "Expected start"], queued.map((j) => el("tr", {},
+        jobName(j), el("td", {}, j.user), el("td", {}, source(j)), el("td", {}, j.partition),
+        el("td", {}, [`${j.cpus} CPU`, j.memory && j.memory !== "0" && j.memory].filter(Boolean).join(" · ")),
+        el("td", {}, reason(j.reason)), el("td", {}, (j.submitted || "").replace("T", " ")),
+        el("td", {}, j.start ? j.start.replace("T", " ") : el("span", { class: "muted" }, "not estimated")))),
+        words ? "No waiting job matches." : "Nothing is waiting."));
+  };
+  filter.addEventListener("input", () => { queueText[c.name] = filter.value; draw(); });
+  hpclibOnly.addEventListener("change", () => { queueHpclib[c.name] = hpclibOnly.checked; draw(); });
+  draw();
+  // squeue failed (a busy or rate-limiting controller, say): say so, and don't show an empty queue as if it were the answer
+  const problem = q.error ? el("div", { class: "error-box", role: "alert" },
+    `squeue failed: ${q.error}. ` + (q.stale ? `Showing the last answer it gave, from ${new Date(q.at * 1000).toLocaleTimeString()}.`
+      : "The jobs and users can't be shown, which is not the same as an empty queue; Refresh tries again.")) : null;
+  if (q.error && !q.stale) {
+    return el("div", {}, jobViews(c, "queue"), jobOpener(c), problem,
+      el("div", { class: "toolbar" }, action("Refresh", () => ctx.render())),
+      el("h3", {}, "Partitions"), partitions);
+  }
+  return el("div", {}, jobViews(c, "queue"), jobOpener(c), problem,
+    el("div", { class: "toolbar" },
+      el("div", { class: "counts" }, el("span", {}, el("strong", {}, String(n.users)), " other users"),
+        el("span", {}, el("strong", {}, String(n.hpclib || 0)), " jobs from hpclib"),
+        el("span", {}, el("strong", {}, String(n.running)), ` running · ${cpus(n.running_cpus)}`),
+        el("span", {}, el("strong", {}, String(n.queued)), ` waiting · ${cpus(n.queued_cpus)}`)),
+      el("span", { class: "muted" }, `as of ${new Date(q.at * 1000).toLocaleTimeString()}`),
+      action("Refresh", () => ctx.render())),
+    el("h3", {}, "Partitions"), el("p", { class: "muted small" }, "CPUs in use and waiting jobs count everyone's jobs, yours too."), partitions,
+    el("h3", {}, "Who is using the cluster"), users,
+    el("h3", {}, "Why jobs are waiting"), reasons,
+    el("div", { class: "toolbar" }, filter,
+      el("label", { class: "inline-check", title: "Agents' jobs, apps and agent tunnels: the jobs hpclib started" }, hpclibOnly, " Only hpclib jobs")),
+    lists);
 }
 
 // One job: what was asked of Slurm, the batch script, and what the job wrote, wherever each still exists
@@ -428,13 +590,16 @@ async function jobPage(c, id) {
       appLink,
       el("span", { class: "muted" }, `as of ${new Date(d.at * 1000).toLocaleTimeString()}`),
       action("Refresh", () => ctx.render())),
+    d.mine === false ? el("p", { class: "muted" }, `${d.owner ? `${d.owner}'s job` : "Someone else's job"}: this is what Slurm shows about it. ` +
+      "Its script and output are not read.") : null,
     el("h3", {}, "Settings"),
     d.info.length ? el("table", { class: "compact job-info" }, el("tbody", {}, d.info.map(([k, v]) =>
       el("tr", {}, el("td", { class: "muted" }, k), el("td", {}, v)))))
       : el("p", { class: "muted" }, "Slurm no longer has this job's settings."),
-    ...file("Script", d.files.script, "Slurm kept no copy of the script, and the file it was submitted from is gone."),
-    ...file("Output", d.files.stdout, "No output file was found."),
-    ...file("Error output", d.files.stderr, null));
+    ...(d.mine === false ? [] : [
+      ...file("Script", d.files.script, "Slurm kept no copy of the script, and the file it was submitted from is gone."),
+      ...file("Output", d.files.stdout, "No output file was found."),
+      ...file("Error output", d.files.stderr, null)]));
 }
 const jobFilter = {};      // cluster -> the kind of job its Jobs tab shows (null: all), while the page is open
 

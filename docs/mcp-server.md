@@ -103,7 +103,7 @@ What else an app runs keeps whatever protection you give its directories. PAI's 
 | `cluster_info` | `GET /cluster`: partitions, limits, templates, guides, allowed directories, notes, proposal policy | yes |
 | `sandbox_info` | `GET /sandbox`: the node's isolation features and a self-test | yes |
 | `list_templates`, `read_guide` | `GET /templates`, `GET /templates/guide` | yes |
-| `submit_job` | `POST /jobs`, with `dry_run`, `idempotency_key`, `label`, and `tasks`/`tasks_from`/`throttle` for arrays | |
+| `submit_job` | `POST /jobs`, with `dry_run`, `idempotency_key`, `label` (also added to the job's SLURM name, so the queue says what the job is for), and `tasks`/`tasks_from`/`throttle` for arrays | |
 | `list_jobs`, `job_status`, `wait_for_job` | `GET /jobs`, `/jobs/status`, `/jobs/wait` (up to 300 s) | yes |
 | `cancel_job` | `POST /jobs/cancel` | |
 | `list_files`, `read_file`, `tail_file` | `GET /files`, `/files/read`, `/files/tail`, bounded in size | yes |
@@ -223,6 +223,7 @@ you in `/etc/subuid` and `/etc/subgid`, and lingering (`loginctl enable-linger`)
   "limits": {"partitions": ["short", "gpu"], "accounts": null, "qos": null, "max_time": "04:00:00",
              "max_mem": "64G", "max_cpus": 16, "max_nodes": 1, "max_gpus": 1,
              "max_concurrent_jobs": 4, "max_array_tasks": 1000},
+  "job_name_prefix": "hpcrest-",
   "cluster_notes": "Prefer the short partition; ORCA is ORCA/5.0.4 after GCC and OpenMPI.",
   "sandbox": {"method": "auto", "binds": ["/sw"], "writable": [], "flags": []},
   "environments": {"uv": "auto", "pixi": "auto", "modules": ["WebProxy"], "timeout": 1800, "max_running": 2},
@@ -241,6 +242,7 @@ you in `/etc/subuid` and `/etc/subgid`, and lingering (`loginctl enable-linger`)
 | `environment` | variables for all jobs and syncs, template jobs only, or syncs only; names that would change `PATH`, the sandbox, hpclib or SLURM are refused | yes |
 | `extra_path` | directories added to the end of `PATH` for the server and the commands and jobs it starts, e.g. `["/cm/local/apps/slurm/current/bin"]`. Some clusters put SLURM on `PATH` only for login shells, so a server started over SSH can't find `sbatch` or `srun`. `setup_agents` and server start look for SLURM in a login shell, then an interactive one, then the usual install directories (Bright's `/cm/local/apps/slurm/current/bin`, `/opt/slurm/bin` and others), and save its directory here; the console's Server settings show it as **Extra PATH directories** and offer a one-click fix | yes |
 | `server_modules` | environment modules the server loads for itself and for the commands and jobs it starts, e.g. `["slurm/25.05"]`. For clusters where SLURM comes from a module (Bright Cluster Manager's `slurm/25.05`) that sets more than `PATH`, such as its configuration and libraries, which `extra_path` can't. The server loads them in a login shell and applies what they changed to its own environment. A module that doesn't load is refused when saving. At start, if SLURM still can't be found, the server loads the cluster's SLURM module itself and saves it here; the console's Server settings show it as **Modules to load for the server** and offer a one-click fix | yes |
+| `job_name_prefix` | what the SLURM names of the agents' jobs start with: the name is `PREFIX` + template + `-` + the job's `label` (`hpcrest-python_project-zpe_scan`). Default `hpcrest-`; up to 16 letters, digits, `.`, `_` and `-`, and `""` for none. Jobs already queued keep their names | yes |
 | `poll_interval` | how often job states are refreshed | yes |
 | `scheduler` | `{"type": "local"}` and its budget on machines without SLURM | restart |
 | `module_command` | how `module` is run (default `["bash", "-lc", "module \"$@\" 2>&1", "hpclib-module"]`), if a login shell isn't right | restart |

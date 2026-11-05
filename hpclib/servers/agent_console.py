@@ -1034,6 +1034,70 @@ class Logins:
 
 
 
+QUEUE_LIST_LIMIT = 300      # the queued and the running jobs of other users that the page lists (all are counted)
+
+
+QUEUED_JOB_STATES = frozenset({"PENDING", "REQUEUED", "SUSPENDED", "REQUEUE_HOLD", "RESV_DEL_HOLD", "SPECIAL_EXIT"})
+
+
+def parse_cluster_queue(text, limit=QUEUE_LIST_LIMIT, queued_states=QUEUED_JOB_STATES, source_of=None):
+    """CLUSTER_QUEUE_SCRIPT's lines: the queue of everyone but you, as {me, partitions, users, reasons, queued,
+    running, counts}: your own jobs are left out (the Jobs page has them), but the partitions' CPUs count everything.
+    source_of(name, comment) says what started a job ({kind, label, ...}); jobs hpclib started are counted per user."""
+    me, partitions, jobs = "", {}, []
+    for line in text.splitlines():
+        kind, _, rest = line.partition("|")
+        if kind == "U":
+            me = rest.strip()
+        elif kind == "P":
+            name, _, rest = rest.partition("|")
+            cpus, _, nodes = rest.partition("|")
+            parts = cpus.split("/")
+            if len(parts) == 4 and all(p.isdigit() for p in parts):
+                partitions[name] = {"name": name, "cpus": dict(zip(("allocated", "idle", "other", "total"), map(int, parts))),
+                                    "nodes": int(nodes) if nodes.strip().isdigit() else None}
+        elif kind == "Q":
+            f = rest.split("|", 15)
+            if len(f) == 16:
+                jobs.append({"id": f[0], "user": f[1], "state": f[2], "reason": f[3], "partition": f[4], "elapsed": f[5],
+                             "time_limit": f[6], "nodes": f[7], "cpus": f[8], "memory": f[9], "node_list": f[10],
+                             "start": "" if f[11] in ("N/A", "Unknown") else f[11], "submitted": f[12],
+                             "priority": f[13], "name": f[15],
+                             "source": source_of(f[15], f[14]) if source_of else {"kind": "other", "label": "other"}})
+    cpu_of = lambda job: int(job["cpus"]) if job["cpus"].isdigit() else 0
+    users, reasons, queued, running, per_part = {}, {}, [], [], {}
+    for job in jobs:
+        waiting = job["state"] in queued_states
+        p = per_part.setdefault(job["partition"], {"running": 0, "queued": 0, "running_cpus": 0, "queued_cpus": 0})
+        p["queued" if waiting else "running"] += 1
+        p["queued_cpus" if waiting else "running_cpus"] += cpu_of(job)
+        if job["user"] == me:
+            continue
+        u = users.setdefault(job["user"], {"user": job["user"], "running": 0, "queued": 0, "running_cpus": 0,
+                                           "queued_cpus": 0, "hpclib": 0})
+        u["hpclib"] += job["source"]["kind"] != "other"
+        u["queued" if waiting else "running"] += 1
+        u["queued_cpus" if waiting else "running_cpus"] += cpu_of(job)
+        if waiting:
+            reasons[job["reason"]] = reasons.get(job["reason"], 0) + 1
+            queued.append(job)
+        else:
+            running.append(job)
+    for name, p in per_part.items():                  # a partition sinfo didn't list still shows what is in it
+        partitions.setdefault(name, {"name": name, "cpus": None, "nodes": None}).update(p)
+    for part in partitions.values():
+        part.setdefault("running", 0), part.setdefault("queued", 0)
+        part.setdefault("running_cpus", 0), part.setdefault("queued_cpus", 0)
+    busiest = sorted(users.values(), key=lambda u: (-(u["running_cpus"] + u["queued_cpus"]), u["user"]))
+    return {"me": me, "partitions": sorted(partitions.values(), key=lambda p: p["name"]), "users": busiest[:25],
+            "reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
+            "queued": queued[:limit], "running": running[:limit],
+            "read": len(jobs),
+            "counts": {"queued": len(queued), "running": len(running), "users": len(users),
+                       "queued_cpus": sum(cpu_of(j) for j in queued), "running_cpus": sum(cpu_of(j) for j in running),
+                       "hpclib": sum(u["hpclib"] for u in users.values())}}
+
+
 def parse_rss(value):
     """sacct's MaxRSS ("123456K", "1.5G") in KiB."""
     m = re.fullmatch(r"([0-9.]+)([KMGT]?)", (value or "").strip())
@@ -1253,6 +1317,20 @@ sacct -n -P -u "$USER" -S now-1day -o JobID,JobName,State,ExitCode,Elapsed,End,P
   2>/dev/null | sed 's/^/A|/'
 """
 
+# Runs ON the login node: the whole queue, every user's: `U|ME`, then `P|PARTITION|ALLOCATED/IDLE/OTHER/TOTAL CPUS|NODES`
+# per partition (sinfo), `E|MESSAGE` if squeue failed (a busy or rate-limiting Slurm controller says so there) and `Q|...` per queued or running job (squeue; the comment, which hpclib marks its jobs with, and
+# the job's name last, since a name may hold a `|`).
+CLUSTER_QUEUE_SCRIPT = r"""
+echo "U|$(id -un)"
+sinfo -h -o 'P|%R|%C|%D' 2>/dev/null
+fmt='Q|%i|%u|%T|%r|%P|%M|%l|%D|%C|%m|%N|%S|%V|%Q'
+jobs=$(squeue -h -a -o "$fmt|%k|%j" 2>&1); rc=$?
+[ "$rc" -eq 0 ] || { jobs=$(squeue -h -a -o "$fmt||%j" 2>&1); rc=$?; }    # a squeue without the comment field still lists jobs
+if [ "$rc" -ne 0 ]; then printf 'E|%s\n' "$(printf '%s\n' "$jobs" | head -n 1)"
+else printf '%s\n' "$jobs" | awk '/^Q\|/ { if (line != "") print line; line = $0; next } { line = line " " $0 } END { if (line != "") print line }'    # a comment can run over several lines (a job_submit plugin's): one job, one line
+fi
+"""
+
 # Runs ON the login node: JOB: what Slurm still knows about one of your jobs, and the files it names, as marked
 # lines: `S|key|value` (scontrol, while the job is in its memory), `A|key|value` (sacct, once it isn't), and for the
 # batch script, the output and the error file `F|kind|source|path|state|size|mtime` then `D|kind|base64` (the last
@@ -1263,15 +1341,13 @@ me=$(id -un)
 info=$(scontrol show job -o "$job" 2>/dev/null | head -n 1)
 pick() { printf '%s\n' "$info" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -n 1; }
 if [ -n "$info" ]; then
-  owner=$(pick UserId)
-  case "$owner" in "$me("*) ;; *) echo "N|not yours"; exit 3 ;; esac
-  for k in JobName JobState Reason Partition Account QOS TimeLimit NumNodes NumCPUs NumTasks CPUs/Task MinMemoryNode \
+  for k in JobName UserId JobState Reason Partition Account QOS TimeLimit NumNodes NumCPUs NumTasks CPUs/Task MinMemoryNode \
            MinMemoryCPU ReqTRES AllocTRES TresPerNode Features Dependency Reservation Nice Requeue SubmitTime \
            StartTime EndTime NodeList ExitCode Comment WorkDir Command StdOut StdErr; do
     v=$(pick "$k"); [ -z "$v" ] || printf 'S|%s|%s\n' "$k" "$v"
   done
 fi
-fields=JobID,JobName,State,ExitCode,Elapsed,Timelimit,Submit,Start,End,Partition,Account,QOS,AllocCPUS,ReqTRES,AllocTRES,NodeList,Comment
+fields=JobID,JobName,User,State,ExitCode,Elapsed,Timelimit,Submit,Start,End,Partition,Account,QOS,AllocCPUS,ReqTRES,AllocTRES,NodeList,Comment
 names="$fields"
 row=$(sacct -X -P -n -j "$job" -o "$fields,WorkDir,SubmitLine" 2>/dev/null | head -n 1) && names="$fields,WorkDir,SubmitLine"
 [ -n "$row" ] || { row=$(sacct -X -P -n -j "$job" -o "$fields" 2>/dev/null | head -n 1); names="$fields"; }
@@ -1282,6 +1358,13 @@ if [ -n "$row" ]; then
   so=$(sacct -X -P -n -j "$job" -o StdOut,StdErr 2>/dev/null | head -n 1)
   [ -z "$so" ] || { printf 'A|StdOut|%s\n' "${so%%|*}"; printf 'A|StdErr|%s\n' "${so#*|}"; }
 fi
+# whose job it is: only your own jobs' script and output are read; for anyone else's, the settings are all
+owner=$(pick UserId); owner="${owner%%(*}"
+[ -n "$owner" ] || owner=$(printf '%s\n' "$row" | awk -F'|' -v names="$names" 'BEGIN { n = split(names, k, ",") }
+  { for (i = 1; i <= n; i++) if (k[i] == "User") print $i }')
+mine=0; [ -n "$owner" ] && [ "$owner" = "$me" ] && mine=1
+printf 'O|%s|%s\n' "$owner" "$mine"
+[ "$mine" = 1 ] || exit 0
 want() { # first value of KEY from scontrol, else sacct
   v=$(pick "$1"); [ -n "$v" ] || v=$(printf '%s\n' "$row" | awk -F'|' -v names="$names" -v key="$1" \
     'BEGIN { n = split(names, k, ",") } { for (i = 1; i <= n; i++) if (k[i] == key) print $i }')
@@ -1396,6 +1479,7 @@ class Clusters:
         self.ssh_login_lock = threading.Lock()  # public-key bootstrap; no REST server needed
         self.script_runner = self._login_script
         self.storage_scans = {}      # name -> {"state": "running", "started": ...} while a storage scan runs
+        self.queue_cache = {}        # name -> (time, the last whole-queue answer that squeue gave)
         self.storage_lock = threading.Lock()   # the storage cache file: a scan and quota checks both write it
         self.stops = {}              # (name, app or None) -> when Stop was asked for here (notifications skip those)
         self.packages = load_package_apps()
@@ -1831,7 +1915,57 @@ class Clusters:
                 return {"kind": "app", "label": spec["title"], "app": app}
         return {"kind": "other", "label": "other"}
 
-    QUEUED_STATES = {"PENDING", "REQUEUED", "SUSPENDED", "REQUEUE_HOLD", "RESV_DEL_HOLD", "SPECIAL_EXIT"}
+    QUEUED_STATES = QUEUED_JOB_STATES
+
+    QUEUE_CACHE = 15           # seconds a whole-queue answer is reused: squeue on everyone's jobs is heavy, and some
+                               # sites rate-limit it, so a page that is refreshed often shouldn't ask every time
+    QUEUE_RETRY_WAIT = 3       # seconds before squeue is tried once more after it failed
+
+    def cluster_queue(self, profile):
+        """The queue of everyone else on the cluster: how busy each partition is, who is using it, why jobs wait, and
+        the queued and running jobs (the first few hundred of each), read over the console's login. When squeue
+        fails (after one retry) the answer says why in `error`: with the last good job lists and `stale` if there
+        were any, else with the partitions alone and no jobs, which is not the same as an empty queue."""
+        name = profile["name"]
+        if not self.logins.alive(profile):
+            raise ConsoleError(409, f"log in to {name} first: the queue is read over the console's login")
+        with self.lock:
+            cached = self.queue_cache.get(name)
+        if cached and time.time() - cached[0] < self.QUEUE_CACHE:
+            return dict(cached[1])
+        for attempt in (1, 2):
+            code, out, err = self.script_runner(profile, CLUSTER_QUEUE_SCRIPT, (), 60)
+            failed = next((line[2:].strip() for line in out.splitlines() if line.startswith("E|")), None)
+            if failed is None and code != 0 and "Q|" not in out and "P|" not in out:
+                failed = (err or out).strip().splitlines()[-1] if (err or out).strip() else f"exit {code}"
+            if failed is None:
+                break
+            if attempt == 1:
+                time.sleep(self.QUEUE_RETRY_WAIT)
+        text = "\n".join(line for line in out.splitlines() if line[:2] in ("U|", "P|", "Q|"))
+        queue = parse_cluster_queue(text, source_of=self.job_source)
+        if failed is None:                # squeue said nothing was wrong: check that what it printed was read
+            said = [line for line in out.splitlines() if line.strip()]
+            odd = [line for line in said if line[:2] not in ("U|", "P|", "Q|")]
+            lines = [line for line in said if line.startswith("Q|")]
+            if lines and not queue["read"]:
+                failed = f"squeue printed {len(lines)} lines the console couldn't read, such as {lines[0][:160]!r}"
+            elif odd and not lines:
+                failed = f"squeue printed something else: {odd[0][:200]}"
+        answer = dict(queue, cluster=name, at=time.time(), list_limit=QUEUE_LIST_LIMIT, error=None, stale=False)
+        if failed is None:
+            with self.lock:
+                self.queue_cache[name] = (time.time(), answer)
+            return dict(answer)
+        reason = self._one_line(failed) or "no answer"
+        if cached:                       # the last good lists, with today's partitions where sinfo answered
+            return dict(cached[1], error=reason, stale=True)
+        if not queue["partitions"] and not queue["me"]:
+            raise ConsoleError(502, f"squeue failed on {name}: {reason}")
+        no_jobs = [dict(p, running=None, queued=None, running_cpus=None, queued_cpus=None) for p in queue["partitions"]]
+        return dict(answer, error=reason, partitions=no_jobs, queued=[], running=[], users=[], reasons={},
+                    counts=dict(queue["counts"], queued=None, running=None, users=None, queued_cpus=None,
+                                running_cpus=None, hpclib=None))
 
     def cluster_jobs(self, profile):
         """Every job of yours on the cluster: squeue's queued and running jobs, and the last day's finished ones."""
@@ -1883,36 +2017,42 @@ class Clusters:
     JOB_DETAIL_LIMIT = 131072            # the last bytes of the script, output and error file that are sent
 
     # the settings worth showing (Slurm's names), in this order; the rest of what Slurm said stays out of the way
-    JOB_INFO_KEYS = ("JobName", "JobState", "Reason", "ExitCode", "Partition", "Account", "QOS", "TimeLimit", "NumNodes",
+    JOB_INFO_KEYS = ("JobName", "User", "JobState", "Reason", "ExitCode", "Partition", "Account", "QOS", "TimeLimit", "NumNodes",
                      "NumCPUs", "NumTasks", "CPUs/Task", "MinMemoryNode", "MinMemoryCPU", "ReqTRES", "AllocTRES",
                      "TresPerNode", "Features", "Dependency", "Reservation", "Nice", "Requeue", "SubmitTime",
                      "StartTime", "EndTime", "Elapsed", "NodeList", "WorkDir", "SubmitLine", "Command", "StdOut",
                      "StdErr", "Comment")
-    JOB_INFO_ALIASES = {"State": "JobState", "Timelimit": "TimeLimit", "Submit": "SubmitTime", "Start": "StartTime",
+    JOB_INFO_ALIASES = {"UserId": "User", "State": "JobState", "Timelimit": "TimeLimit", "Submit": "SubmitTime", "Start": "StartTime",
                         "End": "EndTime", "AllocCPUS": "NumCPUs"}
     JOB_EMPTY = ("", "N/A", "(null)", "Unknown", "None", "0:0")
 
     def job_detail(self, profile, job):
-        """One job: its sbatch settings, and its script, output and error file where they still exist."""
+        """One job: its sbatch settings, and its script, output and error file where they still exist. Anyone's job
+        can be looked up (what Slurm lets you see: `PrivateData` can hide other users' jobs), but only your own
+        job's script and output are read."""
         if not re.fullmatch(r"[0-9]+(_[0-9]+)?", job or ""):
             raise ConsoleError(400, "a job ID is digits, with _N for an array task")
         if not self.logins.alive(profile):
             raise ConsoleError(409, f"log in to {profile['name']} first: the job is read over the console's login")
         code, out, err = self.script_runner(profile, JOB_DETAIL_SCRIPT, (job, str(self.JOB_DETAIL_LIMIT)), 60)
-        if code == 3:
-            raise ConsoleError(403, f"job {job} isn't yours")
         if code == 4 or out.startswith("N|unknown"):
-            raise ConsoleError(404, f"{profile['name']} no longer knows job {job} (Slurm's accounting keeps jobs "
-                                    "for as long as the site sets)")
+            raise ConsoleError(404, f"{profile['name']} doesn't show job {job}: it may be too old (Slurm's accounting "
+                                    "keeps jobs for as long as the site sets), or belong to someone whose jobs the "
+                                    "site hides from you")
         if code != 0 and "F|" not in out:
             raise ConsoleError(502, f"reading job {job} failed: "
                                     f"{self._one_line((err or out).strip().splitlines()[-1] if (err or out).strip() else code)}")
-        info, files = {}, {}
+        info, files, owner, mine = {}, {}, "", False
         for line in out.splitlines():
             kind, _, rest = line.partition("|")
-            if kind in ("S", "A"):
+            if kind == "O":
+                owner, _, flag = rest.partition("|")
+                mine = flag.strip() == "1"
+            elif kind in ("S", "A"):
                 key, _, value = rest.partition("|")
                 key = self.JOB_INFO_ALIASES.get(key, key)
+                if key == "User":
+                    value = value.split("(")[0]
                 # scontrol (S) speaks first; accounting (A) fills in what it left out
                 if value not in self.JOB_EMPTY and key not in info:
                     info[key] = value
@@ -1938,6 +2078,7 @@ class Clusters:
         return {"cluster": profile["name"], "id": job, "name": info.get("JobName", ""),
                 "state": (info.get("JobState") or "").split()[0] if info.get("JobState") else "",
                 "source": self.job_source(info.get("JobName"), info.get("Comment")),
+                "owner": owner or info.get("User", ""), "mine": mine,
                 "info": ordered, "files": files, "at": time.time(), "limit": self.JOB_DETAIL_LIMIT}
 
     def cancel_job(self, profile, body):
@@ -4724,6 +4865,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 return 202, dict(c.install(profile, self.json_body()), ok=True)
             if rest == ["setup"] and verb == "POST":
                 return 202, dict(c.setup(profile, self.json_body()), ok=True)
+            if rest == ["queue"] and verb == "GET":
+                return 200, dict(c.cluster_queue(profile), ok=True)
             if rest == ["jobs"] and verb == "GET":
                 return 200, dict(c.cluster_jobs(profile), ok=True)
             if len(rest) == 2 and rest[0] == "jobs" and rest[1] != "cancel" and verb == "GET":

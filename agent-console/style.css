@@ -228,6 +228,10 @@ table.bars td.num, table.bars th.num { text-align: right; }
 table.bars th { font-weight: 400; color: var(--muted); font-size: var(--font-size-small); }
 /* a running storage scan: a moving bar on the card, a pulse on the folder being scanned, a spinner by the status */
 .inline-check { display: inline-flex; align-items: center; gap: var(--space-xs); cursor: pointer; }
+.util { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; min-width: 120px; }
+.util > span { display: block; height: 100%; background: var(--accent); }
+.job-open { display: flex; align-items: center; gap: var(--space-md); flex-wrap: wrap; margin: 0 0 var(--space-md); }
+.error-text { color: var(--bad); }
 .scan-limits { display: inline-flex; align-items: center; gap: var(--space-lg); flex-wrap: wrap; }
 input.minutes { width: 4.5em; }
 .root-controls { display: flex; align-items: center; gap: var(--space-md); flex-wrap: wrap; margin: var(--space-xs) 0 var(--space-sm); }
