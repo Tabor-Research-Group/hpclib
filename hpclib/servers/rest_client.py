@@ -199,6 +199,12 @@ class RESTClient:
             query["refresh"] = 1
         return self.request("GET", "/quota", query=query, timeout=max(self.timeout, 180))
 
+    # the whole queue (queue_view.py on the cluster)
+    def queue(self, jobs="none", user=None, partition=None, name=None, hpclib=False, limit=50, refresh=False):
+        return self.request("GET", "/queue", query={"jobs": jobs, "user": user, "partition": partition, "name": name,
+                                                    "hpclib": 1 if hpclib else None, "limit": limit,
+                                                    "refresh": 1 if refresh else None}, timeout=max(self.timeout, 120))
+
     # Python environments (uv, pixi)
     def environment(self, project=None, manager="auto", environment="default"):
         query = {"project": project, "manager": manager, "environment": environment} if project else None

@@ -88,6 +88,10 @@ Endpoints (all responses are JSON unless noted)    scope
                                  with the cluster's own commands (lib/quota.sh: showquota and
                                  myproject by default; HPCLIB_*_QUOTA_CHECK or the cluster's
                                  settings change them); cached for a minute
+  GET    /queue[?jobs=none|running|queued|all][&user=U][&partition=P][&name=TEXT][&hpclib=1][&limit=N][&refresh=1]
+                                 everyone's queue: counts, partitions (CPUs), GPUs by partition and   read
+                                 type (in use, free, most free on one node), busiest users, why jobs
+                                 wait; with jobs=, those jobs (filtered, the first N of each); cached 15 s
   POST   /slurm/{sbatch,squeue,sacct,scontrol,scancel}
            body: {"args": [...], "cwd": "...", "input": "..."}   slurm
   GET    /slurm/{squeue,sacct}?arg=...&arg=...&cwd=...          slurm
@@ -148,8 +152,9 @@ import traceback
 import urllib.parse
 
 try:
-    from . import rest_envs, rest_jobs, rest_local, rest_sandbox, ssh_keys, rest_installs, rest_actions
+    from . import rest_envs, rest_jobs, rest_local, rest_sandbox, ssh_keys, rest_installs, rest_actions, queue_view
 except ImportError:  # run as a script from the servers directory
+    import queue_view
     import rest_actions
     import rest_envs
     import rest_jobs
@@ -437,6 +442,56 @@ class QuotaChecks:
         raise RESTError(500, "lib/quota.sh gave no answer: " + (stderr.strip()[-2000:] or f"exit {proc.returncode}"))
 
 
+class ClusterQueue:
+    """
+    GET /queue: queue_view's CLUSTER_QUEUE_SCRIPT (squeue and sinfo for everyone's jobs, which agents can't ask for
+    through their own jobs' list), run as this user. squeue on everyone's jobs is heavy and some sites rate-limit it,
+    so an answer is kept for TTL seconds and one read runs at a time; when squeue fails the last good answer is
+    returned with `error` and `stale`, and with no earlier answer the partitions alone and no counts.
+    """
+    TTL = 15
+    TIMEOUT = 60
+    RETRY_WAIT = 3
+
+    def __init__(self, env=None, runner=None):
+        self.env = env
+        self.runner = runner or self._run
+        self._lock = threading.Lock()
+        self._cache = None
+
+    def read(self, refresh=False):
+        with self._lock:
+            cached = self._cache
+            if cached and not refresh and time.time() - cached[0] < self.TTL:
+                return dict(cached[1])
+            queue, failed = queue_view.read_queue(self.runner, queue_view.hpclib_source, self.RETRY_WAIT)
+            answer = dict(queue, cluster=socket.gethostname(), at=time.time(), error=None, stale=False)
+            if failed is None:
+                self._cache = (time.time(), answer)
+                return dict(answer)
+            reason = " ".join(failed.split())[:300] or "no answer"
+            if cached:
+                return dict(cached[1], error=reason, stale=True)
+            if not queue["partitions"] and not queue["me"]:
+                raise RESTError(502, f"squeue failed: {reason}")
+            return queue_view.failed_queue_answer(answer, queue, reason)
+
+    def _run(self):
+        env = self.env if self.env is not None else rest_sandbox.child_env()
+        proc = subprocess.Popen(["bash", "-s"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env, start_new_session=True)
+        try:
+            stdout, stderr = proc.communicate(queue_view.CLUSTER_QUEUE_SCRIPT, timeout=self.TIMEOUT)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.communicate()
+            raise RESTError(504, f"squeue took over {self.TIMEOUT} s")
+        return proc.returncode, stdout, stderr
+
+
 class RESTServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -458,6 +513,7 @@ class RESTServer(http.server.ThreadingHTTPServer):
         self.ssh_keys = ssh_keys.SSHKeyStore()
         self.tunnel_installs = rest_installs.TunnelInstalls()
         self.quota = QuotaChecks()
+        self.cluster_queue = ClusterQueue()
         self.sandbox_prober = None
         if jobs is not None:
             probe_dir = os.path.join(jobs.sandbox.data_dir or tempfile.gettempdir(), "sandbox", "probe")
@@ -737,6 +793,7 @@ class HPCRESTHandler(RESTHandler):
             ("GET", "/actions"): "read",
             ("POST", "/actions/run"): "read",
             ("GET", "/quota"): "read",
+            ("GET", "/queue"): "read",
         },
         **{("POST", f"/slurm/{c}"): "slurm" for c in SLURM_COMMANDS},
         **{("GET", f"/slurm/{c}"): "slurm" for c in READ_ONLY_COMMANDS},
@@ -784,6 +841,7 @@ class HPCRESTHandler(RESTHandler):
             ("GET", "/actions"): self.do_actions,
             ("POST", "/actions/run"): self.do_run_action,
             ("GET", "/quota"): self.do_quota,
+            ("GET", "/queue"): self.do_queue,
             # owner only: not in ROUTE_SCOPES, so they need the `*` scope
             ("GET", "/admin/proposals"): self.do_admin_proposals,
             ("GET", "/admin/proposals/diff"): self.do_admin_proposal_diff,
@@ -947,6 +1005,16 @@ class HPCRESTHandler(RESTHandler):
         out = self.server.quota.check(kind, refresh=self.query_flag("refresh"))
         self.audit_detail = {"quota": kind}
         return 200, out
+
+    def do_queue(self):
+        show = self.query_value("jobs", "none")
+        if show not in ("none", "running", "queued", "all"):
+            raise RESTError(422, "jobs: one of none, running, queued, all")
+        limit = self.query_int("limit", 50, minimum=1, maximum=500)
+        answer = self.server.cluster_queue.read(refresh=self.query_flag("refresh"))
+        self.audit_detail = {"queue": show}
+        return 200, queue_view.queue_report(answer, show, self.query_value("user"), self.query_value("partition"),
+                                            self.query_value("name"), self.query_flag("hpclib"), limit)
 
     def do_health(self):
         wl = self.whitelist

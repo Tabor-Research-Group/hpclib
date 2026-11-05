@@ -294,6 +294,8 @@ function addClusterForm(onAdded) {
   const host = el("input", { placeholder: "user@login.cluster.edu", size: 32 });
   const port = el("input", { type: "number", min: 1, max: 65535, placeholder: "22", size: 6 });
   const jump = el("input", { placeholder: "optional: [user@]jumphost", size: 24 });
+  const identity = el("input", { placeholder: "optional: ~/.ssh/id_ed25519_cluster", size: 32, "aria-label": "Identity file" });
+  const sshOptions = el("input", { placeholder: "optional: -o ServerAliveInterval=30", size: 32, "aria-label": "SSH options" });
   const work = el("input", { placeholder: "/scratch/user/me/llm", size: 32 });
   const binds = el("input", { placeholder: "optional: /software", size: 24 });
   const local = el("input", { placeholder: "~/Documents/hpclib-agents", size: 32 });
@@ -310,7 +312,8 @@ function addClusterForm(onAdded) {
   const add = action("Add, then log in and set up", async () => {
     if (!work.value.trim()) throw new Error("give a work directory on the cluster");
     const c = await api("clusters", { method: "POST", body: { host: host.value.trim(),
-      port: port.value ? Number(port.value) : null, jump: jump.value.trim() || null } });
+      port: port.value ? Number(port.value) : null, jump: jump.value.trim() || null,
+      identity_file: identity.value.trim() || null, ssh_options: sshOptions.value.trim() || null } });
     const setup = { work_dirs: [work.value.trim()], binds: words(binds.value),
                     local_roots: local.value.trim() ? [local.value.trim()] : [] };
     if (defaultLauncher().command) Object.assign(setup, { mcp_command: defaultLauncher().command, mcp_args: defaultLauncher().args });
@@ -322,6 +325,10 @@ function addClusterForm(onAdded) {
     el("h3", {}, "Add a cluster"),
     el("p", { class: "muted" }, "The console logs in (password, then a Duo push) and runs setup_agents over that login."),
     el("div", { class: "row" }, field("Login", host), field("Port", port), field("Jump host", jump)),
+    el("details", {}, el("summary", {}, "More ssh options (identity file, other ssh settings)"),
+      el("div", { class: "row" }, field("Identity file", identity, "a private key on this machine, for a site that wants a specific one; " +
+        "if it has a passphrase, enter that as the password when you log in"),
+        field("SSH options", sshOptions, "-o Key=Value, -F FILE; also changeable later in the cluster's Settings"))),
     el("div", { class: "row" }, field("Work directory for agents", work, "absolute path on the cluster"),
       field("Extra read-only directories", binds, "space-separated")),
     el("div", { class: "row" }, field("Local folder for the agent's files", local,
@@ -956,6 +963,38 @@ async function quotaSettings(c) {
     el("div", { class: "actions" }, save, needLogin ? el("span", { class: "muted small" }, "Log in to save: it's written on the cluster.") : null));
 }
 
+// How the console reaches the cluster: the ssh options its login is made with (kept in the profile, on this machine)
+async function sshConnectionSettings(c) {
+  const s = await api(cluster(c.name) + "/ssh/connection");
+  const port = el("input", { type: "number", min: 1, max: 65535, value: s.port || "", placeholder: "22", size: 6, "aria-label": "Port" });
+  const jump = el("input", { value: s.jump || "", placeholder: "optional: [user@]jumphost", size: 28, "aria-label": "Jump host" });
+  const identity = el("input", { value: s.identity_file || "", placeholder: "optional: ~/.ssh/id_ed25519_cluster", size: 40, "aria-label": "Identity file" });
+  const options = el("input", { value: s.options || "", placeholder: "optional: -o ServerAliveInterval=30", size: 40, "aria-label": "SSH options" });
+  const command = el("code", {}, s.command);
+  const save = saveButton("Save SSH connection", async () => {
+    const out = await api(cluster(c.name) + "/ssh/connection", { method: "PUT", body: {
+      port: port.value ? Number(port.value) : null, jump: jump.value.trim() || null,
+      identity_file: identity.value.trim() || null, options: options.value.trim() } });
+    command.textContent = out.command;
+    identity.value = out.identity_file || "";
+    options.value = out.options || "";
+    return "Saved. " + (out.connected ? "You are logged in now: log out and in again for it to apply." : "It applies from the next login.");
+  });
+  return el("section", { class: "card" },
+    el("h3", {}, "SSH connection ", el("span", { class: "muted" }, "· kept on this machine")),
+    el("p", { class: "muted" }, "How the console, the tunnel and setup log in to ", el("code", {}, s.host),
+      ". Use an identity file when the site wants a specific private key; if the key has a passphrase, give it as the " +
+      "password when you log in. The SSH options are ", el("code", {}, "-o Key=Value"), " settings (such as ServerAliveInterval or " +
+      "PreferredAuthentications), ", el("code", {}, "-F FILE"), " for an ssh config file, and -4, -6, -A, -a, -C, -q, -v."),
+    el("div", { class: "row" }, field("Port", port), field("Jump host", jump)),
+    el("div", { class: "row" },
+      field("Identity file", identity, s.identity_file && !s.identity_found ? "this file isn't on this machine now" : "a private key file on this machine; ssh is told to offer only it (IdentitiesOnly=yes) unless you set that yourself"),
+      field("SSH options", options)),
+    s.managed_key ? el("p", { class: "muted small" }, "The key hpclib installed for this login (SSH keys tab) is kept as it is.") : null,
+    el("p", { class: "muted small" }, "Logs in with: ", command),
+    el("div", { class: "actions" }, save));
+}
+
 async function serverSettings(c) {
   const head = el("h3", {}, "Server ", el("span", { class: "muted" }, "· config.json on the cluster"));
   if (!c.tunnel || c.tunnel.state !== "up") {
@@ -1393,7 +1432,8 @@ async function settingsPage() {
   const pick = el("hpc-cluster-picker", { value: c.name });
   pick.clusters = clusters;
   pick.addEventListener("change", () => { location.hash = "#/settings/" + encodeURIComponent(pick.value); });
-  const sections = await Promise.all([tunnelSettings(c), portSettings(c).catch(errorBox), serverSettings(c).catch(errorBox)]);
+  const sections = await Promise.all([tunnelSettings(c), portSettings(c).catch(errorBox), serverSettings(c).catch(errorBox),
+                                      sshConnectionSettings(c).catch(errorBox)]);
   return [el("h2", {}, "Settings"), el("div", { class: "toolbar" }, pick), sections];
 }
 
@@ -1932,10 +1972,10 @@ async function packagesDialog() {
 }
 clusterUI.init({
   api, errorBox, render: () => render(),
-  // the cluster's Settings tab: the tunnel and its server first, then port clearing and quota checks
+  // the cluster's Settings tab: the tunnel and its server first, then port clearing, quota checks and the ssh connection
   settingsCards: (c) => Promise.all([tunnelSettings(c), serverSettings(c).catch(errorBox), sandboxToolsSettings(c), pythonToolsSettings(c),
                                      portSettings(c).catch(errorBox),
-                                     quotaSettings(c).catch(errorBox)]),
+                                     quotaSettings(c).catch(errorBox), sshConnectionSettings(c).catch(errorBox)]),
   addCluster: addClusterControls,
   files: (name) => filesPage(name),
   activity: (name) => activityPage(name),

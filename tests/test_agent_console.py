@@ -1123,8 +1123,9 @@ esac
 
     def test_the_whole_queue_is_capped_but_counted(self):
         rows = "".join(f"Q|{i}|u{i % 7}|PENDING|Priority|cpu|0:00|1:00:00|1|1|1G||N/A|2026-11-04T11:10:00|5||n{i}\n" for i in range(450))
-        parsed = agent_console.parse_cluster_queue("U|mark\n" + rows)
-        self.assertEqual((len(parsed["queued"]), parsed["counts"]["queued"]), (agent_console.QUEUE_LIST_LIMIT, 450))
+        parsed = agent_console.parse_cluster_queue("U|mark\n" + rows, limit=300)
+        self.assertEqual((len(parsed["queued"]), parsed["counts"]["queued"]), (300, 450))
+        self.assertEqual(len(agent_console.parse_cluster_queue("U|mark\n" + rows)["queued"]), 450)      # the page's own limit is far above a busy cluster
         self.assertEqual(len(parsed["users"]), 7)
 
     def test_the_whole_queue_needs_the_login_and_reports_squeue_errors(self):
@@ -1201,6 +1202,36 @@ esac
         self.clusters.script_runner = lambda *a, **k: (0, "U|mark\nP|cpu|1/2/0/3|1\n", "")      # an empty queue is not an error
         out = self.call("GET", f"/api/clusters/{self.dead}/queue")[1]
         self.assertEqual((out["error"], out["counts"]["running"]), (None, 0))
+
+    def test_gpus_are_counted_per_partition_and_type_on_nodes_that_take_jobs(self):
+        self.assertEqual(agent_console.gpu_counts("gpu:a100:4(S:0-1),shard:8"), {"a100": 4})
+        self.assertEqual(agent_console.gpu_counts("gpu:2(IDX:0-1,3)"), {"gpu": 2})
+        self.assertEqual(agent_console.gpu_counts("(null)"), {})
+        rows = [("g1", "gpu", "mixed", "gpu:a100:4(S:0-1)", "gpu:a100:3(IDX:0-2)"), ("g2", "gpu", "idle", "gpu:a100:4", "gpu:a100:0(IDX:N/A)"),
+                ("g3", "gpu", "drained", "gpu:a100:4", "gpu:a100:0(IDX:N/A)"), ("g4", "gpu", "allocated", "gpu:v100:2", "gpu:2(IDX:0-1)"),
+                ("g1", "gpu", "mixed", "gpu:a100:4", "gpu:a100:3"), ("g1", "vnc", "mixed", "gpu:a100:4", "gpu:a100:3")]
+        got = agent_console.summarise_gpus(rows)
+        self.assertEqual([g["partition"] for g in got], ["gpu", "vnc"])                 # g1 once per partition
+        a100, v100 = got[0]["types"]
+        self.assertEqual(a100, {"type": "a100", "total": 12, "used": 3, "free": 5, "unavailable": 4, "nodes": 3, "nodes_free": 2, "max_free": 4})
+        self.assertEqual((v100["total"], v100["used"], v100["free"], v100["max_free"]), (2, 2, 0, 0))   # untyped use goes to the one type
+        out = agent_console.parse_cluster_queue("U|mark\nG|g1|gpu|mixed|gpu:a100:4|gpu:a100:1\nG|short\nP|gpu|1/2/0/3|1\n")
+        self.assertEqual(out["gpus"][0]["types"][0]["free"], 3)
+        self.assertEqual(agent_console.parse_cluster_queue("U|mark\n")["gpus"], [])
+
+    def test_the_queue_script_lists_the_gpus_of_each_node(self):
+        bin_dir = Path(self.tmp) / "gpu-sinfo"
+        bin_dir.mkdir()
+        (bin_dir / "sinfo").write_text('#!/bin/bash\ncase "$*" in *-N*) printf "c01  cpu*  idle  (null)  (null)\\ng01  gpu*  mixed  gpu:a100:4(S:0-1)  gpu:a100:1(IDX:0)\\n";;\n'
+                                      '*) echo "P|gpu|1/2/0/3|1";; esac\n')
+        (bin_dir / "squeue").write_text("#!/bin/bash\n")
+        for f in ("sinfo", "squeue"):
+            (bin_dir / f).chmod(0o755)
+        res = subprocess.run(["bash", "-s"], input=agent_console.CLUSTER_QUEUE_SCRIPT, capture_output=True, text=True,
+                             env={"PATH": f"{bin_dir}:/usr/bin:/bin"})
+        self.assertIn("G|g01|gpu|mixed|gpu:a100:4(S:0-1)|gpu:a100:1(IDX:0)", res.stdout.splitlines())
+        self.assertNotIn("c01", res.stdout)
+        self.assertEqual(agent_console.parse_cluster_queue(res.stdout)["gpus"][0]["types"][0]["free"], 3)
 
     def test_a_comment_over_several_lines_is_still_one_job(self):
         bin_dir = Path(self.tmp) / "multi-squeue"
@@ -1562,6 +1593,66 @@ class TestManage(TestLogin):
         for bad in ({"host": "grace"}, {"host": "me@grace; rm -rf ~"}, {"host": "me@x.edu", "port": 0},
                     {"host": "me@x.edu", "jump": "-oProxyCommand=evil"}, {"host": "me@x.edu", "user": "x"}):
             self.assertIn(self.call("POST", "/api/clusters", bad)[0], (400, 422), bad)
+
+    def test_a_cluster_can_log_in_with_an_identity_file_and_other_ssh_options(self):
+        key = Path(self.tmp) / "id_special"
+        key.write_text("private\n")
+        config = Path(self.tmp) / "ssh_config"
+        config.write_text("Host *\n")
+        status, out = self.call("POST", "/api/clusters", {"host": "me@keyed.example.edu", "port": 2222, "identity_file": str(key),
+                                                         "ssh_options": f"-o ServerAliveInterval=30 -oPreferredAuthentications=publickey,keyboard-interactive -F {config} -4"})
+        self.assertEqual(status, 201, out)
+        profile = agent_profiles.load(out["name"])
+        self.assertEqual(profile["login"], ["-p", "2222", "-i", str(key), "-o", "ServerAliveInterval=30",
+                                            "-o", "PreferredAuthentications=publickey,keyboard-interactive", "-F", str(config), "-4",
+                                            "-o", "IdentitiesOnly=yes", "me@keyed.example.edu"])
+        name = out["name"]
+        got = self.call("GET", f"/api/clusters/{name}/ssh/connection")[1]
+        self.assertEqual((got["port"], got["identity_file"], got["identity_found"], got["jump"]), (2222, str(key), True, None))
+        self.assertIn("-i " + str(key), got["command"])
+        # change it: a jump host, no identity file; options kept as they were are kept
+        status, out = self.call("PUT", f"/api/clusters/{name}/ssh/connection", {"jump": "me@gate.example.edu", "identity_file": None,
+                                                                              "options": got["options"]})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(agent_profiles.load(name)["login"], ["-p", "2222", "-J", "me@gate.example.edu", "-o", "ServerAliveInterval=30",
+                                                             "-o", "PreferredAuthentications=publickey,keyboard-interactive", "-F", str(config), "-4",
+                                                             "-o", "IdentitiesOnly=yes", "me@keyed.example.edu"])
+        self.assertEqual(agent_console.ssh_options(agent_profiles.load(name))[:2], ["-p", "2222"])
+        # the managed login key is kept through edits, and an option typed in isn't doubled
+        profile = agent_profiles.load(name)
+        profile["ssh_login_key"] = {"name": "hpclib-login-key"}
+        agent_profiles.save(profile)
+        managed = str(agent_console.SSHKeyStore().root / "hpclib-login-key")
+        self.call("PUT", f"/api/clusters/{name}/ssh/connection", {"identity_file": str(key), "options": "-o IdentitiesOnly=no"})
+        self.assertEqual(agent_profiles.load(name)["login"], ["-p", "2222", "-J", "me@gate.example.edu", "-i", str(key), "-i", managed,
+                                                              "-o", "IdentitiesOnly=no", "me@keyed.example.edu"])
+        again = self.call("GET", f"/api/clusters/{name}/ssh/connection")[1]
+        self.assertEqual((again["identity_file"], again["options"], again["managed_key"]), (str(key), "-o IdentitiesOnly=no", managed))
+
+    def test_ssh_options_are_checked(self):
+        key = Path(self.tmp) / "id_ok"
+        key.write_text("private\n")
+        host = {"host": "me@checked.example.edu"}
+        for bad, why in (({"identity_file": str(Path(self.tmp) / "missing")}, "no file"),
+                         ({"identity_file": "relative/key"}, "full path"),
+                         ({"ssh_options": "-o ProxyCommand=evil"}, "isn't one hpclib passes on"),
+                         ({"ssh_options": "-o LocalCommand=x"}, "isn't one hpclib passes on"),
+                         ({"ssh_options": "-o ControlPath=/tmp/x"}, "isn't one hpclib passes on"),
+                         ({"ssh_options": "-o ServerAliveInterval=$(id)"}, "Key=Value"),
+                         ({"ssh_options": "-o ServerAliveInterval"}, "Key=Value"),
+                         ({"ssh_options": "-i other"}, "Identity file field"),
+                         ({"ssh_options": "-p 22"}, "Port field"),
+                         ({"ssh_options": "-F /no/such/file"}, "isn't a file"),
+                         ({"ssh_options": "-o 'unclosed"}, "options"),
+                         ({"port": "22; ls"}, "port")):
+            status, out = self.call("POST", "/api/clusters", dict(host, **bad))
+            self.assertEqual(status, 422, (bad, out))
+            self.assertIn(why, out["error"], bad)
+        self.assertEqual(self.call("POST", "/api/clusters", dict(host, identity_file=str(key)))[0], 201)
+        name = agent_profiles.name_for(host["host"])
+        for bad in ({"options": "-o ProxyCommand=evil"}, {"identity_file": "/no/such/key"}, {"port": 70000}, {"surprise": 1}):
+            self.assertIn(self.call("PUT", f"/api/clusters/{name}/ssh/connection", bad)[0], (400, 422), bad)
+        self.assertEqual(agent_profiles.load(name)["login"], ["-i", str(key), "-o", "IdentitiesOnly=yes", host["host"]])
 
     def test_needs_a_login(self):
         status, out = self.call("POST", f"/api/clusters/{self.dead}/install", {})

@@ -497,12 +497,26 @@ async function queuePage(c) {
       el("td", {}, p.running === null ? el("span", { class: "muted" }, "—") : `${p.running} job${p.running === 1 ? "" : "s"} · ${cpus(p.running_cpus)}`),
       el("td", {}, p.queued === null ? el("span", { class: "muted" }, "—") : `${p.queued} job${p.queued === 1 ? "" : "s"} · ${cpus(p.queued_cpus)}`));
   }), "Slurm listed no partitions.");
+  // GPUs by partition and type, from sinfo's per-node GRES: free ones are on nodes that take jobs, "most on one node" is what one job can have
+  const gpuRows = (q.gpus || []).flatMap((g) => g.types.map((t) => el("tr", {},
+    el("td", {}, g.partition), el("td", {}, t.type),
+    el("td", {}, `${count(t.used)} of ${count(t.total)} in use`),
+    el("td", { class: "bar-cell" }, el("div", { class: "util", role: "img", "aria-label": `${t.type} GPUs in ${g.partition}: ${t.total ? Math.round(100 * t.used / t.total) : 0}% in use` },
+      el("span", { style: `width: ${t.total ? 100 * t.used / t.total : 0}%` }))),
+    el("td", {}, el("strong", {}, count(t.free)), " free"),
+    el("td", {}, `${count(t.nodes_free)} of ${count(t.nodes)} node${t.nodes === 1 ? "" : "s"}`),
+    el("td", {}, t.max_free ? `${t.max_free} on one node` : el("span", { class: "muted" }, "none")),
+    el("td", {}, t.unavailable ? `${count(t.unavailable)} out of service` : el("span", { class: "muted" }, "—")))));
+  const gpus = gpuRows.length ? el("div", {}, el("h3", {}, "GPUs"),
+    el("p", { class: "muted small" }, "Free GPUs are on nodes that take jobs now; a node in several partitions is counted in each."),
+    el("table", { class: "jobs gpus" }, el("thead", {}, el("tr", {}, ["Partition", "GPU", "In use", "", "Free", "Nodes with a free one", "Most free", "Out of service"].map((h) => el("th", {}, h)))),
+      el("tbody", {}, gpuRows))) : null;
   const filter = el("input", { type: "search", size: 36, value: queueText[c.name] || "", "aria-label": "Filter jobs",
                                placeholder: "Filter by user, job name, node or partition" });
   const hpclibOnly = el("input", { type: "checkbox", checked: Boolean(queueHpclib[c.name]), "aria-label": "Only jobs started by hpclib" });
   const users = table(["User", "Running", "Waiting", "Started by hpclib"], q.users.map((u) => el("tr", {},
     el("td", {}, el("button", { type: "button", class: "link-button", title: `Show only ${u.user}'s jobs`,
-      onclick: () => { filter.value = queueText[c.name] = u.user; draw(); } }, u.user)),
+      onclick: () => { filter.value = queueText[c.name] = u.user; redraw(); } }, u.user)),
     el("td", {}, u.running ? `${u.running} · ${cpus(u.running_cpus)}` : el("span", { class: "muted" }, "—")),
     el("td", {}, u.queued ? `${u.queued} · ${cpus(u.queued_cpus)}` : el("span", { class: "muted" }, "—")),
     el("td", {}, u.hpclib ? chip(`${u.hpclib} job${u.hpclib === 1 ? "" : "s"}`, "agent", "agents, apps and tunnels hpclib started") : el("span", { class: "muted" }, "—")))),
@@ -510,29 +524,37 @@ async function queuePage(c) {
   const reasons = Object.keys(q.reasons).length ? el("p", { class: "chips" }, Object.entries(q.reasons).map(
     ([r, k]) => chip(`${k} ${QUEUE_REASONS[r] || r}`, "starting", r))) : el("p", { class: "muted" }, "Nothing is waiting.");
   const lists = el("div", {});
+  const SHOW = 300;                                  // rows drawn per list at a time: the filter looks through every job, the table shows the first matches
+  let showRunning = SHOW, showQueued = SHOW;
+  const more = (shown, total, grow) => (total > shown ? el("p", {}, el("span", { class: "muted" }, `Showing ${shown} of ${total}. `),
+    el("button", { type: "button", class: "link-button", onclick: () => { grow(); draw(); } }, `Show ${Math.min(SHOW, total - shown)} more`)) : null);
   const draw = () => {
     const words = filter.value.trim() || hpclibOnly.checked;
     const match = jobMatcher(filter.value);
     const keep = (j) => match(j) && (!hpclibOnly.checked || j.source.kind !== "other");
     const queued = q.queued.filter(keep), running = q.running.filter(keep);
     const cut = (total, list) => (total > list.length ? ` (the first ${list.length} of ${total})` : "");
+    const matching = (total, list) => (words ? ` · ${list.length} match${list.length === 1 ? "" : "es"}` : "");
     lists.replaceChildren(
-      el("h3", { id: "queue-running" }, `Running (${n.running})${cut(n.running, q.running)}`),
-      table(["Job", "User", "From", "Partition", "Node", "Time used", "Asked for"], running.map((j) => el("tr", {},
+      el("h3", { id: "queue-running" }, `Running (${n.running})${cut(n.running, q.running)}${matching(n.running, running)}`),
+      table(["Job", "User", "From", "Partition", "Node", "Time used", "Asked for"], running.slice(0, showRunning).map((j) => el("tr", {},
         jobName(j), el("td", {}, j.user), el("td", {}, source(j)), el("td", {}, j.partition),
         el("td", {}, j.node_list), el("td", {}, `${j.elapsed} of ${j.time_limit}`),
         el("td", {}, [`${j.cpus} CPU`, j.memory && j.memory !== "0" && j.memory].filter(Boolean).join(" · ")))),
         words ? "No running job matches." : "Nothing is running."),
-      el("h3", { id: "queue-waiting" }, `Waiting (${n.queued})${cut(n.queued, q.queued)}`),
-      table(["Job", "User", "From", "Partition", "Asked for", "Waiting because", "Submitted", "Expected start"], queued.map((j) => el("tr", {},
+      more(showRunning, running.length, () => { showRunning += SHOW; }),
+      el("h3", { id: "queue-waiting" }, `Waiting (${n.queued})${cut(n.queued, q.queued)}${matching(n.queued, queued)}`),
+      table(["Job", "User", "From", "Partition", "Asked for", "Waiting because", "Submitted", "Expected start"], queued.slice(0, showQueued).map((j) => el("tr", {},
         jobName(j), el("td", {}, j.user), el("td", {}, source(j)), el("td", {}, j.partition),
         el("td", {}, [`${j.cpus} CPU`, j.memory && j.memory !== "0" && j.memory].filter(Boolean).join(" · ")),
         el("td", {}, reason(j.reason)), el("td", {}, (j.submitted || "").replace("T", " ")),
         el("td", {}, j.start ? j.start.replace("T", " ") : el("span", { class: "muted" }, "not estimated")))),
-        words ? "No waiting job matches." : "Nothing is waiting."));
+        words ? "No waiting job matches." : "Nothing is waiting."),
+      more(showQueued, queued.length, () => { showQueued += SHOW; }));
   };
-  filter.addEventListener("input", () => { queueText[c.name] = filter.value; draw(); });
-  hpclibOnly.addEventListener("change", () => { queueHpclib[c.name] = hpclibOnly.checked; draw(); });
+  const redraw = () => { showRunning = showQueued = SHOW; draw(); };
+  filter.addEventListener("input", () => { queueText[c.name] = filter.value; redraw(); });
+  hpclibOnly.addEventListener("change", () => { queueHpclib[c.name] = hpclibOnly.checked; redraw(); });
   draw();
   // squeue failed (a busy or rate-limiting controller, say): say so, and don't show an empty queue as if it were the answer
   const problem = q.error ? el("div", { class: "error-box", role: "alert" },
@@ -541,7 +563,7 @@ async function queuePage(c) {
   if (q.error && !q.stale) {
     return el("div", {}, jobViews(c, "queue"), jobOpener(c), problem,
       el("div", { class: "toolbar" }, action("Refresh", () => ctx.render())),
-      el("h3", {}, "Partitions"), partitions);
+      el("h3", {}, "Partitions"), partitions, gpus);
   }
   return el("div", {}, jobViews(c, "queue"), jobOpener(c), problem,
     el("div", { class: "toolbar" },
@@ -551,7 +573,7 @@ async function queuePage(c) {
         el("span", {}, el("strong", {}, String(n.queued)), ` waiting · ${cpus(n.queued_cpus)}`)),
       el("span", { class: "muted" }, `as of ${new Date(q.at * 1000).toLocaleTimeString()}`),
       action("Refresh", () => ctx.render())),
-    el("h3", {}, "Partitions"), el("p", { class: "muted small" }, "CPUs in use and waiting jobs count everyone's jobs, yours too."), partitions,
+    el("h3", {}, "Partitions"), el("p", { class: "muted small" }, "CPUs in use and waiting jobs count everyone's jobs, yours too."), partitions, gpus,
     el("h3", {}, "Who is using the cluster"), users,
     el("h3", {}, "Why jobs are waiting"), reasons,
     el("div", { class: "toolbar" }, filter,

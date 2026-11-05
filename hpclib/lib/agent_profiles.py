@@ -361,7 +361,7 @@ def cmd_set(name, *pairs):
             return 2
         if key in LIST_KEYS:
             items = profile.get(key) or [] if append else []
-            if value and (key == "mcp_args" or value not in items):     # (arguments may repeat)
+            if value and (key in ("mcp_args", "login") or value not in items):     # (arguments may repeat: -o A -o B)
                 items.append(value)
             profile[key] = items
         elif key in ("port", "process_port"):

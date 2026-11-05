@@ -700,6 +700,74 @@ class TestConsoleUI(unittest.TestCase):
         self.assertEqual(rest_requests, [])
         self.assertEqual(self.errors, [])
 
+    def test_add_cluster_form_sends_an_identity_file_and_ssh_options(self):
+        posted = []
+        def handler(route, path):
+            if path == 'cluster-presets':
+                route.fulfill(body=json.dumps({'presets': []}), content_type='application/json')
+                return True
+            if path == 'clusters' and route.request.method == 'POST':
+                posted.append(route.request.post_data_json)
+                route.fulfill(status=201, body=json.dumps({'name': 'new', 'host': 'me@new.example.edu', 'login': {'state': 'down'}}),
+                              content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/c")
+        self.page.get_by_role('button', name='Add cluster', exact=True).click()
+        form = self.page.locator('section.card', has=self.page.get_by_role('heading', name='Add a cluster'))
+        form.wait_for()
+        self.assertFalse(form.get_by_label('Identity file').is_visible())              # under "More ssh options"
+        form.get_by_text('More ssh options').click()
+        form.get_by_label('Login').fill('me@new.example.edu')
+        form.get_by_label('Identity file').fill('~/.ssh/id_hprc')
+        form.get_by_label('SSH options').fill('-o ServerAliveInterval=30')
+        form.get_by_label('Work directory for agents').fill('/scratch/me/llm')
+        form.get_by_role('button', name='Add, then log in and set up').click()
+        self.page.wait_for_function("true")
+        for _ in range(50):
+            if posted:
+                break
+            self.page.wait_for_timeout(100)
+        self.assertEqual(posted, [{'host': 'me@new.example.edu', 'port': None, 'jump': None, 'identity_file': '~/.ssh/id_hprc',
+                                   'ssh_options': '-o ServerAliveInterval=30'}])
+
+    def test_settings_has_an_ssh_connection_card_for_an_identity_file_and_ssh_options(self):
+        cluster = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 20735,
+                   'has_owner_token': True, 'login': {'state': 'down'}, 'tunnel': {'state': 'down'}}
+        ssh = {'cluster': 'demo', 'host': 'me@login.example', 'port': 2222, 'jump': None, 'identity_file': None, 'identity_found': False,
+               'options': '', 'managed_key': None, 'command': 'ssh -p 2222 me@login.example', 'connected': False}
+        puts = []
+        def handler(route, path):
+            answers = {'clusters': {'clusters': [cluster]}, 'clusters/demo': cluster,
+                       'clusters/demo/settings': {'modes': ['all'], 'auto_approve_templates': 'all', 'tunnel_args': [],
+                                                  'connection_hours': 12, 'rest_on': 'job'},
+                       'clusters/demo/ports': {'ports': []}, 'clusters/demo/ssh/connection': ssh}
+            if path == 'clusters/demo/ssh/connection' and route.request.method == 'PUT':
+                body = route.request.post_data_json
+                puts.append(body)
+                ssh.update(identity_file=body['identity_file'], options=body['options'], jump=body['jump'], identity_found=True,
+                           command='ssh -p 2222 -i %s -o IdentitiesOnly=yes me@login.example' % body['identity_file'])
+                route.fulfill(body=json.dumps(dict(ssh, ok=True)), content_type='application/json')
+                return True
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/settings/demo")
+        card = self.page.locator('section.card', has=self.page.get_by_role('heading', name='SSH connection'))
+        card.wait_for()
+        self.assertEqual(card.get_by_label('Port').input_value(), '2222')
+        self.assertIn('ssh -p 2222 me@login.example', card.inner_text())
+        card.get_by_label('Identity file').fill('~/.ssh/id_hprc')
+        card.get_by_label('SSH options').fill('-o ServerAliveInterval=30')
+        card.get_by_role('button', name='Save SSH connection').click()
+        card.get_by_text('It applies from the next login.').wait_for()
+        self.assertEqual(puts, [{'port': 2222, 'jump': None, 'identity_file': '~/.ssh/id_hprc', 'options': '-o ServerAliveInterval=30'}])
+        self.assertIn('-i ~/.ssh/id_hprc -o IdentitiesOnly=yes', card.inner_text())
+        self.assertEqual(self.errors, [])
+
     def test_settings_clear_leftover_ports_warns_about_extra_logins(self):
         cluster = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 20735,
                    'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'down'}}
@@ -966,6 +1034,63 @@ class TestConsoleUI(unittest.TestCase):
         self.assertIn('someoneelse', main.locator('table.job-info').inner_text())
         main.get_by_role('link', name='← Jobs').click()
         main.get_by_label('Filter jobs').wait_for()
+        self.assertEqual(self.errors, [])
+
+    def test_whole_queue_filters_every_job_not_just_the_first_rows_shown(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
+             'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up'}}
+        job = lambda i, hp=False: {'id': str(i), 'user': 'alice' if hp else 'u%d' % (i % 5), 'name': 'hpcrest-late' if hp else 'job%d' % i,
+            'state': 'RUNNING', 'reason': 'None', 'partition': 'cpu', 'elapsed': '0:01', 'time_limit': '1:00', 'nodes': '1', 'cpus': '1',
+            'memory': '1G', 'node_list': 'c01', 'start': '', 'submitted': '', 'priority': '1',
+            'source': {'kind': 'agent', 'label': 'agent: late', 'token': 'llm'} if hp else {'kind': 'other', 'label': 'other'}}
+        running = [job(i) for i in range(700)] + [job(9999, True)]               # the hpclib job is past the first 300 rows
+        queue = {'ok': True, 'me': 'mark', 'at': time.time(), 'list_limit': 5000, 'error': None, 'stale': False,
+                 'partitions': [], 'gpus': [], 'users': [], 'reasons': {}, 'queued': [], 'running': running, 'read': 701,
+                 'counts': {'queued': 0, 'running': 701, 'users': 6, 'queued_cpus': 0, 'running_cpus': 701, 'hpclib': 1}}
+        answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c, 'health': {'hpclib_version': '1.11.1'},
+                   'apps': {'apps': [{'id': 'agents', 'title': 'Agents'}]}, 'clusters/demo/queue': queue}
+        def handler(route, path):
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/c/demo/jobs/queue")
+        main = self.page.locator('main')
+        main.get_by_text('Showing 300 of 701.').wait_for()
+        self.assertEqual(main.locator('table.jobs').last.locator('tbody tr').count(), 300)
+        main.get_by_role('button', name='Show 300 more').click()
+        main.get_by_text('Showing 600 of 701.').wait_for()
+        main.get_by_label('Only jobs started by hpclib').check()
+        main.get_by_text('hpcrest-late').wait_for()
+        self.assertIn('Running (701) · 1 match', main.inner_text())
+        self.assertNotIn('Showing', main.inner_text())
+        self.assertEqual(self.errors, [])
+
+    def test_whole_queue_shows_the_gpus_in_use_and_free(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
+             'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up'}}
+        queue = {'ok': True, 'me': 'mark', 'at': time.time(), 'list_limit': 300, 'error': None, 'stale': False,
+                 'partitions': [{'name': 'gpu', 'cpus': {'allocated': 10, 'idle': 90, 'other': 0, 'total': 100}, 'nodes': 3,
+                                 'running': 0, 'queued': 0, 'running_cpus': 0, 'queued_cpus': 0}],
+                 'gpus': [{'partition': 'gpu', 'types': [{'type': 'a100', 'total': 12, 'used': 3, 'free': 5, 'unavailable': 4, 'nodes': 3, 'nodes_free': 2, 'max_free': 4}]}],
+                 'users': [], 'reasons': {}, 'queued': [], 'running': [], 'read': 0,
+                 'counts': {'queued': 0, 'running': 0, 'users': 0, 'queued_cpus': 0, 'running_cpus': 0, 'hpclib': 0}}
+        answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c, 'health': {'hpclib_version': '1.11.1'},
+                   'apps': {'apps': [{'id': 'agents', 'title': 'Agents'}]}, 'clusters/demo/queue': queue}
+        def handler(route, path):
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/c/demo/jobs/queue")
+        main = self.page.locator('main')
+        main.get_by_role('heading', name='GPUs').wait_for()
+        text = main.locator('table.gpus').inner_text()
+        for shown in ('a100', '3 of 12 in use', '5 free', '2 of 3 nodes', '4 on one node', '4 out of service'):
+            self.assertIn(shown, text)
+        self.assertEqual(main.locator('table.gpus .util').get_attribute('aria-label'), 'a100 GPUs in gpu: 25% in use')
         self.assertEqual(self.errors, [])
 
     def test_whole_queue_says_when_squeue_failed_instead_of_showing_an_empty_queue(self):

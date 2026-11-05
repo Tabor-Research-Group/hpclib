@@ -33,6 +33,7 @@ On **Clusters** (the home page), click **Add cluster** and fill in the form:
 | --- | --- |
 | Login | `user@login.cluster.edu`, as you would type it for `ssh` |
 | Port, Jump host | only if you need them to reach the login node |
+| More ssh options → Identity file, SSH options | an identity (private key) file on this machine, for a site that wants a specific key (ssh then offers only that key; if it has a passphrase, give it as the password when you log in), and other ssh settings such as `-o ServerAliveInterval=30` or `-F ~/.ssh/config_hprc`. Both can be changed later under the cluster's **Settings → SSH connection**, and apply from the next login |
 | Work directory for agents | an absolute path on the cluster where agents may write, e.g. `/scratch/user/me/llm` |
 | Extra read-only directories | software trees jobs need to read, e.g. `/software` (optional) |
 | Local folder for the agent's files | a folder on this machine the agent's `push_files` and `pull_files` copy from and into, e.g. `~/Documents/hpclib-agents` (created if missing; empty: none). Change it later with **Set up…** |

@@ -70,7 +70,11 @@ The front end depends only on the routes below; nothing here depends on it.
   POST /api/clusters/NAME/login               {"password": ...}: log in (password, then a Duo push), keeping
                                               the ssh connection pssh and agent_tunnel reuse
   POST /api/clusters/NAME/logout              close that connection
-  POST /api/clusters                          {"host": "user@host", "port"?, "jump"?}: a profile for a new cluster
+  POST /api/clusters                          {"host": "user@host", "port"?, "jump"?, "identity_file"? (a private key
+                                              on this machine), "ssh_options"? ("-o ServerAliveInterval=30"...)}: a
+                                              profile for a new cluster
+  GET/PUT /api/clusters/NAME/ssh/connection   the ssh options of its login: {port, jump, identity_file, options};
+                                              they apply from the next login
   GET  /api/cluster-presets                   configuration choices from installed packages
   POST /api/cluster-presets/ID               create a profile from a preset: username, work_dir,
                                               account?, tunnel_args?, jump?; no remote action
@@ -230,6 +234,9 @@ import console_packages  # noqa: E402
 from token_auth import ServiceToken  # noqa: E402
 import console_prefs  # noqa: E402
 import console_styles  # noqa: E402
+from queue_view import (  # noqa: E402,F401
+    CLUSTER_QUEUE_SCRIPT, QUEUE_LIST_LIMIT, QUEUED_JOB_STATES, failed_queue_answer, gpu_counts, parse_cluster_queue,
+    read_queue, summarise_gpus)
 import console_update  # noqa: E402
 import mcp_clients  # noqa: E402
 from ssh_keys import SSHKeyError, SSHKeyStore  # noqa: E402
@@ -699,6 +706,131 @@ def ssh_options(profile):
     return login
 
 
+# What a cluster's ssh login can be told besides its port, jump host and identity file (the Port, Jump host, Identity file and
+# SSH options fields): `-o Key=Value` for the options below, and a few flags. Options that run a command, or that hpclib sets
+# itself for sharing a login, are left out; a site that needs one can put it in an ssh config file and give that with `-F`.
+SSH_FLAGS = ("-4", "-6", "-A", "-a", "-C", "-q", "-v")
+SSH_OPTIONS = frozenset(
+    "identitiesonly identityagent addkeystoagent usekeychain preferredauthentications pubkeyauthentication "
+    "pubkeyacceptedalgorithms pubkeyacceptedkeytypes hostkeyalgorithms hostkeyalias kexalgorithms ciphers macs "
+    "serveraliveinterval serveralivecountmax connecttimeout connectionattempts stricthostkeychecking userknownhostsfile "
+    "globalknownhostsfile certificatefile compression forwardagent gssapiauthentication gssapidelegatecredentials "
+    "gssapikeyexchange addressfamily tcpkeepalive bindaddress bindinterface numberofpasswordprompts "
+    "kbdinteractiveauthentication passwordauthentication challengeresponseauthentication ipqos loglevel rekeylimit "
+    "verifyhostkeydns updatehostkeys hostbasedauthentication".split())
+SSH_OPTION_VALUE_RE = re.compile(r"[A-Za-z0-9_.,:+\-/~@%^*!]+")
+
+
+def split_ssh_login(options, managed=None):
+    """A profile's ssh options as {port, jump, identity, other}: the -p and -J values, the first -i that isn't the
+    key hpclib installed (`managed`), and everything else in order (further -i's too), options kept with their values."""
+    out = {"port": None, "jump": None, "identity": None, "other": []}
+    i = 0
+    while i < len(options):
+        flag, value = options[i], options[i + 1] if i + 1 < len(options) else None
+        if flag == "-p" and value is not None and out["port"] is None:
+            out["port"], i = value, i + 2
+        elif flag == "-J" and value is not None and out["jump"] is None:
+            out["jump"], i = value, i + 2
+        elif flag == "-i" and value is not None and value == managed:
+            i += 2
+        elif flag == "-i" and value is not None and out["identity"] is None:
+            out["identity"], i = value, i + 2
+        elif flag in ("-o", "-i", "-F", "-p", "-J", "-c", "-m", "-l", "-b", "-B", "-E") and value is not None:
+            out["other"] += [flag, value]
+            i += 2
+        else:
+            out["other"].append(flag)
+            i += 1
+    return out
+
+
+def local_identity_file(value):
+    """An identity (private key) file on this machine: a full path or ~/..., that exists (under WSL a Windows path
+    C:\\... means that file). Returns the full path."""
+    if not isinstance(value, str) or not value.strip() or len(value) > 1024 or re.search(r"[\0\n\r]", value):
+        raise ConsoleError(422, "identity_file: the full path of a private key file on this machine")
+    v = value.strip()
+    if re.match(r"[A-Za-z]:[\\/]", v) and local_platform.platform() == "wsl":
+        v = local_platform.to_linux(v) or v
+    v = os.path.expanduser(v)
+    if not os.path.isabs(v):
+        raise ConsoleError(422, f"identity_file: {v} isn't a full path (/... or ~/...)")
+    if not os.path.isfile(v):
+        raise ConsoleError(422, f"identity_file: there is no file {v} on this machine")
+    return v
+
+
+def parse_ssh_options(text):
+    """The "SSH options" box (or a list of its words) as ssh arguments: `-o Key=Value` (also `-oKey=Value`), -F FILE
+    and the flags in SSH_FLAGS. The port, jump host and identity file have fields of their own."""
+    try:
+        words = list(text) if isinstance(text, list) else shlex.split(text or "")
+    except ValueError as e:
+        raise ConsoleError(422, f"options: {e}") from e
+    if not all(isinstance(w, str) for w in words) or len(words) > 40:
+        raise ConsoleError(422, "options: ssh options as text, such as -o ServerAliveInterval=30")
+    out, i = [], 0
+    while i < len(words):
+        word = words[i]
+        if word in SSH_FLAGS:
+            out.append(word)
+            i += 1
+            continue
+        if word in ("-o", "-F"):
+            if i + 1 >= len(words):
+                raise ConsoleError(422, f"options: {word} needs a value")
+            value, i = words[i + 1], i + 2
+        elif word.startswith("-o") and len(word) > 2:
+            word, value, i = "-o", word[2:], i + 1
+        else:
+            fields = {"-p": "Port", "-J": "Jump host", "-i": "Identity file"}
+            raise ConsoleError(422, f"options: {word} isn't allowed here" + (f"; it has the {fields[word]} field" if word in fields
+                               else f"; use -o Key=Value, -F FILE or one of {' '.join(SSH_FLAGS)}"))
+        if word == "-F":
+            out += ["-F", _ssh_config_file(value)]
+            continue
+        key, eq, setting = value.partition("=")
+        if not eq or not SSH_OPTION_VALUE_RE.fullmatch(setting):
+            raise ConsoleError(422, f"options: -o {value} should be Key=Value, with no spaces or quotes")
+        if key.lower() not in SSH_OPTIONS:
+            raise ConsoleError(422, f"options: -o {key} isn't one hpclib passes on (ones that run commands, and the login-sharing "
+                                    "ones, are left out); put it in an ssh config file and give -F FILE")
+        out += ["-o", f"{key}={setting}"]
+    return out
+
+
+def _ssh_config_file(value):
+    v = os.path.expanduser(value.strip())
+    if not os.path.isabs(v) or not os.path.isfile(v) or re.search(r"[\0\n\r]", v):
+        raise ConsoleError(422, f"options: -F {value} isn't a file on this machine (give its full path)")
+    return v
+
+
+def build_ssh_login(port=None, jump=None, identity=None, options=(), managed=None):
+    """The ssh options of a profile's login (without the host): -p, -J, -i (the identity file, then hpclib's own key),
+    then `options`. With an identity file, ssh is told to offer only the keys it is given (IdentitiesOnly=yes) unless
+    the options say otherwise, so an agent full of keys can't use up the server's attempts first."""
+    login = []
+    if port not in (None, "", 22, "22"):
+        number = int(port) if isinstance(port, str) and port.isdigit() else port
+        if isinstance(number, bool) or not isinstance(number, int) or not 1 <= number <= 65535:
+            raise ConsoleError(422, "port must be a number from 1 to 65535")
+        login += ["-p", str(number)]
+    if jump:
+        if not isinstance(jump, str) or not JUMP_HOST_RE.fullmatch(jump):
+            raise ConsoleError(422, "jump must be [user@]host[:port]")
+        login += ["-J", jump]
+    options = list(options)
+    if identity:
+        login += ["-i", identity]
+    if managed:
+        login += ["-i", managed]
+    if identity and not any(a.lower().startswith("identitiesonly=") for a in options):
+        options += ["-o", "IdentitiesOnly=yes"]
+    return login + options
+
+
 class Logins:
     """
     Cluster logins: an ssh master connection on the socket pssh uses
@@ -1034,70 +1166,6 @@ class Logins:
 
 
 
-QUEUE_LIST_LIMIT = 300      # the queued and the running jobs of other users that the page lists (all are counted)
-
-
-QUEUED_JOB_STATES = frozenset({"PENDING", "REQUEUED", "SUSPENDED", "REQUEUE_HOLD", "RESV_DEL_HOLD", "SPECIAL_EXIT"})
-
-
-def parse_cluster_queue(text, limit=QUEUE_LIST_LIMIT, queued_states=QUEUED_JOB_STATES, source_of=None):
-    """CLUSTER_QUEUE_SCRIPT's lines: the queue of everyone but you, as {me, partitions, users, reasons, queued,
-    running, counts}: your own jobs are left out (the Jobs page has them), but the partitions' CPUs count everything.
-    source_of(name, comment) says what started a job ({kind, label, ...}); jobs hpclib started are counted per user."""
-    me, partitions, jobs = "", {}, []
-    for line in text.splitlines():
-        kind, _, rest = line.partition("|")
-        if kind == "U":
-            me = rest.strip()
-        elif kind == "P":
-            name, _, rest = rest.partition("|")
-            cpus, _, nodes = rest.partition("|")
-            parts = cpus.split("/")
-            if len(parts) == 4 and all(p.isdigit() for p in parts):
-                partitions[name] = {"name": name, "cpus": dict(zip(("allocated", "idle", "other", "total"), map(int, parts))),
-                                    "nodes": int(nodes) if nodes.strip().isdigit() else None}
-        elif kind == "Q":
-            f = rest.split("|", 15)
-            if len(f) == 16:
-                jobs.append({"id": f[0], "user": f[1], "state": f[2], "reason": f[3], "partition": f[4], "elapsed": f[5],
-                             "time_limit": f[6], "nodes": f[7], "cpus": f[8], "memory": f[9], "node_list": f[10],
-                             "start": "" if f[11] in ("N/A", "Unknown") else f[11], "submitted": f[12],
-                             "priority": f[13], "name": f[15],
-                             "source": source_of(f[15], f[14]) if source_of else {"kind": "other", "label": "other"}})
-    cpu_of = lambda job: int(job["cpus"]) if job["cpus"].isdigit() else 0
-    users, reasons, queued, running, per_part = {}, {}, [], [], {}
-    for job in jobs:
-        waiting = job["state"] in queued_states
-        p = per_part.setdefault(job["partition"], {"running": 0, "queued": 0, "running_cpus": 0, "queued_cpus": 0})
-        p["queued" if waiting else "running"] += 1
-        p["queued_cpus" if waiting else "running_cpus"] += cpu_of(job)
-        if job["user"] == me:
-            continue
-        u = users.setdefault(job["user"], {"user": job["user"], "running": 0, "queued": 0, "running_cpus": 0,
-                                           "queued_cpus": 0, "hpclib": 0})
-        u["hpclib"] += job["source"]["kind"] != "other"
-        u["queued" if waiting else "running"] += 1
-        u["queued_cpus" if waiting else "running_cpus"] += cpu_of(job)
-        if waiting:
-            reasons[job["reason"]] = reasons.get(job["reason"], 0) + 1
-            queued.append(job)
-        else:
-            running.append(job)
-    for name, p in per_part.items():                  # a partition sinfo didn't list still shows what is in it
-        partitions.setdefault(name, {"name": name, "cpus": None, "nodes": None}).update(p)
-    for part in partitions.values():
-        part.setdefault("running", 0), part.setdefault("queued", 0)
-        part.setdefault("running_cpus", 0), part.setdefault("queued_cpus", 0)
-    busiest = sorted(users.values(), key=lambda u: (-(u["running_cpus"] + u["queued_cpus"]), u["user"]))
-    return {"me": me, "partitions": sorted(partitions.values(), key=lambda p: p["name"]), "users": busiest[:25],
-            "reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
-            "queued": queued[:limit], "running": running[:limit],
-            "read": len(jobs),
-            "counts": {"queued": len(queued), "running": len(running), "users": len(users),
-                       "queued_cpus": sum(cpu_of(j) for j in queued), "running_cpus": sum(cpu_of(j) for j in running),
-                       "hpclib": sum(u["hpclib"] for u in users.values())}}
-
-
 def parse_rss(value):
     """sacct's MaxRSS ("123456K", "1.5G") in KiB."""
     m = re.fullmatch(r"([0-9.]+)([KMGT]?)", (value or "").strip())
@@ -1315,20 +1383,6 @@ CLUSTER_JOBS_SCRIPT = r"""
 squeue -h -u "$USER" -o 'Q|%i|%j|%T|%r|%P|%M|%l|%D|%C|%b|%m|%N|%S|%k' 2>&1
 sacct -n -P -u "$USER" -S now-1day -o JobID,JobName,State,ExitCode,Elapsed,End,Partition,MaxRSS,ReqMem,Comment \
   2>/dev/null | sed 's/^/A|/'
-"""
-
-# Runs ON the login node: the whole queue, every user's: `U|ME`, then `P|PARTITION|ALLOCATED/IDLE/OTHER/TOTAL CPUS|NODES`
-# per partition (sinfo), `E|MESSAGE` if squeue failed (a busy or rate-limiting Slurm controller says so there) and `Q|...` per queued or running job (squeue; the comment, which hpclib marks its jobs with, and
-# the job's name last, since a name may hold a `|`).
-CLUSTER_QUEUE_SCRIPT = r"""
-echo "U|$(id -un)"
-sinfo -h -o 'P|%R|%C|%D' 2>/dev/null
-fmt='Q|%i|%u|%T|%r|%P|%M|%l|%D|%C|%m|%N|%S|%V|%Q'
-jobs=$(squeue -h -a -o "$fmt|%k|%j" 2>&1); rc=$?
-[ "$rc" -eq 0 ] || { jobs=$(squeue -h -a -o "$fmt||%j" 2>&1); rc=$?; }    # a squeue without the comment field still lists jobs
-if [ "$rc" -ne 0 ]; then printf 'E|%s\n' "$(printf '%s\n' "$jobs" | head -n 1)"
-else printf '%s\n' "$jobs" | awk '/^Q\|/ { if (line != "") print line; line = $0; next } { line = line " " $0 } END { if (line != "") print line }'    # a comment can run over several lines (a job_submit plugin's): one job, one line
-fi
 """
 
 # Runs ON the login node: JOB: what Slurm still knows about one of your jobs, and the files it names, as marked
@@ -1933,25 +1987,8 @@ class Clusters:
             cached = self.queue_cache.get(name)
         if cached and time.time() - cached[0] < self.QUEUE_CACHE:
             return dict(cached[1])
-        for attempt in (1, 2):
-            code, out, err = self.script_runner(profile, CLUSTER_QUEUE_SCRIPT, (), 60)
-            failed = next((line[2:].strip() for line in out.splitlines() if line.startswith("E|")), None)
-            if failed is None and code != 0 and "Q|" not in out and "P|" not in out:
-                failed = (err or out).strip().splitlines()[-1] if (err or out).strip() else f"exit {code}"
-            if failed is None:
-                break
-            if attempt == 1:
-                time.sleep(self.QUEUE_RETRY_WAIT)
-        text = "\n".join(line for line in out.splitlines() if line[:2] in ("U|", "P|", "Q|"))
-        queue = parse_cluster_queue(text, source_of=self.job_source)
-        if failed is None:                # squeue said nothing was wrong: check that what it printed was read
-            said = [line for line in out.splitlines() if line.strip()]
-            odd = [line for line in said if line[:2] not in ("U|", "P|", "Q|")]
-            lines = [line for line in said if line.startswith("Q|")]
-            if lines and not queue["read"]:
-                failed = f"squeue printed {len(lines)} lines the console couldn't read, such as {lines[0][:160]!r}"
-            elif odd and not lines:
-                failed = f"squeue printed something else: {odd[0][:200]}"
+        queue, failed = read_queue(lambda: self.script_runner(profile, CLUSTER_QUEUE_SCRIPT, (), 60),
+                                   self.job_source, self.QUEUE_RETRY_WAIT)
         answer = dict(queue, cluster=name, at=time.time(), list_limit=QUEUE_LIST_LIMIT, error=None, stale=False)
         if failed is None:
             with self.lock:
@@ -1962,10 +1999,7 @@ class Clusters:
             return dict(cached[1], error=reason, stale=True)
         if not queue["partitions"] and not queue["me"]:
             raise ConsoleError(502, f"squeue failed on {name}: {reason}")
-        no_jobs = [dict(p, running=None, queued=None, running_cpus=None, queued_cpus=None) for p in queue["partitions"]]
-        return dict(answer, error=reason, partitions=no_jobs, queued=[], running=[], users=[], reasons={},
-                    counts=dict(queue["counts"], queued=None, running=None, users=None, queued_cpus=None,
-                                running_cpus=None, hpclib=None))
+        return failed_queue_answer(answer, queue, reason)
 
     def cluster_jobs(self, profile):
         """Every job of yours on the cluster: squeue's queued and running jobs, and the last day's finished ones."""
@@ -2566,6 +2600,52 @@ class Clusters:
         finally:
             request["password"] = None
 
+    def _managed_identity(self, profile):
+        """The private key file of the login key hpclib installed for this cluster (None: none)."""
+        key = (profile.get("ssh_login_key") or {}).get("name")
+        return str(SSHKeyStore().root / key) if key else None
+
+    def ssh_connection(self, profile):
+        """How this console reaches the cluster's login node (ssh options kept in the profile), for the Settings tab."""
+        managed = self._managed_identity(profile)
+        parts = split_ssh_login(ssh_options(profile), managed)
+        return {"cluster": profile["name"], "host": profile["host"],
+                "port": int(parts["port"]) if (parts["port"] or "").isdigit() else None,
+                "jump": parts["jump"], "identity_file": parts["identity"],
+                "identity_found": bool(parts["identity"]) and os.path.isfile(parts["identity"]),
+                "options": shlex.join(parts["other"]), "managed_key": managed,
+                "command": shlex.join(["ssh"] + ssh_options(profile) + [profile["host"]]),
+                "connected": self.logins.alive(profile),
+                "applies": "the next time you log in (log out first if you are logged in now)"}
+
+    def save_ssh_connection(self, profile, body):
+        if not isinstance(body, dict) or set(body) - {"port", "jump", "identity_file", "options"}:
+            raise ConsoleError(400, "ssh connection fields are port, jump, identity_file and options")
+        fresh = agent_profiles.load(profile["name"]) or profile
+        managed = self._managed_identity(fresh)
+        now = split_ssh_login(ssh_options(fresh), managed)
+        port = body.get("port", now["port"])
+        if isinstance(port, str) and port.strip().isdigit():
+            port = int(port)
+        if isinstance(port, str) and not port.strip():
+            port = None
+        if port is not None and (isinstance(port, bool) or not isinstance(port, int)):
+            if not (isinstance(port, str) and port.isdigit()):
+                raise ConsoleError(422, "port must be a number from 1 to 65535")
+        identity = body.get("identity_file", now["identity"])
+        if identity and identity != now["identity"]:        # an identity file kept as it was isn't checked again
+            identity = local_identity_file(identity)
+        options = body.get("options")
+        if options is None or (isinstance(options, str) and options.strip() == shlex.join(now["other"])):
+            options = now["other"]                          # kept as they were, whatever they are
+        else:
+            options = parse_ssh_options(options)
+        jump = body.get("jump", now["jump"]) or None
+        login = build_ssh_login(port, jump, identity or None, options, managed) + [fresh["host"]]
+        fresh["login"] = login
+        agent_profiles.save(fresh)
+        return self.ssh_connection(fresh)
+
     def setup_ssh(self, profile, body):
         if (profile.get("preset") or {}).get("ssh_keys") == "site-managed":
             raise ConsoleError(409, "this cluster's SSH keys are managed by the site; hpclib key setup is disabled")
@@ -2775,30 +2855,27 @@ class Clusters:
 
     def add(self, body):
         """A profile for a new cluster, so it can be logged in to and set up."""
-        unknown = set(body) - {"host", "port", "jump"}
+        unknown = set(body) - {"host", "port", "jump", "identity_file", "ssh_options"}
         if unknown:
             raise ConsoleError(400, f"unknown fields {sorted(unknown)}")
         host, port, jump = body.get("host"), body.get("port"), body.get("jump")
         if not isinstance(host, str) or not LOGIN_HOST_RE.fullmatch(host):
             raise ConsoleError(422, "host must be user@host, e.g. maboyer@grace.hprc.tamu.edu")
-        login = []
-        if port not in (None, "", 22):
-            if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
-                raise ConsoleError(422, "port must be a number from 1 to 65535")
-            login += ["-p", str(port)]
-        if jump:
-            if not isinstance(jump, str) or not JUMP_HOST_RE.fullmatch(jump):
-                raise ConsoleError(422, "jump must be [user@]host[:port]")
-            login += ["-J", jump]
+        port = None if port == "" else port
+        if isinstance(port, str) or isinstance(port, bool) or not (port is None or isinstance(port, int)):
+            raise ConsoleError(422, "port must be a number from 1 to 65535")
+        identity = body.get("identity_file")
+        login = build_ssh_login(port, jump, local_identity_file(identity) if identity else None,
+                                parse_ssh_options(body.get("ssh_options")))
         name = agent_profiles.name_for(host)
         if agent_profiles.load(name) is not None:
             raise ConsoleError(409, f"there is already a profile {name}")
         with contextlib.redirect_stdout(io.StringIO()):
             agent_profiles.cmd_init(name, host)
-        agent_profiles.cmd_set(name, "login=", *[f"login+={a}" for a in login + [host]])
         # this machine's defaults for new clusters (Console Settings); a preset's own values replace them
         prefs = console_prefs.load(console_dir())
         fresh = agent_profiles.load(name)
+        fresh["login"] = login + [host]               # as given: `login+=` would drop a repeated -o
         fresh["connection_hours"] = prefs["new_cluster"]["connection_hours"]
         pattern = prefs["new_cluster"].get("mcp_name_pattern") or agent_profiles.DEFAULT_MCP_PATTERN
         taken = {p.get("mcp_name") for p in agent_profiles.all_profiles() if p["name"] != name}
@@ -4908,6 +4985,10 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 return 200, dict(c.new_ports(profile, self.json_body()), ok=True)
             if rest == ["ssh", "setup"] and verb == "POST":
                 return 202, dict(c.setup_ssh(profile, self.json_body()), ok=True)
+            if rest == ["ssh", "connection"] and verb == "GET":
+                return 200, dict(c.ssh_connection(profile), ok=True)
+            if rest == ["ssh", "connection"] and verb == "PUT":
+                return 200, dict(c.save_ssh_connection(profile, self.json_body()), ok=True)
             if rest == ["ssh", "login-keys"] and verb == "GET":
                 return 200, dict(c.ssh_login_keys(profile), ok=True)
             if rest == ["ssh", "login-key"] and verb == "POST":
