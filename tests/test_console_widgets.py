@@ -29,7 +29,7 @@ class TestWidgetManifest(unittest.TestCase):
     def test_valid_and_summarized(self):
         m = self.check(None)
         self.assertEqual(m["widgets"], [{"id": "queue", "title": "Queue", "slot": "home", "entry": "w/queue.html",
-                                         "reads": ["jobs"], "height": 200, "description": ""}])
+                                         "reads": ["jobs"], "height": 200, "description": "", "notifications": []}])
         self.assertIn("widget Queue (queue) on the clusters page; reads jobs", console_packages.summary(m)[0])
 
     def test_refused(self):
@@ -132,6 +132,33 @@ class TestWidgetsUI(unittest.TestCase):
                 return frames[n]
             self.page.wait_for_timeout(50)
         self.fail("no widget frame")
+
+    def test_a_widget_notifies_only_for_kinds_it_declared_and_the_user_ticked(self):
+        html = ("<script>(async()=>{const hpc=await hpclibWidget();"
+                "hpc.notify('undeclared','No','x');hpc.notify('ping','Declared and off','x');"
+                "hpc.notify('pong','Hello','from the widget','#/c/demo/jobs');"
+                "for(let i=0;i<8;i++)hpc.notify('pong','Flood '+i,'x');})();</script>")
+        self.widgets[0]["notifications"] = [{"id": "ping", "label": "Ping", "hint": ""},
+                                            {"id": "pong", "label": "Pong", "hint": ""}]
+        (self.console / "preferences.json").write_text(json.dumps({"app_notifications": {
+            "widget:dash/queue": {"enabled": True, "kinds": {"ping": False, "pong": True}}}}))
+        self.page.add_init_script("""
+          window.shown = [];
+          window.Notification = class { constructor(t, o) { window.shown.push({ title: t, body: (o || {}).body }); }
+            static get permission() { return "granted"; } static requestPermission() { return Promise.resolve("granted"); } };""")
+        base_handler = self.handler
+        def handler(route, path):
+            if path == "widgets/dash/queue":
+                route.fulfill(body=json.dumps({"html": html}), content_type="application/json")
+                return True
+            return base_handler(route, path)
+        console_ui.TestConsoleUI.load_console(self, handler)
+        self.widget_frame()
+        self.page.wait_for_function("window.shown.length >= 5")
+        self.page.wait_for_timeout(300)
+        titles = [n["title"] for n in self.page.evaluate("window.shown")]
+        self.assertEqual(titles, ["Hello", "Flood 0", "Flood 1", "Flood 2", "Flood 3"])    # five a minute; the rest dropped
+        self.assertEqual(self.errors, [])
 
     def test_home_widget_gets_its_topics_and_nothing_else(self):
         console_ui.TestConsoleUI.load_console(self, self.handler)

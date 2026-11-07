@@ -1564,6 +1564,17 @@ function agent_tunnel {
   if [ "$(_hpclib_agent_profiles get "$name" rest_on 2>/dev/null)" = login ]; then
     launch=(--login-node)   # no job, so no sbatch options
   fi
+  # how the pieces meet (the profile's tunnel_link, login_endpoint and job_endpoint; see start_tunnel.sh)
+  local setting value
+  for setting in "tunnel_link:link" "login_endpoint:login-endpoint" "job_endpoint:job-endpoint"; do
+    value=$(_hpclib_agent_profiles get "$name" "${setting%%:*}" 2>/dev/null) || value=''
+    [ -n "$value" ] && launch+=("--${setting##*:}=$value")
+  done
+  # the profile's ssh options (identity file, port, jump host, ...) for the login launch_tunnel makes
+  local _hpclib_launch_ssh=()
+  while IFS= read -r d; do
+    [ -n "$d" ] && [ "$d" != "$host" ] && _hpclib_launch_ssh+=("$d")
+  done < <(_hpclib_agent_lines "$name" login)
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --auto-approve-templates|--auto-approve-templates=new) approve=new ;;
@@ -1654,6 +1665,30 @@ function _hpclib_sessions_root {
 
 function _hpclib_port_file {  # _hpclib_port_file PORT [HOST]
   printf '%s/ports/%s-%s\n' "$(_hpclib_sessions_root)" "${2:-$(hostname -s)}" "$1"
+}
+
+# A socket file for NAME on this node, in a folder only you can use (made by whoever binds it): sessions/sockets, or
+# HPCLIB_SOCKET_DIR; a Unix socket path can be about 100 bytes at most, so a long one falls back to /tmp/hpclib-USER.
+function _hpclib_socket_path {  # _hpclib_socket_path NAME
+  local dir="${HPCLIB_SOCKET_DIR:-$(_hpclib_sessions_root)/sockets}"
+  if [ "$(( ${#dir} + ${#1} + 1 ))" -gt 100 ]; then dir="/tmp/hpclib-$(id -un)"; fi
+  printf '%s/%s\n' "$dir" "$1"
+}
+
+# Does something answer on this node's PORT, or on the socket file (unix:PATH)?
+function _hpclib_endpoint_up {  # _hpclib_endpoint_up PORT|unix:PATH
+  python3 -c '
+import socket, sys
+target = sys.argv[1]
+if target.startswith("unix:"):
+    s, address = socket.socket(socket.AF_UNIX), target[5:]
+else:
+    s, address = socket.socket(), ("127.0.0.1", int(target))
+s.settimeout(2)
+try:
+    s.connect(address)
+except OSError:
+    sys.exit(1)' "$1" 2>/dev/null
 }
 
 function _hpclib_port_free {  # _hpclib_port_free PORT: can 127.0.0.1:PORT be bound here?
@@ -1818,6 +1853,15 @@ function _hpclib_clear_port {
   if pkill -TERM -u "$me" -f "waiting_shim\.py $port " 2>/dev/null; then
     echo "stopped a leftover waiting page on $port" >&2
   fi
+  # a tunnel whose login-node end is a socket file (login_endpoint=socket): its waiting page, its forward and the file
+  local sock
+  sock=$(_hpclib_socket_path "$(hostname -s)-$port.sock")
+  if [ -e "$sock" ]; then
+    pkill -TERM -u "$me" -f "waiting_shim\.py unix:$sock " 2>/dev/null && echo "stopped a leftover waiting page on $sock" >&2
+    pkill -TERM -u "$me" -f "ssh .*-L $sock:" 2>/dev/null && echo "stopped a leftover forward on $sock" >&2
+    sleep 0.2
+    rm -f "$sock"
+  fi
   for other in "$(_hpclib_sessions_root)"/ports/*-"$port"; do
     # (HPCLIB_PORT_NOTES=0: clear_tunnel_ports, which deals with them itself)
     if [ -f "$other" ] && [ "$other" != "$file" ] && [ "${HPCLIB_PORT_NOTES:-1}" != 0 ]; then
@@ -1860,14 +1904,19 @@ function stop_tunnel {
     echo "$usage" >&2
     return 2
   fi
-  script="$(declare -f _hpclib_sessions_root _hpclib_port_file _hpclib_port_free _hpclib_port_holders _hpclib_wait_job_end _hpclib_clear_port)
+  script="$(declare -f _hpclib_sessions_root _hpclib_socket_path _hpclib_port_file _hpclib_port_free _hpclib_port_holders _hpclib_wait_job_end _hpclib_clear_port)
 _hpclib_clear_port \"\$1\" && echo \"port \$1 is free on \$(hostname -s)\""
+  local sock   # where a socket-mode tunnel's forward ends on the login node (empty if it can't be told)
+  sock=$(printf '%s\n' "$(declare -f _hpclib_sessions_root _hpclib_socket_path)
+printf '%s\\n' \"\$(_hpclib_socket_path \"\$(hostname -s)-\$1.sock\")\"" |
+    HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$(printf '%q ' bash -s -- "$port")" 2>/dev/null | tail -n 1)
   if ! printf '%s\n' "$script" | HPCLIB_ECHO_COMMANDS= pssh "${login_args[@]}" "$(printf '%q ' bash -s -- "$port")"; then
     echo "stop_tunnel: shutdown on the login node did not finish; see the message above and retry" >&2
     return 1
   fi
   # the forward this machine's ssh master holds for the tunnel
   HPCLIB_ECHO_COMMANDS= pssh -O cancel -L "127.0.0.1:$port:127.0.0.1:$port" "${login_args[@]}" 2>/dev/null || true
+  case "$sock" in /*) HPCLIB_ECHO_COMMANDS= pssh -O cancel -L "127.0.0.1:$port:$sock" "${login_args[@]}" 2>/dev/null || true ;; esac
 }
 
 # Each tunnel records its port on the login node it started on (sessions/ports/NODE-PORT, in the shared home).
@@ -1898,7 +1947,7 @@ function _hpclib_clear_ports {
     for p in "$@"; do [ "${f##*-}" = "$p" ] && listed=true; done
     if [ "$listed" = false ] && read -r pid job < "$f" && [ -n "${job:-}" ]; then keep="$keep$job "; fi
   done
-  script="$(declare -f _hpclib_sessions_root _hpclib_port_file _hpclib_port_free _hpclib_port_holders _hpclib_wait_job_end _hpclib_clear_port)
+  script="$(declare -f _hpclib_sessions_root _hpclib_socket_path _hpclib_port_file _hpclib_port_free _hpclib_port_holders _hpclib_wait_job_end _hpclib_clear_port)
 _hpclib_clear_port \"\$1\""
   for port in "$@"; do
     if HPCLIB_PORT_NOTES=0 _hpclib_clear_port "$port"; then echo "HPCLIB_PORT_CLEARED $here $port"; else echo "HPCLIB_PORT_BUSY $here $port"; fi
@@ -1933,7 +1982,7 @@ _hpclib_clear_port \"\$1\""
 
 # The lines of a script that runs _hpclib_clear_ports with its arguments on the login node it is sent to.
 function _hpclib_clear_ports_script {
-  printf '%s\n' "$(declare -f _hpclib_sessions_root _hpclib_port_file _hpclib_port_free _hpclib_port_holders \
+  printf '%s\n' "$(declare -f _hpclib_sessions_root _hpclib_socket_path _hpclib_port_file _hpclib_port_free _hpclib_port_holders \
     _hpclib_wait_job_end _hpclib_clear_port _hpclib_clear_ports)" '_hpclib_clear_ports "$@"'
 }
 
@@ -2045,8 +2094,20 @@ function launch_tunnel {
 
           remote_command=$(_hpclib_remote_script_cmd /bin/bash "$remote_hpclib/tunnels/start_tunnel.sh" "$tunnel" \
             -P "$port" "${remote_args[@]}")
-          printf '%s\n' "pssh -t -L 127.0.0.1:$port:127.0.0.1:$port $address \"$remote_command\""
-          pssh -t -L "127.0.0.1:$port:127.0.0.1:$port" "$address" "$remote_command"
+          # the first hop: your port to the login node's port, or (--login-endpoint=socket) to a socket file there
+          local forward="127.0.0.1:$port:127.0.0.1:$port" arg sock
+          for arg in "${remote_args[@]}"; do
+            [ "$arg" = --login-endpoint=socket ] || continue
+            sock=$(printf '%s\n' "$(declare -f _hpclib_sessions_root _hpclib_socket_path)
+printf '%s\n' \"\$(_hpclib_socket_path \"\$(hostname -s)-$port.sock\")\"" |
+              HPCLIB_ECHO_COMMANDS= pssh "${_hpclib_launch_ssh[@]}" "$address" bash -s 2>/dev/null | tail -n 1)
+            case "$sock" in
+              /*) forward="127.0.0.1:$port:$sock" ;;
+              *) echo "launch_tunnel: couldn't find where $address keeps socket files (is the login working?)" >&2; return 1 ;;
+            esac
+          done
+          printf '%s\n' "pssh -t ${_hpclib_launch_ssh[*]} -L $forward $address \"$remote_command\""
+          pssh -t "${_hpclib_launch_ssh[@]}" -L "$forward" "$address" "$remote_command"
       fi
   fi
 }

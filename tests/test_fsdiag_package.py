@@ -316,6 +316,30 @@ class TestServer(unittest.TestCase):
         self.assertEqual(self.call("POST", "/api/run/delete", {"id": run["id"]})[0], 200)
         self.assertEqual(self.call("GET", "/api/run?id=" + run["id"])[0], 404)
 
+    def test_a_finished_run_is_a_notification_the_console_can_poll(self):
+        manifest = json.loads((PACKAGE / "hpclib-package.json").read_text())["apps"]["fsdiag"]
+        self.assertEqual([k["id"] for k in manifest["notifications"]], ["run_finished"])
+        self.assertEqual((manifest["notifications_path"], manifest["notifications_header"]), ("/api/notifications", "X-Fsdiag-Token"))
+        self.assertEqual(self.call("GET", "/api/notifications", token=False)[0], 401)
+        status, first = self.call("GET", "/api/notifications")
+        self.assertEqual((status, first["notifications"]), (200, []))
+        probe_dir = self.tmp / "noted"
+        probe_dir.mkdir()
+        status, run = self.call("POST", "/api/runs", {"where": "login", "paths": ["n=" + str(probe_dir)], "repeats": 3, "quota": False,
+                                                       "survey_roots": [str(probe_dir)], "survey_seconds": 5})
+        self.assertEqual(status, 201, run)
+        notes = []
+        for _ in range(120):
+            notes = self.call("GET", "/api/notifications?after=" + str(first["latest"]))[1]["notifications"]
+            if notes:
+                break
+            time.sleep(0.5)
+        self.assertEqual([n["kind"] for n in notes], ["run_finished"], notes)
+        self.assertIn(run["id"], notes[0]["title"])
+        latest = self.call("GET", "/api/notifications?after=" + str(first["latest"]))[1]["latest"]
+        self.assertEqual(self.call("GET", "/api/notifications?after=" + str(latest))[1]["notifications"], [])
+        self.call("POST", "/api/run/delete", {"id": run["id"]})
+
     def test_a_bad_spec_and_a_bad_id_are_refused(self):
         self.assertEqual(self.call("POST", "/api/runs", {"where": "moon"})[0], 400)
         self.assertEqual(self.call("GET", "/api/run?id=../../etc")[0], 404)

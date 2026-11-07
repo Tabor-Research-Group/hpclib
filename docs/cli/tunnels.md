@@ -168,6 +168,17 @@ launch_tunnel -P 5050 user@login.example rest --login-node
 There is no job, so sbatch options are ignored. Tunnels whose `tunnel_config.sh` sets `RUN_ON_LOGIN_NODE=true`
 always run this way. Shared-instance tunnels (like PAI) can't.
 
+## Reversing the direction, and socket files
+
+```bash
+launch_tunnel -P 5050 user@login.example rest --link=push --login-endpoint=socket --job-endpoint=socket
+```
+
+`--link=push` has the job connect back to the login node with `ssh -R` instead of the login node connecting to the
+job. `--login-endpoint=socket` ends your port forward at a Unix socket file on the login node, and
+`--job-endpoint=socket` has the service listen on a socket file. Agents read the same choices from the cluster's
+settings (`tunnel_link`, `login_endpoint`, `job_endpoint`); see [Architecture](../architecture.md#direction-and-socket-files).
+
 ## Installing tunnels that don't come with hpclib
 
 A tunnel is a folder. Copy or clone it to the cluster, then:

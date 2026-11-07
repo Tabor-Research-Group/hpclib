@@ -102,7 +102,7 @@ done
 set -- "${START_TUNNEL_ARGS[@]}"
 
 START_TUNNEL_FLAGS="fP:"
-START_TUNNEL_LONG_FLAGS="port:,process-port:,env:,login-node"
+START_TUNNEL_LONG_FLAGS="port:,process-port:,env:,login-node,link:,login-endpoint:,job-endpoint:"
 
 CLI_HOST_PORT=$(mcoptvalue "$START_TUNNEL_FLAGS" "$START_TUNNEL_LONG_FLAGS" "P" "$@")
 if [ -z "$CLI_HOST_PORT" ]; then
@@ -111,6 +111,9 @@ fi
 CLI_PROCESS_PORT=$(mclongvalue "$START_TUNNEL_LONG_FLAGS" "process-port" "$@")
 CLI_ENV=$(mclongvalue "$START_TUNNEL_LONG_FLAGS" "env" "$@")
 CLI_LOGIN_NODE=$(mclongvalue "$START_TUNNEL_LONG_FLAGS" "login-node" "$@")
+CLI_LINK=$(mclongvalue "$START_TUNNEL_LONG_FLAGS" "link" "$@")
+CLI_LOGIN_ENDPOINT=$(mclongvalue "$START_TUNNEL_LONG_FLAGS" "login-endpoint" "$@")
+CLI_JOB_ENDPOINT=$(mclongvalue "$START_TUNNEL_LONG_FLAGS" "job-endpoint" "$@")
 start_bg=$(mcoptvalue "$START_TUNNEL_FLAGS" "$START_TUNNEL_LONG_FLAGS" "f" "$@")
 
 # Everything else - short or long, meant for sbatch (--mem=, --time=,
@@ -138,6 +141,11 @@ SHARED_INSTANCE=false        # true: attach to a running instance another job se
 PROCESS_PORT_FROM_JOB=false  # true: the job picks its port and registers it (see instances.sh)
 KEEP_INSTANCE=false          # true: closing the tunnel leaves the job running (for others to attach to)
 RUN_ON_LOGIN_NODE=false      # true (or --login-node): run the sbatch script here, on the login node, not in a job
+# How the pieces meet (a cluster's settings; --link=, --login-endpoint= and --job-endpoint= win):
+TUNNEL_LINK="${TUNNEL_LINK:-pull}"            # pull: this login node runs ssh -L to the job's node; push: the job runs
+                                              # ssh -R back to this login node (for sites that don't let it ssh to compute nodes)
+LOGIN_ENDPOINT="${LOGIN_ENDPOINT:-port}"      # what your machine's forward reaches here: port (a TCP port) or socket (a socket file)
+JOB_ENDPOINT="${JOB_ENDPOINT:-port}"          # what the service listens on in the job: port or socket (a socket file on its node)
 
 if tunnel_config_path=$(resolve_tunnel_file tunnel_config.sh); then
   source "$tunnel_config_path"
@@ -158,10 +166,43 @@ fi
 if [ -n "$CLI_PROCESS_PORT" ]; then PROCESS_PORT="$CLI_PROCESS_PORT"; fi
 if [ -n "$CLI_HOST_PORT" ]; then DEFAULT_PORT="$CLI_HOST_PORT"; fi
 if [ "$CLI_LOGIN_NODE" = "true" ]; then RUN_ON_LOGIN_NODE=true; fi
+if [ -n "$CLI_LINK" ]; then TUNNEL_LINK="$CLI_LINK"; fi
+if [ -n "$CLI_LOGIN_ENDPOINT" ]; then LOGIN_ENDPOINT="$CLI_LOGIN_ENDPOINT"; fi
+if [ -n "$CLI_JOB_ENDPOINT" ]; then JOB_ENDPOINT="$CLI_JOB_ENDPOINT"; fi
+case "$TUNNEL_LINK" in pull|push) ;; *) echo "start_tunnel: --link is pull or push, not '$TUNNEL_LINK'" >&2; exit 2 ;; esac
+case "$LOGIN_ENDPOINT" in port|socket) ;; *) echo "start_tunnel: --login-endpoint is port or socket, not '$LOGIN_ENDPOINT'" >&2; exit 2 ;; esac
+case "$JOB_ENDPOINT" in port|socket) ;; *) echo "start_tunnel: --job-endpoint is port or socket, not '$JOB_ENDPOINT'" >&2; exit 2 ;; esac
 
 HOST_PORT="$DEFAULT_PORT"
 if [ -z "$PROCESS_PORT" ]; then
   PROCESS_PORT="$HOST_PORT"
+fi
+
+# A socket on the login node: its path, in a folder only you can use. The waiting page, the service (on the login
+# node) or the forward to the job binds it; your machine's forward reaches it (launch_tunnel works out the same path).
+LOGIN_SOCKET=''
+if [ "$LOGIN_ENDPOINT" = socket ]; then
+  LOGIN_SOCKET=$(_hpclib_socket_path "$(hostname -s)-$HOST_PORT.sock")
+  mkdir -p -m 700 "$(dirname "$LOGIN_SOCKET")" && chmod 700 "$(dirname "$LOGIN_SOCKET")" 2>/dev/null
+  SHIM_ENDPOINT="unix:$LOGIN_SOCKET"
+else
+  SHIM_ENDPOINT="$HOST_PORT"
+fi
+# what the job (and a service on the login node) needs to know about the ways in
+HPCLIB_TUNNEL_LINK="$TUNNEL_LINK"
+HPCLIB_LOGIN_ENDPOINT="$LOGIN_ENDPOINT"
+HPCLIB_LOGIN_SOCKET="$LOGIN_SOCKET"
+HPCLIB_LOGIN_PORT="$HOST_PORT"
+HPCLIB_LOGIN_HOST="${HPCLIB_LOGIN_HOST_FOR_JOBS:-$(hostname -s)}"
+HPCLIB_JOB_ENDPOINT="$JOB_ENDPOINT"
+HPCLIB_JOB_SOCKET_DIR="${HPCLIB_JOB_SOCKET_DIR:-/tmp}"
+if [ "$TUNNEL_LINK" = push ] && { [ "$PROCESS_PORT_FROM_JOB" = true ] || [ "$SHARED_INSTANCE" = true ]; }; then
+  echo "start_tunnel: $TUNNEL_NAME picks its port in the job or shares its service between jobs; --link=push can't reach that (use pull)" >&2
+  exit 1
+fi
+if [ "$TUNNEL_LINK" = push ] && [ "$start_bg" = true ] && [ "$RUN_ON_LOGIN_NODE" != true ]; then
+  echo "start_tunnel: -f (background) isn't supported with --link=push; the login node keeps the tunnel running" >&2
+  exit 1
 fi
 
 # CLI sbatch args are APPENDED after the tunnel's defaults, not
@@ -232,6 +273,12 @@ if [ "$RUN_ON_LOGIN_NODE" = "true" ]; then
     echo "hpclib: on the login node there is no job; ignoring the sbatch options: ${CLI_SBATCH_ARGS# }" >&2
   fi
   PROCESS_PORT="$HOST_PORT"
+  if [ "$LOGIN_ENDPOINT" = socket ]; then       # the service itself listens on the socket your machine's forward reaches
+    HPCLIB_JOB_ENDPOINT=socket
+    HPCLIB_JOB_SOCKET="$LOGIN_SOCKET"
+  else
+    HPCLIB_JOB_ENDPOINT=port
+  fi
   TUNNEL_ON_LOGIN_NODE=true
   SESSION_ID="login-$job_uuid"
   SESSION_FILE="$SESSIONS_DIR/session-$SESSION_ID.log"
@@ -281,7 +328,7 @@ cancels_job() { [ "$TUNNEL_ATTACHED" != "true" ] && [ "$KEEP_INSTANCE" != "true"
 # connection-refused while SLURM queues the real job. Killed below the
 # instant the real compute node is reachable.
 if [ "$TUNNEL_ATTACHED" != "true" ]; then
-  python3 "$HPCSERVERS_DIR/waiting_shim.py" "$HOST_PORT" "$STATUS_FILE" "$TUNNEL_NAME" > "$STATUS_FILE" &
+  python3 "$HPCSERVERS_DIR/waiting_shim.py" "$SHIM_ENDPOINT" "$STATUS_FILE" "$TUNNEL_NAME" > "$STATUS_FILE" &
   SHIM_PID=$!
 
   # --parsable: the job id comes straight from sbatch, whatever else the site's
@@ -326,6 +373,7 @@ if [ "$SESSION_ID" = "" ]
     else
 
       SESSION_FILE="$SESSIONS_DIR/session-$SESSION_ID.log"
+      JOB_SOCKET="$HPCLIB_JOB_SOCKET_DIR/hpclib-$(id -un)-$SESSION_ID.sock"     # where a socket-mode job's service listens
       # stop_tunnel cancels the recorded job: only one this tunnel owns
       if cancels_job; then _hpclib_record_port "$HOST_PORT" "$$" "$SESSION_ID"; fi
       echo "job $SESSION_ID submitted, waiting for a node..." > "$STATUS_FILE"
@@ -415,7 +463,36 @@ if [ "$SESSION_ID" = "" ]
       # job_node is already confirmed, so connect_to_job's own internal
       # wait_for_job_node succeeds almost immediately - the small -R/-S
       # here is just a formality, not the real wait.
-      connect_to_job $ssh_flags -P $HOST_PORT:$PROCESS_PORT -R 10 -S "$JOB_CONNECT_RETRY_WAIT_TIME" -I $JOB_INITIALIZATION_PAUSE $SESSION_ID "source $TUNNEL_ENV_FIlE; source $POST_SCRIPT"
+      if [ "$TUNNEL_LINK" = push ]; then
+        # The job connects back: it runs ssh -R from its node to this one (configure_job.sh), binding this tunnel's
+        # port or socket once the waiting page is gone. This login node only watches, as postconnect.sh does from the job.
+        [ -n "$LOGIN_SOCKET" ] && rm -f "$LOGIN_SOCKET"
+        (
+          waited=0
+          until _hpclib_endpoint_up "$SHIM_ENDPOINT"; do
+            if [ -z "$(squeue -j "$SESSION_ID" -h -o %T 2>/dev/null)" ]; then exit 0; fi
+            if [ "$waited" -ge "${HPCLIB_PUSH_WAIT:-300}" ]; then
+              echo "hpclib: job $SESSION_ID on $job_node hasn't connected back to $(hostname -s) in ${HPCLIB_PUSH_WAIT:-300} s;" \
+                "it needs to ssh to $HPCLIB_LOGIN_HOST (see the job's log above for ssh's message, and the cluster's SSH keys tab)" >&2
+              scancel "$SESSION_ID" 2>/dev/null
+              exit 0
+            fi
+            sleep 2
+            waited=$((waited + 2))
+          done
+          echo "hpclib: job $SESSION_ID on $job_node connected back to $(hostname -s) ($SHIM_ENDPOINT)"
+        ) &
+        bash "$POST_SCRIPT"
+      else
+        if [ "$LOGIN_ENDPOINT" = port ] && [ "$JOB_ENDPOINT" = port ]; then
+          connect_to_job $ssh_flags -P $HOST_PORT:$PROCESS_PORT -R 10 -S "$JOB_CONNECT_RETRY_WAIT_TIME" -I $JOB_INITIALIZATION_PAUSE $SESSION_ID "source $TUNNEL_ENV_FIlE; source $POST_SCRIPT"
+        else
+          # a socket file on either end: ssh -L [127.0.0.1:PORT|SOCKET]:[127.0.0.1:PORT|SOCKET]
+          login_bind="127.0.0.1:$HOST_PORT"; [ "$LOGIN_ENDPOINT" = socket ] && login_bind="$LOGIN_SOCKET"
+          job_target="127.0.0.1:$PROCESS_PORT"; [ "$JOB_ENDPOINT" = socket ] && job_target="$JOB_SOCKET"
+          connect_to_job $ssh_flags -L "$login_bind:$job_target" -o StreamLocalBindUnlink=yes -R 10 -S "$JOB_CONNECT_RETRY_WAIT_TIME" -I $JOB_INITIALIZATION_PAUSE $SESSION_ID "source $TUNNEL_ENV_FIlE; source $POST_SCRIPT"
+        fi
+      fi
 
       if [ "$start_bg" = "true" ];
         then

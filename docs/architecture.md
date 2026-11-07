@@ -66,6 +66,25 @@ With `--login-node`, or `RUN_ON_LOGIN_NODE=true` in `tunnel_config.sh`, steps 4 
 It ends when the tunnel ends, the way a job would be cancelled. This is for sites that prefer a small service on
 the login node to a job holding part of a compute node, and for development servers without SLURM.
 
+### Direction and socket files
+
+Three per-cluster settings (Settings → Tunnel, or `hpclib_agents set CLUSTER KEY=VALUE`) rewire the hops. They
+reach `start_tunnel.sh` as `--link`, `--login-endpoint` and `--job-endpoint`, and apply the next time the tunnel
+starts.
+
+- `tunnel_link=pull` (default): the login node runs `ssh -L` to the job's node. `push`: for clusters where
+  login nodes can't ssh to compute nodes but they can ssh back, the job runs `ssh -R` to the login node
+  (`configure_job.sh`, using the compute-node key from `setup_cluster_ssh`) and the login node only watches. If
+  nothing connects within `HPCLIB_PUSH_WAIT` seconds (default 300) the job is cancelled.
+- `login_endpoint=socket`: the end of your machine's port forward is a Unix socket file on the login node
+  (`sessions/sockets/HOST-PORT.sock`, or `/tmp/hpclib-USER` when that path is too long) instead of a TCP port. Your
+  machine still uses `127.0.0.1:P`. Needs sshd `AllowStreamLocalForwarding` and OpenSSH 6.7 or later.
+- `job_endpoint=socket`: the service listens on a socket file instead of a port (the REST server's
+  `--unix-socket`), so nothing on a shared compute node holds a TCP port.
+
+`push` can't be used with tunnels that pick their port in the job or share an instance (PAI, apps), nor with `-f`;
+socket endpoints are implemented for the REST agent tunnel first.
+
 ### Shared instances
 
 A tunnel with `SHARED_INSTANCE=true` serves something several sessions should share, such as a database. Before

@@ -905,6 +905,14 @@ async function tunnelSettings(c) {
   const restOn = el("select", {}, (s.rest_on_choices || ["job", "login"]).map((m) => el("option",
     { value: m, selected: m === (s.rest_on || "job") },
     { job: "In a SLURM job on a compute node", login: "On the login node (no job)" }[m] || m)));
+  const choice = (key, choices, labels) => el("select", {}, choices.map((m) => el("option",
+    { value: m, selected: m === (s[key] || choices[0]) }, labels[m] || m)));
+  const link = choice("tunnel_link", s.tunnel_link_choices || ["pull", "push"],
+    { pull: "Login node connects to the job (default)", push: "Job connects back to the login node (ssh -R)" });
+  const loginEnd = choice("login_endpoint", s.endpoint_choices || ["port", "socket"],
+    { port: "A TCP port on the login node", socket: "A Unix socket file on the login node" });
+  const jobEnd = choice("job_endpoint", s.endpoint_choices || ["port", "socket"],
+    { port: "A TCP port on the compute node", socket: "A Unix socket file on the compute node" });
   const jobFields = el("div", { class: "row" },
     TUNNEL_FIELDS.map(([k, label, hint]) => field(`Tunnel job: ${label}`, inputs[k], hint)));
   const showJob = () => { jobFields.hidden = restOn.value === "login"; };
@@ -915,7 +923,8 @@ async function tunnelSettings(c) {
       .concat(other);
     await api(cluster(c.name) + "/settings", { method: "PUT", body: {
       auto_approve_templates: mode.value, tunnel_args: args, connection_hours: Number(hours.value),
-      rest_on: restOn.value } });
+      rest_on: restOn.value, tunnel_link: link.value, login_endpoint: loginEnd.value,
+      job_endpoint: jobEnd.value } });
     return "Saved. Applies the next time the tunnel starts (the login hours: the next time you log in).";
   });
   return el("section", { class: "card" },
@@ -925,6 +934,11 @@ async function tunnelSettings(c) {
     field("Run the REST server", restOn, "on the login node where a site asks for it, or on a machine without SLURM "
       + "(its server config then runs jobs there too); setup_agents picks this for a machine without sbatch"),
     jobFields,
+    field("Tunnel direction", link, "push for clusters where the login node cannot ssh to compute nodes but they can "
+      + "ssh back; needs the compute-node key from setup_cluster_ssh"),
+    field("Main connection ends at", loginEnd, "a socket file on the login node, exposed to your machine by the "
+      + "port forward (needs sshd AllowStreamLocalForwarding)"),
+    field("The service listens on", jobEnd, "a socket file instead of a port (REST tunnel only)"),
     other.length ? el("p", { class: "muted" }, `Also: ${other.join(" ")}`) : null,
     el("div", { class: "actions" }, save));
 }
@@ -1983,7 +1997,7 @@ clusterUI.init({
   appSettings: (app, s, row) => appSettingsForm(app, s, row),
 });
 settingsUI.init({ api, errorBox, field, key: () => key, render: () => render() });
-widgetsUI.init({ api, errorBox, preferences: () => settingsUI.preferences() });
+widgetsUI.init({ api, errorBox, preferences: () => settingsUI.preferences(), notify: settingsUI.notifyWidget });
 Promise.all([loadApps(), settingsUI.loadPreferences(), widgetsUI.load()]).then(render);
 settingsUI.loadPreferences().then(settingsUI.restartWatch);
 checkPrompts();

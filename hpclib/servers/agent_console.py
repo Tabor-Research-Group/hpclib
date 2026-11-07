@@ -57,6 +57,8 @@ The front end depends only on the routes below; nothing here depends on it.
   GET  /api/clusters/NAME/llm-clients         this cluster's entry in each client (current, different, missing),
                                               and whether its Python has the MCP SDK
   POST /api/llm-clients/ID/remove            {"name"}: remove an hpclib entry no cluster has any more
+  GET  /api/notification-sources             the apps and widgets that declare notifications (Console Settings)
+  GET  /api/notifications/apps               new notifications from the apps switched on there (polls their tunnels)
   GET  /api/watch                            each tunnel's port open or not, and Stops asked for here
   GET  /api/widgets                          the installed packages' widgets (slot, topics they read, height)
   GET  /api/widgets/PACKAGE/ID               {"html"}: a widget's page, which the front end shows sandboxed
@@ -272,6 +274,10 @@ TRANSFER_GUI_RE = re.compile(r"^HPCLIB_(TRANSFER|RCLONE)_GUI((?: [a-z]+=\S*)+)\s
 #   shared        the tunnel attaches to a running instance another job serves (SHARED_INSTANCE), and keeps
 #                 the one it starts running after Stop (KEEP_INSTANCE); `instance_label` names that service,
 #                 and its row gets a toolbar tool describing the job and a control that ends it
+#   notifications  [{"id", "label", "hint"}]: the kinds of browser notification the app may send, each switched on in
+#                 Console Settings (see app_notifications.py); the console polls `notifications_path` (default
+#                 /notifications) on the app's port with its token in the header `notifications_header` (default
+#                 Authorization: Bearer TOKEN), needing token_re
 # A session's state carries `tools` (for the row's <hpclib-toolbar>: {"id", "kind": "info"|"select", "label",
 # "text" | "options"/"value"/"control"}) and `controls` (for its <hpclib-extra-controls>: {"id", "label",
 # "title", "confirm", "args"}), run with POST /api/apps/APP/NAME/control/ID.
@@ -357,6 +363,7 @@ APPS = {
 }
 # hpclib's own apps; installed packages add theirs to APPS (load_package_apps)
 BUILTIN_APPS = dict(APPS)
+NOTE_HASH_RE = re.compile(r"#/[A-Za-z0-9_\-./%?=&@:~]*")
 SETTING_VALUE_RE = re.compile(r"[^\0\n\r]{0,1024}")
 
 
@@ -398,6 +405,10 @@ def load_package_apps(store=None):
             spec["login_user"] = app["login_user"]
         if app.get("theme_link"):
             spec["theme_link"] = True
+        if app.get("notifications"):
+            spec["notifications"] = [dict(k) for k in app["notifications"]]
+            spec["notifications_path"] = app.get("notifications_path") or "/notifications"
+            spec["notifications_header"] = app.get("notifications_header") or "Authorization"
         if app.get("secrets"):
             spec["secrets"] = [(f["name"], f["label"], f["hint"]) for f in app["secrets"]]
         if app.get("tokens"):
@@ -1535,6 +1546,9 @@ class Clusters:
         self.storage_scans = {}      # name -> {"state": "running", "started": ...} while a storage scan runs
         self.queue_cache = {}        # name -> (time, the last whole-queue answer that squeue gave)
         self.storage_lock = threading.Lock()   # the storage cache file: a scan and quota checks both write it
+        self.note_cursors = {}       # (cluster, app) -> the last notification number taken from the app
+        self.note_states = {}        # (cluster, app) -> the state last seen, for kinds that fire on entering one
+        self.note_seq = 0
         self.stops = {}              # (name, app or None) -> when Stop was asked for here (notifications skip those)
         self.packages = load_package_apps()
         self.secret_runner = self._run_with_input
@@ -4598,6 +4612,98 @@ class Clusters:
                             "stopped": self.stops.get((name, app))})
         return {"at": time.time(), "tunnels": out}
 
+    def notification_sources(self):
+        """The apps and widgets that declare notifications, for Console Settings: [{key, title, kind, kinds}]."""
+        out = [{"key": f"app:{a}", "title": spec["title"], "kind": "app", "kinds": spec["notifications"]}
+               for a, spec in sorted(APPS.items()) if spec.get("notifications")]
+        try:
+            widgets = self.packages.widgets()
+        except console_packages.PackageError:
+            widgets = []
+        out += [{"key": f"widget:{w['key']}", "title": w["title"], "kind": "widget", "kinds": w["notifications"]}
+                for w in widgets if w.get("notifications")]
+        return {"sources": out}
+
+    def app_notifications(self):
+        """New notifications from the apps whose sources are switched on: polls each running app's endpoint (see
+        app_notifications.py), keeps what is wanted (the kind declared, and switched on), and moves on past the rest."""
+        prefs = console_prefs.load(console_dir())
+        found = []
+        for p in agent_profiles.all_profiles():
+            name = p["name"]
+            for app, conf in sorted((p.get("apps") or {}).items()):
+                spec = APPS.get(app)
+                if not spec or not spec.get("notifications") or not isinstance(conf, dict) or not conf.get("port"):
+                    continue
+                source, key = f"app:{app}", (name, app)
+                if not (prefs["app_notifications"].get(source) or {}).get("enabled"):
+                    self.note_cursors.pop(key, None)         # switched off: start fresh when it is switched on
+                    self.note_states.pop(key, None)
+                    continue
+                found += self.state_notifications(prefs, p, name, app, spec, source, key)
+                polled = [k for k in spec["notifications"] if not k.get("on_state")]
+                if not polled:
+                    continue                                 # only state kinds: the app has no endpoint to ask
+                token = self._app_token(name, app)
+                if token is None or not self.port_open(conf["port"]):
+                    continue
+                header = spec.get("notifications_header") or "Authorization"
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{conf['port']}{spec.get('notifications_path') or '/notifications'}"
+                    + (f"?after={self.note_cursors[key]}" if key in self.note_cursors else ""),
+                    headers={header: f"Bearer {token}" if header == "Authorization" else token})
+                try:
+                    with urllib.request.urlopen(req, timeout=3) as res:
+                        reply = json.loads(res.read(1 << 20))
+                except (urllib.error.URLError, OSError, ValueError):
+                    continue
+                if not isinstance(reply, dict) or isinstance(reply.get("latest"), bool) or not isinstance(reply.get("latest"), int):
+                    continue
+                known = {k["id"] for k in polled}
+                if reply["latest"] < self.note_cursors.get(key, 0):
+                    self.note_cursors[key] = reply["latest"]       # the app restarted: its numbers began again
+                    continue
+                for n in reply.get("notifications") or []:
+                    if (isinstance(n, dict) and n.get("kind") in known and isinstance(n.get("title"), str)
+                            and console_prefs.app_note_wanted(prefs, source, n["kind"])):
+                        found.append(self.clean_note(source, name, app, spec, n))
+                self.note_cursors[key] = reply["latest"]
+        return {"notifications": found}
+
+    def state_notifications(self, prefs, profile, name, app, spec, source, key):
+        """
+        The kinds a manifest ties to a state (`on_state`: queued, up or error): the console already knows the app's
+        state (it is the row's Open button), so these need nothing from the app, and work while its job is still
+        waiting, before its port exists. One is sent when the app enters the state; the first look takes nothing.
+        """
+        wanted = [k for k in spec["notifications"] if k.get("on_state") and console_prefs.app_note_wanted(prefs, source, k["id"])]
+        if not wanted:
+            self.note_states.pop(key, None)
+            return []
+        try:
+            state = self._app_state(profile, app).get("state")
+        except (OSError, ValueError, KeyError):
+            return []
+        before, self.note_states[key] = self.note_states.get(key), state
+        out = []
+        if before is not None and before != state:
+            for k in wanted:
+                if k["on_state"] == state:
+                    self.note_seq += 1
+                    out.append(self.clean_note(source, name, app, spec, {
+                        "id": f"{state}-{self.note_seq}", "kind": k["id"], "title": k["label"], "body": k.get("hint") or ""}))
+        return out
+
+    @staticmethod
+    def clean_note(source, cluster, app, spec, n):
+        """One polled notification as the page shows it: text kept short, the address one the console knows."""
+        link = n.get("hash") if isinstance(n.get("hash"), str) else ""
+        if not NOTE_HASH_RE.fullmatch(link) or "key=" in link.lower():
+            link = f"#/c/{urllib.parse.quote(cluster)}/apps/{urllib.parse.quote(app)}"
+        return {"source": source, "cluster": cluster, "app": app, "kind": n["kind"], "id": n.get("id"),
+                "title": f"{n['title'][:120]}", "body": str(n.get("body") or "")[:300], "hash": link,
+                "app_title": spec["title"]}
+
     def about(self):
         on_disk = local_hpclib_version()
         return {"hpclib_version": STARTED_VERSION, "hpclib_version_on_disk": on_disk,
@@ -4875,6 +4981,10 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             return 200, dict(c.llm_client_write(parts[1], body.get("names"), body.get("force")), ok=True)
         if len(parts) == 3 and parts[0] == "llm-clients" and parts[2] == "remove" and verb == "POST":
             return 200, dict(c.llm_client_remove(parts[1], self.json_body()), ok=True)
+        if parts == ["notification-sources"] and verb == "GET":
+            return 200, dict(c.notification_sources(), ok=True)
+        if parts == ["notifications", "apps"] and verb == "GET":
+            return 200, dict(c.app_notifications(), ok=True)
         if parts == ["watch"] and verb == "GET":
             return 200, dict(c.watch(), ok=True)
         if parts == ["about"] and verb == "GET":
@@ -5175,12 +5285,18 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 "connection_hours": profile.get("connection_hours") or Logins.DEFAULT_HOURS,
                 "rest_on": profile.get("rest_on") or "job",
                 "rest_on_choices": list(agent_profiles.REST_ON),
+                "tunnel_link": profile.get("tunnel_link") or "pull",
+                "login_endpoint": profile.get("login_endpoint") or "port",
+                "job_endpoint": profile.get("job_endpoint") or "port",
+                "tunnel_link_choices": list(agent_profiles.TUNNEL_LINKS),
+                "endpoint_choices": list(agent_profiles.ENDPOINTS),
                 "modes": list(agent_profiles.APPROVE_MODES),
                 "tunnel_arg_pattern": agent_profiles.TUNNEL_ARG_RE.pattern,
                 "applies": "the next time the tunnel starts"}
 
     def save_tunnel_settings(self, profile, body):
-        unknown = set(body) - {"auto_approve_templates", "tunnel_args", "connection_hours", "rest_on"}
+        unknown = set(body) - {"auto_approve_templates", "tunnel_args", "connection_hours", "rest_on",
+                                   "tunnel_link", "login_endpoint", "job_endpoint"}
         if unknown:
             raise ConsoleError(400, f"unknown settings {sorted(unknown)}")
         mode = body.get("auto_approve_templates", profile.get("auto_approve_templates") or "all")
@@ -5197,8 +5313,17 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         rest_on = body.get("rest_on", profile.get("rest_on") or "job")
         if rest_on not in agent_profiles.REST_ON:
             raise ConsoleError(422, f"rest_on must be one of {list(agent_profiles.REST_ON)}")
+        link = body.get("tunnel_link", profile.get("tunnel_link") or "pull")
+        if link not in agent_profiles.TUNNEL_LINKS:
+            raise ConsoleError(422, f"tunnel_link must be one of {list(agent_profiles.TUNNEL_LINKS)}")
+        endpoints = {}
+        for key in ("login_endpoint", "job_endpoint"):
+            endpoints[key] = body.get(key, profile.get(key) or "port")
+            if endpoints[key] not in agent_profiles.ENDPOINTS:
+                raise ConsoleError(422, f"{key} must be one of {list(agent_profiles.ENDPOINTS)}")
         fresh = agent_profiles.load(profile["name"]) or profile
-        fresh.update(auto_approve_templates=mode, tunnel_args=args, connection_hours=hours, rest_on=rest_on)
+        fresh.update(auto_approve_templates=mode, tunnel_args=args, connection_hours=hours, rest_on=rest_on,
+                     tunnel_link=link, **endpoints)
         agent_profiles.save(fresh)
         return self.tunnel_settings(fresh)
 

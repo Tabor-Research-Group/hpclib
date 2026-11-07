@@ -3,6 +3,11 @@ The console's own preferences (this machine, not a cluster), kept in preferences
 
   notifications   which browser notifications the page shows: a tunnel dropping, a password or host-key prompt,
                   an agent's job finishing, a new template proposal
+  badge           {"dock": bool}: an unread count on the console's Dock icon (the browser's Badging API, so only
+                  when the console is installed as a web app); off until switched on
+  app_notifications  what apps and widgets may notify about: {"app:ID" or "widget:PACKAGE/ID": {"enabled": bool,
+                  "kinds": {KIND: bool}}}; nothing is on until it is switched on here (the app's manifest
+                  declares its kinds)
   new_cluster     defaults a cluster added from now on starts with: how long its login is kept, the work
                   directory the Add cluster form suggests ({user} is the login's user), the local folder it
                   suggests for the agent's files ({cluster}, {user}; "" suggests none), the launcher it suggests
@@ -31,6 +36,8 @@ GPU_MODES = ("auto", "always", "never")
 LLM_CLIENTS = ("claude_desktop", "claude_code", "cursor", "chatgpt")
 DEFAULTS = {
     "notifications": {k: False for k in NOTIFICATIONS},
+    "app_notifications": {},
+    "badge": {"dock": False},
     "new_cluster": {"connection_hours": 12, "work_dir_pattern": "", "sandbox_gpus": "auto", "max_gpus": None,
                     "mcp_name_pattern": "hpclib-{cluster}", "local_root_pattern": "", "mcp_command": "",
                     "mcp_args": ""},
@@ -42,6 +49,8 @@ DEFAULTS = {
 PLATFORM_CHOICES = ("auto", "linux", "macos", "wsl")      # local_platform.CHOICES
 WORK_PATTERN_RE = re.compile(r"(/[A-Za-z0-9_.@{}+-]+)+/?")
 MCP_PATTERN_RE = re.compile(r"(?:[A-Za-z0-9_-]|\{(?:cluster|user|host)\}){1,64}")      # agent_profiles' too
+NOTE_SOURCE_RE = re.compile(r"app:[a-z0-9][a-z0-9_-]{0,39}|widget:[A-Za-z0-9][A-Za-z0-9_.-]{0,63}/[a-z][a-z0-9_-]{0,31}")
+NOTE_KIND_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 WIDGET_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}/[a-z][a-z0-9_-]{0,31}")
 
 
@@ -134,6 +143,29 @@ def _widgets(values):
     return values
 
 
+def _app_notifications(values):
+    if not isinstance(values, dict) or len(values) > 200:
+        raise PrefsError("app_notifications maps app:ID or widget:PACKAGE/ID to {enabled, kinds}")
+    out = {}
+    for source, v in values.items():
+        if not isinstance(source, str) or not NOTE_SOURCE_RE.fullmatch(source):
+            raise PrefsError(f"app_notifications: {source!r} isn't app:ID or widget:PACKAGE/ID")
+        if not isinstance(v, dict) or set(v) - {"enabled", "kinds"} or not isinstance(v.get("enabled", False), bool):
+            raise PrefsError(f"app_notifications.{source} is {{enabled: true|false, kinds: {{KIND: true|false}}}}")
+        kinds = v.get("kinds", {})
+        if (not isinstance(kinds, dict) or len(kinds) > 32 or not all(
+                isinstance(k, str) and NOTE_KIND_RE.fullmatch(k) and isinstance(b, bool) for k, b in kinds.items())):
+            raise PrefsError(f"app_notifications.{source}.kinds takes true or false for each kind")
+        out[source] = {"enabled": v.get("enabled", False), "kinds": dict(kinds)}
+    return out
+
+
+def app_note_wanted(prefs, source, kind):
+    """Whether the user switched on this source and this kind of its notifications."""
+    entry = (prefs.get("app_notifications") or {}).get(source) or {}
+    return bool(entry.get("enabled")) and bool((entry.get("kinds") or {}).get(kind))
+
+
 def _system(values):
     if not isinstance(values, dict) or set(values) - set(DEFAULTS["system"]):
         raise PrefsError("system has platform and windows_home")
@@ -162,6 +194,8 @@ def _client_paths(values):
 
 CHECKS = {
     "notifications": lambda v: _bool_map(v, NOTIFICATIONS, "notifications"),
+    "app_notifications": _app_notifications,
+    "badge": lambda v: _bool_map(v, ("dock",), "badge"),
     "new_cluster": _new_cluster,
     "llm_clients": lambda v: _bool_map(v, LLM_CLIENTS, "llm_clients"),
     "widgets": _widgets,
@@ -178,7 +212,10 @@ def update(console_dir, body):
     with _lock:
         prefs = load(console_dir)
         for section, values in checked.items():
-            prefs[section].update(values)
+            if section == "app_notifications":     # the whole map: a source left out is switched off
+                prefs[section] = values
+            else:
+                prefs[section].update(values)
         _write(console_dir, prefs)
     return prefs
 

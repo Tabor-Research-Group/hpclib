@@ -143,6 +143,7 @@ import secrets
 import shutil
 import signal
 import socket
+import socketserver
 import stat
 import subprocess
 import tempfile
@@ -524,6 +525,35 @@ class RESTServer(http.server.ThreadingHTTPServer):
         super().__init__(address, handler_class)
 
 
+class UnixRESTServer(RESTServer):
+    """The server on a Unix socket file, private to you (mode 600, in a folder only you can use): for tunnels that
+    reach it through ssh's socket forwarding instead of a TCP port on a shared node. An earlier socket file that
+    nothing listens on is replaced; one that something does answer on is an error."""
+    address_family = socket.AF_UNIX
+
+    def server_bind(self):
+        path = self.server_address
+        try:
+            if stat.S_ISSOCK(os.lstat(path).st_mode):
+                probe = socket.socket(socket.AF_UNIX)
+                try:
+                    probe.connect(path)
+                    raise OSError(f"something is already listening on {path}")
+                except (ConnectionRefusedError, FileNotFoundError):
+                    os.unlink(path)
+                finally:
+                    probe.close()
+        except FileNotFoundError:
+            pass
+        old = os.umask(0o177)
+        try:
+            socketserver.TCPServer.server_bind(self)
+        finally:
+            os.umask(old)
+        os.chmod(path, 0o600)
+        self.server_name, self.server_port = "localhost", 0
+
+
 class RESTHandler(http.server.BaseHTTPRequestHandler):
     """
     Minimal JSON router. Subclasses supply `get_routes`, a dict mapping
@@ -726,8 +756,17 @@ class RESTHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         sys.stderr.write(f"[{self.log_date_time_string()}] {self.address_string()} {format % args}\n")
 
+    def address_string(self):
+        return self.client_address[0] if self.client_address else "unix"     # a Unix socket's peers have no address
+
     @classmethod
-    def start_server(cls, host="127.0.0.1", port=5000, **server_opts):
+    def start_server(cls, host="127.0.0.1", port=5000, unix_socket=None, **server_opts):
+        if unix_socket:
+            with UnixRESTServer(unix_socket, cls, **server_opts) as server:
+                print(f"hpclib REST server listening on the socket {unix_socket} "
+                      f"{round(time.monotonic() - _IMPORTED_AT, 2)} s after it started, rss {rss_mb()} MB", flush=True)
+                server.serve_forever()
+            return
         with RESTServer((host, port), cls, **server_opts) as server:
             print(f"hpclib REST server listening on {host}:{port} "
                   f"{round(time.monotonic() - _IMPORTED_AT, 2)} s after it started, rss {rss_mb()} MB", flush=True)
@@ -1888,6 +1927,9 @@ def parse_args(argv=None):
     parser.add_argument("--host", default=os.environ.get("HPC_REST_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int,
                         default=os.environ.get("HPC_REST_PORT", os.environ.get("PROCESS_PORT", 5000)))
+    parser.add_argument("--unix-socket", metavar="PATH", default=os.environ.get("HPC_REST_UNIX_SOCKET") or None,
+                        help="listen on this Unix socket file (private to you) instead of a TCP port, for tunnels "
+                             "that reach the server through a socket (the tunnel's job_endpoint=socket)")
     parser.add_argument("--allow", action="append", default=[d for d in env_dirs.split(":") if d],
                         metavar="DIR",
                         help="restrict file access to DIR and its children (repeatable; "
@@ -2342,7 +2384,7 @@ def main(argv=None, handler_class=HPCRESTHandler):
 
     if opts.host not in ("127.0.0.1", "localhost", "::1"):
         print(f"WARNING: binding {opts.host} exposes this server beyond the local node", file=sys.stderr)
-    print(f"hpclib REST server on http://{opts.host}:{opts.port}")
+    print(f"hpclib REST server on " + (f"the socket {opts.unix_socket}" if opts.unix_socket else f"http://{opts.host}:{opts.port}"))
     print(f"  token: {auth.source}; scoped tokens: {config['tokens_file']}")
     print(f"  allowed dirs: {', '.join(whitelist.roots) if whitelist.restricted else 'unrestricted'}")
     print(f"  file changes: {'disabled' if opts.disable_file_changes else 'enabled'}")
@@ -2387,7 +2429,7 @@ def main(argv=None, handler_class=HPCRESTHandler):
 
     try:
         handler_class.start_server(
-            opts.host, opts.port,
+            opts.host, opts.port, unix_socket=opts.unix_socket,
             auth=auth, whitelist=whitelist,
             command_timeout=opts.command_timeout, max_upload=opts.max_upload,
             disable_file_changes=opts.disable_file_changes,

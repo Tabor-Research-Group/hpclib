@@ -10,6 +10,7 @@ requests that change something must be JSON, and a request naming another Origin
 
   fsdiag_server.py --port PORT
 
+  GET  /api/notifications           what the console polls for its notifications (see app_notifications.py)
   GET  /health                     {"ok", "version"}
   GET  /api/info                   user, host, the default places, the control, the settings
   GET  /api/nodes[?refresh=1]      {slurm, partitions, nodes, mine}: what can be targeted; mine: where your running jobs are
@@ -38,6 +39,7 @@ import threading
 import time
 import urllib.parse
 
+from app_notifications import Notifier
 from token_auth import ServiceToken
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -65,6 +67,22 @@ class Diagnostics:
         self.runs = Runs(self.state_dir, os.path.join(HERE, "fsprobe.py"), self.shell, self.slurm)
         self.runs.compute_python = os.environ.get("FSDIAG_COMPUTE_PYTHON") or "python3"
         self._requests, self._lock = {}, threading.Lock()
+        self.notes = Notifier()
+        self._seen_runs = None         # run id -> its last final state, once the first look has been taken
+
+    def notifications(self, after):
+        """The poll: a run that has ended since the last one is a "run_finished" notification."""
+        with self._lock:
+            ended = {r["id"]: r for r in self.runs.list() if r["state"] in ("done", "partial", "failed")}
+            if self._seen_runs is not None:             # the first look only notes what had already ended
+                for run_id, r in sorted(ended.items()):
+                    if run_id not in self._seen_runs:
+                        failed = sum(1 for t in r["targets"] if t["state"] != "done")
+                        self.notes.notify("run_finished", "Diagnostics run {} {}".format(
+                            run_id, "finished" if not failed else "finished with {} of {} failed".format(failed, len(r["targets"]))),
+                            "{} target(s) on {}".format(len(r["targets"]), r["where"]))
+            self._seen_runs = set(ended)
+        return self.notes.poll(after)
 
     def settings(self):
         env = os.environ.get
@@ -231,6 +249,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return 200, d.info()
         if verb == "GET" and path == "/api/nodes":
             return 200, d.nodes(bool(self.q("refresh")))
+        if verb == "GET" and path == "/api/notifications":
+            return 200, d.notifications(self.q("after"))
         if verb == "GET" and path == "/api/runs":
             return 200, {"runs": d.runs.list()}
         if verb == "POST" and path == "/api/runs":

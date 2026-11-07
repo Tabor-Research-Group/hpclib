@@ -1391,9 +1391,29 @@ class TestSettings(ConsoleTestCase):
         res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
                              env=dict(os.environ, HPCLIB_AGENTS_DIR=str(self.agents)))
         self.assertIn(" rest --process-port=", res.stdout)
-        self.assertIn(" --login-node -- ", res.stdout)
+        self.assertIn(" --login-node ", res.stdout)
         self.assertNotIn("--time=12:00:00", res.stdout)                            # no job, no sbatch options
         self.assertEqual(agent_profiles.cmd_set(self.live, "rest_on=elsewhere"), 2)
+
+    def test_tunnel_link_and_endpoints(self):
+        url = f"/api/clusters/{self.live}/settings"
+        out = self.call("GET", url)[1]
+        self.assertEqual((out["tunnel_link"], out["login_endpoint"], out["job_endpoint"]), ("pull", "port", "port"))
+        status, out = self.call("PUT", url, {"tunnel_link": "push", "login_endpoint": "socket",
+                                             "job_endpoint": "socket"})
+        self.assertEqual((status, out["tunnel_link"], out["login_endpoint"], out["job_endpoint"]),
+                         (200, "push", "socket", "socket"), out)
+        for bad in ({"tunnel_link": "reverse"}, {"login_endpoint": "pipe"}, {"job_endpoint": ""}):
+            self.assertEqual(self.call("PUT", url, bad)[0], 422, bad)
+        repo = Path(__file__).resolve().parents[1]
+        script = (f'source {repo / "hpclib" / "hpclib.sh"}; launch_tunnel() {{ printf "%s\\n" "$*"; }}; '
+                  f'agent_tunnel {self.live}')
+        res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                             env=dict(os.environ, HPCLIB_AGENTS_DIR=str(self.agents)))
+        for flag in ("--link=push", "--login-endpoint=socket", "--job-endpoint=socket"):
+            self.assertIn(flag, res.stdout)
+        self.assertEqual(agent_profiles.cmd_set(self.live, "tunnel_link=sideways"), 2)
+        self.assertEqual(agent_profiles.cmd_set(self.live, "job_endpoint=fifo"), 2)
 
     def test_server_config_through_the_proxy(self):
         path = self.data / "rest" / "config.json"

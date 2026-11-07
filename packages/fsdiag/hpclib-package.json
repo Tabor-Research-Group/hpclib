@@ -21,14 +21,20 @@
         {"name": "FSDIAG_PYTHON", "label": "Python", "hint": "Python 3.6 or newer on the login node; default python3"},
         {"name": "FSDIAG_COMPUTE_PYTHON", "label": "Python on compute nodes", "hint": "Python 3.6 or newer there; default python3"}
       ],
-      "theme_link": true
+      "theme_link": true,
+      "notifications": [
+        {"id": "run_finished", "label": "A diagnostics run ends", "hint": "done, partly done or failed"}
+      ],
+      "notifications_path": "/api/notifications",
+      "notifications_header": "X-Fsdiag-Token"
     }
   },
   "tunnels": {
     "fsdiag": "tunnels/fsdiag"
   },
   "core_helpers": {
-    "tunnels/fsdiag/token_auth.py": "token_auth"
+    "tunnels/fsdiag/token_auth.py": "token_auth",
+    "tunnels/fsdiag/app_notifications.py": "app_notifications"
   },
   "bundle": {
     "tunnels/fsdiag/ui/hpclib-ui": "hpclib/ui",

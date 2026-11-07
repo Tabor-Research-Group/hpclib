@@ -38,8 +38,16 @@ LIST_KEYS = ("login", "work_dirs", "binds", "local_roots", "tunnel_args", "mcp_a
 #   connection_hours        how long an ssh login is kept for reuse once idle (default 12)
 #   rest_on                 where the REST server runs: job (default; a SLURM job on a compute node) or login (on
 #                           the login node, for sites that would rather it didn't hold a share of a compute node)
+#   tunnel_link             how the login node and the job meet: pull (default; the login node runs ssh -L to the job's
+#                           node) or push (the job runs ssh -R back to the login node, for sites that don't let the
+#                           login node ssh to compute nodes)
+#   login_endpoint          what your machine's forward reaches on the login node: port (default; a TCP port there) or
+#                           socket (a Unix socket file, for sites that don't want ports on the login nodes)
+#   job_endpoint            what the service listens on in the job: port (default) or socket (a socket file on the node)
 APPROVE_MODES = ("all", "new", "review")
 REST_ON = ("job", "login")
+TUNNEL_LINKS = ("pull", "push")
+ENDPOINTS = ("port", "socket")
 TUNNEL_ARG_RE = re.compile(r"--(?:(time|mem|partition|account|qos|cpus-per-task|constraint)=[A-Za-z0-9:._,+-]{1,64}|nodelist=[A-Za-z0-9._,+\[\]-]{1,256})")
 
 
@@ -355,6 +363,12 @@ def cmd_set(name, *pairs):
             return 2
         if key == "rest_on" and value not in REST_ON:
             print(f"agent_profiles: rest_on is one of {', '.join(REST_ON)}", file=sys.stderr)
+            return 2
+        if key == "tunnel_link" and value not in TUNNEL_LINKS:
+            print(f"agent_profiles: tunnel_link is one of {', '.join(TUNNEL_LINKS)}", file=sys.stderr)
+            return 2
+        if key in ("login_endpoint", "job_endpoint") and value not in ENDPOINTS:
+            print(f"agent_profiles: {key} is one of {', '.join(ENDPOINTS)}", file=sys.stderr)
             return 2
         if key == "auto_approve_templates" and value not in APPROVE_MODES:
             print(f"agent_profiles: auto_approve_templates is one of {', '.join(APPROVE_MODES)}", file=sys.stderr)

@@ -41,6 +41,8 @@ class TestConsoleSettingsUI(unittest.TestCase):
             "clusters": {"clusters": []}, "health": {"hpclib_version": "0.2.79"},
             "watch": {"at": time.time(), "tunnels": self.tunnels},
             "jobs": {"jobs": self.jobs, "clusters": {"demo": {"ok": True}}},
+            "notification-sources": {"sources": getattr(self, "sources", [])},
+            "notifications/apps": {"notifications": getattr(self, "app_notes", [])},
             "ports": {"range": [20000, 32000], "default_range": [20000, 32000], "ports": [
                 {"cluster": "demo", "app": None, "title": "agent tunnel", "which": "port", "port": 20735, "status": "taken"},
                 {"cluster": "demo", "app": None, "title": "agent tunnel", "which": "process_port", "port": 20736, "status": "free"}]},
@@ -144,6 +146,32 @@ class TestConsoleSettingsUI(unittest.TestCase):
         self.assertEqual(self.page.evaluate("document.documentElement.dataset.theme"), "light")
         self.assertEqual(self.page.get_by_role("link", name="View the default stylesheet").get_attribute("href"),
                          "default-styles.css")
+        self.assertEqual(self.errors, [])
+
+    def test_app_notifications_have_a_switch_and_a_checkbox_per_kind(self):
+        self.sources = [{"key": "app:fsdiag", "title": "Filesystem diagnostics", "kind": "app",
+                         "kinds": [{"id": "run_finished", "label": "A diagnostics run ends", "hint": "any outcome"},
+                                   {"id": "slow", "label": "Something is slow", "hint": ""}]}]
+        self.open("#/console", notifications=True)
+        notes = self.page.locator("#notifications")
+        notes.get_by_text("may send notifications").wait_for()
+        run_ended = notes.get_by_label("A diagnostics run ends", exact=False)
+        self.assertTrue(run_ended.is_disabled())                                 # nothing before the app's own switch
+        notes.get_by_label("Filesystem diagnostics may send notifications", exact=False).check()
+        self.assertFalse(run_ended.is_disabled())
+        run_ended.check()
+        with self.page.expect_response(lambda r: r.url.endswith("/api/preferences") and r.request.method == "PUT"):
+            notes.get_by_role("button", name="Save", exact=True).click()
+        saved = json.loads((self.console / "preferences.json").read_text())["app_notifications"]
+        self.assertEqual(saved, {"app:fsdiag": {"enabled": True, "kinds": {"run_finished": True, "slow": False}}})
+        # and what the console polls up is shown, once the app is on
+        self.app_notes = [{"source": "app:fsdiag", "cluster": "demo", "app": "fsdiag", "kind": "run_finished", "id": 3,
+                           "title": "Diagnostics run 1 finished", "body": "3 target(s)", "hash": "#/c/demo/apps/fsdiag",
+                           "app_title": "Filesystem diagnostics"}]
+        self.page.reload()
+        self.page.wait_for_function("window.shown && window.shown.length > 0")
+        shown = self.page.evaluate("window.shown")
+        self.assertEqual(shown[0]["title"], "Diagnostics run 1 finished (Filesystem diagnostics on demo)")
         self.assertEqual(self.errors, [])
 
     def test_console_settings_save_ports_and_clients(self):

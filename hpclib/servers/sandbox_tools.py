@@ -55,7 +55,7 @@ def patch_readonly_destinations(source):
 
 def run(args, cwd=None, env=None, timeout=180):
     result = subprocess.run([str(a) for a in args], cwd=cwd, env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+                            stderr=subprocess.STDOUT, universal_newlines=True, timeout=timeout, stdin=subprocess.DEVNULL)
     if result.returncode:
         raise RuntimeError(f"{Path(str(args[0])).name} failed ({result.returncode}):\n{result.stdout[-12000:]}")
     return result.stdout

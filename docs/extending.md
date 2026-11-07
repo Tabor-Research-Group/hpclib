@@ -176,6 +176,45 @@ only on compute nodes) exits 3, with the reason on standard error. `setup_tunnel
 `HPCLIB_TOKENS_ELSEWHERE REASON`, and the console runs the same call on the node of the cluster's REST server
 instead (`POST /admin/tunnel-tokens`, owner token only), through the agent tunnel, which must then be up.
 
+### Notifications from an app
+
+An app can send browser notifications through the console (a run ended, a download finished), and the user decides
+whether it may: Console Settings → Notifications lists each app that declares notifications with a switch for the
+app and a checkbox for each kind it declared, all off until ticked. The app says which kinds it may send, in the
+package manifest:
+
+```json
+"apps": {"myapp": {"title": "My app", "tunnel": "my-tunnel", "token_regex": "[?&]token=([A-Za-z0-9_-]{20,})",
+  "notifications": [{"id": "run_finished", "label": "A run ends", "hint": "done or failed"}],
+  "notifications_path": "/api/notifications", "notifications_header": "X-Myapp-Token"}}
+```
+
+The console polls the app's port every 20 s while any of its kinds is switched on (the app needs a `token_regex`, which
+the console sends in `notifications_header`; `Authorization: Bearer TOKEN` by default, `notifications_path` defaults to
+`/notifications`). The app's server queues notifications with `hpclib/servers/app_notifications.py`, which a package
+embeds with `"core_helpers": {"tunnels/my-tunnel/app_notifications.py": "app_notifications"}`:
+
+```python
+from app_notifications import Notifier
+notes = Notifier()
+notes.notify("run_finished", "Run 7 finished", "3 targets done", hash="#/c/grace/apps/myapp")   # hash: where a click goes
+# in the request handler:   GET /api/notifications[?after=N]  ->  notes.poll(after)
+```
+
+A poll without `after` only reports where the queue stands (`{"latest": N, "notifications": []}`), so nothing from before
+the console first looked is shown; with `after=N` it returns what came since. The console drops a kind the manifest
+doesn't declare or the user didn't tick, shortens the text, and only follows `#/` addresses of its own pages. Notifications
+are shown by the browser while the console's page is open. `fsdiag` is the example: its `run_finished` kind.
+
+A kind can instead name a state of the app's row with `on_state` (`queued`, `up` or `error`):
+`{"id": "started", "label": "Its job started", "on_state": "up"}`. The console sends it itself when the app enters that state
+(for a job-backed app, when its job leaves the queue and Open becomes available), so the app needs no endpoint and no token,
+and it works while the job is still waiting. The first look sends nothing, so a state it was already in is not announced. An
+app whose kinds all have `on_state` is never polled.
+
+A widget declares `notifications` the same way and sends one with `hpc.notify(kind, title, body, hash)`; at most five a
+minute, and only for a kind the user ticked.
+
 ### App downloads
 
 An app that needs large things on the cluster (OpenCode's models) can have the console download and remove them.
@@ -480,7 +519,7 @@ puts in its page:
 ```html
 <div id="out"></div>
 <script type="module">
-  const hpc = await hpclibWidget();     // {widget, context, subscribe, navigate, resize}
+  const hpc = await hpclibWidget();     // {widget, context, subscribe, navigate, resize, notify}
   hpc.subscribe("theme", ({ vars }) => {  // the page's CSS variables, so it matches light and dark
     for (const [k, v] of Object.entries(vars)) document.documentElement.style.setProperty(k, v);
   });

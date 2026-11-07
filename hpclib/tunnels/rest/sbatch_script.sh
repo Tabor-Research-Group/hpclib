@@ -22,6 +22,13 @@ if [ -z "$rest_python" ]; then
   rest_python="${HPCTUNNELS_DATA_DIR:-$HOME/.local/tunnels}/rest/python"
   [ -x "$rest_python" ] || rest_python=python3
 fi
+# job_endpoint=socket (or a login node whose tunnel end is a socket): listen on a socket file, not a TCP port. In a job it is
+# on this node, where the login node's ssh -L (pull) or this job's ssh -R (push) reaches it.
+if [ "${HPCLIB_JOB_ENDPOINT:-port}" = socket ]; then
+  rest_socket="${HPCLIB_JOB_SOCKET:-${HPCLIB_JOB_SOCKET_DIR:-/tmp}/hpclib-$(id -un)-${SLURM_JOB_ID:-$$}.sock}"
+  echo "Launching hpclib REST server on the socket $rest_socket (Python: $rest_python)"
+  exec "$rest_python" "$HPCSERVERS_DIR/rest_server.py" --unix-socket "$rest_socket" "$@"
+fi
 echo "Launching hpclib REST server on 127.0.0.1:$PROCESS_PORT (Python: $rest_python)"
 exec "$rest_python" "$HPCSERVERS_DIR/rest_server.py" \
   --host 127.0.0.1 --port "$PROCESS_PORT" "$@"

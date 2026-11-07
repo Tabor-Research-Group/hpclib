@@ -10,6 +10,9 @@
 //                   {hpclib: 1, type: "subscribe", topic}            a topic its manifest `reads` (or "theme")
 //                   {hpclib: 1, type: "navigate", hash}              e.g. "#/c/grace/jobs"; never a #key= address
 //                   {hpclib: 1, type: "resize", height}              its content's height, in pixels
+//                   {hpclib: 1, type: "notify", kind, title, body, hash}   a browser notification, for a kind its
+//                                                                    manifest declares in `notifications` and the user
+//                                                                    ticked in Console Settings (5 a minute at most)
 //   page → widget   {hpclib: 1, type: "init", widget, context}       context: {cluster} on a cluster's page
 //                   {hpclib: 1, type: "data", topic, value}          now, and whenever the topic is refreshed
 //                   {hpclib: 1, type: "error", topic, message}
@@ -38,7 +41,9 @@ const SHIM = `(() => {
   const api = { widget: null, context: {},
     subscribe(topic, fn) { (subs[topic] = subs[topic] || []).push(fn); send({ type: "subscribe", topic }); return api; },
     navigate(hash) { send({ type: "navigate", hash: String(hash) }); },
-    resize(height) { send({ type: "resize", height: Number(height) }); } };
+    resize(height) { send({ type: "resize", height: Number(height) }); },
+    notify(kind, title, body, hash) { send({ type: "notify", kind: String(kind), title: String(title || ""),
+      body: String(body || ""), hash: hash ? String(hash) : "" }); } };
   addEventListener("message", (e) => {
     const m = e.data;
     if (e.source !== parent || !m || m.hpclib !== 1) return;
@@ -193,7 +198,7 @@ window.addEventListener("message", (e) => {
   if (!f) return;
   if (m.type === "hello") {
     post(f, { type: "init", context: f.context,
-              widget: pick(f.widget, ["key", "id", "title", "slot", "reads", "package", "version"]) });
+              widget: pick(f.widget, ["key", "id", "title", "slot", "reads", "package", "version", "notifications"]) });
   } else if (m.type === "subscribe") {
     const topic = String(m.topic);
     if (!(topic in TOPICS) || (topic !== "theme" && !f.widget.reads.includes(topic))) {
@@ -208,6 +213,8 @@ window.addEventListener("message", (e) => {
   } else if (m.type === "navigate") {
     const hash = String(m.hash || "");
     if (NAV_RE.test(hash) && !/key=/i.test(hash)) location.hash = hash;
+  } else if (m.type === "notify") {
+    if (ctx.notify) ctx.notify(f.widget, m);
   } else if (m.type === "resize") {
     const h = Math.round(Number(m.height));
     if (h > 0) f.iframe.style.height = `${Math.min(Math.max(h, 40), 1600)}px`;

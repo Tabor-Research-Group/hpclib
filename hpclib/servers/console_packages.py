@@ -16,6 +16,11 @@ A package is a zip file with hpclib-package.json at its top level:
                 "password_regex": null,      # optional: finds a password it prints there instead (Copy password)
                 "login_user": null,          # optional, with password_regex: the user name of its basic-auth
                                              #   login; Open then signs in with both (user:password@ in the URL)
+                "notifications": [{"id": "done", "label": "A run finished", "hint": "when it ends"}],
+                                             # optional: the kinds of notification it may send (each a checkbox, off
+                                             #   until switched on in Console Settings); the console polls
+                                             #   notifications_path ("/notifications"; see app_notifications.py), sending
+                                             #   its token in notifications_header ("Authorization": Bearer TOKEN)
                 "theme_link": false,         # optional: Open adds the console's theme and address to the link
                                              #   (#theme=dark&console=http://127.0.0.1:PORT), for a page that follows them
                 "shared": false,             # optional: one running instance serves everyone (see below)
@@ -153,7 +158,14 @@ MAX_FILES = 5000
 MAX_SETTINGS_FILE = 1 << 20
 APP_KEYS = {"title", "tunnel", "description", "open_path", "health_path", "token_regex", "password_regex", "login_user",
             "settings", "secrets", "downloads", "install_files", "install_modules",
-            "shared", "instance_label", "reinstall", "tokens", "tab", "theme_link"}
+            "shared", "instance_label", "reinstall", "tokens", "tab", "theme_link", "notifications",
+            "notifications_path", "notifications_header"}
+NOTE_KIND_KEYS = {"id", "label", "hint", "on_state"}
+NOTE_STATES = ("queued", "up", "error")     # what a kind's on_state may name (an app row's states)
+NOTE_KIND_ID_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+NOTE_PATH_RE = re.compile(r"/[A-Za-z0-9_./-]{0,100}")
+NOTE_HEADER_RE = re.compile(r"[A-Za-z][A-Za-z0-9-]{0,40}")
+MAX_NOTE_KINDS = 12
 LOGIN_USER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 DOWNLOAD_KEYS = {"label", "description", "kinds"}
 DOWNLOAD_KIND_KEYS = {"id", "label", "placeholder", "pattern"}
@@ -164,7 +176,7 @@ TOKEN_KEYS = {"label", "scopes", "default_scope", "days", "description"}
 SCOPE_RE = re.compile(r"[a-z][a-z0-9_-]{0,19}")
 TOP_KEYS = {"format", "name", "version", "description", "apps", "tunnels", "settings", "clusters", "widgets", "core_helpers", "bundle"}
 BUNDLE_SKIP = (".py", ".pyc", ".md")      # hpclib/ui is copied whole; its maintenance scripts and notes (and any _build/ directory) stay behind
-WIDGET_KEYS = {"id", "title", "slot", "entry", "reads", "height", "description"}
+WIDGET_KEYS = {"id", "title", "slot", "entry", "reads", "height", "description", "notifications"}
 WIDGET_SLOTS = ("home", "cluster.overview", "cluster.tab")
 WIDGET_TOPICS = ("clusters", "jobs", "storage", "apps")      # and "theme", which every widget gets
 MAX_WIDGETS = 20
@@ -358,7 +370,7 @@ def _check_install_files(value, app_id, members):
 
 # Only these first-party modules may be embedded at build time. This is a
 # source-distribution feature, not an installer that reads arbitrary local files.
-CORE_HELPERS = {"token_auth": "token_auth.py", "envinfo": "envinfo.py", "clusterinfo": "clusterinfo.py"}
+CORE_HELPERS = {"app_notifications": "app_notifications.py", "token_auth": "token_auth.py", "envinfo": "envinfo.py", "clusterinfo": "clusterinfo.py"}
 
 
 def core_helpers(manifest):
@@ -606,6 +618,13 @@ def check_manifest(manifest, members, builtin_tunnels):
                 raise PackageError(f"app {app_id}: downloads needs {out['tunnels'][tunnel]['dir']}/downloads.sh in the tunnel")
         if not isinstance(app["theme_link"], bool):
             raise PackageError(f"app {app_id}: theme_link is true or false")
+        app["notifications"] = check_notification_kinds(spec.get("notifications"), f"app {app_id}")
+        path, header = spec.get("notifications_path", "/notifications"), spec.get("notifications_header", "Authorization")
+        if not isinstance(path, str) or not NOTE_PATH_RE.fullmatch(path) or ".." in path:
+            raise PackageError(f"app {app_id}: notifications_path is a path such as /notifications")
+        if not isinstance(header, str) or not NOTE_HEADER_RE.fullmatch(header):
+            raise PackageError(f"app {app_id}: notifications_header is the header that carries its token")
+        app["notifications_path"], app["notifications_header"] = path, header
         if app["login_user"] is not None:
             if not isinstance(app["login_user"], str) or not LOGIN_USER_RE.fullmatch(app["login_user"]):
                 raise PackageError(f"app {app_id}: login_user is a user name (letters, digits, . _ -)")
@@ -703,6 +722,29 @@ def check_manifest(manifest, members, builtin_tunnels):
     return out
 
 
+def check_notification_kinds(kinds, what):
+    """[{id, label, hint}]: the kinds of notification an app or widget may send (each is a checkbox in Settings)."""
+    if kinds is None:
+        return []
+    if not isinstance(kinds, list) or len(kinds) > MAX_NOTE_KINDS:
+        raise PackageError(f"{what}: notifications is a list of at most {MAX_NOTE_KINDS} kinds {{id, label, hint}}")
+    out, seen = [], set()
+    for k in kinds:
+        if not isinstance(k, dict) or set(k) - NOTE_KIND_KEYS or not {"id", "label"} <= set(k):
+            raise PackageError(f"{what}: a notification kind is {{id, label, hint}}")
+        if not isinstance(k["id"], str) or not NOTE_KIND_ID_RE.fullmatch(k["id"]) or k["id"] in seen:
+            raise PackageError(f"{what}: notification kind ids are lower-case letters, digits, _ and -, unique")
+        seen.add(k["id"])
+        kind = {"id": k["id"], "label": _text(k["label"], f"{what} notification label", 80),
+                "hint": _text(k.get("hint"), f"{what} notification hint", 200, required=False) or ""}
+        if "on_state" in k:      # sent by the console itself when the app enters this state; nothing is polled for it
+            if k["on_state"] not in NOTE_STATES:
+                raise PackageError(f"{what}: on_state is one of {', '.join(NOTE_STATES)}")
+            kind["on_state"] = k["on_state"]
+        out.append(kind)
+    return out
+
+
 def _check_widgets(widgets, members):
     """
     The `widgets` section: [{id, title, slot, entry, reads, height, description}]. A widget is one self-contained
@@ -738,7 +780,8 @@ def _check_widgets(widgets, members):
             raise PackageError(f"widget {wid}: height is pixels from 60 to 1600")
         out.append({"id": wid, "title": _text(w.get("title"), f"widget {wid} title", 80), "slot": w["slot"],
                     "entry": entry, "reads": list(reads), "height": height,
-                    "description": _text(w.get("description"), f"widget {wid} description", 500, required=False) or ""})
+                    "description": _text(w.get("description"), f"widget {wid} description", 500, required=False) or "",
+                    "notifications": check_notification_kinds(w.get("notifications"), f"widget {wid}")})
     return out
 
 

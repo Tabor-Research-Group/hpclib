@@ -254,6 +254,8 @@ const NOTES = [["tunnel", "A tunnel stops without Stop", "an agent tunnel or an 
 function notificationsCard(p) {
   const supported = "Notification" in window;
   const boxes = Object.fromEntries(NOTES.map(([k]) => [k, el("input", { type: "checkbox", checked: !!p.notifications[k] })]));
+  const dockSupported = "setAppBadge" in navigator;
+  const dockBox = el("input", { type: "checkbox", checked: !!(p.badge || {}).dock, disabled: !dockSupported });
   const permission = el("span");
   const ask = el("button", { type: "button" }, "Allow notifications in this browser");
   const drawPermission = () => {
@@ -265,16 +267,59 @@ function notificationsCard(p) {
   };
   ask.addEventListener("click", async () => { await Notification.requestPermission(); drawPermission(); });
   drawPermission();
+  // Apps and widgets that declare notifications: a switch for each, and a checkbox for each kind it may send
+  const sources = el("div", { class: "checks" });
+  const choices = {};          // source key -> {enabled: checkbox, kinds: {id: checkbox}}
+  const drawSources = async () => {
+    let list = [];
+    try { list = (await ctx.api("notification-sources")).sources; } catch { /* an older console */ }
+    const saved = (prefs && prefs.app_notifications) || {};
+    sources.replaceChildren(...(list.length ? [el("p", { class: "muted" }, "Apps and widgets can send notifications of " +
+      "their own. Each is off until you switch it on here, and only the kinds you tick are shown.")] : []));
+    for (const src of list) {
+      const have = saved[src.key] || { enabled: false, kinds: {} };
+      const master = el("input", { type: "checkbox", checked: !!have.enabled });
+      const kinds = Object.fromEntries(src.kinds.map((k) => [k.id, el("input", { type: "checkbox", checked: !!(have.kinds || {})[k.id] })]));
+      const syncKinds = () => { for (const box of Object.values(kinds)) box.disabled = !master.checked; };
+      master.addEventListener("change", syncKinds);
+      syncKinds();
+      choices[src.key] = { enabled: master, kinds };
+      sources.append(el("div", { class: "note-source" },
+        el("label", {}, master, ` ${src.title} may send notifications `, el("span", { class: "muted small" }, `(${src.kind})`)),
+        el("div", { class: "checks", style: "margin-left: 1.5em" }, src.kinds.map((k) =>
+          el("label", {}, kinds[k.id], ` ${k.label} `, k.hint ? el("span", { class: "muted small" }, `(${k.hint})`) : null)))));
+    }
+  };
+  drawSources();
   const save = saveButton("Save", async () => {
+    const appNotes = Object.fromEntries(Object.entries(choices).map(([key, c]) => [key, { enabled: c.enabled.checked,
+      kinds: Object.fromEntries(Object.entries(c.kinds).map(([id, box]) => [id, box.checked])) }]));
     prefs = await ctx.api("preferences", { method: "PUT",
-      body: { notifications: Object.fromEntries(NOTES.map(([k]) => [k, boxes[k].checked])) } });
-    if (supported && Notification.permission === "default" && Object.values(boxes).some((b) => b.checked)) {
+      body: { notifications: Object.fromEntries(NOTES.map(([k]) => [k, boxes[k].checked])),
+              badge: { dock: dockBox.checked },
+              app_notifications: Object.assign({}, ((prefs || {}).app_notifications) || {}, appNotes) } });
+    if (supported && Notification.permission === "default" &&
+        (Object.values(boxes).some((b) => b.checked) || Object.values(appNotes).some((a) => a.enabled))) {
       await Notification.requestPermission();
       drawPermission();
     }
+    if (!badgeOn()) clearBadge();
     restartWatch();
+    drawStatus();
     return "Saved.";
   });
+  const status = el("p", { class: "muted small" });
+  const drawStatus = () => { status.textContent = notificationStatus(); };
+  drawStatus();
+  const refresh = action("Refresh status", () => { drawStatus(); return "Updated."; }, { result: true });
+  const later = action("Send a test in 10 s", () => {
+    if (!supported || Notification.permission !== "granted") throw new Error("Allow notifications in this browser first.");
+    setTimeout(() => {
+      showTest("Delayed test: if this appeared while another app was in front, notifications work in the background.");
+      drawStatus();
+    }, 10000);
+    return "Sending in 10 s: switch to another app now (and look for the Dock badge if it is on).";
+  }, { result: true });
   const test = action("Send a test", () => {
     if (!supported || Notification.permission !== "granted") throw new Error("Allow notifications in this browser first.");
     new Notification("hpclib console", { body: "Notifications work in this browser." });
@@ -287,7 +332,13 @@ function notificationsCard(p) {
     el("div", { class: "toolbar" }, permission, ask),
     el("div", { class: "checks" }, NOTES.map(([k, label, hint]) =>
       el("label", {}, boxes[k], ` ${label} `, el("span", { class: "muted small" }, `(${hint})`)))),
-    el("div", { class: "actions" }, save, test));
+    el("div", { class: "checks" }, el("label", {}, dockBox, " Show an unread count on the Dock icon ",
+      el("span", { class: "muted small" }, dockSupported
+        ? "(only when the console is installed as a web app: Chrome's Install page as app, or Safari's Add to Dock; off by default)"
+        : "(this browser has no badge support)"))),
+    sources,
+    status,
+    el("div", { class: "actions" }, save, test, later, refresh));
 }
 
 async function portsCard() {
@@ -657,11 +708,94 @@ const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF
 const on = (kind) => !!(prefs && prefs.notifications && prefs.notifications[kind]) &&
   "Notification" in window && Notification.permission === "granted";
 
+// Dock badge (the Badging API): a count of notifications shown while the page was out of sight, cleared when it is in
+// front again. Only an installed web app has a Dock icon to badge, and nothing happens unless it is switched on.
+let unread = 0;
+const badgeOn = () => !!(prefs && prefs.badge && prefs.badge.dock) && "setAppBadge" in navigator;
+function clearBadge() {
+  if (!unread) return;
+  unread = 0;
+  if ("clearAppBadge" in navigator) navigator.clearAppBadge().catch(() => {});
+}
+function bumpBadge() {
+  if (!badgeOn() || (document.visibilityState === "visible" && document.hasFocus())) return;
+  unread += 1;
+  navigator.setAppBadge(unread).catch(() => {});
+}
+addEventListener("focus", clearBadge);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") clearBadge(); });
+
+let lastAppCheck = null;     // {at, shown}: the last poll of apps and widgets, and how many notifications it showed
+let testsShown = 0;
+
+/** A notification that goes the way the real ones do (the browser's, and the Dock badge), for the settings page. */
+function showTest(body) {
+  const n = new Notification("hpclib console test", { body, tag: `hpc-test-${Date.now()}` });
+  bumpBadge();
+  testsShown += 1;
+  n.onclick = () => { window.focus(); n.close(); };
+}
+
+/** One line for the settings page: permission, what is being watched and when it last looked, the Dock badge. */
+export function notificationStatus() {
+  const permission = !("Notification" in window) ? "not supported in this browser"
+    : { granted: "allowed", denied: "blocked", default: "not allowed yet" }[Notification.permission];
+  const watching = [watchTimer && "tunnels (20 s)", jobsTimer && "jobs (60 s)", appsTimer && "apps and widgets (20 s)"].filter(Boolean);
+  const apps = !appsTimer ? "" : lastAppCheck
+    ? ` Last app check ${new Date(lastAppCheck.at).toLocaleTimeString()}, ${lastAppCheck.shown} shown since.` : " No app check yet.";
+  const badge = !("setAppBadge" in navigator) ? "not supported in this browser"
+    : badgeOn() ? `on (count ${unread})` : "off";
+  return `Browser permission: ${permission}. Watching: ${watching.length ? watching.join(", ") : "nothing switched on"}.${apps}` +
+    ` Dock badge: ${badge}. Tests shown this session: ${testsShown}.`;
+}
+
 export function notify(kind, title, body, hash = null) {
   if (!on(kind)) return;
   const n = new Notification(title, { body, tag: `hpc-${kind}-${title}-${body}` });
+  bumpBadge();
   n.onclick = () => { window.focus(); if (hash) location.hash = hash; n.close(); };
 }
+
+const appWanted = (source, kind) => {
+  const e = ((prefs && prefs.app_notifications) || {})[source] || {};
+  return !!e.enabled && !!(e.kinds || {})[kind] && "Notification" in window && Notification.permission === "granted";
+};
+const NOTE_HASH = /^#\/[A-Za-z0-9_\-./%?=&@:~]*$/;
+const widgetNotes = new Map();    // source -> times of its recent notifications (a widget gets 5 a minute)
+
+/** A notification a widget asked for (postMessage "notify"): only for a kind its manifest declares and the user ticked. */
+export function notifyWidget(widget, m) {
+  const source = `widget:${widget.key}`;
+  const kind = String(m.kind || "");
+  if (!(widget.notifications || []).some((k) => k.id === kind) || !appWanted(source, kind)) return false;
+  const now = Date.now();
+  const recent = (widgetNotes.get(source) || []).filter((t) => now - t < 60000);
+  if (recent.length >= 5) return false;
+  widgetNotes.set(source, recent.concat(now));
+  const link = String(m.hash || "");
+  const hash = NOTE_HASH.test(link) && !/key=/i.test(link) ? link : null;
+  const n = new Notification(String(m.title || widget.title).slice(0, 120), { body: String(m.body || "").slice(0, 300),
+    tag: `hpc-${source}-${kind}-${m.title}-${m.body}` });
+  bumpBadge();
+  n.onclick = () => { window.focus(); if (hash) location.hash = hash; n.close(); };
+  return true;
+}
+
+let appsTimer = null;
+async function checkApps() {
+  try {
+    const { notifications } = await ctx.api("notifications/apps");
+    lastAppCheck = { at: Date.now(), shown: (lastAppCheck || { shown: 0 }).shown };
+    for (const a of notifications) {
+      if (!appWanted(a.source, a.kind)) continue;
+      lastAppCheck.shown += 1;
+      const n = new Notification(`${a.title} (${a.app_title} on ${a.cluster})`, { body: a.body, tag: `hpc-${a.source}-${a.cluster}-${a.id}` });
+      bumpBadge();
+      n.onclick = () => { window.focus(); if (a.hash) location.hash = a.hash; n.close(); };
+    }
+  } catch { /* not connected: try again */ }
+}
+const anyAppOn = () => Object.values((prefs && prefs.app_notifications) || {}).some((e) => e.enabled);
 
 let watchTimer = null;
 let jobsTimer = null;
@@ -705,8 +839,11 @@ async function checkJobs() {
 }
 
 export function restartWatch() {
-  clearInterval(watchTimer); clearInterval(jobsTimer);
-  watchTimer = jobsTimer = null;
+  clearInterval(watchTimer); clearInterval(jobsTimer); clearInterval(appsTimer);
+  watchTimer = jobsTimer = appsTimer = null;
+  if (anyAppOn() && "Notification" in window && Notification.permission === "granted") {
+    checkApps(); appsTimer = setInterval(checkApps, 20000);
+  }
   if (on("tunnel")) { checkTunnels(); watchTimer = setInterval(checkTunnels, 20000); } else lastTunnels = null;
   if (on("job")) { checkJobs(); jobsTimer = setInterval(checkJobs, 60000); } else lastJobs = null;
 }

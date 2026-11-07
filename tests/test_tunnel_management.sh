@@ -790,4 +790,76 @@ assert_equal "$(sed -n 1,4p "$test_dir/smb-remote" | tr '\n' ' ')" '-t -p 2222 m
 grep -q 'tunnels/data-transfer/smbshell.sh get proj/raw /scratch/user/me/a\\ b' "$test_dir/smb-remote" ||
   fail "remote: $(cat "$test_dir/smb-remote")"
 
+# --login-endpoint=socket on the login node: the script gets the socket file as its endpoint, not a port.
+rm -f "$test_dir/login.log"
+HOME="$test_dir/home" HPCLIB_DIR="$HPCLIB_DIR" \
+  HPCLIB_TUNNEL_PATH="$test_dir/login-tunnels:$HPCLIB_DIR/tunnels" HPCSESSIONS_DIR="$test_dir/sessions" \
+  HPCSERVERS_DIR="$test_dir" PATH="$test_dir/bin:$PATH" \
+  timeout 60 bash -c 'cat > "$HPCSERVERS_DIR/login-tunnels/svc/sbatch_script.sh" <<"S"
+#!/usr/bin/env bash
+echo "endpoint=$HPCLIB_JOB_ENDPOINT socket=$HPCLIB_JOB_SOCKET link=$HPCLIB_TUNNEL_LINK login=$HPCLIB_LOGIN_ENDPOINT"
+S
+exec bash "$HPCLIB_DIR/tunnels/start_tunnel.sh" svc -P 5153 --login-node --login-endpoint=socket' \
+  > "$test_dir/login-socket.log" 2>&1 || fail "the socket login-node tunnel failed: $(cat "$test_dir/login-socket.log")"
+grep -q "endpoint=socket socket=$test_dir/sessions/sockets/.*-5153.sock link=pull login=socket" "$test_dir/login-socket.log" ||
+  fail "the script wasn't given the login socket: $(cat "$test_dir/login-socket.log")"
+
+# Unusable choices are refused before anything is submitted.
+for bad in --link=sideways --login-endpoint=pipe --job-endpoint=fifo; do
+  if HOME="$test_dir/home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PATH="$HPCLIB_DIR/tunnels" \
+    HPCSESSIONS_DIR="$test_dir/sessions" HPCSERVERS_DIR="$test_dir" PATH="$test_dir/bin:$PATH" TEST_SBATCH_ARGS_FILE="$test_dir/never" \
+    timeout 60 bash "$HPCLIB_DIR/tunnels/start_tunnel.sh" flask -P 5154 "$bad" > "$test_dir/bad.log" 2>&1; then
+    fail "accepted $bad"
+  fi
+done
+[ ! -e "$test_dir/never" ] || fail 'submitted a job with a bad endpoint choice'
+if HOME="$test_dir/home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PATH="$fixture_tunnels:$HPCLIB_DIR/tunnels" \
+  HPCSESSIONS_DIR="$test_dir/sessions" HPCSERVERS_DIR="$test_dir" PATH="$test_dir/bin:$PATH" \
+  timeout 60 bash "$HPCLIB_DIR/tunnels/start_tunnel.sh" shared-demo -P 5155 --link=push > "$test_dir/push-shared.log" 2>&1; then
+  fail 'pushed a shared-instance tunnel'
+fi
+grep -q 'link=push' "$test_dir/push-shared.log" || fail "no reason for refusing push: $(cat "$test_dir/push-shared.log")"
+
+# --link=push: the job is told to connect back; the login node cancels it when nothing arrives.
+cat > "$test_dir/bin/sbatch" <<'SCRIPT'
+#!/usr/bin/env bash
+printf '%s\n' "$@" "HPCLIB_TUNNEL_LINK=$HPCLIB_TUNNEL_LINK" > "$TEST_SBATCH_ARGS_FILE"
+echo 4242
+SCRIPT
+cat > "$test_dir/bin/squeue" <<'SCRIPT'
+#!/usr/bin/env bash
+case "$*" in
+  *%N*) echo node7 ;;
+  *%R*) echo None ;;
+  *) echo RUNNING ;;
+esac
+SCRIPT
+cat > "$test_dir/bin/scancel" <<'SCRIPT'
+#!/usr/bin/env bash
+echo "scancel $*" >> "$TEST_SCANCEL_LOG"
+SCRIPT
+chmod +x "$test_dir/bin/sbatch" "$test_dir/bin/squeue" "$test_dir/bin/scancel"
+HOME="$test_dir/home" HPCLIB_DIR="$HPCLIB_DIR" HPCLIB_TUNNEL_PATH="$HPCLIB_DIR/tunnels" HPCSESSIONS_DIR="$test_dir/sessions" \
+  HPCSERVERS_DIR="$test_dir" TEST_SBATCH_ARGS_FILE="$test_dir/push-sbatch" TEST_SCANCEL_LOG="$test_dir/scancel.log" \
+  HPCLIB_PUSH_WAIT=2 PATH="$test_dir/bin:$PATH" \
+  timeout 60 bash "$HPCLIB_DIR/tunnels/start_tunnel.sh" flask -P 5156 --link=push > "$test_dir/push.log" 2>&1 || true
+grep -q 'HPCLIB_TUNNEL_LINK=push' "$test_dir/push-sbatch" || fail "the job wasn't told to push: $(cat "$test_dir/push-sbatch" 2>&1)"
+sleep 1
+grep -q 'scancel 4242' "$test_dir/scancel.log" || fail "an unanswered push wasn't cancelled: $(cat "$test_dir/push.log")"
+
+# launch_tunnel binds the first hop to the login node's socket file when the login end is a socket.
+(
+  pssh() { printf '%s\n' "$*" > "$test_dir/socket-pssh"; if [ "$1" != -t ]; then cat > /dev/null; echo /scratch/me/hpclib/sockets/login1-5157.sock; fi; }
+  _wait_for_port() { return 1; }
+  HOME="$test_dir/home"
+  launch_tunnel -P 5157 login.example svc --login-endpoint=socket >/dev/null 2>&1
+)
+grep -q -- '-L 127.0.0.1:5157:/scratch/me/hpclib/sockets/login1-5157.sock login.example' "$test_dir/socket-pssh" ||
+  fail "the first hop wasn't bound to the socket: $(cat "$test_dir/socket-pssh")"
+
+# Socket files live in the sessions folder, or in /tmp when that path is too long for a socket.
+assert_equal "$(HPCSESSIONS_DIR="$test_dir/sessions" _hpclib_socket_path a.sock)" "$test_dir/sessions/sockets/a.sock"
+long="$test_dir/$(printf 'x%.0s' {1..120})"
+case "$(HPCSESSIONS_DIR="$long" _hpclib_socket_path a.sock)" in /tmp/hpclib-*/a.sock) ;; *) fail 'a long socket path was kept' ;; esac
+
 echo 'Tunnel management tests passed'

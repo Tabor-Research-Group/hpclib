@@ -768,6 +768,37 @@ class TestConsoleUI(unittest.TestCase):
         self.assertIn('-i ~/.ssh/id_hprc -o IdentitiesOnly=yes', card.inner_text())
         self.assertEqual(self.errors, [])
 
+    def test_tunnel_card_sends_direction_and_socket_choices(self):
+        cluster = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 20735,
+                   'has_owner_token': True, 'login': {'state': 'down'}, 'tunnel': {'state': 'down'}}
+        puts = []
+        settings = {'modes': ['all'], 'auto_approve_templates': 'all', 'tunnel_args': [], 'connection_hours': 12,
+                    'rest_on': 'job', 'tunnel_link': 'pull', 'login_endpoint': 'port', 'job_endpoint': 'port',
+                    'tunnel_link_choices': ['pull', 'push'], 'endpoint_choices': ['port', 'socket']}
+        def handler(route, path):
+            if path == 'clusters/demo/settings' and route.request.method == 'PUT':
+                puts.append(route.request.post_data_json)
+                route.fulfill(body=json.dumps(dict(settings, ok=True)), content_type='application/json')
+                return True
+            answers = {'clusters': {'clusters': [cluster]}, 'clusters/demo': cluster,
+                       'clusters/demo/settings': settings, 'clusters/demo/ports': {'ports': []}}
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/settings/demo")
+        card = self.page.locator('section.card', has=self.page.get_by_role('heading', name='Tunnel', exact=False)).filter(has_text='kept on this machine')
+        card.wait_for()
+        card.get_by_label('Tunnel direction').select_option('push')
+        card.get_by_label('Main connection ends at').select_option('socket')
+        card.get_by_label('The service listens on').select_option('socket')
+        card.get_by_role('button', name='Save tunnel settings').click()
+        card.get_by_text('Saved.').wait_for()
+        self.assertEqual(puts[0]['tunnel_link'], 'push')
+        self.assertEqual((puts[0]['login_endpoint'], puts[0]['job_endpoint']), ('socket', 'socket'))
+        self.assertEqual(self.errors, [])
+
     def test_settings_clear_leftover_ports_warns_about_extra_logins(self):
         cluster = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 20735,
                    'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'down'}}

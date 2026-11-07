@@ -7,8 +7,9 @@ instead of connection-refused. start_tunnel.sh kills this process the
 moment the real job is reachable, freeing the port for the real
 second-hop forward to bind to.
 
-Usage: waiting_shim.py PORT STATUS_FILE [TUNNEL_NAME]
-  - Binds 127.0.0.1:PORT immediately.
+Usage: waiting_shim.py PORT|unix:SOCKET_PATH STATUS_FILE [TUNNEL_NAME]
+  - Binds 127.0.0.1:PORT immediately (or, for unix:PATH, the Unix socket file
+    PATH, private to you: for tunnels whose login-node end is a socket).
   - Every request re-reads STATUS_FILE (start_tunnel.sh keeps this
     updated with whatever squeue reason is current) and serves a page
     that auto-refreshes every 3s.
@@ -19,7 +20,13 @@ import http.server
 import signal
 import sys
 
-PORT = int(sys.argv[1])
+import os
+import socket
+import socketserver
+
+ENDPOINT = sys.argv[1]
+SOCKET_PATH = ENDPOINT[len("unix:"):] if ENDPOINT.startswith("unix:") else None
+PORT = None if SOCKET_PATH else int(ENDPOINT)
 STATUS_FILE = sys.argv[2]
 TUNNEL_NAME = sys.argv[3] if len(sys.argv) > 3 else "tunnel"
 
@@ -73,5 +80,24 @@ signal.signal(signal.SIGTERM, _stop)
 # HTTPServer sets allow_reuse_address=True, so once this process exits
 # and frees the port, the real forward can bind the exact same
 # 127.0.0.1:PORT right after without hitting a TIME_WAIT EADDRINUSE.
-server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
+class UnixHTTPServer(http.server.HTTPServer):
+    address_family = socket.AF_UNIX
+
+    def server_bind(self):
+        try:
+            os.unlink(self.server_address)         # an earlier shim's socket file, or what a forward left
+        except FileNotFoundError:
+            pass
+        old = os.umask(0o177)
+        try:
+            socketserver.TCPServer.server_bind(self)
+        finally:
+            os.umask(old)
+        self.server_name, self.server_port = "localhost", 0
+
+
+if SOCKET_PATH:
+    server = UnixHTTPServer(SOCKET_PATH, Handler)
+else:
+    server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
 server.serve_forever()

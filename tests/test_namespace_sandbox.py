@@ -180,6 +180,24 @@ class TestSandboxInstaller(unittest.TestCase):
 
 
 @unittest.skipUnless(sys.platform == "linux" and ctypes.util.find_library("seccomp"), "requires Linux libseccomp")
+class TestInstallerRunsOnOldPython(unittest.TestCase):
+    """sandbox_tools.py runs with the login node's python3, which may be 3.6 (no text= or capture_output= for subprocess)."""
+
+    def test_no_python_37_features(self):
+        import ast
+        source = Path(sandbox_tools.__file__).read_text()
+        tree = ast.parse(source, feature_version=(3, 6))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                for keyword in node.keywords:
+                    self.assertNotIn(keyword.arg, ("text", "capture_output"), f"line {node.lineno}: not in Python 3.6")
+        for newer in (":=", "removeprefix", "removesuffix", "from __future__ import annotations"):
+            self.assertNotIn(newer, source)
+
+    def test_run_returns_the_output_as_text(self):
+        self.assertEqual(sandbox_tools.run([sys.executable, "-c", "print('hi')"]).strip(), "hi")
+
+
 class TestNativePolicy(unittest.TestCase):
     def test_concurrent_publication_and_tampered_policy(self):
         with tempfile.TemporaryDirectory() as temporary:

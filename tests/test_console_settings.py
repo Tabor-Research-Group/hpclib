@@ -21,6 +21,12 @@ class TestPreferences(ConsoleTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(out["notifications"], {"tunnel": False, "prompt": False, "job": False, "proposal": False})
         self.assertEqual(out["new_cluster"]["connection_hours"], 12)
+        self.assertEqual(out["badge"], {"dock": False})                      # the Dock badge is off until switched on
+        self.assertEqual(self.call("PUT", "/api/preferences", {"badge": {"dock": True}})[1]["badge"], {"dock": True})
+        for bad in ({"badge": {"dock": "yes"}}, {"badge": {"menu": True}}):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.call("PUT", "/api/preferences", bad)[0], 422)
+        self.call("PUT", "/api/preferences", {"badge": {"dock": False}})
         status, out = self.call("PUT", "/api/preferences", {"notifications": {"job": True}})
         self.assertEqual(status, 200, out)
         self.assertTrue(out["notifications"]["job"])
