@@ -8,6 +8,7 @@ from rest_client import RESTClient, RESTClientError  # noqa: E402
 QUEUE = ("U|mark\n"
          "P|cpu|880/40/0/920|23\nP|gpu|64/0/0/64|2\n"
          "G|g01|gpu|mixed|gpu:a100:4(S:0-1)|gpu:a100:3(IDX:0-2)\nG|g02|gpu|idle|gpu:a100:4|gpu:a100:0(IDX:N/A)\n"
+         "R|201||gres/gpu:a100:2|||\nR|202|gres/gpu:1||||a100|v100\nR|203|gres/gpu:h100=4||||\n"
          "Q|201|alice|RUNNING|None|cpu|1:02:03|2-00:00:00|2|96|384G|c[01-02]|2026-11-04T10:00:00|2026-11-04T09:00:00|1000|hpclib-rest:llm:orca|hpcrest-orca-big\n"
          "Q|202|alice|PENDING|Priority|cpu|0:00|1-00:00:00|1|48|100G||N/A|2026-11-04T09:30:00|900||ml_train\n"
          "Q|203|bob|PENDING|AssocGrpGRES|gpu|0:00|04:00:00|1|8|32G||N/A|2026-11-04T11:00:00|800||torch\n"
@@ -48,6 +49,19 @@ class QueueServer(JobServerTestCase):
         limited = self.llm.queue(jobs="queued", limit=1)["jobs"]
         self.assertEqual((len(limited["queued"]), limited["queued_matching"]), (1, 2))
         self.expect_error(422, self.llm.queue, "everything")
+
+    def test_jobs_are_filtered_on_what_they_asked_sbatch_for(self):
+        ids = lambda **kw: sorted(j["id"] for kind in ("running", "queued") for j in self.llm.queue(jobs="all", **kw)["jobs"].get(kind, []))
+        self.assertEqual(self.llm.queue(jobs="all")["jobs"]["running"][0]["requests"], {"gres": "gpu:a100:2"})
+        self.assertEqual(ids(resources="--gres=gpu:a100:2"), ["201"])
+        self.assertEqual(ids(resources="gpus=1:a100"), [])                  # 201 asked with --gres, not --gpus
+        self.assertEqual(ids(resources="a100"), ["201", "202"])             # a type, in any request or the features
+        self.assertEqual(ids(resources="gpu:h100:4"), ["203"])
+        self.assertEqual(ids(resources="gpu"), ["201", "202", "203"])
+        self.assertEqual(ids(resources="constraint=v100"), ["202"])
+        self.assertEqual(ids(resources="a100 constraint=v100"), ["202"])    # every term must match
+        self.assertEqual(ids(resources="a100", user="alice", partition="gpu"), [])
+        self.assertEqual(self.llm.queue(jobs="all", resources="a100")["jobs"]["queued_matching"], 1)
 
     def test_answers_are_cached_and_refresh_reads_again(self):
         self.llm.queue()

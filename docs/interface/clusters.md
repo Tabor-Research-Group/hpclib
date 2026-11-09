@@ -123,11 +123,27 @@ hides from you is "not found"), but never their script or output files, which ar
 else's (`#/c/CLUSTER/jobs/queue`, one `squeue` and `sinfo` over your login). It shows how busy each partition is (CPUs in
 use, idle, and the running and waiting jobs there, yours included), who is using the cluster (the busiest 25 users),
 why jobs are waiting, and the other users' running and waiting jobs (all of them, 300 rows at a time with a **Show more** button; the filter looks through every job, so it finds the
-ones past the first 300), with a filter for a user, job name, node (a host list such as `c[01-03]` matches `c02`) or partition, and a box for only the
+ones past the first 300), with a filter for a user, job name, node (a host list such as `c[01-03]` matches `c02`), partition or what a job asked `sbatch` for (see below), and a box for only the
 jobs hpclib started (from their comment: agents, apps and tunnels, each marked with what it is). A user's name in
 **Who is using the cluster** filters to that user, and the table says how many of their jobs hpclib started. On clusters with GPUs a **GPUs** table (from `sinfo`'s per-node GRES) shows, for each partition and GPU type, how many are in use, how many are free on nodes that take jobs now, how many nodes have a free one, the most free on a single node (what one job can ask for) and how many sit on nodes that are down, drained or reserved. A job's name
 opens its page. Your own jobs are left out of the lists; a site
 that hides other users' jobs from `squeue` (Slurm's `PrivateData`) shows only what it allows. If `squeue` fails (a busy or rate-limiting Slurm controller says so), the page says so, after one retry, and shows the last answer that worked (marked with its time) or just the partitions: a failed read is never shown as an empty queue. If `squeue` lists jobs the console can't read, or prints something that isn't a job list, the page says that and quotes a sample line. A job comment that runs over several lines (some sites' submit plugins write one) is read as one job. A `squeue` that doesn't support the comment field is read without it (hpclib-started jobs then can't be marked). The answer is reused for 15 seconds, since `squeue` on everyone's jobs is heavy.
+
+**Filtering on what a job asked for.** Each job in the whole queue shows what it asked `sbatch` for besides CPUs and memory,
+as Slurm keeps it: `gpus=gpu:a100:1` (`--gpus`), `gres=gpu:a100:2` (`--gres` and `--gpus-per-node`), `gpus-per-socket`,
+`gpus-per-task` and `constraint=a100|v100`. Type the request into the filter the way you pass it to `sbatch`:
+
+| Filter | Finds jobs that |
+| --- | --- |
+| `gpus=1:a100`, `--gpus=a100:1` | asked `--gpus` for one A100 (the type and the count may come in either order) |
+| `--gres=gpu:a100:2`, `gpus-per-node=a100` | asked that option only; `--gpus-per-node` is looked up as `--gres` |
+| `gpu:a100`, `2:a100`, `a100`, `gpu` | asked for that GPU in any option, or (a type alone) in the constraint |
+| `constraint=a100`, `-C a100` | have that feature in their constraint |
+
+A type matches as part of the job's (`a100` also finds `a100-80gb`); a count is exact; words are all required, so
+`a100 alice` is alice's A100 jobs. The agents' `queue_status` tool has the same filter as `resources` (`GET /queue?resources=gpus=1:a100`).
+Slurms whose `squeue` can't print these fields (before 19.05) show and match nothing here, and a site that hides other users'
+requests (`PrivateData`) shows only what it allows.
 
 Jobs are labelled from what hpclib puts on them: names that start with the server's job name prefix
 (`hpcrest-` unless **Server → Job name prefix** or `job_name_prefix` in config.json says otherwise) and the

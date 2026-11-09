@@ -200,8 +200,10 @@ class RESTClient:
         return self.request("GET", "/quota", query=query, timeout=max(self.timeout, 180))
 
     # the whole queue (queue_view.py on the cluster)
-    def queue(self, jobs="none", user=None, partition=None, name=None, hpclib=False, limit=50, refresh=False):
+    def queue(self, jobs="none", user=None, partition=None, name=None, hpclib=False, limit=50, refresh=False,
+              resources=None):
         return self.request("GET", "/queue", query={"jobs": jobs, "user": user, "partition": partition, "name": name,
+                                                    "resources": resources,
                                                     "hpclib": 1 if hpclib else None, "limit": limit,
                                                     "refresh": 1 if refresh else None}, timeout=max(self.timeout, 120))
 

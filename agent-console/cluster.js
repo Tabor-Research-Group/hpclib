@@ -431,13 +431,56 @@ function expandHosts(list) {
 
 // A filter over jobs: every word typed must be somewhere in the job's user, name, ID, partition, nodes (host lists
 // written out) or what started it (an agent's template and token, an app's name)
+// What a job asked sbatch for (queue_view.py's resource_term: the same rules, so the page and the agents' queue_status agree).
+// `gpus=1:a100`, `--gres=gpu:a100:2`, `gpus-per-node=a100`: that option as passed to sbatch; `gpu:a100:2`, `2:a100` and
+// `gpu` look at every GPU request; `constraint=a100` at the features. A type matches as part of the job's; a count is exact.
+const REQUEST_KEYS = ["gpus", "gres", "gpus-per-socket", "gpus-per-task", "constraint"];
+const REQUEST_OPTIONS = { gpus: "gpus", gres: "gres", "gpus-per-node": "gres", "gpus-per-socket": "gpus-per-socket",
+                          "gpus-per-task": "gpus-per-task", constraint: "constraint", c: "constraint" };
+const requestText = (requests) => Object.entries(requests || {}).map(([k, v]) => `${k}=${v}`).join(" ").toLowerCase();
+function resourceTerm(term) {
+  const text = term.trim().replace(/^-+/, "").trim();
+  let option = null, value = text.toLowerCase();
+  if (text.includes("=")) {
+    const at = text.indexOf("=");
+    option = text.slice(0, at).trim().toLowerCase();
+    value = text.slice(at + 1).trim().toLowerCase();
+    if (!(option in REQUEST_OPTIONS)) return (requests) => requestText(requests).includes(text.toLowerCase());
+  }
+  const keys = option ? [REQUEST_OPTIONS[option]] : REQUEST_KEYS;
+  if (keys.length === 1 && keys[0] === "constraint") return (requests) => !!value && ((requests || {}).constraint || "").toLowerCase().includes(value);
+  const tokens = value.split(":").filter(Boolean);
+  let name = "gpu";
+  if (tokens.length && (option === "gres" || tokens[0] === "gpu") && !/^\d+$/.test(tokens[0])) name = tokens.shift();
+  const counts = tokens.filter((t) => /^\d+$/.test(t)), kinds = tokens.filter((t) => !/^\d+$/.test(t));
+  const count = counts.length ? Number(counts[counts.length - 1]) : null, kind = kinds.join(":") || null;
+  const gres = (requests) => keys.some((key) => key !== "constraint" && ((requests || {})[key] || "").split(",").some((item) => {
+    if (!item) return false;
+    const parts = item.toLowerCase().split(":");
+    const itemCount = parts.length > 1 && /^\d+$/.test(parts[parts.length - 1]) ? Number(parts.pop()) : null;
+    const itemKind = parts.slice(1).join(":") || null;
+    return parts[0] === name && (!kind || (itemKind || "").includes(kind)) && (count === null || count === (itemCount === null ? 1 : itemCount));
+  }));
+  return (requests) => {
+    if (gres(requests)) return true;
+    if (option) return false;
+    if (kind && count === null && ((requests || {}).constraint || "").toLowerCase().includes(kind)) return true;
+    return requestText(requests).includes(text.toLowerCase());
+  };
+}
+// a word with = in it, starting with - or gpu:, or like 2:a100, is a request; the other words look through the job's user, name, node,
+// partition and what it asked for
+const isRequestWord = (w) => w.includes("=") || w.startsWith("-") || /^(gpu:|\d+:[a-z])/.test(w);
 function jobMatcher(text) {
   const words = text.toLowerCase().split(/\s+/).filter(Boolean);
+  const asked = words.filter(isRequestWord).map(resourceTerm);
+  const plain = words.filter((w) => !isRequestWord(w));
   return (job) => {
     if (!words.length) return true;
+    if (!asked.every((check) => check(job.requests))) return false;
     const hay = [job.user, job.name, job.id, job.partition, job.node_list, job.node_list ? expandHosts(job.node_list).join(" ") : "",
-      job.source && job.source.label, job.source && job.source.token].filter(Boolean).join(" ").toLowerCase();
-    return words.every((w) => hay.includes(w));
+      job.source && job.source.label, job.source && job.source.token, requestText(job.requests)].filter(Boolean).join(" ").toLowerCase();
+    return plain.every((w) => hay.includes(w));
   };
 }
 const jobText = {};        // cluster -> the Jobs tab's filter text, kept while the page is open
@@ -486,6 +529,9 @@ async function queuePage(c) {
   const reason = (r) => el("span", { title: r }, QUEUE_REASONS[r] || r);
   // the name opens the job's page (what Slurm shows about it; not their script or output)
   const jobName = (j) => el("td", {}, el("a", { class: "job-link", href: href(c.name, "jobs", j.id) }, j.name), el("div", { class: "muted small" }, j.id));
+  // CPUs and memory, then what it asked sbatch for (the GPUs and constraint; hover for the option)
+  const asked = (j) => el("span", {}, [`${j.cpus} CPU`, j.memory && j.memory !== "0" && j.memory].filter(Boolean).join(" · "),
+    ...Object.entries(j.requests || {}).map(([k, v]) => el("div", { class: "small", title: `--${k}=${v}` }, `${k}=${v}`)));
   const source = (j) => (j.source.kind === "other" ? el("span", { class: "muted" }, "—")
     : chip(j.source.label, SOURCE_TONE[j.source.kind] || "down", j.source.token ? `token ${j.source.token}` : null));
   const partitions = table(["Partition", "CPUs in use", "", "Running", "Waiting"], q.partitions.map((p) => {
@@ -512,7 +558,9 @@ async function queuePage(c) {
     el("table", { class: "jobs gpus" }, el("thead", {}, el("tr", {}, ["Partition", "GPU", "In use", "", "Free", "Nodes with a free one", "Most free", "Out of service"].map((h) => el("th", {}, h)))),
       el("tbody", {}, gpuRows))) : null;
   const filter = el("input", { type: "search", size: 36, value: queueText[c.name] || "", "aria-label": "Filter jobs",
-                               placeholder: "Filter by user, job name, node or partition" });
+                               placeholder: "Filter by user, job name, node, partition or request (gpus=1:a100)",
+                               title: "Words must all match. A request is written like the sbatch option: gpus=1:a100, --gres=gpu:a100:2, " +
+                                 "gpus-per-node=a100, constraint=a100; gpu:a100 or 2:a100 looks at every GPU request" });
   const hpclibOnly = el("input", { type: "checkbox", checked: Boolean(queueHpclib[c.name]), "aria-label": "Only jobs started by hpclib" });
   const users = table(["User", "Running", "Waiting", "Started by hpclib"], q.users.map((u) => el("tr", {},
     el("td", {}, el("button", { type: "button", class: "link-button", title: `Show only ${u.user}'s jobs`,
@@ -535,22 +583,22 @@ async function queuePage(c) {
     const queued = q.queued.filter(keep), running = q.running.filter(keep);
     const cut = (total, list) => (total > list.length ? ` (the first ${list.length} of ${total})` : "");
     const matching = (total, list) => (words ? ` · ${list.length} match${list.length === 1 ? "" : "es"}` : "");
-    lists.replaceChildren(
+    lists.replaceChildren(...[      // more() is null when everything is shown: replaceChildren would write "null"
       el("h3", { id: "queue-running" }, `Running (${n.running})${cut(n.running, q.running)}${matching(n.running, running)}`),
       table(["Job", "User", "From", "Partition", "Node", "Time used", "Asked for"], running.slice(0, showRunning).map((j) => el("tr", {},
         jobName(j), el("td", {}, j.user), el("td", {}, source(j)), el("td", {}, j.partition),
         el("td", {}, j.node_list), el("td", {}, `${j.elapsed} of ${j.time_limit}`),
-        el("td", {}, [`${j.cpus} CPU`, j.memory && j.memory !== "0" && j.memory].filter(Boolean).join(" · ")))),
+        el("td", {}, asked(j)))),
         words ? "No running job matches." : "Nothing is running."),
       more(showRunning, running.length, () => { showRunning += SHOW; }),
       el("h3", { id: "queue-waiting" }, `Waiting (${n.queued})${cut(n.queued, q.queued)}${matching(n.queued, queued)}`),
       table(["Job", "User", "From", "Partition", "Asked for", "Waiting because", "Submitted", "Expected start"], queued.slice(0, showQueued).map((j) => el("tr", {},
         jobName(j), el("td", {}, j.user), el("td", {}, source(j)), el("td", {}, j.partition),
-        el("td", {}, [`${j.cpus} CPU`, j.memory && j.memory !== "0" && j.memory].filter(Boolean).join(" · ")),
+        el("td", {}, asked(j)),
         el("td", {}, reason(j.reason)), el("td", {}, (j.submitted || "").replace("T", " ")),
         el("td", {}, j.start ? j.start.replace("T", " ") : el("span", { class: "muted" }, "not estimated")))),
         words ? "No waiting job matches." : "Nothing is waiting."),
-      more(showQueued, queued.length, () => { showQueued += SHOW; }));
+      more(showQueued, queued.length, () => { showQueued += SHOW; })].filter(Boolean));
   };
   const redraw = () => { showRunning = showQueued = SHOW; draw(); };
   filter.addEventListener("input", () => { queueText[c.name] = filter.value; redraw(); });

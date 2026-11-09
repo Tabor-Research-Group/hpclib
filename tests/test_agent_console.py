@@ -1263,6 +1263,37 @@ esac
         self.assertEqual([l[:2] for l in res.stdout.splitlines()], ["U|", "P|", "Q|"])
         self.assertEqual((parsed["counts"]["running"], parsed["running"][0]["name"]), (1, "job"))
 
+    def test_the_queue_script_reads_what_each_job_asked_for(self):
+        bin_dir = Path(self.tmp) / "tres-squeue"
+        bin_dir.mkdir()
+        (bin_dir / "sinfo").write_text("#!/bin/bash\necho 'P|gpu|1/2/0/3|1'\n")
+        # -O prints fixed-width columns: JobID 24, three TRES 80/80/50/50, Features 80
+        col = lambda text, width: text.ljust(width)
+        rows = [col("11", 24) + col("gres/gpu:a100=1", 80) + col("N/A", 80) + col("N/A", 50) + col("N/A", 50) + col("", 80),
+                col("12", 24) + col("N/A", 80) + col("gres/gpu:h100:2,gres/shard:4", 80) + col("N/A", 50) + col("N/A", 50) + col("gpu80", 80),
+                col("13", 24) + col("N/A", 80) + col("N/A", 80) + col("N/A", 50) + col("N/A", 50) + col("N/A", 80)]
+        (bin_dir / "squeue").write_text('#!/bin/bash\ncase "$*" in *tres-per-job*) cat <<\'EOF\'\n' + "\n".join(rows) + '\nEOF\n;;\n'
+            '*) echo "Q|11|bob|RUNNING|None|gpu|0:01|1:00|1|8|1G|g1|N/A|2026-11-04T09:00:00|5||a"\n'
+            'echo "Q|12|bob|PENDING|Priority|gpu|0:00|1:00|1|8|1G||N/A|2026-11-04T09:00:00|5||b"\n'
+            'echo "Q|13|bob|PENDING|Priority|cpu|0:00|1:00|1|8|1G||N/A|2026-11-04T09:00:00|5||c";; esac\n')
+        for f in ("sinfo", "squeue"):
+            (bin_dir / f).chmod(0o755)
+        res = subprocess.run(["bash", "-s"], input=agent_console.CLUSTER_QUEUE_SCRIPT, capture_output=True, text=True,
+                             env={"PATH": f"{bin_dir}:/usr/bin:/bin"})
+        self.assertEqual([l for l in res.stdout.splitlines() if l.startswith("R|")],
+                         ["R|11|gres/gpu:a100=1||||", "R|12||gres/gpu:h100:2,gres/shard:4|||gpu80"])    # job 13 asked for nothing
+        parsed = agent_console.parse_cluster_queue(res.stdout)
+        by_id = {j["id"]: j["requests"] for j in parsed["running"] + parsed["queued"]}
+        self.assertEqual(by_id, {"11": {"gpus": "gpu:a100:1"},
+                                 "12": {"gres": "gpu:h100:2,shard:4", "constraint": "gpu80"}, "13": {}})
+        # a Slurm without those squeue fields: no R lines, jobs still listed
+        (bin_dir / "squeue").write_text('#!/bin/bash\ncase "$*" in *tres-per-job*) echo "squeue: error: Invalid job format" >&2; exit 1;; esac\n'
+                                       'echo "Q|11|bob|RUNNING|None|gpu|0:01|1:00|1|8|1G|g1|N/A|2026-11-04T09:00:00|5||a"\n')
+        res = subprocess.run(["bash", "-s"], input=agent_console.CLUSTER_QUEUE_SCRIPT, capture_output=True, text=True,
+                             env={"PATH": f"{bin_dir}:/usr/bin:/bin"})
+        parsed = agent_console.parse_cluster_queue(res.stdout)
+        self.assertEqual((parsed["running"][0]["id"], parsed["running"][0]["requests"]), ("11", {}))
+
     def test_the_whole_queue_is_reused_for_a_few_seconds(self):
         runs = []
         runner = self.clusters.script_runner

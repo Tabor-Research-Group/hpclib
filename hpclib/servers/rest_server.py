@@ -88,7 +88,7 @@ Endpoints (all responses are JSON unless noted)    scope
                                  with the cluster's own commands (lib/quota.sh: showquota and
                                  myproject by default; HPCLIB_*_QUOTA_CHECK or the cluster's
                                  settings change them); cached for a minute
-  GET    /queue[?jobs=none|running|queued|all][&user=U][&partition=P][&name=TEXT][&hpclib=1][&limit=N][&refresh=1]
+  GET    /queue[?jobs=none|running|queued|all][&user=U][&partition=P][&name=TEXT][&resources=gpus=1:a100][&hpclib=1][&limit=N][&refresh=1]
                                  everyone's queue: counts, partitions (CPUs), GPUs by partition and   read
                                  type (in use, free, most free on one node), busiest users, why jobs
                                  wait; with jobs=, those jobs (filtered, the first N of each); cached 15 s
@@ -1053,7 +1053,8 @@ class HPCRESTHandler(RESTHandler):
         answer = self.server.cluster_queue.read(refresh=self.query_flag("refresh"))
         self.audit_detail = {"queue": show}
         return 200, queue_view.queue_report(answer, show, self.query_value("user"), self.query_value("partition"),
-                                            self.query_value("name"), self.query_flag("hpclib"), limit)
+                                            self.query_value("name"), self.query_flag("hpclib"), limit,
+                                            self.query_value("resources"))
 
     def do_health(self):
         wl = self.whitelist

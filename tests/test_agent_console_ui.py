@@ -988,6 +988,49 @@ class TestConsoleUI(unittest.TestCase):
         self.assertIn('good-job', main.inner_text())
         self.assertEqual(self.errors, [])
 
+    def test_the_whole_queue_filters_on_what_jobs_asked_sbatch_for(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': [],
+             'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up'}}
+        job = lambda i, name, requests, state='PENDING': {
+            'id': str(i), 'user': 'bob', 'name': name, 'state': state, 'reason': 'Priority', 'partition': 'gpu', 'elapsed': '0:00',
+            'time_limit': '1:00:00', 'nodes': '1', 'cpus': '8', 'memory': '32G', 'node_list': '', 'start': '',
+            'submitted': '2026-11-04T09:30:00', 'priority': '900', 'requests': requests, 'source': {'kind': 'other', 'label': 'other'}}
+        queue = {'ok': True, 'me': 'mark', 'at': time.time(), 'partitions': [], 'users': [], 'reasons': {}, 'gpus': [],
+                 'queued': [job(1, 'train_a', {'gpus': 'gpu:a100:1'}), job(2, 'train_b', {'gres': 'gpu:h100:4'}),
+                            job(3, 'plain', {}), job(4, 'feat', {'constraint': 'a100|v100'})],
+                 'running': [job(5, 'run_a', {'gres': 'gpu:a100:2'}, 'RUNNING')],
+                 'counts': {'queued': 4, 'running': 1, 'users': 1, 'queued_cpus': 32, 'running_cpus': 8, 'hpclib': 0}}
+        answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c, 'health': {'hpclib_version': '1.11.1'},
+                   'apps': {'apps': [{'id': 'agents', 'title': 'Agents'}]}, 'clusters/demo/queue': queue,
+                   'clusters/demo/jobs': {'at': 0, 'queued': [], 'running': [], 'finished': [],
+                                          'counts': {'queued': 0, 'running': 0, 'finished': 0, 'failed': 0}}}
+        def handler(route, path):
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.load_console(handler)
+        self.page.goto(self.base + "/#/c/demo/jobs/queue")
+        main = self.page.locator('main')
+        main.get_by_text('Waiting (4)').wait_for()
+        self.assertIn('gpus=gpu:a100:1', main.inner_text())                 # what each job asked for is shown
+        names = lambda: [t.strip() for t in main.locator('table.jobs a.job-link').all_text_contents()]
+        def filtered(text, expect):
+            main.get_by_label('Filter jobs').fill(text)
+            self.page.wait_for_function('(want) => [...document.querySelectorAll("table.jobs a.job-link")].map(a => a.textContent.trim()).sort().join(",") === want',
+                                        arg=','.join(sorted(expect)))
+        self.assertNotIn('null', main.inner_text().split())                    # nothing left to show must not print "null"
+        filtered('gpus=1:a100', ['train_a'])
+        filtered('--gres=gpu:a100:2', ['run_a'])
+        filtered('a100', ['train_a', 'run_a', 'feat'])
+        filtered('gpu:h100:4', ['train_b'])
+        filtered('constraint=v100', ['feat'])
+        filtered('2:a100', ['run_a'])
+        filtered('a100 constraint=v100', ['feat'])
+        filtered('', ['train_a', 'train_b', 'plain', 'feat', 'run_a'])
+        self.assertNotIn('null', main.inner_text().split())
+        self.assertEqual(self.errors, [])
+
     def test_jobs_tab_has_a_whole_queue_of_other_peoples_jobs(self):
         c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
              'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up'}}
