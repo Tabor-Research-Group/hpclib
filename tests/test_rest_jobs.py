@@ -484,6 +484,75 @@ class TestSubmit(JobServerTestCase):
 
 
 
+class TestPathWhitelist(unittest.TestCase):
+
+    def test_restrict_intersects_directory_trees_in_requested_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = str(Path(tmp).resolve())
+            project, other = base + "/project", base + "/other"
+            child = project + "/llm"
+            for server, requested, expected in (
+                ([project], [project], (project,)),
+                ([project], [child], (child,)),
+                ([child], [project], (child,)),
+                ([child, other], [base], (child, other)),
+                ([child, other], [other, base, base], (other, child)),
+                ([project], [project + "-elsewhere"], ()),
+                ([project], [other], ()),
+                (None, [child], (child,)),
+                ([], [base], ()),
+                ([project], [], ()),
+                (None, [], ()),
+                (None, None, None),
+                ([project], None, (project,)),
+            ):
+                with self.subTest(server=server, requested=requested):
+                    whole = PathWhitelist(server, base_dir=base)
+                    narrow = whole.restrict(requested)
+                    self.assertEqual(narrow.roots, expected)
+                    self.assertEqual(narrow.base_dir, expected[0] if requested is not None and expected else base)
+                    self.assertEqual(whole.roots, tuple(server) if server is not None else None)
+                    if requested is None:
+                        self.assertIs(narrow, whole)
+
+    def test_restrict_preserves_denied_subtrees(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            child, hidden = base / "project" / "llm", base / "hidden"
+            private = child / "private"
+            for server in ([str(child), str(hidden)], None):
+                with self.subTest(server=server):
+                    whole = PathWhitelist(server, base_dir=base, deny=[str(hidden), str(private)])
+                    narrow = whole.restrict([str(base)])
+                    self.assertEqual(narrow.roots, (str(child if server is not None else base),))
+                    self.assertEqual(narrow.deny, whole.deny)
+                    self.assertEqual(narrow.resolve(str(child / "input.py"))[1], str(child / "input.py"))
+                    for path in (private, private / "secret", hidden, hidden / "secret"):
+                        with self.assertRaisesRegex(PermissionError, "protected server path"):
+                            narrow.resolve(str(path))
+            blocked = PathWhitelist([str(child)], deny=[str(base)]).restrict([str(base)])
+            self.assertEqual(blocked.roots, ())
+            with self.assertRaises(PermissionError):
+                blocked.resolve(str(child))
+
+    def test_restrict_resolves_symlinks_without_allowing_an_escape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            project, outside = base / "project", base / "outside"
+            child = project / "llm"
+            child.mkdir(parents=True)
+            outside.mkdir()
+            alias = base / "alias"
+            alias.symlink_to(project, target_is_directory=True)
+            (child / "escape").symlink_to(outside, target_is_directory=True)
+            narrow = PathWhitelist([str(child)]).restrict([str(alias)])
+            self.assertEqual((narrow.roots, narrow.base_dir), ((str(child),), str(child)))
+            self.assertEqual(narrow.resolve("input.py")[1], str(child / "input.py"))
+            for path in ("escape/secret", "../sibling", str(outside)):
+                with self.assertRaises(PermissionError):
+                    narrow.resolve(path)
+
+
 class TestRequestFileSystemCost(unittest.TestCase):
     """What every request needs from the file system is kept small: they are seconds apiece on a slow network mount."""
 
@@ -499,6 +568,10 @@ class TestRequestFileSystemCost(unittest.TestCase):
             self.assertEqual((narrow.roots, narrow.base_dir, narrow.deny), ((str(inner),), str(inner), whole.deny))
             self.assertIs(whole.restrict(None), whole)
             self.assertEqual(whole.restrict([str(Path(tmp, "elsewhere"))]).roots, ())
+            with mock.patch("os.path.realpath", side_effect=real) as spy:
+                overlap = whole.restrict([str(base.parent)])
+            self.assertEqual(spy.call_count, 1)  # the broader requested root; the kept server root is already resolved
+            self.assertEqual((overlap.roots, overlap.base_dir, overlap.deny), ((str(base),), str(base), whole.deny))
 
     def test_version_is_read_once(self):
         hpclib_version.cache_clear()
@@ -715,6 +788,32 @@ class TestScopes(JobServerTestCase):
         self.expect_error(403, self.llm.read_file, str(self.root / "private.txt"))
         self.expect_error(403, self.llm.list_files, "..")
         self.assertEqual(self.owner.read_file(str(self.root / "private.txt"))["text"], "secret")
+
+    def test_broader_token_keeps_only_the_server_overlap(self):
+        private = self.llm_root / "private"
+        private.mkdir()
+        (private / "secret.txt").write_text("secret")
+        (self.root / "sibling.txt").write_text("outside the server roots")
+        (self.llm_root / "input.py").write_text("print('hello')\n")
+        self.server.whitelist = PathWhitelist([str(self.llm_root)], base_dir=self.root,
+                                              deny=[str(self.data), str(private)])
+        self.server.agent_whitelist = self.server.whitelist.with_deny(self.server.agent_whitelist.deny)
+        token = TokenAuth.add_token(str(self.tokens_file), "broad", ["read", "submit"], [str(self.root)])
+        client = RESTClient(self.url, token=token)
+        health = client.health()
+        self.assertEqual(health["token"]["allow"], [str(self.root)])
+        self.assertEqual(health["allowed_dirs"], [str(self.llm_root)])
+        self.assertEqual(health["base_dir"], str(self.llm_root))
+        self.assertEqual(client.cluster()["allowed_dirs"], [str(self.llm_root)])
+        self.assertEqual(client.read_file("input.py")["text"], "print('hello')\n")
+        with mock.patch.object(self.jobs.sandbox, "launch", wraps=self.jobs.sandbox.launch) as launch:
+            plan = client.submit_job("python_script", {"script": "input.py"}, dry_run=True)
+        self.assertTrue(plan["accepted"])
+        self.assertEqual(plan["workdir"], str(self.llm_root))
+        self.assertEqual(launch.call_args.args[2], [str(self.llm_root)])
+        for path in ("..", str(self.root / "sibling.txt"), str(private / "secret.txt"), str(self.tokens_file)):
+            self.expect_error(403, client.read_file, path)
+        self.expect_error(403, client.submit_job, "hello", workdir=str(self.root), dry_run=True)
 
     def test_server_data_is_protected_even_for_the_owner(self):
         for path in (self.tokens_file, self.audit_path, self.templates / "hello" / "script.sh"):

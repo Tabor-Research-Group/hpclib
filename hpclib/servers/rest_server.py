@@ -267,11 +267,21 @@ class PathWhitelist:
         return wl
 
     def restrict(self, roots):
-        """A narrower whitelist: only those `roots` that this one allows."""
+        """Intersect this whitelist with `roots`, keeping the narrower root of each overlapping pair."""
         if roots is None:
             return self
         roots = [os.path.realpath(os.path.expanduser(r)) for r in roots]
-        kept = [r for r in roots if self.contains(r)]
+        kept = []
+        for root in roots:
+            for allowed in self.roots if self.restricted else (root,):
+                if self._inside(allowed, root):
+                    overlap = root
+                elif self._inside(root, allowed):
+                    overlap = allowed
+                else:
+                    continue
+                if overlap not in kept and self.contains(overlap):
+                    kept.append(overlap)
         # the roots kept and the deny list are already resolved: resolving them again would cost an lstat for every
         # component of every path, on every request, which on a slow network file system is seconds
         wl = PathWhitelist.__new__(PathWhitelist)
