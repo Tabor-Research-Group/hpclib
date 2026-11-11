@@ -151,6 +151,47 @@ try the short service name once after a definite unknown-principal response on a
 the original server's network destination. Explicit settings take precedence. Existing encryption policy remains
 in force; client changes do not repair missing service identities or AES configuration on the storage/domain side.
 
+### Directory sync setup (initial implementation stage)
+
+**Data transfer → Directory sync** (`#/transfer/sync`) saves one local directory with multiple cluster targets.
+In hpclib 1.14.0, a dedicated **Directory sync** panel appears above the SMB controls on both the cluster and
+all-cluster Data transfer pages. Its primary **Manage directory syncs** link opens the setup/management page;
+the cluster-specific link preselects that cluster. The all-cluster navigation also labels the page **Directory sync**.
+The first implementation stage supports pair editing, configurable per-file/aggregate/file-count warning
+thresholds, pause preferences, and local Git ignore setup. Transfers, snapshots, and heartbeat workers are not
+enabled yet; the page says so and Run remains disabled. Git-only setup does not require or invoke rclone.
+The compact editor and saved cards place the local and remote directories beside one another. Direction is
+saved explicitly: bidirectional (↔), local to remote (→), or remote to local (←). Existing Git registrations
+default to bidirectional; existing standalone rclone registrations retain their push/pull choice. Branch,
+poll interval and warning thresholds are under **Advanced settings**.
+
+**Ignore setup** shows the versioned default list. When `.gitignore` exists without `.hpclib-sync.json`, the page
+first offers a reviewed default-rule merge. Declining offers sync-only exclusions; declining both records that
+choice and keeps existing rules. An explicit final confirmation writes repository metadata and, only when chosen,
+the displayed `.gitignore` change. Existing rule order/comments are preserved. Setup creates no commit and does
+not change the ordinary Git index or checked-out branch. A changed file invalidates its setup preview.
+
+Registrations live under the console's `sync/` directory. **Unregister** removes the active registration while
+preserving working directories, repository metadata, and archived registration/history data.
+
+**Agent sync context actions.** Data transfer also declares permanent cluster-side actions, independent of
+the SMB login. Enable Data transfer under the cluster's **Agents → Tunnel actions** settings. Inspection
+actions are then enabled by default; enable the two metadata-write actions individually when wanted.
+
+| Action | Purpose |
+| --- | --- |
+| `sync_inspect` | Read metadata, effective warning thresholds and ignore choice from an existing scoped directory. |
+| `sync_setup_preview` | Preview defaults and the proposed `.gitignore` merge; return a review token. |
+| `sync_setup` | Save `gitignore`, `sync-only` or `off`, using the review token and `confirm: true`. |
+| `sync_settings` | Change selected positive warning thresholds using a current review token and `confirm: true`; omitted or zero values stay unchanged. |
+
+Each takes `root`, an existing directory in the token's work roots. Write actions require `files:write` and
+server file changes enabled. They preserve unrelated ignore rules and refuse symlinked control files.
+A changed setup file invalidates the review token. These actions manage portable metadata on the cluster;
+local console registrations, pause preferences, commits and transfers are managed separately. No action here
+starts a sync. The matching REST backend and Data transfer manifest must be installed together, then the
+REST service restarted; replacing only the manifest on an older server is unsupported.
+
 ## Filesystem diagnostics (a package)
 
 Finds out why tunnels are slow. Tunnel requests are slow when the file system calls behind them are: the REST server

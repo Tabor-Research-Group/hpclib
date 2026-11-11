@@ -4,6 +4,7 @@
 // GET clusters/NAME/jobs[/ID], GET/POST clusters/NAME/storage[/scan] and GET clusters/NAME/quota. app.js passes what they share with it (init).
 import { el, action, confirmDialog, connectClients, ownerRecovery, appUrl } from "./components.js";
 import * as widgets from "./widgets.js";
+import { syncEntry } from "./sync.js";
 
 // { api, errorBox, render, settingsCards: (c) => [cards], addCluster: () => [button, area], files: (name) => page,
 //   activity: (name) => page, sshKeys: (name) => page, appSettings: (app, session, row) => (draws in row.showDetail) }
@@ -808,6 +809,7 @@ async function appPage(c, id) {
     family.length > 1 ? subTabs(family.map((x) => [appHref(c.name, x.id), x.tab ? x.tab.label : x.title, x.id]), id) : null,
     el("div", { class: "toolbar" }, el("h3", {}, a.title),
       el("a", { class: "muted small", href: `#/${parentId}` }, `${parent.title} on all clusters`)),
+    id === "transfer" ? [syncEntry(c.name), el("h3", {}, "SMB transfers")] : null,
     linkNote,
     el("p", { class: "muted" }, a.description || `${kindText} It runs as you, with your full permissions on ` +
       "the cluster (it is not the agents' sandbox)."),
@@ -1321,6 +1323,8 @@ function tunnelActionsCard(c) {
           el("td", {}, el("span", { class: "chips" },
             a.writes === "remote" ? chip("writes outside the cluster", "error") : null,
             a.writes === "cluster" ? chip("writes to your directories", "starting") : null,
+            a.availability ? chip(a.availability.available ? "available" : "not available",
+                                  a.availability.available ? "up" : "starting") : null,
             !a.default ? chip("off by default", "down") : null)));
       });
       return el("div", { class: "action-tunnel" },

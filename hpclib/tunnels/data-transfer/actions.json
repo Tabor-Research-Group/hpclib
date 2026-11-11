@@ -1,6 +1,6 @@
 {
-  "title": "SMB server",
-  "description": "Files on your group SMB server through smbclient and your Data Transfer Kerberos ticket. The optional rclone GUI has an independent session password.",
+  "title": "Data transfer",
+  "description": "SMB transfers and scoped cluster-side sync setup. Sync context actions do not require an SMB ticket and do not start transfers.",
   "available": {
     "run": [
       "smbshell.sh",
@@ -111,6 +111,213 @@
       ],
       "output": "{data_dir}/sessions/data-transfer/transfer-{job_id}.log",
       "timeout": 120
+    },
+    "sync_inspect": {
+      "title": "Inspect sync context",
+      "description": "Read the cluster directory sync metadata and default ignore context without writing files. Local console registrations are unchanged.",
+      "mode": "sync",
+      "scope": "read",
+      "params": {
+        "root": {
+          "type": "cluster-path",
+          "access": "read",
+          "description": "an existing directory in the token work roots; mutations only change .hpclib-sync.json and a reviewed .gitignore"
+        }
+      },
+      "available": {
+        "run": [
+          "sync-context.sh",
+          "{helper}",
+          "capabilities"
+        ],
+        "require": [
+          "ready"
+        ],
+        "cache": 30,
+        "message": "Update hpclib on this cluster to enable sync context actions."
+      },
+      "run": [
+        "sync-context.sh",
+        "{helper}",
+        "inspect",
+        "--scope",
+        "{scope_file}",
+        "--root",
+        "{root}"
+      ],
+      "timeout": 30
+    },
+    "sync_setup_preview": {
+      "title": "Preview sync ignore setup",
+      "description": "Read the cluster directory sync metadata and default ignore context without writing files. Local console registrations are unchanged.",
+      "mode": "sync",
+      "scope": "read",
+      "params": {
+        "root": {
+          "type": "cluster-path",
+          "access": "read",
+          "description": "an existing directory in the token work roots; mutations only change .hpclib-sync.json and a reviewed .gitignore"
+        }
+      },
+      "available": {
+        "run": [
+          "sync-context.sh",
+          "{helper}",
+          "capabilities"
+        ],
+        "require": [
+          "ready"
+        ],
+        "cache": 30,
+        "message": "Update hpclib on this cluster to enable sync context actions."
+      },
+      "run": [
+        "sync-context.sh",
+        "{helper}",
+        "preview",
+        "--scope",
+        "{scope_file}",
+        "--root",
+        "{root}"
+      ],
+      "timeout": 30
+    },
+    "sync_setup": {
+      "title": "Save reviewed sync ignore setup",
+      "description": "Apply a reviewed cluster-side ignore choice and portable metadata. Requires explicit confirm and a fresh sync_setup_preview token. Does not commit or transfer files.",
+      "mode": "sync",
+      "scope": "files:write",
+      "writes": "cluster",
+      "default": false,
+      "params": {
+        "root": {
+          "type": "cluster-path",
+          "access": "read",
+          "description": "an existing directory in the token work roots; mutations only change .hpclib-sync.json and a reviewed .gitignore"
+        },
+        "review": {
+          "type": "string",
+          "pattern": "[a-f0-9]{64}",
+          "description": "the review token returned by sync_setup_preview"
+        },
+        "mode": {
+          "type": "string",
+          "pattern": "gitignore|sync-only|off",
+          "description": "merge defaults into .gitignore, use private sync exclusions, or decline defaults"
+        },
+        "confirm": {
+          "type": "boolean",
+          "default": false,
+          "description": "explicitly confirm the reviewed metadata writes"
+        }
+      },
+      "available": {
+        "run": [
+          "sync-context.sh",
+          "{helper}",
+          "capabilities"
+        ],
+        "require": [
+          "ready"
+        ],
+        "cache": 30,
+        "message": "Update hpclib on this cluster to enable sync context actions."
+      },
+      "run": [
+        "sync-context.sh",
+        "{helper}",
+        "setup",
+        "--scope",
+        "{scope_file}",
+        "--root",
+        "{root}",
+        "--state",
+        "{data_dir}",
+        "--review",
+        "{review}",
+        "--mode",
+        "{mode}",
+        "--confirm",
+        "{confirm}"
+      ],
+      "timeout": 30
+    },
+    "sync_settings": {
+      "title": "Change reviewed sync warning settings",
+      "description": "Update selected warning thresholds in existing cluster-side sync metadata. Zero leaves a value unchanged. Requires a current preview and explicit confirm; local console registrations are unchanged.",
+      "mode": "sync",
+      "scope": "files:write",
+      "writes": "cluster",
+      "default": false,
+      "params": {
+        "root": {
+          "type": "cluster-path",
+          "access": "read",
+          "description": "an existing directory in the token work roots; mutations only change .hpclib-sync.json and a reviewed .gitignore"
+        },
+        "review": {
+          "type": "string",
+          "pattern": "[a-f0-9]{64}",
+          "description": "the review token returned by sync_setup_preview"
+        },
+        "confirm": {
+          "type": "boolean",
+          "default": false,
+          "description": "explicitly confirm the reviewed metadata writes"
+        },
+        "warn_file_mb": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0,
+          "description": "per-file warning in decimal MB; zero leaves unchanged"
+        },
+        "warn_snapshot_mb": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0,
+          "description": "aggregate snapshot warning in decimal MB; zero leaves unchanged"
+        },
+        "warn_file_count": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "changed-file warning count; zero leaves unchanged"
+        }
+      },
+      "available": {
+        "run": [
+          "sync-context.sh",
+          "{helper}",
+          "capabilities"
+        ],
+        "require": [
+          "ready"
+        ],
+        "cache": 30,
+        "message": "Update hpclib on this cluster to enable sync context actions."
+      },
+      "run": [
+        "sync-context.sh",
+        "{helper}",
+        "settings",
+        "--scope",
+        "{scope_file}",
+        "--root",
+        "{root}",
+        "--state",
+        "{data_dir}",
+        "--review",
+        "{review}",
+        "--confirm",
+        "{confirm}",
+        "--warn-file-mb",
+        "{warn_file_mb}",
+        "--warn-snapshot-mb",
+        "{warn_snapshot_mb}",
+        "--warn-file-count",
+        "{warn_file_count}"
+      ],
+      "timeout": 30
     }
   }
 }

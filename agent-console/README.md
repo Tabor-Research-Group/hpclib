@@ -1,5 +1,13 @@
 # agent-console
 
+Directory sync's initial setup stage is available under **Data transfer → Directory sync** (`#/transfer/sync`).
+Both Data transfer pages show a dedicated **Directory sync** panel above the SMB controls, with a primary
+**Manage directory syncs** link. A cluster's link preselects that cluster. `sync.js` uses the existing shared elements and console API to save
+pairs, edit warning thresholds, and review local ignore setup. The compact editor places local and remote
+paths on the same row with a direction arrow (↔, → or ←); saved cards use the same paired layout.
+Advanced settings holds the branch, interval and warning thresholds. Git snapshot/transfer workers, rclone, and the
+heartbeat are not enabled in this stage. Their routes return an explicit unavailable error rather than success.
+
 A minimal browser front end for `agent_console`, the local backend in
 `hpclib/servers/agent_console.py`. Plain HTML, CSS and JavaScript modules (with native custom elements), no build step.
 

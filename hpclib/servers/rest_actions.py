@@ -28,7 +28,11 @@ token's directories, for action_paths.py), {helper} (action_paths.py) and {data_
 Parameter types: `cluster-path` (resolved like the files API: inside the token's directories, never a protected
 path; `access: write` needs file changes allowed, `read` an existing path; the tunnel gets the resolved path),
 `remote-path` (a path relative to the tunnel's own root: no leading / or -, no .., no control characters),
-`string` (with a `pattern`), `integer` (`minimum`, `maximum`) and `boolean`. Optional parameters have a `default`.
+`string` (with a `pattern`), `integer` or finite `number` (`minimum`, `maximum`) and `boolean`.
+Optional parameters have a `default`. An action's `available` overrides the tunnel's readiness check;
+readiness commands may use the trusted {helper}/{data_dir} paths, without an agent scope or a job.
+Synchronous actions' private scope files are removed when they finish. A scope file also records
+`file_changes`, which metadata helpers must check before writing into an existing directory.
 
 The owner turns a tunnel's actions on in the REST config (PUT /admin/config, section tunnel_actions):
   {"tunnel_actions": {"data-transfer": {"enabled": true, "actions": {"put": true}}}}
@@ -39,6 +43,7 @@ job_status, wait_for_job and the concurrent-job cap cover them.
 Standard library only.
 """
 import json
+import math
 import os
 import re
 import subprocess
@@ -57,7 +62,7 @@ RESTError = rest_jobs.RESTError
 ACTIONS_FILE = "actions.json"
 NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 TUNNEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
-PARAM_TYPES = ("cluster-path", "remote-path", "string", "integer", "boolean")
+PARAM_TYPES = ("cluster-path", "remote-path", "string", "integer", "number", "boolean")
 SCOPES = ("read", "submit", "files:write")
 MODES = ("sync", "job")
 SPECIAL = {"job_options", "scope_file", "helper", "data_dir"}
@@ -108,6 +113,31 @@ def _check_run(run, params, what, allow_job=False):
             raise ValueError(f"{what}.run: {{job_options}} is for job-mode actions")
 
 
+def check_availability(avail):
+    """Normalize one readiness check, shared by tunnel defaults and action overrides."""
+    if avail is None:
+        return None
+    if not isinstance(avail, dict) or set(avail) - {"run", "line", "require", "any", "show", "message", "cache"}:
+        raise ValueError("available has run, line, require, any, show, message and cache")
+    _check_run(avail.get("run"), {}, "available")
+    if any(arg in ("{scope_file}", "{job_options}") for arg in avail["run"]):
+        raise ValueError("availability checks cannot create scope files or jobs")
+    for key in ("require", "any", "show"):
+        v = avail.get(key) or []
+        if not isinstance(v, list) or not all(isinstance(k, str) and re.fullmatch(r"[a-z_]{1,32}", k) for k in v):
+            raise ValueError(f"available.{key} is a list of field names")
+    line = avail.get("line")
+    if line is not None and not (isinstance(line, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", line)):
+        raise ValueError("available.line is the marker its JSON line starts with")
+    cache = avail.get("cache", 30)
+    if isinstance(cache, bool) or not isinstance(cache, int) or not 0 <= cache <= 3600:
+        raise ValueError("available.cache is seconds, 0 to 3600")
+    return {"run": list(avail["run"]), "line": line, "require": list(avail.get("require") or []),
+                        "any": list(avail.get("any") or []), "show": list(avail.get("show") or []),
+                        "message": _text(avail.get("message"), "available.message", 300, required=False),
+                        "cache": cache}
+
+
 def check_manifest(manifest, tunnel):
     """The tunnel's actions.json, normalized; ValueError if it isn't valid."""
     if not isinstance(manifest, dict) or set(manifest) - {"title", "description", "available", "actions"}:
@@ -115,25 +145,7 @@ def check_manifest(manifest, tunnel):
     out = {"tunnel": tunnel, "title": _text(manifest.get("title") or tunnel, "title", 80),
            "description": _text(manifest.get("description"), "description", 2000, required=False),
            "available": None, "actions": {}}
-    avail = manifest.get("available")
-    if avail is not None:
-        if not isinstance(avail, dict) or set(avail) - {"run", "line", "require", "any", "show", "message", "cache"}:
-            raise ValueError("available has run, line, require, any, show, message and cache")
-        _check_run(avail.get("run"), {}, "available")
-        for key in ("require", "any", "show"):
-            v = avail.get(key) or []
-            if not isinstance(v, list) or not all(isinstance(k, str) and re.fullmatch(r"[a-z_]{1,32}", k) for k in v):
-                raise ValueError(f"available.{key} is a list of field names")
-        line = avail.get("line")
-        if line is not None and not (isinstance(line, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", line)):
-            raise ValueError("available.line is the marker its JSON line starts with")
-        cache = avail.get("cache", 30)
-        if isinstance(cache, bool) or not isinstance(cache, int) or not 0 <= cache <= 3600:
-            raise ValueError("available.cache is seconds, 0 to 3600")
-        out["available"] = {"run": list(avail["run"]), "line": line, "require": list(avail.get("require") or []),
-                            "any": list(avail.get("any") or []), "show": list(avail.get("show") or []),
-                            "message": _text(avail.get("message"), "available.message", 300, required=False),
-                            "cache": cache}
+    out["available"] = check_availability(manifest.get("available"))
     actions = manifest.get("actions")
     if not isinstance(actions, dict) or not actions or len(actions) > 32:
         raise ValueError("actions maps names to actions (1 to 32)")
@@ -142,7 +154,7 @@ def check_manifest(manifest, tunnel):
         if not NAME_RE.fullmatch(name):
             raise ValueError(f"{what}: names are lower-case letters, digits, _ and -")
         if not isinstance(spec, dict) or set(spec) - {"title", "description", "mode", "default", "scope", "params",
-                                                      "run", "output", "timeout", "writes"}:
+                                                      "run", "output", "timeout", "writes", "available"}:
             raise ValueError(f"{what}: unknown keys")
         mode = spec.get("mode", "sync")
         if mode not in MODES:
@@ -174,6 +186,16 @@ def check_manifest(manifest, tunnel):
                 re.compile(p["pattern"])
             if p["type"] == "string" and "pattern" not in p:
                 raise ValueError(f"{what}.{pname}: a string parameter needs a pattern")
+            if p["type"] in ("integer", "number"):
+                for bound in ("minimum", "maximum"):
+                    if bound not in p:
+                        continue
+                    value = p[bound]
+                    valid = not isinstance(value, bool) and isinstance(value, int if p["type"] == "integer" else (int, float))
+                    if not valid or (isinstance(value, float) and not math.isfinite(value)):
+                        raise ValueError(f"{what}.{pname}: {bound} must be a finite {p['type']}")
+                if "minimum" in p and "maximum" in p and p["minimum"] > p["maximum"]:
+                    raise ValueError(f"{what}.{pname}: minimum exceeds maximum")
             checked[pname] = dict(p, description=_text(p.get("description"), f"{what}.{pname}.description", 300,
                                                         required=False))
             if p["type"] == "cluster-path":
@@ -191,7 +213,8 @@ def check_manifest(manifest, tunnel):
         out["actions"][name] = {"name": name, "title": _text(spec.get("title") or name, f"{what}.title", 80),
                                 "description": _text(spec.get("description"), f"{what}.description", 1000),
                                 "mode": mode, "default": default, "scope": scope, "writes": writes,
-                                "params": checked, "run": list(spec["run"]), "output": output, "timeout": timeout}
+                                "params": checked, "run": list(spec["run"]), "output": output, "timeout": timeout,
+                                "available": check_availability(spec.get("available"))}
     return out
 
 
@@ -254,16 +277,19 @@ class TunnelActions:
         chosen = ((self.config.get(tunnel) or {}).get("actions") or {}).get(action["name"])
         return action["default"] if chosen is None else chosen
 
-    def availability(self, tunnel, manifest, directory, refresh=False):
-        avail = manifest.get("available")
+    def availability(self, tunnel, manifest, directory, refresh=False, action=None):
+        override = action.get("available") if action else None
+        avail = override if override is not None else manifest.get("available")
+        cache_key = (tunnel, action["name"]) if override is not None else tunnel
         if avail is None:
             return {"available": True}
         with self.lock:
-            cached = self._availability.get(tunnel)
+            cached = self._availability.get(cache_key)
         if cached and not refresh and time.time() - cached[0] < avail["cache"]:
             return cached[1]
         try:
-            code, stdout, stderr = self.runner(self._argv(directory, avail["run"]), directory, 60)
+            readiness = [arg.replace("{helper}", HELPER).replace("{data_dir}", self.data_dir) for arg in avail["run"]]
+            code, stdout, stderr = self.runner(self._argv(directory, readiness), directory, 60)
         except subprocess.TimeoutExpired:
             code, stdout, stderr = None, "", "timed out"
         info = None
@@ -285,7 +311,7 @@ class TunnelActions:
             if not ok:
                 result["reason"] = avail["message"] or "it isn't ready"
         with self.lock:
-            self._availability[tunnel] = (time.time(), result)
+            self._availability[cache_key] = (time.time(), result)
         return result
 
     def describe(self, identity, owner, refresh=False):
@@ -314,6 +340,14 @@ class TunnelActions:
                      "enabled": self.tunnel_enabled(tunnel), "actions": actions}
             if self.tunnel_enabled(tunnel) or refresh:
                 entry["availability"] = self.availability(tunnel, m, directory, refresh)
+                if any(a.get("available") is not None for a in m["actions"].values()):
+                    for shown in actions:
+                        shown["availability"] = self.availability(tunnel, m, directory, refresh,
+                                                                    action=m["actions"][shown["name"]])
+                    enabled = [a["availability"] for a in actions if a["enabled"] and a["permitted"]]
+                    entry["availability"] = {"available": any(a["available"] for a in enabled),
+                                               "partial": any(not a["available"] for a in enabled),
+                                               "reason": "See each action's availability."}
             out.append(entry)
         return {"tunnels": out}
 
@@ -368,6 +402,14 @@ class TunnelActions:
                         ("minimum" in p and value < p["minimum"]) or ("maximum" in p and value > p["maximum"]):
                     raise RESTError(422, f"{name} must be a whole number in its range")
                 values[name] = str(value)
+            elif kind == "number":
+                try:
+                    valid = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+                except OverflowError:
+                    valid = False
+                if not valid or ("minimum" in p and value < p["minimum"]) or ("maximum" in p and value > p["maximum"]):
+                    raise RESTError(422, f"{name} must be a finite number in its range")
+                values[name] = str(value)
             elif kind == "string":
                 if not isinstance(value, str) or not re.fullmatch(p["pattern"], value) or value.startswith("-"):
                     raise RESTError(422, f"{name} must match {p['pattern']}")
@@ -396,14 +438,14 @@ class TunnelActions:
                 values[name] = real
         return values
 
-    def scope_file(self, whitelist):
+    def scope_file(self, whitelist, file_changes=False):
         """The token's directories, for action_paths.py in the action's job: a private file of its own."""
         directory = os.path.join(self.data_dir, "sessions", "actions")
         os.makedirs(directory, mode=0o700, exist_ok=True)
         path = os.path.join(directory, f"scope-{uuid.uuid4().hex}.json")
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f:
-            json.dump({"roots": list(whitelist.roots) if whitelist.restricted else None, "deny": list(whitelist.deny)}, f)
+            json.dump({"roots": list(whitelist.roots) if whitelist.restricted else None, "deny": list(whitelist.deny), "file_changes": bool(file_changes)}, f)
         return path
 
     def run(self, identity, tunnel, name, given, whitelist, file_changes, jobs=None, audit=None):
@@ -417,15 +459,17 @@ class TunnelActions:
                                  "console: the cluster's Agents tab)")
         if not identity.has_scope(action["scope"]):
             raise RESTError(403, f"token {identity.name!r} lacks the `{action['scope']}` scope {tunnel}/{name} needs")
+        if action["writes"] == "cluster" and not file_changes:
+            raise RESTError(403, "file changes are disabled on this server")
         values = self.check_params(action, given, whitelist, file_changes)
-        avail = self.availability(tunnel, m, directory)
+        avail = self.availability(tunnel, m, directory, action=action)
         if not avail["available"]:
             raise RESTError(409, f"{m['title']} isn't available: {avail.get('reason')}", availability=avail)
         if audit is not None:
             audit.update(tunnel=tunnel, action=name, params={k: v for k, v in values.items()})
         special = {"helper": HELPER, "data_dir": self.data_dir}
         if any(a == "{scope_file}" for a in action["run"]):
-            special["scope_file"] = self.scope_file(whitelist)
+            special["scope_file"] = self.scope_file(whitelist, file_changes)
         job_options = [f"--comment=hpclib-rest:{identity.name}:{tunnel}/{name}"]
 
         argv = []
@@ -440,12 +484,20 @@ class TunnelActions:
                 argv.append(special[ph.group(1)])
             else:
                 argv.append(arg.replace("{data_dir}", self.data_dir))
-        command = self._argv(directory, [action["run"][0]]) + argv
-        if action["mode"] == "job" and jobs is not None:
-            with jobs.submit_lock:        # the cap, the submission and its record together, as for template jobs
-                jobs.check_capacity(1)
-                return self._finish(identity, tunnel, name, action, values, directory, command, jobs, audit)
-        return self._finish(identity, tunnel, name, action, values, directory, command, jobs, audit)
+        try:
+            command = self._argv(directory, [action["run"][0]]) + argv
+            if action["mode"] == "job" and jobs is not None:
+                with jobs.submit_lock:        # the cap, submission and record together, as for template jobs
+                    jobs.check_capacity(1)
+                    return self._finish(identity, tunnel, name, action, values, directory, command, jobs, audit)
+            return self._finish(identity, tunnel, name, action, values, directory, command, jobs, audit)
+        finally:
+            # A synchronous action has no queued job left needing its scope file, even after errors/timeouts.
+            if action["mode"] == "sync" and "scope_file" in special:
+                try:
+                    os.unlink(special["scope_file"])
+                except FileNotFoundError:
+                    pass
 
     def _finish(self, identity, tunnel, name, action, values, directory, command, jobs, audit):
         try:

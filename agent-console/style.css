@@ -334,3 +334,33 @@ table.job-info td:first-child { white-space: nowrap; padding-right: 1.5em; verti
 table.job-info td { overflow-wrap: anywhere; }
 td.next { white-space: nowrap; }
 td.next > * + * { margin-left: 0.4em; }
+
+/* Directory sync keeps each local/remote pair adjacent, including while editing. */
+.sync-page { display: grid; gap: var(--space-lg); }
+.sync-editor { display: grid; gap: var(--space-md); }
+.sync-basics { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-lg); }
+.sync-editor input, .sync-editor select { box-sizing: border-box; max-width: 100%; }
+.sync-basics input, .sync-settings-grid input, .sync-warning-grid input { width: 100%; }
+.sync-pairs { display: grid; gap: var(--space-md); }
+.sync-pair-row { display: grid; grid-template-columns: minmax(0, 1fr) var(--space-xl) minmax(0, 1fr) auto; gap: var(--space-md); align-items: end; }
+.sync-endpoint { min-width: 0; }
+.sync-endpoint-title { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--space-sm); margin-bottom: var(--space-xs); }
+.sync-endpoint-title select { min-width: 0; max-width: var(--dialog-max-width); }
+.sync-endpoint input { width: 100%; min-width: 0; }
+.sync-direction-arrow { display: inline-flex; align-items: center; justify-content: center; white-space: nowrap; }
+.sync-connector { align-self: end; display: flex; align-items: center; justify-content: center; padding-bottom: var(--space-md); }
+.sync-editor-actions, .sync-card-status { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--space-md); }
+.sync-card-status { justify-content: flex-start; margin-bottom: var(--space-md); }
+.sync-advanced > summary { cursor: pointer; }
+.sync-settings-grid, .sync-warning-grid { display: grid; gap: var(--space-md); padding-top: var(--space-md); }
+.sync-settings-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.sync-warning-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.sync-pair-table { overflow-x: auto; }
+.sync-pair-table table { width: 100%; }
+.sync-path { overflow-wrap: anywhere; }
+.sync-setup pre { overflow: auto; max-height: var(--code-max-height); white-space: pre-wrap; }
+@media (max-width: 600px) {
+  .sync-endpoint-title { display: block; }
+  .sync-endpoint-title select { display: block; width: 100%; margin-top: var(--space-xs); }
+  .sync-warning-grid { grid-template-columns: minmax(0, 1fr); }
+}

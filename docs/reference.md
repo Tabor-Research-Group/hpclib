@@ -10,7 +10,13 @@
 | `~/.config/hpclib/console/session` | the console's current session key (mode 600) |
 | `~/.config/hpclib/console/logs/` | tunnel, app and operation logs |
 | `~/.config/hpclib/console/packages/` | installed console packages |
+| `~/.config/hpclib/console/sync/specs.json` | versioned directory sync registrations and cached setup status (mode 600) |
+| `~/.config/hpclib/console/sync/removed/` | unregistered sync records retained for review/history |
 | `~/.ssh/connections/` | sockets of the shared ssh connections |
+
+Git sync setup also writes `.hpclib-sync.json` inside the selected local root after explicit confirmation. It
+records the portable ignore choice/default-list version and may contain warning overrides; cluster bindings and
+credentials remain outside it. The initial implementation has no cluster sync-state writes or transfer worker.
 
 ## Files on a cluster
 

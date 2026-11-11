@@ -25,6 +25,11 @@ The front end depends only on the routes below; nothing here depends on it.
                                               are in the way); the console runs the new code after a restart
   POST /api/restart                           start this console again (same port and session key), running the
                                               hpclib now on disk; refused while a login or an operation runs
+  GET/POST /api/sync                         saved sync groups (records only; no scan/transfer)
+  GET/POST/DELETE /api/sync/ID                read, revision-checked edit/setup, or unregister preserving history
+  GET /api/sync/ID/setup                     explicit local ignore/metadata setup preview
+  GET /api/sync/ID/status                    cached status, no login or scan
+  POST /api/sync/ID/pause|resume              persist scheduling preference (heartbeat not enabled yet)
   GET  /api/styles                            Interface Settings: what user.css sets default-styles.css's variables
                                               to ({"values": {"common", "light", "dark"}})
   PUT  /api/styles                            {"common", "light", "dark"}: write them into user.css (changed in
@@ -242,6 +247,8 @@ from queue_view import (  # noqa: E402,F401
 import console_update  # noqa: E402
 import mcp_clients  # noqa: E402
 from ssh_keys import SSHKeyError, SSHKeyStore  # noqa: E402
+from sync_manager import SyncManager  # noqa: E402
+from sync_spec import SyncError  # noqa: E402
 
 VERSION = "0.1"
 DEFAULT_PORT = 27180
@@ -4790,7 +4797,13 @@ class ConsoleServer(http.server.ThreadingHTTPServer):
         self.max_body = max_body
         self.updater = console_update.Updater(os.path.dirname(HPCLIB_DIR))
         self.restart_argv = None     # main() sets it: how to start this console again
+        self.sync = SyncManager(os.path.join(console_dir(), "sync"),
+                                clusters.profile if clusters is not None else None, write_private)
         super().__init__(address, ConsoleHandler)
+
+    def server_close(self):
+        self.sync.close()
+        super().server_close()
 
     RESTART_KEY_VAR = "HPCLIB_CONSOLE_RESTART_KEY"   # the session key for the next process (not on its command line)
 
@@ -4948,9 +4961,54 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             self.send_json(500, {"error": f"{type(e).__name__}: {e}"})
 
+    def sync_route(self, verb, parts):
+        """Sync writes require JSON and an allowed Origin in addition to dispatch's Host/Bearer checks."""
+        body = {}
+        if verb in ("POST", "PUT", "DELETE"):
+            origin = self.headers.get("Origin")
+            own = "http://" + self.headers.get("Host", "")
+            if origin is not None and origin not in (own, self.server.allow_origin):
+                raise ConsoleError(403, "cross-origin sync changes are not allowed")
+            if self.headers.get_content_type() != "application/json":
+                raise ConsoleError(415, "sync changes require Content-Type: application/json")
+            body = self.json_body()
+        manager = self.server.sync
+        try:
+            if not parts:
+                if verb == "GET":
+                    return 200, dict(manager.list(), ok=True)
+                if verb == "POST":
+                    return 201, dict(manager.save(body), ok=True)
+            if len(parts) == 1:
+                if verb == "GET":
+                    return 200, dict(manager.get(parts[0]), ok=True)
+                if verb == "POST":
+                    out = manager.setup_apply(parts[0], body) if "setup" in body else manager.save(body, parts[0])
+                    return 200, dict(out, ok=True)
+                if verb == "DELETE":
+                    return 200, dict(manager.unregister(parts[0], body), ok=True)
+            if len(parts) == 2:
+                sync_id, action = parts
+                if verb == "GET" and action == "status":
+                    return 200, dict(manager.get(sync_id), ok=True)
+                if verb == "GET" and action == "setup":
+                    return 200, dict(manager.setup_preview(sync_id), ok=True)
+                if verb == "POST" and action in ("pause", "resume"):
+                    if set(body) != {"revision"}:
+                        raise SyncError(422, "pause/resume takes the current revision")
+                    return 200, dict(manager.pause(sync_id, action == "pause", body["revision"]), ok=True)
+                if verb == "POST" and action in ("run", "dry-run", "resolve"):
+                    manager.get(sync_id)
+                    manager.unavailable(action)
+            raise ConsoleError(404, "unknown sync route")
+        except SyncError as e:
+            raise ConsoleError(e.status, str(e), **{k: v for k, v in e.payload.items() if k != "error"}) from e
+
     def route(self, verb, path):
         parts = [urllib.parse.unquote(p) for p in path.strip("/").split("/")[1:]]  # without "api"
         c = self.server.clusters
+        if parts and parts[0] == "sync":
+            return self.sync_route(verb, parts[1:])
         if parts == ["styles"] and verb == "GET":
             return 200, dict(self.styles(), ok=True)
         if parts == ["styles"] and verb == "PUT":

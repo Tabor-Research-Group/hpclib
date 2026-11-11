@@ -322,9 +322,10 @@ def build_server(client: RESTClient, enable_file_writes=False, local_roots=None)
         "Tunnel actions this cluster offers you: typed operations a tunnel runs for you with the cluster "
         "owner's own access, such as copying files to and from the group's SMB server. Each lists its "
         "parameters (types: cluster-path, a path in your directories; remote-path, a path relative to the "
-        "tunnel's own folder; string, integer, boolean), its mode (sync: the result comes back; job: it submits a "
+        "tunnel's own folder; string, integer, finite number, boolean), its mode (sync: the result comes back; job: it submits a "
         "SLURM job, followed with job_status or wait_for_job) and whether it is available now (an SMB action "
-        "needs the owner signed in to the server). Only actions the owner turned on are listed."))
+        "needs the owner signed in to the server; sync context actions use their own readiness check). "
+        "Only actions the owner turned on are listed."))
     async def list_tunnel_actions() -> dict[str, Any]:
         return await call(client.actions)
 

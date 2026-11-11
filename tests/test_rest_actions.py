@@ -50,10 +50,15 @@ MANIFEST = {
 class TestManifest(unittest.TestCase):
     def test_data_transfer_actions(self):
         m = rest_actions.check_manifest(json.loads((DATA_TRANSFER / "actions.json").read_text()), "data-transfer")
-        self.assertEqual({n: (a["mode"], a["default"], a["writes"]) for n, a in m["actions"].items()},
+        self.assertEqual({n: (a["mode"], a["default"], a["writes"]) for n, a in m["actions"].items() if not n.startswith("sync_")},
                          {"list": ("sync", True, None), "get": ("job", True, "cluster"), "put": ("job", False, "remote")})
         self.assertTrue((DATA_TRANSFER / m["actions"]["get"]["run"][0]).is_file())
         self.assertEqual(m["available"]["any"], ["ticket"])
+        self.assertEqual(set(m["actions"]) - {"list", "get", "put"},
+                         {"sync_inspect", "sync_setup_preview", "sync_setup", "sync_settings"})
+        for name in ("sync_setup", "sync_settings"):
+            self.assertEqual(m["actions"][name]["scope"], "files:write")
+            self.assertFalse(m["actions"][name]["default"])
 
     def test_refused(self):
         def bad(**change):

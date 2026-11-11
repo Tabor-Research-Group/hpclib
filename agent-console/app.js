@@ -11,6 +11,7 @@ import { activityPage as buildActivity } from "./activity.js";
 import * as clusterUI from "./cluster.js";
 import * as settingsUI from "./settings.js";
 import * as widgetsUI from "./widgets.js";
+import { syncEntry, syncPage } from "./sync.js";
 
 const params = new URLSearchParams(location.search);
 // ?api= may only name a console on this machine (127.0.0.1 or localhost): the session key goes with every call, and a
@@ -1692,6 +1693,7 @@ async function appPage(app) {
   const { kind, description } = APPS_UI[app] || {};
   return [
     el("h2", {}, title),
+    app === "transfer" ? [syncEntry(), el("h3", {}, "SMB transfers")] : null,
     el("p", { class: "muted" }, description ? description : kind === "login"
       ? `A ${title} session per cluster, on its login node, reached through the console's ssh login. ` +
         "It runs as you, with your full permissions on the cluster (it is not the agents' sandbox)."
@@ -1740,6 +1742,11 @@ async function loadApps() {
         throw new Error(`Invalid tab for ${a.id}`);
       }
       parent.pages[a.tab.id] = [a.tab.label, () => appPage(a.id)];
+    }
+    // Sync is a console page, not a tunnel app or package tab.
+    if (next.transfer) {
+      next.transfer.pages.sessions[0] = "SMB transfers";
+      next.transfer.pages.sync = ["Directory sync", () => syncPage({ api })];
     }
     // Replace only after a complete response. Refresh also removes obsolete
     // entries/tabs after a package upgrade or removal.

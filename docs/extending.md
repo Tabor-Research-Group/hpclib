@@ -576,13 +576,21 @@ programmed against the server: an `actions.json` beside the tunnel's scripts (th
   `"default": false` (anything that writes outside the cluster) stays off even then until turned on by itself.
 - **Typed parameters, checked by the server.** `cluster-path` is resolved like the files API, inside the token's
   directories; `access: write` must name a new directory. `remote-path` is relative to the tunnel's own root (no
-  leading `/` or `-`, no `..`). `string` needs a `pattern`; `integer` and `boolean` are what they say. Each fills
+  leading `/` or `-`, no `..`). `string` needs a `pattern`; `integer`, finite `number` and `boolean` are supported.
+  Numeric parameters accept `minimum`/`maximum`. Each fills
   one whole argument of `run`, which runs without a shell, from the tunnel's folder.
 - **Jobs like any other.** A `job` action passes `{job_options}` (which name the agent and the action) to sbatch
   and prints the job's ID: the job is recorded with the template jobs, so `job_status`, `wait_for_job`, cancel and
   the concurrent-job cap apply, and the console labels it "agent: TUNNEL/ACTION".
 - **Availability.** `available` runs a quick status command; the action answers 409 with the tunnel's `message`
-  while it says no (for Data transfer: no transfer ticket).
+  while it says no (for SMB transfers: no transfer ticket). An action may supply its own `available` check;
+  Data transfer's sync setup actions use this to work without SMB credentials. Status commands may use
+  `{helper}` and `{data_dir}`, but cannot request a scope file or submit a job. The catalog reports each
+  action's readiness when overrides exist.
+- **Existing-directory metadata writes.** `writes: cluster` requires file changes enabled even when the
+  root parameter has `access: read` (an existing path). A metadata helper must also verify the private scope
+  file's `file_changes` flag, anchor file access with `action_paths.walk_open`, and require its own reviewed
+  explicit write decision. Synchronous scope files are removed after completion, failure or timeout.
 - **Never the agent's path.** An action's job copies between the agent's directory and a staging folder of yours
   with `{helper}` (`action_paths.py`), which follows no links and checks the token's directories (`{scope_file}`)
   again when the job runs: an agent can't swap in a link to `~/.ssh` while the job waits.
