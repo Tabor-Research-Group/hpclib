@@ -2,11 +2,11 @@
 // page (Overview, Jobs, Apps, Installed, Storage, Files, SSH keys, Agents, Settings); #/c/NAME/apps/APP is one app there, with
 // its controls, tools and settings, and a package's tabs for it. They use the console's existing API, plus
 // GET clusters/NAME/jobs[/ID], GET/POST clusters/NAME/storage[/scan] and GET clusters/NAME/quota. app.js passes what they share with it (init).
-import { el, action, confirmDialog, connectClients, ownerRecovery, appUrl } from "./components.js";
+import { el, action, confirmDialog, connectClients, ownerRecovery, appUrl, hpclibVersionInfo } from "./components.js";
 import * as widgets from "./widgets.js";
 import { syncEntry } from "./sync.js";
 
-// { api, errorBox, render, settingsCards: (c) => [cards], addCluster: () => [button, area], files: (name) => page,
+// { api, errorBox, render, filesHash: (name, path) => hash, settingsCards: (c) => [cards], addCluster: () => [button, area], files: (name) => page,
 //   activity: (name) => page, sshKeys: (name) => page, appSettings: (app, session, row) => (draws in row.showDetail) }
 let ctx = null;
 export function init(given) { ctx = given; }
@@ -91,8 +91,14 @@ const SOURCE_TONE = { agent: "agent", "agent-tunnel": "service", app: "service",
 // What a cluster needs next, as one action: [label, fn, explanation]
 function nextStep(c, local, go) {
   if (!login(c)) return ["Log in", () => go("login"), "Log in to see and do anything on this cluster."];
-  if (c.tunnel && c.tunnel.hpclib_version && local && versionCompare(c.tunnel.hpclib_version, local) < 0) {
-    return ["Update hpclib", () => go("update"), `The cluster runs hpclib ${c.tunnel.hpclib_version}; this console has ${local}.`];
+  const version = hpclibVersionInfo(c.tunnel, local);
+  if (version.installed && local && versionCompare(version.installed, local) < 0) {
+    const remote = version.restart ? `has hpclib ${version.installed} installed` : `runs hpclib ${version.running}`;
+    return ["Update hpclib", () => go("update"), `The cluster ${remote}; this console has ${local}.`];
+  }
+  if (version.restart) {
+    return ["Restart agent tunnel", () => go("start"),
+      `The agent tunnel runs hpclib ${version.running}; ${version.installed} is installed. Restart the agent tunnel to use it.`];
   }
   if (!c.set_up) return ["Set up agents", () => go("setup"), "Agents can't use this cluster until it is set up."];
   if (tunnelStarting(c) && c.tunnel.prompt) {
@@ -116,24 +122,38 @@ function stepAction(step, primary = true) {
   return action(step[0], step[1] || (() => {}), { primary, ...(extra.disabled ? { disabled: true, title: "starting" } : {}) });
 }
 
-// while a tunnel starts, its state is asked for every 5 s (cheap: the local port and its health) and the page is
-// drawn again once it changes (up, a password prompt, or stopped)
+// Keep following stable tunnels too: they can stop, be replaced, or have newer files installed elsewhere.
+// One request at a time; a new render invalidates even an in-flight answer from the previous page.
 let followTimer = null;
-function followWhileStarting(clusters) {
+let followGeneration = 0;
+export function stopFollowing() {
   clearTimeout(followTimer);
-  const starting = clusters.filter(tunnelStarting);
-  if (!starting.length) return;
+  followTimer = null;
+  followGeneration++;
+}
+function followClusters(clusters, update = () => ctx.render()) {
+  stopFollowing();
+  if (!clusters.length) return;
+  const generation = followGeneration;
   const here = location.hash;
-  const was = (c) => `${c.tunnel.state}|${!!c.tunnel.prompt}`;
+  const snapshot = (c) => JSON.stringify([c.tunnel, c.login, c.operation, c.set_up]);
+  const delay = () => clusters.some((c) => tunnelStarting(c) || c.operation?.state === "running" ||
+    ["starting", "password_sent", "push_sent", "code_required"].includes(c.login?.state)) ? 5000 : 30000;
+  const current = () => generation === followGeneration && location.hash === here;
   const check = async () => {
-    if (location.hash !== here) return;
-    try {
-      const now = await Promise.all(starting.map((c) => ctx.api(path(c.name))));
-      if (now.some((c, i) => was(c) !== was(starting[i]))) return ctx.render();
-    } catch { /* try again */ }
-    followTimer = setTimeout(check, 5000);
+    if (!current()) return;
+    const now = await Promise.all(clusters.map(async (c) => {
+      try { return await ctx.api(path(c.name)); }
+      catch (err) { return { ...c, login: { state: "unknown" },
+        tunnel: { state: "error", error: `Status check failed: ${err.message}` } }; }
+    }));
+    if (!current()) return;
+    const changed = now.some((c, i) => snapshot(c) !== snapshot(clusters[i]));
+    clusters = now;
+    if (changed) update(now);
+    if (current()) followTimer = setTimeout(check, delay());
   };
-  followTimer = setTimeout(check, 5000);
+  followTimer = setTimeout(check, delay());
 }
 
 async function runStep(c, what) {
@@ -199,6 +219,7 @@ function storageText(st) {
 // ---------------------------------------------------------------- #/c: the clusters
 
 export async function clustersHome() {
+  const generation = followGeneration;
   const { api } = ctx;
   const [{ clusters }, health] = await Promise.all([api("clusters"), api("health")]);
   const local = health.hpclib_version;
@@ -208,19 +229,20 @@ export async function clustersHome() {
     if (login(c)) jobsSummary(c.name).then((n) => jobsCell.replaceChildren(countsText(n)));
     api(path(c.name, "storage")).then((st) => storeCell.replaceChildren(storageText(st)))
       .catch(() => storeCell.replaceChildren(el("span", { class: "muted" }, "—")));
-    const older = c.tunnel && c.tunnel.hpclib_version && local && versionCompare(c.tunnel.hpclib_version, local) < 0;
+    const version = hpclibVersionInfo(c.tunnel, local);
+    const older = version.installed && local && versionCompare(version.installed, local) < 0;
     return el("tr", {},
       el("td", {}, el("a", { href: `#/c/${enc(c.name)}/overview`, class: "cluster-link" }, c.name),
         el("div", { class: "muted small" }, c.host)),
       el("td", {}, chip(login(c) ? "logged in" : "not logged in", login(c) ? "up" : "down")),
       el("td", {}, chip(tunnelUp(c) ? "up" : (c.tunnel || {}).state || "down", tunnelTone(c))),
-      el("td", {}, c.tunnel && c.tunnel.hpclib_version ? [c.tunnel.hpclib_version, older ? [" ", chip("update", "starting")] : null]
+      el("td", {}, version.running ? [version.label, older ? [" ", chip("update", "starting")] : null]
         : el("span", { class: "muted" }, "—")),
       jobsCell, storeCell,
       el("td", { class: "next" }, stepButton(c, local) ||
         el("a", { class: "button", href: `#/c/${enc(c.name)}/overview` }, "Open")));
   });
-  followWhileStarting(clusters);
+  if (generation === followGeneration) followClusters(clusters);
   // the Add cluster form opens under the toolbar, full width (inside it, it was squeezed beside the heading)
   const [addBtn, addArea] = ctx.addCluster();
   return [
@@ -238,21 +260,38 @@ export async function clustersHome() {
 // ---------------------------------------------------------------- #/c/NAME/TAB
 
 export async function clusterPage(name, tab, sub = "") {
+  const generation = followGeneration;
   const { api } = ctx;
-  const [c, health] = await Promise.all([api(path(name)), api("health")]);
+  let [c, health] = await Promise.all([api(path(name)), api("health")]);
   const local = health.hpclib_version;
+  const chips = el("div", { class: "chips" });
+  const actions = el("div", { class: "actions" });
+  const updateHead = (next) => {
+    c = next;
+    chips.replaceChildren(
+      chip(c.login?.state === "unknown" ? "login unknown" : login(c) ? "logged in" : "not logged in",
+        c.login?.state === "unknown" ? "error" : login(c) ? "up" : "down"),
+      chip(`agent tunnel ${(c.tunnel || {}).state || "down"}`, tunnelTone(c), c.tunnel?.error));
+    actions.replaceChildren(login(c)
+      ? action("Log out", async () => { await api(path(name, "logout"), { method: "POST" }); ctx.render(); })
+      : action("Log in", () => runStep(c, "login"), { primary: true }));
+  };
+  updateHead(c);
   const head = el("div", { class: "cluster-head" },
     el("div", {}, el("h2", {}, c.name), el("div", { class: "muted" }, `${c.host} · MCP ${c.mcp_name || "—"}`)),
-    el("div", { class: "chips" },
-      chip(login(c) ? "logged in" : "not logged in", login(c) ? "up" : "down"),
-      chip(`agent tunnel ${tunnelUp(c) ? "up" : (c.tunnel || {}).state || "down"}`, tunnelTone(c))),
-    el("div", { class: "actions" }, login(c)
-      ? action("Log out", async () => { await api(path(name, "logout"), { method: "POST" }); ctx.render(); })
-      : action("Log in", () => runStep(c, "login"), { primary: true })));
+    chips, actions);
   const pages = { overview, jobs: jobsTab, apps: appsTab, installed, storage: storageTab, files, ssh: sshTab, agents, settings,
                   widget: widgetTab };
   const body = await (tab === "apps" && sub ? appPage(c, sub) : (pages[tab] || overview)(c, local, sub));
-  followWhileStarting([c]);
+  if (generation === followGeneration) followClusters([c], ([next]) => {
+    // Summary pages can redraw on changes. Other tabs keep their forms, logs and filters intact.
+    if (["overview", "installed"].includes(tab) || tunnelStarting(c)) return ctx.render();
+    updateHead(next);
+  });
+  // The Agents row already follows Start/Stop and installation progress at a shorter interval.
+  for (const row of body.querySelectorAll("hpc-cluster-row")) {
+    row.addEventListener("update", ({ detail }) => updateHead(detail));
+  }
   return [head, body];
 }
 
@@ -268,7 +307,8 @@ async function overview(c, local) {
   // the Overview lists the pinned apps and running ones; the rest are on the Apps tab
   const listed = states.filter((s) => s && (appPlace(c, s.app) === "pinned" || ACTIVE_STATES.includes(s.state)));
   const unlisted = states.filter(Boolean).length - listed.length;
-  const older = c.tunnel && c.tunnel.hpclib_version && local && versionCompare(c.tunnel.hpclib_version, local) < 0;
+  const version = hpclibVersionInfo(c.tunnel, local);
+  const older = version.installed && local && versionCompare(version.installed, local) < 0;
   const tile = (title, value, detail, link) => el("a", { class: "tile", href: link || null },
     el("div", { class: "tile-title" }, title), el("div", { class: "tile-value" }, value),
     detail ? el("div", { class: "muted small" }, detail) : null);
@@ -285,8 +325,9 @@ async function overview(c, local) {
       tile("Agent tunnel", el("hpc-state", { state: (c.tunnel || {}).state || "down" }),
         tunnelUp(c) ? `REST server on ${(c.tunnel || {}).hostname || "a compute node"}` : "agents can't reach the cluster",
         null),
-      tile("hpclib", c.tunnel && c.tunnel.hpclib_version ? c.tunnel.hpclib_version : "—",
-        older ? `this console has ${local}: update` : (local ? `this console: ${local}` : null), `#/c/${enc(c.name)}/installed`),
+      tile("hpclib", version.running || "—",
+        version.restart ? `${version.installed} installed · restart agent tunnel`
+          : older ? `this console has ${local}: update` : (local ? `this console: ${local}` : null), `#/c/${enc(c.name)}/installed`),
       tile("Jobs", countsText(jobs), login(c) ? "queued, running, last 24 h" : "log in to see them", `#/c/${enc(c.name)}/jobs`),
       tile("Storage", storageTotal(st) || el("span", { class: "muted" }, "not scanned"),
         `${(c.work_dirs || []).join(", ") || "no work directory"}${st && st.scanned ? ` · scanned ${ago(st.scanned)}` : ""}`,
@@ -638,16 +679,20 @@ async function jobPage(c, id) {
     return el("div", {}, el("p", {}, el("a", { href: href(c.name, "jobs") }, "← Jobs")), ctx.errorBox(err));
   }
   const when = (t) => (t ? new Date(t * 1000).toLocaleString() : "");
+  const fileLink = (label, target = label) => d.mine !== false && target?.startsWith("/")
+    ? el("a", { href: ctx.filesHash(c.name, target), title: "Open in Files" }, label) : label;
   const appLink = d.source.kind === "agent-tunnel" ? el("a", { class: "button", href: href(c.name, "agents") }, "Agent tunnel")
     : d.source.app ? el("a", { class: "button", href: href(c.name, "apps", d.source.app) }, d.source.label) : null;
   const file = (heading, f, missing) => {
     if (!f) return missing ? [el("h3", {}, heading), el("p", { class: "muted" }, missing)] : [];
-    const where = f.from === "file" ? `${f.path} (the file as it is now; it may have changed since the job)`
-      : f.from === "slurm" && f.path === "(kept by Slurm)" ? "the copy Slurm kept" : f.from === "accounting" ? "the copy Slurm's accounting kept" : f.path;
     if (!f.found) return [el("h3", {}, heading), el("p", { class: "muted" },
       f.path && f.path !== "(kept by Slurm)" ? `${f.path} no longer exists, or isn't readable.` : (missing || "Not available."))];
+    const where = f.from === "slurm" && f.path === "(kept by Slurm)" ? "the copy Slurm kept"
+      : f.from === "accounting" ? "the copy Slurm's accounting kept" : fileLink(f.path);
     return [el("h3", {}, heading),
-      el("p", { class: "muted small" }, `${where}${f.size ? ` · ${size(f.size / 1024)}` : ""}${f.mtime ? ` · written ${when(f.mtime)}` : ""}` +
+      el("p", { class: "muted small" }, where,
+        f.from === "file" ? " (the file as it is now; it may have changed since the job)" : "",
+        `${f.size ? ` · ${size(f.size / 1024)}` : ""}${f.mtime ? ` · written ${when(f.mtime)}` : ""}` +
         (f.truncated ? ` · showing the last ${size(d.limit / 1024)}` : "")),
       el("pre", { class: "log" }, f.text || "(empty)")];
   };
@@ -664,8 +709,11 @@ async function jobPage(c, id) {
     d.mine === false ? el("p", { class: "muted" }, `${d.owner ? `${d.owner}'s job` : "Someone else's job"}: this is what Slurm shows about it. ` +
       "Its script and output are not read.") : null,
     el("h3", {}, "Settings"),
-    d.info.length ? el("table", { class: "compact job-info" }, el("tbody", {}, d.info.map(([k, v]) =>
-      el("tr", {}, el("td", { class: "muted" }, k), el("td", {}, v)))))
+    d.info.length ? el("table", { class: "compact job-info" }, el("tbody", {}, d.info.map(([k, v]) => {
+      const f = k === "StdOut" ? d.files.stdout : k === "StdErr" ? d.files.stderr : null;
+      return el("tr", {}, el("td", { class: "muted" }, k),
+        el("td", {}, fileLink(v, k === "WorkDir" ? v : f?.found ? f.path : null)));
+    })))
       : el("p", { class: "muted" }, "Slurm no longer has this job's settings."),
     ...(d.mine === false ? [] : [
       ...file("Script", d.files.script, "Slurm kept no copy of the script, and the file it was submitted from is gone."),
@@ -824,15 +872,17 @@ async function installed(c, local) {
   const { api } = ctx;
   const ids = await appList();
   const states = await Promise.all(ids.map((a) => api(`apps/${a.id}/${enc(c.name)}`).then((s) => [a, s]).catch(() => null)));
-  const remote = c.tunnel && c.tunnel.hpclib_version;
+  const version = hpclibVersionInfo(c.tunnel, local);
+  const remote = version.installed;
   const older = remote && local && versionCompare(remote, local) < 0;
   const needLogin = !login(c);
   const label = { installed: ["installed", "up"], missing: ["not installed", "starting"], unknown: ["can't check", "down"],
                   unchecked: ["not checked", "down"], nothing: ["nothing to install", "down"] };
   const rows = [
     el("tr", {}, el("td", {}, el("strong", {}, "hpclib")),
-      el("td", {}, remote ? chip(older ? "out of date" : "current", older ? "starting" : "up") : chip("unknown", "down")),
-      el("td", { class: "muted" }, remote ? `${remote} on the cluster · ${local} here` : "start the agent tunnel to see its version"),
+      el("td", {}, remote ? chip(older ? "out of date" : version.restart ? "restart needed" : "current",
+        older || version.restart ? "starting" : "up") : chip("unknown", "down")),
+      el("td", { class: "muted" }, remote ? version.label : "start the agent tunnel to see its version"),
       el("td", { class: "next" }, action(older ? "Update" : "Reinstall", async () => {
         await api(path(c.name, "install"), { method: "POST", body: {} }); ctx.render(); }, { primary: !!older, disabled: needLogin }))),
     el("tr", {}, el("td", {}, el("strong", {}, "Agent setup")),
@@ -872,7 +922,7 @@ async function installed(c, local) {
 // ---------------------------------------------------------------- Storage
 
 let rescanRecent = false;       // "Rescan recent folders", kept while the console page is open
-let folderMinutes = 5, totalMinutes = 30;     // the scan's time limits (a folder, the whole scan), kept the same way
+const storageLimits = new Map();     // each cluster's time limits while this page is open; saved with auto-update
 // The roots left out of the next scan, as "CLUSTER\nPATH": for this round only (starting a scan clears them), kept
 // while the console page is open.
 const skipRoots = new Set();
@@ -906,6 +956,10 @@ async function storageTab(c) {
   const roots = st.roots || [];
   const custom = st.custom_roots || [];
   const scanRoots = new Set(scan.roots || []);
+  const auto = st.auto_update || { interval: 0 };
+  let { folderMinutes, totalMinutes } = storageLimits.get(c.name) || {
+    folderMinutes: (auto.folder_timeout || 300) / 60, totalMinutes: (auto.total_timeout || 1800) / 60 };
+  const rememberLimits = () => storageLimits.set(c.name, { folderMinutes, totalMinutes });
   const chosen = () => roots.filter((r) => !skipRoots.has(rootKey(c, r))).map((r) => r.path);
   const scanWith = async (paths, retry = false) => {
     const folder = Math.round(folderMinutes * 60), total = Math.max(folder, Math.round(totalMinutes * 60));
@@ -930,14 +984,39 @@ async function storageTab(c) {
     el("input", { type: "number", min: 1, max, step: 1, value: get(), disabled: scanning, class: "minutes", "aria-label": `${label} (minutes)`,
                   onchange: (e) => { const v = Number(e.target.value); if (v >= 1 && v <= max) set(v); else e.target.value = get(); } }), " min");
   const limits = el("span", { class: "scan-limits" },
-    minutes("Per folder", () => folderMinutes, 240, (v) => { folderMinutes = v; if (totalMinutes < v) totalMinutes = v; }),
-    minutes("Whole scan", () => totalMinutes, 1440, (v) => { totalMinutes = v; }));
+    minutes("Per folder", () => folderMinutes, 240, (v) => { folderMinutes = v; if (totalMinutes < v) totalMinutes = v; rememberLimits(); }),
+    minutes("Whole scan", () => totalMinutes, 1440, (v) => { totalMinutes = v; rememberLimits(); }));
+  let autoChanged = false;
+  const every = el("input", { type: "number", min: 5, max: 10080, step: 1, class: "minutes",
+    value: auto.interval ? auto.interval / 60 : 60, disabled: !auto.interval, "aria-label": "Auto-update interval (minutes)",
+    oninput: () => { autoChanged = true; } });
+  const automatic = el("input", { type: "checkbox", checked: Boolean(auto.interval), "aria-label": "Auto-update storage",
+    onchange: (e) => { every.disabled = !e.target.checked; autoChanged = true; } });
+  const saveAuto = action("Save auto-update", async () => {
+    const value = Number(every.value);
+    if (automatic.checked && (!Number.isInteger(value) || value < 5 || value > 10080))
+      throw new Error("Auto-update: choose a whole number of minutes from 5 to 10080 (one week)");
+    const folder = Math.round(folderMinutes * 60), total = Math.max(folder, Math.round(totalMinutes * 60));
+    await api(path(c.name, "storage/auto-update"), { method: "PUT", body: {
+      interval: automatic.checked ? value * 60 : 0, folder_timeout: folder, total_timeout: total } });
+    ctx.render();
+  });
+  const autoStatus = auto.interval
+    ? (scanning ? "The next interval starts when this scan finishes."
+      : !login(c) ? "Waiting for login."
+      : auto.next_scan > Date.now() / 1000 ? `Next scan ${new Date(auto.next_scan * 1000).toLocaleString()}.`
+      : "Next scan is due.") : "Off.";
   const timedOut = (st.dirs || []).reduce((n, d) => n + ((d.folder_counts || {}).timed_out || 0), 0);
   const retry = timedOut ? action(`Retry ${timedOut} timed-out folder${timedOut === 1 ? "" : "s"}`,
     () => scanWith(roots.map((r) => r.path), true),
     { disabled: scanning || !login(c), title: "Scan just the folders that ran out of time, with the limits set here: raise Per folder first" }) : null;
   // follow a running scan: the page fills in as folders finish
-  if (scanning) setTimeout(() => { if (location.hash.endsWith("/storage")) ctx.render(); }, 3000);
+  const follow = () => {
+    if (!autoControls.isConnected || location.hash !== href(c.name, "storage")) return;
+    if (autoChanged) setTimeout(follow, 3000);     // keep an interval being edited until it is saved
+    else ctx.render();
+  };
+  if (scanning || auto.interval) setTimeout(follow, scanning ? 3000 : 15000);
   // add a directory to the scan: any full path on the cluster, or one from its home directory (~/...)
   const newRoot = el("input", { type: "text", placeholder: "/scratch/shared/data or ~/projects", size: 36,
                                 "aria-label": "Folder to add to the scan", disabled: scanning });
@@ -967,6 +1046,10 @@ async function storageTab(c) {
     if (d.missing) return el("section", { class: "card" }, el("h3", {}, d.path), controls(r), el("p", { class: "muted" }, "doesn't exist"));
     return storageCard(d, scan, controls(r));
   });
+  const autoControls = el("div", { class: "toolbar" },
+    el("label", { class: "inline-check" }, automatic, " Auto-update every ", every, " min"), saveAuto,
+    el("span", { class: "muted small", "aria-live": "polite" }, autoStatus,
+      " Uses all scan directories and the time limits saved here; runs while the console is running and you are logged in."));
   return el("div", {},
     el("div", { class: "toolbar" },
       el("span", { class: "scan-status", "aria-live": "polite" }, scanning ? el("span", { class: "spinner", "aria-hidden": "true" }) : null,
@@ -974,6 +1057,7 @@ async function storageTab(c) {
           ? el("span", { class: "error-box" }, ` · the last scan failed: ${scan.error}`) : null),
       button, retry, toggle, limits,
       el("span", { class: "muted small" }, "du over your login at low priority; results are saved as each folder finishes")),
+    autoControls,
     el("div", { class: "add-root" }, el("label", {}, "Add a directory to scan ", newRoot), add),
     quotaCard(c, st),
     cards);

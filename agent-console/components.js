@@ -399,6 +399,17 @@ class TunnelRow extends HTMLElement {
   }
 }
 
+// Running code and installed files can differ until the agent tunnel is restarted. Older servers only
+// report the running version, so use that as the best available installation information.
+export function hpclibVersionInfo(t = {}, local = null) {
+  t = t || {};
+  const running = t.hpclib_version;
+  const installed = t.hpclib_version_on_disk || running;
+  const restart = !!(running && installed && running !== installed);
+  const label = running ? `hpclib ${running}${restart ? ` running · ${installed} installed · restart agent tunnel` : ""}` : "";
+  return { running, installed, restart, label: label + (installed && local && installed !== local ? ` · ${local} here` : "") };
+}
+
 export class HpcClusterRow extends TunnelRow {
   // An agent profile (GET /api/clusters/NAME): its tunnel, login, port, token, and the actions on it (start/stop
   // the tunnel, its log, update hpclib, setup_agents), with install/setup output in a dismissible panel.
@@ -447,7 +458,8 @@ export class HpcClusterRow extends TunnelRow {
     const t = c.tunnel || {};
     const lg = c.login || {};
     const local = this.getAttribute("local");
-    const behind = t.hpclib_version && local && t.hpclib_version !== local;
+    const version = hpclibVersionInfo(t, local);
+    const behind = version.installed && local && version.installed !== local;
     const loggedIn = lg.state === "connected";
     const running = !!(c.operation && c.operation.state === "running");
     const b = this.buttons;
@@ -468,8 +480,7 @@ export class HpcClusterRow extends TunnelRow {
        el("div", { class: "muted" }, c.mcp_name || "")],
       [el("hpc-state", { state: t.state || "down" }),
        t.state === "up" ? el("div", { class: "muted" }, `${t.hostname || ""}${t.slurm_job_id ? ` · job ${t.slurm_job_id}` : ""}`) : null,
-       t.hpclib_version ? el("div", { class: behind ? "state starting" : "muted" },
-         `hpclib ${t.hpclib_version}${behind ? ` · ${local} here` : ""}`) : null,
+       version.running ? el("div", { class: behind || version.restart ? "state starting" : "muted" }, version.label) : null,
        t.error ? el("div", { class: "muted" }, t.error) : null,
        this.promptLine(c.name, `clusters/${enc(c.name)}/tunnel/answer`, t.prompt)],
       this.loginCells(lg, c),

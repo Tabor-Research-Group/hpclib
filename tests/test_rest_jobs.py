@@ -24,6 +24,7 @@ SERVERS = Path(__file__).resolve().parents[1] / "hpclib" / "servers"
 TEMPLATES = Path(__file__).resolve().parents[1] / "hpclib" / "tunnels" / "rest" / "templates"
 sys.path.insert(0, str(SERVERS))
 import rest_jobs  # noqa: E402
+import rest_server  # noqa: E402
 from rest_client import RESTClient, RESTClientError  # noqa: E402
 from rest_server import (AuditLog, HPCRESTHandler, PathWhitelist, RESTServer, SlowRequestWatch,  # noqa: E402
                          TokenAuth, TokenRegistry, hpclib_version)
@@ -573,12 +574,31 @@ class TestRequestFileSystemCost(unittest.TestCase):
             self.assertEqual(spy.call_count, 1)  # the broader requested root; the kept server root is already resolved
             self.assertEqual((overlap.roots, overlap.base_dir, overlap.deny), ((str(base),), str(base), whole.deny))
 
-    def test_version_is_read_once(self):
-        hpclib_version.cache_clear()
+    def test_version_is_read_once_until_the_file_changes(self):
+        rest_server._read_hpclib_version.cache_clear()
         with mock.patch("builtins.open", side_effect=open) as spy:
             first, second = hpclib_version(), hpclib_version()
         self.assertEqual(first, second)
         self.assertEqual(spy.call_count, 1)
+
+    def test_version_follows_atomic_install_and_recovers_from_missing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "servers").mkdir()
+            version = root / "hpclib.sh"
+            version.write_text('HPCLIB_VERSION="1.14.2"\n')
+            with mock.patch.object(rest_server, "__file__", str(root / "servers/rest_server.py")):
+                self.assertEqual(hpclib_version(), "1.14.2")
+                replacement = root / "new.sh"
+                replacement.write_text('HPCLIB_VERSION="1.14.5"\n')
+                st = version.stat()
+                os.utime(replacement, ns=(st.st_atime_ns, st.st_mtime_ns))
+                replacement.replace(version)  # Same size and timestamp; the inode changes.
+                self.assertEqual(hpclib_version(), "1.14.5")
+                version.unlink()
+                self.assertIsNone(hpclib_version())
+                version.write_text('HPCLIB_VERSION="1.14.6"\n')
+                self.assertEqual(hpclib_version(), "1.14.6")
 
     def test_token_registry_rereads_only_when_the_file_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -765,6 +785,14 @@ class TestJobTracking(JobServerTestCase):
 
 
 class TestScopes(JobServerTestCase):
+
+    def test_health_keeps_running_version_after_install_before_first_health_request(self):
+        running = rest_server.STARTED_VERSION
+        with mock.patch.object(rest_server, "hpclib_version", return_value="99.0.0"):
+            for client in (self.owner, self.llm):
+                health = client.health()
+                self.assertEqual(health["hpclib_version"], running)
+                self.assertEqual(health["hpclib_version_on_disk"], "99.0.0")
 
     def test_health_reports_identity(self):
         h = self.llm.health()

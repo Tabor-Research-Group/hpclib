@@ -991,6 +991,122 @@ esac
         self.assertEqual(out["dirs"][0]["kb"], 2568)
         self.assertEqual(out["custom_roots"], [])
 
+    def test_storage_auto_update_is_validated_saved_and_disabled(self):
+        url = f"/api/clusters/{self.dead}/storage/auto-update"
+        profile = self.clusters.profile(self.dead)
+        self.assertEqual(self.clusters.storage(profile)["auto_update"]["interval"], 0)
+        for body in ({}, {"interval": True}, {"interval": "600"}, {"interval": 600.0},
+                     {"interval": -1}, {"interval": 299}, {"interval": 604801},
+                     {"interval": 600, "roots": ["/"]}, {"interval": 600, "folder_timeout": True},
+                     {"interval": 600, "folder_timeout": 3600, "total_timeout": 600}):
+            self.assertEqual(self.call("PUT", url, body)[0], 400, body)
+        self.clusters._update_storage(self.dead, lambda stored: stored.update(custom_roots=["~/projects"], quota={"saved": True}))
+        before = time.time()
+        status, out = self.call("PUT", url, {"interval": 600, "folder_timeout": 900, "total_timeout": 1800})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["auto_update"]["interval"], 600)
+        self.assertGreaterEqual(out["auto_update"]["next_scan"], before + 600)
+        self.assertEqual((out["custom_roots"], out["quota"]), (["~/projects"], {"saved": True}))
+        # A new console's Clusters loads the same schedule, without launching anything on GET.
+        fresh = agent_console.Clusters(shell_runner=self.shell)
+        self.assertEqual(fresh.storage(profile)["auto_update"], out["auto_update"])
+        self.assertEqual(self.ran, [])
+        status, out = self.call("PUT", url, {"interval": 0})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["auto_update"], {"interval": 0, "next_scan": None,
+                                             "folder_timeout": 900, "total_timeout": 1800})
+        self.clusters.update_due_storage()
+        self.assertEqual(self.ran, [])
+
+    def test_storage_auto_update_runs_when_due_and_uses_saved_limits(self):
+        profile = self.clusters.profile(self.dead)
+        self.clusters.set_storage_auto_update(profile, {"interval": 600, "folder_timeout": 900, "total_timeout": 2400})
+        self.clusters.update_due_storage()
+        self.assertEqual(self.ran, [])                 # enabling waits for the first interval
+        self.clusters._update_storage(self.dead, lambda stored: stored["auto_update"].update(next_scan=time.time() - 1))
+        self.clusters.update_due_storage()
+        out = self.wait_scan()
+        self.assertEqual(out["scan"]["state"], "done", out)
+        self.assertEqual(len(self.folder_calls), 2)
+        self.assertEqual(out["scan"]["folder_timeout"], 900)
+        self.assertAlmostEqual(out["scan"]["deadline"] - out["scan"]["started"], 2400, delta=1)
+        self.assertEqual(out["scan"]["roots"], ["/scratch/me/llm", "~/.local/tunnels"])
+        self.assertFalse(out["scan"]["rescan_recent"])
+        self.assertGreaterEqual(out["auto_update"]["next_scan"], out["scan"]["finished"] + 600)
+        self.clusters.update_due_storage()
+        self.assertEqual(len(self.folder_calls), 2)
+
+    def test_storage_auto_update_waits_for_login_and_survives_restart(self):
+        profile = self.clusters.profile(self.dead)
+        self.clusters.set_storage_auto_update(profile, {"interval": 300})
+        due = time.time() - 100
+        self.clusters._update_storage(self.dead, lambda stored: stored["auto_update"].update(next_scan=due))
+        fresh = agent_console.Clusters(shell_runner=self.shell)
+        fresh.logins = mock.Mock()
+        fresh.logins.alive.return_value = False
+        fresh.start_storage_scan = mock.Mock()
+        fresh.update_due_storage()
+        fresh.start_storage_scan.assert_not_called()
+        self.assertEqual(fresh.storage(profile)["auto_update"]["next_scan"], due)
+        fresh.logins.alive.return_value = True
+        fresh.update_due_storage()
+        fresh.start_storage_scan.assert_called_once_with(profile, {"folder_timeout": 300, "total_timeout": 1800})
+        fresh.logins.start.assert_not_called()
+
+    def test_storage_auto_update_does_not_overlap_and_manual_scan_resets_interval(self):
+        profile = self.clusters.profile(self.dead)
+        self.clusters.set_storage_auto_update(profile, {"interval": 300})
+        self.clusters._update_storage(self.dead, lambda stored: stored["auto_update"].update(next_scan=time.time() - 1))
+        self.folder_gate = threading.Event()
+        self.addCleanup(self.folder_gate.set)
+        first = self.scan(wait=False)
+        with mock.patch.object(self.clusters, "start_storage_scan", wraps=self.clusters.start_storage_scan) as start:
+            self.clusters.update_due_storage()
+            start.assert_not_called()
+        self.folder_gate.set()
+        out = self.wait_scan()
+        self.assertEqual(out["scan"]["started"], first["started"])
+        self.assertGreaterEqual(out["auto_update"]["next_scan"], out["scan"]["finished"] + 300)
+
+    def test_storage_auto_update_backs_off_after_start_failure_and_checks_other_clusters(self):
+        for name in (self.dead, self.live):
+            self.clusters.set_storage_auto_update(self.clusters.profile(name), {"interval": 300})
+            self.clusters._update_storage(name, lambda stored: stored["auto_update"].update(next_scan=time.time() - 1))
+        with mock.patch.object(self.clusters, "start_storage_scan", side_effect=agent_console.ConsoleError(409, "login lost")) as start, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.clusters.update_due_storage()
+            self.assertEqual(start.call_count, 2)
+            self.clusters.update_due_storage()
+            self.assertEqual(start.call_count, 2)
+
+    def test_storage_auto_update_claims_only_once_in_concurrent_rounds(self):
+        profile = self.clusters.profile(self.dead)
+        self.clusters.set_storage_auto_update(profile, {"interval": 300})
+        self.clusters._update_storage(self.dead, lambda stored: stored["auto_update"].update(next_scan=time.time() - 1))
+        ready = threading.Barrier(2)
+        self.clusters.logins.alive = lambda profile: ready.wait(timeout=2) is not None
+        with mock.patch.object(self.clusters, "start_storage_scan") as start:
+            workers = [threading.Thread(target=self.clusters.update_due_storage) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=3)
+                self.assertFalse(worker.is_alive())
+            start.assert_called_once_with(profile, {"folder_timeout": 300, "total_timeout": 1800})
+
+    def test_storage_auto_update_worker_runs_without_browser_and_stops_on_close(self):
+        clusters = mock.Mock()
+        ran = threading.Event()
+        clusters.update_due_storage.side_effect = lambda: ran.set()
+        with mock.patch.object(agent_console.ConsoleServer, "STORAGE_AUTO_POLL", 0.01), \
+                mock.patch.object(agent_console, "SyncManager"):
+            server = agent_console.ConsoleServer(("127.0.0.1", 0), KEY, clusters)
+            try:
+                self.assertTrue(ran.wait(2))     # no HTTP request, browser or serve_forever needed
+            finally:
+                server.server_close()
+            self.assertFalse(server.storage_thread.is_alive())
+
     def test_roots_in_the_scan_body_must_be_ones_the_tab_shows(self):
         url = f"/api/clusters/{self.dead}/storage/scan"
         for roots in ([], ["/etc"], "/scratch/me/llm", [4]):
@@ -1811,6 +1927,11 @@ class TestManage(TestLogin):
         self.assertEqual(self.call("GET", "/api/health")[1]["hpclib_version"], local)
         tunnel = self.call("GET", f"/api/clusters/{self.live}")[1]["tunnel"]
         self.assertEqual(tunnel["hpclib_version"], local)                # the test server runs from this repo
+        self.assertEqual(tunnel["hpclib_version_on_disk"], local)
+        with mock.patch("rest_server.hpclib_version", return_value="99.0.0"):
+            tunnel = self.call("GET", f"/api/clusters/{self.live}")[1]["tunnel"]
+        self.assertEqual(tunnel["hpclib_version"], local)
+        self.assertEqual(tunnel["hpclib_version_on_disk"], "99.0.0")
 
 
 class FakeApp(http.server.BaseHTTPRequestHandler):

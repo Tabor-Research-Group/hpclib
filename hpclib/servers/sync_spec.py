@@ -1,7 +1,7 @@
 """Directory sync records: validation, default excludes, policy and change classification.
 
 Pure functions only; paths are checked on disk by SyncManager when explicitly requested.
-Console-side Python 3.10+, standard library only.
+Shared by the console and remote helper; Python 3.6+, standard library only.
 """
 import copy
 import difflib
@@ -130,10 +130,22 @@ def validate(value):
     if 0 < interval < 10:
         raise SyncError(422, "interval must be 0 (manual) or at least 10 seconds")
     policy = value.get("policy", {})
-    object_fields(policy, {"on_change", "merge"}, "policy")
+    object_fields(policy, {"on_change", "merge", "background"}, "policy")
     policy = dict(on_change=policy.get("on_change", "notify"), merge=policy.get("merge", "undecided"))
     if policy["on_change"] not in ("notify", "auto-push", "auto-both") or policy["merge"] not in ("undecided", "review"):
         raise SyncError(422, "unsupported change or merge policy")
+    if 'background' in value.get('policy', {}):
+        if not isinstance(value['policy']['background'], bool):
+            raise SyncError(422, 'background must be boolean')
+        policy['background'] = value['policy']['background']
+    if policy.get('background') and 'on_change' not in value.get('policy', {}):
+        policy['on_change'] = 'auto-push'
+        if 'direction' not in value:
+            direction = 'push'
+    if policy.get('background') and mode == 'git':
+        required = {'auto-push': 'push', 'auto-both': 'both'}
+        if policy['on_change'] in required and direction != required[policy['on_change']]:
+            raise SyncError(422, 'automatic uploads need push direction; automatic two-way sync needs both direction')
     if "paused" in value and not isinstance(value["paused"], bool):
         raise SyncError(422, "paused must be boolean")
     targets = value.get("targets")

@@ -195,17 +195,28 @@ def setup_parent_terminated_listener(PARENT_PID):
     thread.start()
     return thread
 
-@functools.lru_cache(maxsize=1)
 def hpclib_version():
-    """HPCLIB_VERSION from the hpclib.sh this server was installed with (None if it can't be read). Read once: the
-    file changes only when hpclib is updated, which restarts the server."""
+    """The installed version, reread when hpclib.sh changes (updates need not restart this server)."""
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hpclib.sh")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return _read_hpclib_version(path, (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+
+
+@functools.lru_cache(maxsize=1)
+def _read_hpclib_version(path, stamp):
+    # Keep health checks cheap on network mounts, including atomic directory replacements by install_hpclib.
     try:
         with open(path) as f:
             m = re.search(r'^HPCLIB_VERSION="([^"]+)"', f.read(), re.M)
     except OSError:
         return None
     return m.group(1) if m else None
+
+
+STARTED_VERSION = hpclib_version()     # Capture before the first request; an install can happen before /health.
 
 
 def tunnels_data_dir():
@@ -1072,7 +1083,8 @@ class HPCRESTHandler(RESTHandler):
             "status": "ok",
             "auth_api": 2,
             "server": self.server_version,
-            "hpclib_version": hpclib_version(),
+            "hpclib_version": STARTED_VERSION,
+            "hpclib_version_on_disk": hpclib_version(),
             "hostname": socket.gethostname(),
             "pid": os.getpid(),
             "slurm_job_id": os.environ.get("SLURM_JOB_ID"),

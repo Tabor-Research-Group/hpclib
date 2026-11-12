@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -24,8 +25,20 @@ class Profiles:
 
 
 class TestSyncRoutes(unittest.TestCase):
+    def test_agent_control_requires_local_confirmation_and_does_not_change_revision(self):
+        _, saved = self.call('POST', body=spec(str(self.code)))
+        path = '/' + saved['spec']['id'] + '/agent-control'
+        self.assertFalse(saved['agent_control'])
+        self.assertEqual(self.call('POST', path, {'revision': 1, 'allow': True})[0], 422)
+        status, allowed = self.call('POST', path, {'revision': 1, 'allow': True, 'confirm': True})
+        self.assertEqual(status, 200)
+        self.assertTrue(allowed['agent_control'])
+        self.assertEqual(allowed['spec']['revision'], 1)
+        self.assertEqual(self.call('POST', path, {'revision': 99, 'allow': True, 'confirm': True})[0], 409)
+        self.assertFalse(self.call('POST', path, {'revision': 1, 'allow': False, 'confirm': True})[1]['agent_control'])
+
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='hpclib-sync-routes-')
+        self.temp = tempfile.TemporaryDirectory(prefix='hpclib-sync-routes-', dir=os.environ.get('HPCLIB_SYNC_FIXTURE_ROOT'))
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.code = self.base / 'code'
@@ -117,15 +130,73 @@ class TestSyncRoutes(unittest.TestCase):
         self.assertTrue((self.code / '.hpclib-sync.json').exists())
         self.assertEqual(self.call('POST', path, body=apply)[0], 409)
 
-    def test_unimplemented_runs_never_look_successful(self):
+    def test_snapshot_and_review_routes_require_revision_setup_and_named_confirmation(self):
         _, saved = self.call('POST', body=spec(str(self.code)))
         path = '/' + saved['spec']['id']
-        for action in ('run', 'dry-run', 'resolve'):
+        for action in ('run', 'dry-run', 'review'):
             with self.subTest(action=action):
                 status, out = self.call('POST', path + '/' + action, body={})
-                self.assertEqual(status, 501)
-                self.assertIn('no transfer or snapshot', out['error'])
+                self.assertEqual(status, 422)
+                self.assertEqual(self.call('POST', path + '/' + action, body={'revision': 1})[0], 202)
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    result = self.call('GET', path + '/status')[1]
+                    if not result['status'].get('running'):
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(result['status']['state'], 'needs-ignore-setup')
+        self.assertEqual(self.call('POST', path + '/resolve', body={'action': 'apply'})[0], 422)
+        self.assertEqual(self.call('POST', path + '/resolve', body={'action': 'apply-sync', 'revision': 1})[0], 422)
         self.assertEqual(list(self.code.iterdir()), [])
+
+
+    def test_directory_setup_routes_require_confirmation_and_preserve_missing_roots(self):
+        from sync_git import rpc
+        remote = self.base.resolve() / 'new-remote'
+        self.server.sync.remote = lambda profile, request: rpc(request, str(self.base / 'remote-state'))
+        body = spec(str(self.code))
+        body['targets'] = [{'cluster': 'entropy', 'remote': str(remote)}]
+        status, record = self.call('POST', body=body)
+        self.assertEqual(status, 201, record)
+        path = '/' + record['spec']['id'] + '/provision'
+        status, preview = self.call('GET', path)
+        self.assertEqual(status, 200, preview)
+        self.assertFalse(remote.exists())
+        create = dict(revision=preview['revision'], review=preview['review'], endpoint=record['spec']['targets'][0]['id'], action='mkdir')
+        self.assertEqual(self.call('POST', path, body=create)[0], 422)
+        self.assertFalse(remote.exists())
+        create['confirm'] = True
+        status, preview = self.call('POST', path, body=create)
+        self.assertEqual(status, 200, preview)
+        self.assertTrue(remote.is_dir())
+        self.assertTrue(preview['needs_git_choice'])
+        choose = dict(revision=preview['revision'], review=preview['review'], action='private-git', confirm=True)
+        self.assertEqual(self.call('POST', path, body=choose)[0], 200)
+        self.assertFalse((self.code / '.git').exists())
+        remote.rename(self.base.resolve() / 'moved-remote')
+        status, preview = self.call('GET', path)
+        self.assertEqual(status, 200, preview)
+        self.assertTrue(preview['inactive'])
+        create.update(review=preview['review'])
+        self.assertEqual(self.call('POST', path, body=create)[0], 409)
+        self.assertFalse(remote.exists())
+
+
+    def test_restart_admission_cannot_release_an_existing_update_hold(self):
+        def restart():
+            request = urllib.request.Request(self.url + '/api/restart', data=b'{}', method='POST',
+                headers={'Authorization': 'Bearer sync-test-key', 'Content-Type': 'application/json'})
+            try:
+                urllib.request.urlopen(request)
+            except urllib.error.HTTPError as error:
+                return error.code
+            self.fail('fixture has no restart argv; must not exec')
+        with self.server.sync.maintenance():
+            self.assertEqual(restart(), 409)
+            self.assertTrue(self.server.sync.scheduling_held)
+        self.assertFalse(self.server.sync.scheduling_held)
+        self.assertEqual(restart(), 409)
+        self.assertFalse(self.server.sync.scheduling_held)
 
 
 if __name__ == '__main__':

@@ -1828,6 +1828,7 @@ function drawChrome({ app, page, cluster: name, tab, sub }) {
 }
 
 function stopFollowing() {
+  clusterUI.stopFollowing();
   if (followTimer) clearInterval(followTimer);
   followTimer = null;
 }
@@ -1992,7 +1993,7 @@ async function packagesDialog() {
   drawBundled().catch(() => null);
 }
 clusterUI.init({
-  api, errorBox, render: () => render(),
+  api, errorBox, filesHash, render: () => render(),
   // the cluster's Settings tab: the tunnel and its server first, then port clearing, quota checks and the ssh connection
   settingsCards: (c) => Promise.all([tunnelSettings(c), serverSettings(c).catch(errorBox), sandboxToolsSettings(c), pythonToolsSettings(c),
                                      portSettings(c).catch(errorBox),

@@ -25,10 +25,13 @@ The front end depends only on the routes below; nothing here depends on it.
                                               are in the way); the console runs the new code after a restart
   POST /api/restart                           start this console again (same port and session key), running the
                                               hpclib now on disk; refused while a login or an operation runs
-  GET/POST /api/sync                         saved sync groups (records only; no scan/transfer)
+  GET/POST /api/sync                         saved sync groups (cached reads; explicit snapshot runs)
   GET/POST/DELETE /api/sync/ID                read, revision-checked edit/setup, or unregister preserving history
   GET /api/sync/ID/setup                     explicit local ignore/metadata setup preview
   GET /api/sync/ID/status                    cached status, no login or scan
+  POST /api/sync/ID/run|dry-run               queue snapshots or metadata-only inventory
+  GET /api/sync/ID/plan/PLAN                  immutable snapshot review
+  POST /api/sync/ID/resolve                   confirm inventory-bound snapshot ingestion
   POST /api/sync/ID/pause|resume              persist scheduling preference (heartbeat not enabled yet)
   GET  /api/styles                            Interface Settings: what user.css sets default-styles.css's variables
                                               to ({"values": {"common", "light", "dark"}})
@@ -103,6 +106,8 @@ The front end depends only on the routes below; nothing here depends on it.
                                               the login: queued, running and finished, each labelled with what started it
   POST /api/clusters/NAME/jobs/cancel         {"job": ID}: scancel an agent's or another job (apps stop with their Stop)
   GET  /api/clusters/NAME/storage             the last storage scan of the work directories (du), and the quota
+  PUT  /api/clusters/NAME/storage/auto-update  {"interval": seconds (0: off), "folder_timeout"?, "total_timeout"?}:
+                                              save automatic scans while the console runs and the login is alive
   POST /api/clusters/NAME/storage/scan        start a scan over the login in the background, folder by folder, saved as it
                                               goes: 5 minutes a folder, 30 in all, folders scanned in the last 5 minutes
                                               skipped unless {"rescan_recent": true}; the quotas are checked beside it
@@ -1028,6 +1033,83 @@ class Logins:
             return False
         return res.returncode == 0
 
+    def _sync_ssh(self, profile):
+        """One fail-closed SSH route for both metadata RPC and Git's native transport."""
+        options = self._base(profile)[1:]
+        # A jump is already part of the master; -J conflicts with the fail-closed ProxyCommand override.
+        kept, i = [], 0
+        while i < len(options):
+            if options[i] == '-J':
+                i += 2
+            elif options[i].startswith('-J'):
+                i += 1
+            else:
+                kept.append(options[i])
+                i += 1
+        strict = ['-o', 'ControlMaster=no', '-o', 'ProxyCommand=false', '-o', 'BatchMode=yes',
+                  '-o', 'ConnectionAttempts=1', '-o', 'ConnectTimeout=10']
+        return [self.ssh] + strict + kept
+
+    @staticmethod
+    def _sync_program(arguments=()):
+        install = os.environ.get('HPCLIB_REMOTE_INSTALL_LOCATION', 'hpclib')
+        script = 'p=' + shlex.quote(install) + '; case "$p" in /*) ;; *) p="$HOME/$p";; esac; exec sh "$p/servers/sync_remote.sh"'
+        if arguments:
+            script += ' ' + ' '.join(shlex.quote(x) for x in arguments) + ' "$@"'
+            return 'sh -c ' + shlex.quote(script) + ' hpclib-sync'
+        return 'sh -c ' + shlex.quote(script)
+
+    def sync_transfer(self, profile, local, request):
+        """Git streams packs over the cached master; metadata remains small JSON RPC."""
+        operation = request['operation']
+        if operation not in ('fetch-objects', 'push-objects'):
+            raise SyncError(422, 'unknown native Git transfer')
+        wire = {k: request[k] for k in ('protocol', 'root', 'group', 'endpoint', 'settings', 'binding')}
+        wire['commit'] = request['offer']['commit'] if operation == 'fetch-objects' else request['commit']
+        if operation == 'push-objects':
+            wire['run'] = request['run']
+        encoded = base64.urlsafe_b64encode(json.dumps(wire, allow_nan=False).encode()).decode('ascii')
+        command = self._sync_program(('--git-upload-pack' if operation == 'fetch-objects' else '--git-receive-pack', encoded))
+        env = {'GIT_SSH_COMMAND': ' '.join(shlex.quote(x) for x in self._sync_ssh(profile)),
+               'GIT_SSH_VARIANT': 'ssh', 'GIT_ALLOW_PROTOCOL': 'ssh'}
+        user, separator, host = profile['host'].rpartition('@')
+        host = host if separator else profile['host']
+        if ':' in host and not host.startswith('['):
+            host = '[' + host + ']'
+        url = 'ssh://' + (user + '@' if separator else '') + host + '/hpclib-sync'
+        try:
+            if operation == 'fetch-objects':
+                return local.fetch_objects(url, request['offer'], request['endpoint'], command, env)
+            return local.push_objects(url, request['commit'], request['run'], command, env)
+        except SyncError as error:
+            if not self.alive(profile):
+                raise SyncError(409, 'cached SSH login ended; log in through the console', state='login-needed') from error
+            raise
+
+    def sync_call(self, profile, request):
+        """Only use the existing master. ProxyCommand=false makes a lost mux fail closed."""
+        command = self._sync_ssh(profile) + [profile['host'], self._sync_program()]
+        try:
+            result = subprocess.run(command, input=json.dumps(request).encode(), stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, timeout=10 if request.get('operation', '').startswith('agent-') else 180)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise SyncError(409, 'cached SSH connection could not complete the sync request', state='login-needed') from e
+        if result.returncode == 255:
+            raise SyncError(409, 'cached SSH login ended; log in through the console', state='login-needed')
+        if len(result.stdout) > 256 << 20:
+            raise SyncError(413, 'remote sync response exceeded its transport limit')
+        try:
+            reply = json.loads(result.stdout)
+        except (ValueError, UnicodeDecodeError) as e:
+            raise SyncError(503, 'update hpclib on the cluster; the snapshot helper returned no valid protocol response',
+                            diagnostics=result.stderr.decode(errors='replace')[-1000:]) from e
+        if reply.get('protocol') != 1:
+            raise SyncError(501, 'update hpclib on the cluster for this snapshot protocol')
+        if result.returncode or 'error' in reply:
+            raise SyncError(reply.get('status', 409), reply.get('error', 'remote snapshot failed'),
+                            **{k: v for k, v in reply.get('detail', {}).items() if k != 'error'})
+        return reply['result']
+
     def status(self, profile, check=True):
         with self.lock:
             attempt = dict(self.attempts.get(profile["name"]) or {})
@@ -1690,7 +1772,8 @@ class Clusters:
             return dict(out, state="error", error=health.get("error", f"HTTP {status}"))
         return dict(out, state="up", server=health.get("server"), hostname=health.get("hostname"),
                     slurm_job_id=health.get("slurm_job_id"), token=(health.get("token") or {}).get("name"),
-                    hpclib_version=health.get("hpclib_version"))
+                    hpclib_version=health.get("hpclib_version"),
+                    hpclib_version_on_disk=health.get("hpclib_version_on_disk"))
 
     def describe(self, profile, tunnel=True):
         out = {k: profile.get(k) for k in PROFILE_KEYS}
@@ -2159,6 +2242,8 @@ class Clusters:
     STORAGE_TOTAL_TIMEOUT = 1800     # seconds a whole scan gets; folders it didn't reach wait for the next scan
     STORAGE_RECENT = 300             # a folder scanned this recently is skipped unless "Rescan recent folders"
     STORAGE_QUEUE_SHOWN = 500        # queued folders listed to the page, for its progress marks
+    STORAGE_AUTO_MIN = 300           # no more often than the window that skips recently scanned folders
+    STORAGE_AUTO_MAX = 7 * 86400
 
     def storage_path(self, name):
         return os.path.join(console_dir(), "storage", f"{name}.json")
@@ -2177,7 +2262,62 @@ class Clusters:
         out["work_dirs"] = list(profile.get("work_dirs") or [])
         out["custom_roots"] = list(out.get("custom_roots") or [])
         out["roots"] = storage_roots(out["work_dirs"], out["custom_roots"])
+        out.setdefault("auto_update", {"interval": 0, "next_scan": None,
+                                       "folder_timeout": self.STORAGE_FOLDER_TIMEOUT,
+                                       "total_timeout": self.STORAGE_TOTAL_TIMEOUT})
         return out
+
+    def storage_limits(self, body, defaults=None):
+        limits = {}
+        for key, (low, high) in STORAGE_TIME_LIMITS.items():
+            value = body.get(key, (defaults or {}).get(key, getattr(self, "STORAGE_" + key.upper())))
+            if key in body and (isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high):
+                raise ConsoleError(400, f"{key}: seconds, from {low} to {high}")
+            limits[key] = int(value)
+        if ("folder_timeout" in body or "total_timeout" in body) and limits["folder_timeout"] > limits["total_timeout"]:
+            raise ConsoleError(400, "folder_timeout is longer than total_timeout")
+        return limits
+
+    def set_storage_auto_update(self, profile, body):
+        if (not isinstance(body, dict) or "interval" not in body
+                or set(body) - {"interval", "folder_timeout", "total_timeout"}):
+            raise ConsoleError(400, 'send {"interval": seconds (0: off), "folder_timeout": seconds, "total_timeout": seconds}')
+        interval = body["interval"]
+        if (isinstance(interval, bool) or not isinstance(interval, int)
+                or interval != 0 and not self.STORAGE_AUTO_MIN <= interval <= self.STORAGE_AUTO_MAX):
+            raise ConsoleError(400, f"interval: 0 (off), or {self.STORAGE_AUTO_MIN} to {self.STORAGE_AUTO_MAX} seconds")
+
+        def change(stored):
+            limits = self.storage_limits(body, stored.get("auto_update"))
+            stored["auto_update"] = dict(limits, interval=interval,
+                                         next_scan=time.time() + interval if interval else None)
+        self._update_storage(profile["name"], change)
+        return self.storage(profile)
+
+    def update_due_storage(self):
+        """One scheduler round; use only an existing login, and the usual scan's overlap guard and limits."""
+        for profile in agent_profiles.all_profiles():
+            name = profile["name"]
+            try:
+                settings = self.storage(profile)["auto_update"]
+                with self.lock:
+                    running = (self.storage_scans.get(name) or {}).get("state") == "running"
+                if (not settings.get("interval") or running
+                        or (settings.get("next_scan") or 0) > time.time() or not self.logins.alive(profile)):
+                    continue
+                claimed = {}
+
+                def claim(stored):
+                    auto = stored.get("auto_update") or {}
+                    if auto.get("interval") and (auto.get("next_scan") or 0) <= time.time():
+                        claimed.update({k: auto[k] for k in STORAGE_TIME_LIMITS})
+                        # Also back off after a failed attempt; don't retry a broken login every scheduler tick.
+                        auto["next_scan"] = time.time() + auto["interval"]
+                self._update_storage(name, claim)
+                if claimed:
+                    self.start_storage_scan(profile, claimed)
+            except Exception as e:
+                sys.stderr.write(f"storage auto-update ({name}): {self._one_line(e)}\n")
 
     def set_storage_roots(self, profile, body):
         """{"custom": [directory, ...]}: the folders added to the scan, replacing the ones before. The results of a
@@ -2209,14 +2349,7 @@ class Clusters:
                 or not isinstance(body.get("retry_timed_out", False), bool)):
             raise ConsoleError(400, 'send {"rescan_recent": bool, "roots": [directory, ...], "retry_timed_out": bool, '
                                     '"folder_timeout": seconds, "total_timeout": seconds} or nothing')
-        limits = {}
-        for key, (low, high) in STORAGE_TIME_LIMITS.items():
-            value = body.get(key, getattr(self, "STORAGE_" + key.upper()))
-            if key in body and (isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high):
-                raise ConsoleError(400, f"{key}: seconds, from {low} to {high}")
-            limits[key] = int(value)
-        if ("folder_timeout" in body or "total_timeout" in body) and limits["folder_timeout"] > limits["total_timeout"]:
-            raise ConsoleError(400, "folder_timeout is longer than total_timeout")
+        limits = self.storage_limits(body)
         known = self.storage(profile)["roots"]
         chosen = body.get("roots")
         if chosen is None:
@@ -2285,8 +2418,16 @@ class Clusters:
         except Exception as e:
             state = {"state": "failed", "finished": time.time(), "error": self._one_line(getattr(e, "payload", {}).get("error") or e)}
         quotas.join(timeout=5)
-        with self.lock:
-            scan.update(state, current=None, queued=[])
+
+        def reschedule(stored):
+            auto = stored.get("auto_update") or {}
+            if auto.get("interval"):
+                auto["next_scan"] = time.time() + auto["interval"]
+        try:
+            self._update_storage(name, reschedule)
+        finally:
+            with self.lock:
+                scan.update(state, current=None, queued=[])
 
     def _scan_quotas(self, profile):
         try:
@@ -4742,7 +4883,7 @@ class Clusters:
             return {"name": p["name"], "host": p.get("host"), "set_up": d.get("set_up"),
                     "preset": (p.get("preset") or {}).get("id"), "rest_on": p.get("rest_on") or "job",
                     "connection_hours": d.get("connection_hours"),
-                    "tunnel": {k: t.get(k) for k in ("state", "error", "hpclib_version", "server", "started_here",
+                    "tunnel": {k: t.get(k) for k in ("state", "error", "hpclib_version", "hpclib_version_on_disk", "server", "started_here",
                                                      "last_exit", "port")},
                     "login": {k: lg.get(k) for k in ("state", "message")},
                     "operation": d.get("operation"), "apps": apps}
@@ -4785,6 +4926,7 @@ class Clusters:
 class ConsoleServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    STORAGE_AUTO_POLL = 15
 
     def __init__(self, address, key, clusters: Clusters, allow_origin=None, static_dir=None,
                  max_body=256 << 20):
@@ -4798,10 +4940,28 @@ class ConsoleServer(http.server.ThreadingHTTPServer):
         self.updater = console_update.Updater(os.path.dirname(HPCLIB_DIR))
         self.restart_argv = None     # main() sets it: how to start this console again
         self.sync = SyncManager(os.path.join(console_dir(), "sync"),
-                                clusters.profile if clusters is not None else None, write_private)
+                                clusters.profile if clusters is not None else None, write_private,
+                                getattr(getattr(clusters, 'logins', None), 'sync_call', None),
+                                getattr(getattr(clusters, 'logins', None), 'sync_transfer', None))
         super().__init__(address, ConsoleHandler)
+        self.sync.start_agent_bridge()
+        self.storage_stop = threading.Event()
+        self.storage_thread = None
+        if clusters is not None:
+            self.storage_thread = threading.Thread(target=self._storage_updates, daemon=True)
+            self.storage_thread.start()
+
+    def _storage_updates(self):
+        while not self.storage_stop.wait(self.STORAGE_AUTO_POLL):
+            try:
+                self.clusters.update_due_storage()
+            except Exception as e:
+                sys.stderr.write(f"storage auto-update: {e}\n")
 
     def server_close(self):
+        self.storage_stop.set()
+        if self.storage_thread is not None:
+            self.storage_thread.join(timeout=2)
         self.sync.close()
         super().server_close()
 
@@ -4815,6 +4975,7 @@ class ConsoleServer(http.server.ThreadingHTTPServer):
             raise ConsoleError(409, "this console wasn't started by agent_console's main(); restart it yourself")
         c = self.clusters
         busy = []
+        busy += self.sync.busy()
         if c is not None:
             with c.lock:
                 busy += [f"{name}: {op.get('kind')}" for name, op in c.ops.items() if op.get("state") == "running"]
@@ -4991,15 +5152,28 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 sync_id, action = parts
                 if verb == "GET" and action == "status":
                     return 200, dict(manager.get(sync_id), ok=True)
+                if action == 'provision':
+                    if verb == 'GET':
+                        return 200, dict(manager.provision_preview(sync_id), ok=True)
+                    if verb == 'POST':
+                        return 200, dict(manager.provision_apply(sync_id, body), ok=True)
+                if verb == 'GET' and action == 'provision-ignore':
+                    return 200, dict(manager.provision_ignore(sync_id, self.query.get('endpoint', ['local'])[0]), ok=True)
                 if verb == "GET" and action == "setup":
                     return 200, dict(manager.setup_preview(sync_id), ok=True)
                 if verb == "POST" and action in ("pause", "resume"):
                     if set(body) != {"revision"}:
                         raise SyncError(422, "pause/resume takes the current revision")
                     return 200, dict(manager.pause(sync_id, action == "pause", body["revision"]), ok=True)
-                if verb == "POST" and action in ("run", "dry-run", "resolve"):
-                    manager.get(sync_id)
-                    manager.unavailable(action)
+                if verb == "POST" and action in ("run", "dry-run", "review"):
+                    return 202, dict(manager.start(sync_id, body, preview=action == 'dry-run',
+                                                   intent='sync' if action == 'review' else 'snapshot'), ok=True)
+                if verb == "POST" and action == 'resolve':
+                    return 202, dict(manager.resolve(sync_id, body), ok=True)
+                if verb == 'POST' and action == 'agent-control':
+                    return 200, dict(manager.agent_access(sync_id, body), ok=True)
+            if len(parts) == 3 and parts[1] == 'plan' and verb == 'GET':
+                return 200, dict(manager.plan(parts[0], parts[2]), ok=True)
             raise ConsoleError(404, "unknown sync route")
         except SyncError as e:
             raise ConsoleError(e.status, str(e), **{k: v for k, v in e.payload.items() if k != "error"}) from e
@@ -5052,11 +5226,16 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
             return 200, dict(self.server.updater.status(fetch=self.flag("fetch")), ok=True, running=STARTED_VERSION)
         if parts == ["update"] and verb == "POST":
             try:
-                return 200, dict(self.server.updater.update(), ok=True, running=STARTED_VERSION)
-            except console_update.UpdateError as e:
+                with self.server.sync.maintenance():
+                    return 200, dict(self.server.updater.update(), ok=True, running=STARTED_VERSION)
+            except (console_update.UpdateError, SyncError) as e:
                 raise ConsoleError(e.status, str(e)) from e
         if parts == ["restart"] and verb == "POST":
-            return 202, dict(self.server.restart(), ok=True)
+            try:
+                with self.server.sync.maintenance(hold=True):
+                    return 202, dict(self.server.restart(), ok=True)
+            except SyncError as e:
+                raise ConsoleError(e.status, str(e)) from e
         if parts == ["diagnostics"] and verb == "GET":
             return 200, dict(c.diagnostics(), ok=True)
         if parts == ["widgets"] and verb == "GET":
@@ -5122,6 +5301,8 @@ class ConsoleHandler(http.server.BaseHTTPRequestHandler):
                 return 200, dict(c.storage(profile), ok=True)
             if rest == ["storage", "roots"] and verb == "PUT":
                 return 200, dict(c.set_storage_roots(profile, self.json_body()), ok=True)
+            if rest == ["storage", "auto-update"] and verb == "PUT":
+                return 200, dict(c.set_storage_auto_update(profile, self.json_body()), ok=True)
             if rest == ["storage", "scan"] and verb == "POST":
                 return 202, dict(c.start_storage_scan(profile, self.json_body()), ok=True)
             if rest == ["quota"] and verb == "GET":

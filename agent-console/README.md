@@ -1,12 +1,63 @@
 # agent-console
 
-Directory sync's initial setup stage is available under **Data transfer → Directory sync** (`#/transfer/sync`).
+Directory sync is available under **Data transfer → Directory sync** (`#/transfer/sync`).
 Both Data transfer pages show a dedicated **Directory sync** panel above the SMB controls, with a primary
 **Manage directory syncs** link. A cluster's link preselects that cluster. `sync.js` uses the existing shared elements and console API to save
 pairs, edit warning thresholds, and review local ignore setup. The compact editor places local and remote
 paths on the same row with a direction arrow (↔, → or ←); saved cards use the same paired layout.
-Advanced settings holds the branch, interval and warning thresholds. Git snapshot/transfer workers, rclone, and the
-heartbeat are not enabled in this stage. Their routes return an explicit unavailable error rather than success.
+Advanced settings holds the branch, interval and warning thresholds. In 1.14.1, **Check files** queues metadata-only
+inventories and **Create snapshots…** captures eligible local/remote edits on an owned sync branch. Size/file-count
+limits pause ingestion for a complete, inventory-bound approval. **Continue scan…** increases a bounded scan's
+budget. In 1.14.2, **Create verified snapshots…** explicitly asks Git to rehash all eligible content, create/update
+sync commits and exchange objects; unchanged content creates no new commit. Inventories list up to 100 eligible
+paths even when unchanged, and each endpoint shows its saved snapshot ID after a check. Zero changed files means
+unchanged metadata relative to that endpoint's own snapshot; it does not mean the working folders match.
+Snapshots preserve working files,
+HEAD and ordinary indexes, and sharing objects declares no successful working-file sync.
+In 1.14.4, **Review sync…** captures permitted snapshots and builds one Git merge for all online participants.
+**Apply reviewed sync…** separately confirms the displayed per-directory additions, edits and deletions.
+Conflicts block the group; later edits invalidate review. Successful working-file application advances each
+acknowledged pair's base and Last sync separately. **Retry reviewed sync…** reconciles interrupted applies;
+mixed content or later edits require recovery and are never blindly rolled back. That release enabled bidirectional Git apply; 1.14.8 adds uploads and background scheduling. Rclone remains deferred. Remote requests only reuse the existing
+console SSH master. Local merge preview requires Git's explicit-base merge-tree support (Git 2.43+).
+
+In 1.14.5, each saved Git sync has **Allow agent access…** / **Revoke agent access…**. Access is off by default,
+is independent of the sync settings revision, and is cleared when local/remote paths change. Enable the Data
+transfer **sync_query** and **sync_manage** actions in the cluster's Agents tab. The running console polls scoped
+requests using only its existing SSH master and invokes the same sync manager used by the UI. All targets in an
+agent-managed group must be on the requesting cluster and inside that token's directories. No console session
+key is exported, and there is no new inbound callback service. Restart the console and REST tunnel after updating.
+
+In 1.14.7, object transfer uses native Git fetch/push through the cached SSH master. Git negotiates missing
+objects and streams packs, preserving named remotes/configuration, ordinary indexes and FETCH_HEAD. Transfers
+stage owned refs only; the existing separate review/apply step changes working files. Native pack operations
+share endpoint locks with application, and a shared per-root journal prevents another group/private repository
+from bypassing an unfinished apply. Broader multiple-connection-point identity and coordinator handoff remain
+separate design work. Update both local/remote installations and restart the console and REST tunnel.
+
+In 1.14.8, **Background sync** on each card selects Off, Upload local changes, Sync both directions,
+or Check only. Existing registrations stay off. Choosing automatic uploads changes the direction to →;
+two-way scheduling uses ↔. First review/apply is required before automatic working-file changes. Keep the
+console open and the cluster connected; this does not install a login service. Pause and an interval of 0
+stop scheduling. Size/selection reviews, conflicts, stale plans, inactive roots and interrupted applies block
+further automatic work; connection failures retry with bounded backoff through the cached SSH master only.
+Update/restart admission is coordinated with the worker pool.
+
+Upload mode pushes source objects, plans/applies on the cluster, and leaves local working files unchanged.
+Only current and previously uploaded source paths are scanned and snapshotted remotely. Cluster-only outputs
+are neither fetched to the Mac nor added to these upload snapshots. Changes to managed inputs on the cluster
+pause for review. Unchanged uploads skip another object transfer and do not create commits. Git still retains
+source history; switching from two-way sync does not delete previously downloaded files/history. The most
+recent 32 run logs are kept; recovery journals and Git history are preserved.
+
+**Set up directories…** asks before creating initially missing local/remote paths, then offers Git initialization
+when neither side is a repository. Declining can explicitly select private Git storage; Git itself is required
+in either case. Each endpoint has its own reviewed ignore choice, including the merge-first `.gitignore`
+question. Existing private snapshot history keeps its backing repository. Registered directories are pinned
+by path/inode (including legacy snapshot claims); removal, movement or replacement marks the sync inactive
+at the next check. It never recreates the old path. Restore the original directory and review again, or make
+a fresh registration for its new location using a fresh sync branch if the old one is still owned. Automatic
+relocation, cross-computer identity and connection-point handoff remain separate design work.
 
 A minimal browser front end for `agent_console`, the local backend in
 `hpclib/servers/agent_console.py`. Plain HTML, CSS and JavaScript modules (with native custom elements), no build step.

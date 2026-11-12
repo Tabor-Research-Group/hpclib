@@ -107,7 +107,8 @@ export async function activityPage({ api, filesHash, setFollowing, only = null }
     panel.addEventListener("dismiss", (event) => { if (event.target === panel) closeDetail(); });
     const stats = [["State", job.state], ["Agent", job.token], ["Template", job.template], ["Submitted", timestamp(job.submitted)],
       ["Elapsed", job.elapsed], ["Exit code", job.exit_code], ["Started", job.start], ["Finished", job.end],
-      ["Reason", job.reason], ["Nodes", job.nodes], ["Working directory", job.workdir]];
+      ["Reason", job.reason], ["Nodes", job.nodes], ["Working directory", job.workdir
+        ? el("a", { href: filesHash(clusterName, job.workdir), title: "Open in Files" }, job.workdir) : ""]];
     panel.append(el("dl", { class: "activity-details" }, stats.filter(([, value]) => value !== undefined && value !== "")
       .map(([label, value]) => [el("dt", {}, label), el("dd", {}, value)])));
     if (job.output) panel.append(message(`Output: ${job.output}`));

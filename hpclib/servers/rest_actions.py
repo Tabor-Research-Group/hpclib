@@ -438,14 +438,15 @@ class TunnelActions:
                 values[name] = real
         return values
 
-    def scope_file(self, whitelist, file_changes=False):
+    def scope_file(self, whitelist, file_changes=False, actor=None):
         """The token's directories, for action_paths.py in the action's job: a private file of its own."""
         directory = os.path.join(self.data_dir, "sessions", "actions")
         os.makedirs(directory, mode=0o700, exist_ok=True)
         path = os.path.join(directory, f"scope-{uuid.uuid4().hex}.json")
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f:
-            json.dump({"roots": list(whitelist.roots) if whitelist.restricted else None, "deny": list(whitelist.deny), "file_changes": bool(file_changes)}, f)
+            json.dump({"roots": list(whitelist.roots) if whitelist.restricted else None, "deny": list(whitelist.deny),
+                       "file_changes": bool(file_changes), "actor": actor}, f)
         return path
 
     def run(self, identity, tunnel, name, given, whitelist, file_changes, jobs=None, audit=None):
@@ -469,7 +470,7 @@ class TunnelActions:
             audit.update(tunnel=tunnel, action=name, params={k: v for k, v in values.items()})
         special = {"helper": HELPER, "data_dir": self.data_dir}
         if any(a == "{scope_file}" for a in action["run"]):
-            special["scope_file"] = self.scope_file(whitelist, file_changes)
+            special["scope_file"] = self.scope_file(whitelist, file_changes, identity.name)
         job_options = [f"--comment=hpclib-rest:{identity.name}:{tunnel}/{name}"]
 
         argv = []

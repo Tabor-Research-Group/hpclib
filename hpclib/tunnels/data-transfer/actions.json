@@ -1,6 +1,6 @@
 {
   "title": "Data transfer",
-  "description": "SMB transfers and scoped cluster-side sync setup. Sync context actions do not require an SMB ticket and do not start transfers.",
+  "description": "SMB transfers, scoped sync setup, and opt-in agent control of saved local/cluster Git syncs through the running console.",
   "available": {
     "run": [
       "smbshell.sh",
@@ -308,6 +308,185 @@
         "{data_dir}",
         "--review",
         "{review}",
+        "--confirm",
+        "{confirm}",
+        "--warn-file-mb",
+        "{warn_file_mb}",
+        "--warn-snapshot-mb",
+        "{warn_snapshot_mb}",
+        "--warn-file-count",
+        "{warn_file_count}"
+      ],
+      "timeout": 30
+    },
+    "sync_query": {
+      "title": "Query saved Git syncs",
+      "description": "List permitted agent-enabled syncs, get status/plan, or poll a request ticket. The console must be running for new queries; ticket polling works while it is offline. Results never expose other clusters or out-of-scope groups.",
+      "mode": "sync",
+      "scope": "read",
+      "default": false,
+      "params": {
+        "root": {
+          "type": "cluster-path",
+          "access": "read",
+          "description": "existing scoped remote sync directory; list/request-status also accept its parent directory"
+        },
+        "operation": {
+          "type": "string",
+          "pattern": "list|status|plan|request-status",
+          "description": "list returns IDs/revisions; status/plan are asynchronous requests; request-status polls ticket"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "[a-z0-9_-]{0,64}",
+          "default": "",
+          "description": "sync group ID returned by list"
+        },
+        "plan": {
+          "type": "string",
+          "pattern": "[a-z0-9_-]{0,64}",
+          "default": "",
+          "description": "current plan ID returned by sync status or plan query"
+        },
+        "ticket": {
+          "type": "string",
+          "pattern": "[a-z0-9_-]{0,64}",
+          "default": "",
+          "description": "ticket returned by sync_query or sync_manage"
+        }
+      },
+      "available": {
+        "run": [
+          "sync-context.sh",
+          "{helper}",
+          "capabilities",
+          "--state",
+          "{data_dir}"
+        ],
+        "require": [
+          "agent_protocol"
+        ],
+        "show": [
+          "agent_ready"
+        ],
+        "cache": 2,
+        "message": "Update both ends to hpclib 1.14.5; open the console, connect the cluster and Allow agent access for the sync."
+      },
+      "run": [
+        "sync-context.sh",
+        "{helper}",
+        "agent",
+        "--scope",
+        "{scope_file}",
+        "--state",
+        "{data_dir}",
+        "--root",
+        "{root}",
+        "--command",
+        "{operation}",
+        "--id",
+        "{id}",
+        "--plan",
+        "{plan}",
+        "--ticket",
+        "{ticket}"
+      ],
+      "timeout": 30
+    },
+    "sync_manage": {
+      "title": "Manage reviewed Git syncs",
+      "description": "Request review, size approval, apply/retry, pause/resume or warning configuration from the same console sync manager. Requires local per-sync consent, files:write, current revision and confirm=true. Apply/retry/approve-snapshot require the exact reviewed plan. Poll the returned ticket, then query status for the run.",
+      "mode": "sync",
+      "scope": "files:write",
+      "writes": "cluster",
+      "default": false,
+      "params": {
+        "root": {
+          "type": "cluster-path",
+          "access": "read",
+          "description": "existing scoped remote sync directory; list/request-status also accept its parent directory"
+        },
+        "operation": {
+          "type": "string",
+          "pattern": "review|approve-snapshot|apply|retry|pause|resume|configure",
+          "description": "review creates snapshots and a merge preview; apply/retry change local and remote files only under the exact plan"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "[a-z0-9_-]{0,64}",
+          "description": "sync group ID returned by list"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "current sync revision"
+        },
+        "plan": {
+          "type": "string",
+          "pattern": "[a-z0-9_-]{0,64}",
+          "default": "",
+          "description": "current plan ID returned by sync status or plan query"
+        },
+        "confirm": {
+          "type": "boolean",
+          "default": false,
+          "description": "explicit consent for this command; false performs no command"
+        },
+        "warn_file_mb": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0,
+          "description": "configure only: per-file warning MB; zero leaves unchanged"
+        },
+        "warn_snapshot_mb": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0,
+          "description": "configure only: aggregate warning MB; zero leaves unchanged"
+        },
+        "warn_file_count": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "configure only: changed-file count warning; zero leaves unchanged"
+        }
+      },
+      "available": {
+        "run": [
+          "sync-context.sh",
+          "{helper}",
+          "capabilities",
+          "--state",
+          "{data_dir}"
+        ],
+        "require": [
+          "agent_protocol",
+          "agent_ready"
+        ],
+        "show": [
+          "agent_ready"
+        ],
+        "cache": 2,
+        "message": "Update both ends to hpclib 1.14.5; open the console, connect the cluster and Allow agent access for the sync."
+      },
+      "run": [
+        "sync-context.sh",
+        "{helper}",
+        "agent",
+        "--scope",
+        "{scope_file}",
+        "--state",
+        "{data_dir}",
+        "--root",
+        "{root}",
+        "--command",
+        "{operation}",
+        "--id",
+        "{id}",
+        "--revision",
+        "{revision}",
+        "--plan",
+        "{plan}",
         "--confirm",
         "{confirm}",
         "--warn-file-mb",

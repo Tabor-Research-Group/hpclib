@@ -950,6 +950,74 @@ class TestConsoleUI(unittest.TestCase):
         main.get_by_text('Finished in the last 24 hours').wait_for()
         self.assertEqual(self.errors, [])
 
+    def test_job_paths_open_the_directory_or_resolved_output_in_files(self):
+        from urllib.parse import parse_qs, quote, urlencode, urlsplit
+        name, work = 'demo + east', '/scratch/me/run +&?#% λ'
+        output, error = work + '/slurm-11_2.out', work + '/slurm-11_2.err'
+        c = {'name': name, 'host': 'me@login.example', 'has_owner_token': True,
+             'login': {'state': 'connected'}, 'tunnel': {'state': 'up'}}
+        prefix = 'clusters/' + quote(name, safe='')
+        job_hash = '#/c/' + quote(name, safe='') + '/jobs/11_2'
+        file_hash = lambda path: '#/c/' + quote(name, safe='') + '/files?' + urlencode({'path': path})
+        file = lambda path, text: {'from': 'slurm', 'path': path, 'found': True, 'size': len(text),
+                                  'mtime': 1, 'text': text, 'truncated': False}
+        detail = {'id': '11_2', 'name': 'array task', 'state': 'RUNNING', 'mine': True, 'at': 0, 'limit': 131072,
+                  'source': {'kind': 'agent', 'label': 'agent: py'},
+                  'info': [['WorkDir', work], ['StdOut', 'slurm-%A_%a.out'], ['StdErr', 'slurm-%A_%a.err']],
+                  'files': {'script': file('(kept by Slurm)', '#!/bin/bash'),
+                            'stdout': file(output, 'Output from Files'), 'stderr': file(error, 'Error from Files')}}
+        entries = [{'type': 'file', 'path': path, 'name': path.rsplit('/', 1)[-1], 'size': len(text), 'mtime': 1}
+                   for path, text in ((output, 'Output from Files'), (error, 'Error from Files'))]
+        calls = []
+        def handler(route, path):
+            if path == 'clusters': result = {'clusters': [c]}
+            elif path == prefix: result = c
+            elif path == prefix + '/jobs/11_2': result = detail
+            elif path in (prefix + '/rest/files', prefix + '/rest/files/content'):
+                target = parse_qs(urlsplit(route.request.url).query)['path'][0]
+                calls.append((path, target))
+                if path.endswith('/content'):
+                    route.fulfill(body='Output from Files' if target == output else 'Error from Files', content_type='text/plain')
+                    return True
+                if target in ('.', '/scratch/me', work):
+                    result = {'type': 'directory', 'path': '/scratch/me' if target == '.' else target,
+                              'entries': entries if target == work else []}
+                else:
+                    result = next(entry for entry in entries if entry['path'] == target)
+            else: return False
+            route.fulfill(body=json.dumps(result), content_type='application/json')
+            return True
+        self.load_console(handler)
+        self.page.goto(self.base + '/' + job_hash)
+        job = self.page.locator('.job-page')
+        job.get_by_role('link', name=work, exact=True).click()
+        directory = self.page.get_by_label('Directory', exact=True)
+        directory.wait_for()
+        self.assertEqual(directory.input_value(), work)
+        self.assertEqual(self.page.locator('#pages a.active').inner_text(), 'Files')
+        self.assertEqual(self.page.locator('.file-preview hpc-panel').count(), 0)
+        for label, target, text in ((output, output, 'Output from Files'),
+                                    ('slurm-%A_%a.out', output, 'Output from Files'),
+                                    ('slurm-%A_%a.err', error, 'Error from Files')):
+            self.page.goto(self.base + '/' + job_hash)
+            link = job.get_by_role('link', name=label, exact=True)
+            self.assertEqual(link.get_attribute('href'), file_hash(target))
+            link.click()
+            self.page.locator('.file-preview pre.file').filter(has_text=text).wait_for()
+            self.assertEqual(directory.input_value(), work)
+            self.assertEqual(self.page.locator('#pages a.active').inner_text(), 'Files')
+            self.assertIn((prefix + '/rest/files/content', target), calls)
+        # Missing files and Slurm-only copies are text; other people's paths are also text.
+        detail['files']['stdout']['found'] = False
+        self.page.goto(self.base + '/' + job_hash)
+        job.get_by_text('no longer exists', exact=False).wait_for()
+        self.assertEqual(job.locator('a[title="Open in Files"]').count(), 3)  # directory and both error links
+        detail['mine'] = False
+        self.page.reload()
+        job.get_by_text('Its script and output are not read.', exact=False).wait_for()
+        self.assertEqual(job.locator('a[title="Open in Files"]').count(), 0)
+        self.assertEqual(self.errors, [])
+
     def test_job_counts_filter_the_jobs_tab(self):
         c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
              'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up'}}
@@ -1401,6 +1469,63 @@ class TestConsoleUI(unittest.TestCase):
         self.assertEqual(posts[1], {'rescan_recent': True, 'roots': ['/scratch/me/llm', '~/.local/tunnels'], 'folder_timeout': 300, 'total_timeout': 1800})
         self.assertEqual(self.errors, [])
 
+    def test_storage_auto_update_saves_interval_limits_and_survives_reload(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234,
+             'work_dirs': ['/scratch/me/llm'], 'has_owner_token': True,
+             'login': {'state': 'connected'}, 'tunnel': {'state': 'up', 'hpclib_version': '0.2.70'}}
+        storage = {'scanned': None, 'scan': {'state': 'idle'}, 'dirs': [], 'quota': None,
+                   'roots': [{'path': '/scratch/me/llm', 'kind': 'work'}],
+                   'auto_update': {'interval': 0, 'next_scan': None, 'folder_timeout': 300, 'total_timeout': 1800}}
+        answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c, 'health': {'hpclib_version': '0.2.70'},
+                   'apps': {'apps': [{'id': 'agents', 'title': 'Agents'}]}, 'clusters/demo/storage': storage}
+        puts = []
+
+        def handler(route, path):
+            if path == 'clusters/demo/storage/auto-update':
+                body = route.request.post_data_json
+                puts.append(body)
+                storage['auto_update'] = dict(body, next_scan=time.time() + body['interval'] if body['interval'] else None)
+                route.fulfill(body=json.dumps(storage), content_type='application/json')
+                return True
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+
+        self.load_console(handler)
+        self.page.goto(self.base + '/#/c/demo/storage')
+        enabled = self.page.get_by_label('Auto-update storage', exact=True)
+        interval = self.page.get_by_label('Auto-update interval (minutes)', exact=True)
+        enabled.wait_for()
+        self.assertFalse(enabled.is_checked())
+        self.assertTrue(interval.is_disabled())
+        enabled.check()
+        interval.fill('4')
+        self.page.get_by_role('button', name='Save auto-update', exact=True).click()
+        self.page.get_by_text('Auto-update: choose a whole number of minutes from 5 to 10080 (one week)', exact=True).wait_for()
+        self.assertEqual(puts, [])
+        interval.fill('15')
+        self.page.get_by_label('Per folder (minutes)').fill('10')
+        self.page.get_by_label('Per folder (minutes)').dispatch_event('change')
+        self.page.get_by_role('button', name='Save auto-update', exact=True).click()
+        self.page.get_by_text('Next scan ', exact=False).wait_for()
+        self.assertEqual(puts, [{'interval': 900, 'folder_timeout': 600, 'total_timeout': 1800}])
+        self.page.reload()
+        enabled.wait_for()
+        self.assertTrue(enabled.is_checked())
+        self.assertEqual(interval.input_value(), '15')
+        self.assertEqual(self.page.get_by_label('Per folder (minutes)').input_value(), '10')
+        # Polling must not discard an interval being edited.
+        self.page.clock.install()
+        interval.fill('45')
+        self.page.clock.run_for(16000)
+        self.assertEqual(interval.input_value(), '45')
+        enabled.uncheck()
+        self.page.get_by_role('button', name='Save auto-update', exact=True).click()
+        self.page.wait_for_function("document.querySelector('input[aria-label=\"Auto-update interval (minutes)\"]').disabled")
+        self.assertEqual(puts[-1], {'interval': 0, 'folder_timeout': 600, 'total_timeout': 1800})
+        self.assertEqual(self.errors, [])
+
     def test_storage_tab_raises_the_time_limits_and_retries_timed_out_folders(self):
         c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234, 'work_dirs': ['/scratch/me/llm'],
              'has_owner_token': True, 'login': {'state': 'connected'}, 'tunnel': {'state': 'up', 'hpclib_version': '0.2.70'}}
@@ -1518,6 +1643,70 @@ class TestConsoleUI(unittest.TestCase):
         self.page.get_by_role('button', name='Remove').click()
         self.page.get_by_label('Scan /scratch/shared/data', exact=True).wait_for(state='detached')
         self.assertEqual(puts[-1], {'custom': []})
+        self.assertEqual(self.errors, [])
+
+    def test_live_tunnel_badge_and_installed_version_preserve_running_version_and_forms(self):
+        c = {'name': 'demo', 'host': 'me@login.example', 'set_up': True, 'port': 1234,
+             'has_owner_token': True, 'mcp_name': 'hpclib-demo', 'login': {'state': 'connected'},
+             'tunnel': {'state': 'up', 'hpclib_version': '1.14.2', 'hpclib_version_on_disk': '1.14.2'}}
+        answers = {'clusters': {'clusters': [c]}, 'clusters/demo': c, 'health': {'hpclib_version': '1.14.5'},
+                   'apps': {'apps': [{'id': 'agents', 'title': 'Agents'}]},
+                   'clusters/demo/jobs': {'queued': [], 'running': [], 'finished': [],
+                                          'counts': {'queued': 0, 'running': 0, 'finished': 0, 'failed': 0}},
+                   'clusters/demo/storage': {'scanned': None, 'dirs': []}}
+        fail = False
+        requests = []
+        def handler(route, path):
+            requests.append((route.request.method, path))
+            if path == 'clusters/demo' and fail:
+                route.fulfill(status=502, body=json.dumps({'error': 'console unreachable'}), content_type='application/json')
+                return True
+            if path in answers:
+                route.fulfill(body=json.dumps(answers[path]), content_type='application/json')
+                return True
+            return False
+        self.page.clock.install()
+        self.load_console(handler)
+        self.page.goto(self.base + '/#/c/demo/jobs')
+        badge = self.page.locator('.cluster-head .chips')
+        badge.get_by_text('agent tunnel up', exact=True).wait_for()
+        search = self.page.get_by_label('Filter jobs', exact=True)
+        search.fill('keep-my-filter')
+        search.evaluate('e => window.originalFilter = e')
+        for state in ('down', 'error', 'up'):
+            c['tunnel'] = {'state': state, 'hpclib_version': '1.14.2'}
+            self.page.clock.fast_forward(30001)
+            badge.get_by_text('agent tunnel ' + state, exact=True).wait_for()
+            self.assertEqual(search.input_value(), 'keep-my-filter')
+            self.assertTrue(search.evaluate('e => e === window.originalFilter'))
+        fail = True
+        self.page.clock.fast_forward(30001)
+        badge.get_by_text('agent tunnel error', exact=True).wait_for()
+        self.assertIn('console unreachable', badge.locator('.error').get_attribute('title'))
+        fail = False
+        self.page.clock.fast_forward(30001)
+        badge.get_by_text('agent tunnel up', exact=True).wait_for()
+
+        self.page.goto(self.base + '/#/c/demo/agents')
+        row = self.page.locator('hpc-cluster-row')
+        row.get_by_text('hpclib 1.14.2 · 1.14.5 here', exact=True).wait_for()
+        mcp = self.page.get_by_label('MCP server name', exact=True)
+        mcp.fill('unsaved-name')
+        c['tunnel']['hpclib_version_on_disk'] = '1.14.5'
+        self.page.clock.fast_forward(30001)
+        row.get_by_text('hpclib 1.14.2 running · 1.14.5 installed · restart agent tunnel', exact=True).wait_for()
+        self.assertEqual(mcp.input_value(), 'unsaved-name')
+        self.page.goto(self.base + '/#/c/demo/overview')
+        self.page.get_by_role('button', name='Restart agent tunnel', exact=True).wait_for()
+        self.assertEqual(self.page.get_by_role('button', name='Update hpclib', exact=True).count(), 0)
+        self.page.goto(self.base + '/#/c/demo/installed')
+        self.page.get_by_text('restart needed', exact=True).wait_for()
+        # A replacement process now runs the installed version; both the header and summary follow it.
+        c['tunnel']['hpclib_version'] = '1.14.5'
+        self.page.clock.fast_forward(30001)
+        self.page.get_by_text('current', exact=True).wait_for()
+        self.assertEqual(self.page.get_by_text('restart needed', exact=True).count(), 0)
+        self.assertFalse(any(method != 'GET' for method, path in requests), requests)
         self.assertEqual(self.errors, [])
 
     def test_start_agent_tunnel_waits_while_it_starts(self):

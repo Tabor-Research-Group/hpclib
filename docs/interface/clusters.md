@@ -56,6 +56,13 @@ clusters suggests a launcher for new clusters. (Setup… holds only what the clu
 
 ### Jobs
 
+Click a job's name to see its settings, script and output. For your own jobs, click **WorkDir**'s path to open
+the working directory in the cluster's **Files** tab. Output and error paths open the file there, with its
+directory beside the preview; the links use the resolved filenames, including array-task substitutions.
+Only files that were found are linked. Copies of scripts kept only by Slurm stay in the job preview.
+Browsing needs the cluster's agent tunnel and owner token, and follows the Files tab's access rules.
+Job details in **Agents → Activity** also link the working directory; **Open in Files** opens the output directly.
+
 ![The Jobs tab: queued, running and finished jobs, each labelled with what started it](../images/cluster-jobs.png)
 
 ### Installed
@@ -83,6 +90,19 @@ whatever the boxes say. The REST calls are `PUT clusters/NAME/storage/roots` wit
 and `POST clusters/NAME/storage/scan` with `{"roots": ["/path", ...], "rescan_recent": false,
 "folder_timeout": 300, "total_timeout": 1800, "retry_timed_out": false}` (any of the directories the tab shows, all
 of them when `roots` is left out; the timeouts are seconds, 30 to 14400 a folder and 60 to 86400 in all).
+
+**Automatic scans.** Tick **Auto-update every**, set an interval in minutes (5 to 10080, or one week),
+and choose **Save auto-update**. This saves the interval and the current **Per folder** and **Whole scan**
+limits for this cluster on this machine. Untick it and save to turn it off; it starts off disabled.
+The first scan is due one interval after saving. Each completed scan, including a manual scan or a failed
+scan, starts the next interval. Automatic scans include every scan directory, skip recently scanned folders,
+and never overlap another scan. A failed start is retried after another interval. The console must remain
+running, but its browser tab may be closed. A due scan waits until the cluster has an existing login;
+it does not open a new login or ask for credentials. Saved intervals and due times survive console restarts.
+The REST call is `PUT clusters/NAME/storage/auto-update` with `{"interval": 3600, "folder_timeout": 300,
+"total_timeout": 1800}`; `interval` is whole seconds, 300 to 604800, or `0` to turn it off. The time limits
+are optional and retain their saved values. `GET clusters/NAME/storage` includes `auto_update` with these
+settings and `next_scan` (a Unix timestamp, or null when off). The console checks for due scans every 15 seconds.
 
 ![The Storage tab sorted by file count](../images/cluster-storage-files.png)
 

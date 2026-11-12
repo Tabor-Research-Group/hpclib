@@ -151,19 +151,44 @@ try the short service name once after a definite unknown-principal response on a
 the original server's network destination. Explicit settings take precedence. Existing encryption policy remains
 in force; client changes do not repair missing service identities or AES configuration on the storage/domain side.
 
-### Directory sync setup (initial implementation stage)
+### Directory sync: setup and Git snapshots
 
 **Data transfer → Directory sync** (`#/transfer/sync`) saves one local directory with multiple cluster targets.
 In hpclib 1.14.0, a dedicated **Directory sync** panel appears above the SMB controls on both the cluster and
 all-cluster Data transfer pages. Its primary **Manage directory syncs** link opens the setup/management page;
 the cluster-specific link preselects that cluster. The all-cluster navigation also labels the page **Directory sync**.
-The first implementation stage supports pair editing, configurable per-file/aggregate/file-count warning
-thresholds, pause preferences, and local Git ignore setup. Transfers, snapshots, and heartbeat workers are not
-enabled yet; the page says so and Run remains disabled. Git-only setup does not require or invoke rclone.
+Version 1.14.1 adds metadata checks, reviewed Git snapshot ingestion and bidirectional object exchange. Version
+1.14.2 lists unchanged eligible paths (up to 100), shows each endpoint's saved snapshot ID, and labels the full
+rehash operation **Create verified snapshots…** because it creates/updates commits and exchanges objects.
+Zero changed files refers to each endpoint's own snapshot, not equality of the working folders. Version 1.14.4
+adds **Review sync…** and **Apply reviewed sync…** for bidirectional Git working-file sync. In that version every apply needed explicit confirmation; 1.14.8 adds reviewed uploads and opt-in automatic scheduling. Rclone remains deferred. Git-only operation
+does not require, detect or invoke rclone.
 The compact editor and saved cards place the local and remote directories beside one another. Direction is
 saved explicitly: bidirectional (↔), local to remote (→), or remote to local (←). Existing Git registrations
 default to bidirectional; existing standalone rclone registrations retain their push/pull choice. Branch,
 poll interval and warning thresholds are under **Advanced settings**.
+
+**Background sync** is visible on each saved card and in the editor. Existing registrations remain Off.
+Upload local changes (→) is the default automatic mode when enabled; two-way sync (↔) and Check only are
+also available. The console and its authenticated cluster connection must stay open. After the first reviewed
+apply, clean changes and deletions run at the configured interval. Pause or interval 0 disables scheduling.
+Large/incomplete snapshots, selection changes, conflicts, stale plans, directory changes and recovery states
+pause for attention; automatic workers never approve those warnings. Failed connections back off without
+starting a password/key/MFA login. No browser tab needs to stay open.
+
+Upload mode compares only current and previously uploaded input paths on the cluster. Cluster-only outputs
+stay remote and do not enter upload snapshots or download to the Mac. Edits to managed inputs on the cluster
+are held for review. Two-way mode intentionally scans/snapshots/fetches eligible remote additions too, using
+configured warning limits. Source Git history still consumes storage; prior downloads/history are not pruned
+when changing modes. Unchanged background uploads create no new commit or object transfer.
+
+**Set up directories…** handles missing paths and Git/ignore decisions for both endpoints. Initial creation
+requires a current preview and explicit confirmation. If neither directory is a repository, it offers normal
+Git initialization or explicit use of hpclib's private Git storage. Sync needs Git in either case. Existing
+private snapshot history retains its backing repository. Once a directory has been observed/registered,
+its disappearance, replacement or movement makes the sync **inactive** on the next check; the manager never
+creates a replacement at the old path. Restore the original and review, or register the new location with a
+fresh sync branch. Automatic relocation and identity sharing across computers remain deferred.
 
 **Ignore setup** shows the versioned default list. When `.gitignore` exists without `.hpclib-sync.json`, the page
 first offers a reviewed default-rule merge. Declining offers sync-only exclusions; declining both records that
@@ -173,6 +198,91 @@ not change the ordinary Git index or checked-out branch. A changed file invalida
 
 Registrations live under the console's `sync/` directory. **Unregister** removes the active registration while
 preserving working directories, repository metadata, and archived registration/history data.
+
+**Check files** queues a bounded Git-selected metadata inventory locally and on online targets. It writes no
+candidate blobs or snapshot commits. The result shows eligible/new/changed file counts, estimated uncompressed
+bytes, largest files and growth by directory. Limits in **Advanced settings** apply before content ingestion;
+an incomplete scan cannot be approved. **Continue scan…** rescans with larger explicit budgets, up to one
+million paths and sixty seconds. Budgets are checked between filesystem operations; a blocked NFS call can
+exceed the elapsed-time budget.
+
+**Create snapshots…** makes one local snapshot per group check, captures online remote edits, fetches their
+objects to the hub, and stages local objects under remote incoming refs. Above-limit inventories pause for
+**Approve snapshot…**; any changed settings, root identity, selected paths, stat metadata or tip makes the
+approval stale. An unchanged accepted inventory does not repeatedly warn. Staging races and expanded Git-filter
+output stop ref advancement; objects already written by Git are retained. Snapshotting neither checks out a
+branch nor edits working files or ordinary indexes. It creates no merge or successful-sync acknowledgement.
+
+Normal checks reuse private Git stat caches. Equal-size/mtime edits with changed ctime are detected, but metadata
+is not proof against arbitrary filesystem cache/timestamp anomalies. **Create verified snapshots…** discards private stat
+caches through Git and rehashes every selected file. It applies warning limits conservatively to the full
+inventory, so a large verification needs fresh approval even when a normal check reports no metadata changes.
+
+**Review sync…** creates/fetches permitted snapshots and uses local Git `merge-tree --write-tree --merge-base`
+to build one candidate in stable target order. The first sync uses an empty base and always needs review;
+independent histories remain parents. A clean plan lists additions, edits, deletions and type changes for each
+directory. A conflict anywhere blocks working-file application to the group. Resolve the differing source files
+manually and review again; conflict markers are not written into working folders by preview.
+
+**Apply reviewed sync…** rechecks settings, root identities, selections, refs, acknowledged bases and actual
+working content on all participating endpoints before the first write. It uses private indexes and native Git
+`read-tree -m -u`, preserving ordinary HEAD/branch/index state. Ignored/untracked collisions are blocked. Changes
+to `.hpclib-sync.json`, `.gitignore` or `.gitattributes` require separate selection/configuration review rather
+than propagation in this release. Replacing an existing directory with a file is also conservatively blocked.
+Updates to ordinary text/binary files, additions/deletions, file renames, symlinks and executable modes are supported
+when Git can merge them cleanly. Local Git needs explicit-base `merge-tree` support (Git 2.43+); no fallback merge
+algorithm is used. Update both hpclib installations to 1.14.4.
+
+Each endpoint journals expected old/new commits and phases before applying. It verifies the result, updates owned
+refs with compare-and-swap and durably acknowledges. Last sync and the pair's base move only after successful
+local/remote acknowledgement. Offline or failed targets keep their old bases; incomplete distribution is `partial`.
+**Retry reviewed sync…** can recognize and acknowledge already applied content. Mixed content, external ref moves
+or later edits produce `recovery-needed`; there is no automatic rollback. After a console crash, the saved apply
+review is retained and shown as needing reconciliation. A Git checkout and a cross-machine sync are not atomic:
+pause external writers during application and inspect recovery before making further changes.
+
+Version 1.14.5 adds two opt-in agent tunnel actions, **sync_query** and **sync_manage**, to this same sync manager.
+Update hpclib locally and remotely, restart the local console and the cluster REST tunnel, and enable both actions
+in the cluster's Agents tab. Then choose **Allow agent access…** on the saved sync card. This consent applies only
+to that registered group, can be revoked separately from sync settings, and is cleared if its paths change.
+Commands already accepted finish or report recovery when access is revoked; future commands are denied.
+
+`sync_query` supports `list`, `status`, `plan` and `request-status`. `sync_manage` supports `review`,
+`approve-snapshot`, `apply`, `retry`, `pause`, `resume` and warning-threshold `configure`. Mutations need a
+files:write token, enabled server file changes, current revision and `confirm=true`; plan-bound commands also
+need the exact plan ID. Queries return only consent-enabled groups entirely on the requesting cluster and inside
+the token's remote directory scope. Agents cannot grant themselves access, change local/remote paths, or operate
+another cluster through one cluster token. They do not read the console session key.
+
+New commands return a ticket. Poll `sync_query` with `operation=request-status` and that ticket until the
+console replies. A successful ticket means the command was accepted; a queued Git run is then followed using a
+new `status` query. The request expires after five minutes if it is not admitted. Polling tickets remains
+available while the console is offline. Receipts prevent a lost reply from replaying a mutation; a console stop
+during uncertain dispatch reports that status must be inspected before issuing a fresh command. These commands
+use existing SSH-master RPC polling. Version 1.14.8 shares that console wake-up loop with the opt-in file-sync scheduler; no inbound service is added.
+
+Each root must have its ignore choice recorded before snapshots. A remote root needing setup reports that state;
+the agent actions below can configure it. Checked-out or unowned sync branches, unsupported nested repositories
+and gitlinks are refused. Independently selected repository/worktree roots and non-repository roots are supported;
+non-repository roots use a private bare repository outside the working directory. Newly ignored snapshotted paths
+are blocked for selection review rather than silently removed from history.
+
+Remote commands use the existing SSH master only; a missing/dead master reports **login-needed**, without a new
+key/password/MFA login. Update hpclib on the cluster as well as locally. The helper uses Python 3.6+ and
+SHA-1 Git supporting the tested plumbing commands (validated on Git 2.52 and 2.54).
+Version 1.14.7 transfers objects using native Git fetch/push over that same cached SSH master. Git negotiates
+missing objects and streams pack data; normal sync no longer uses JSON/base64 bundles or their 128 MiB limit.
+Fetch updates only the owned remote-tracking ref, and push stages only the owned incoming-run ref. Transfers
+do not apply working files. Existing named remotes, configuration, HEAD, ordinary indexes and FETCH_HEAD remain
+unchanged. Legacy explicit bundle RPCs retain their old cap for older clients; the new manager never falls back
+to them. Update both ends to 1.14.8 and restart the console and REST tunnel.
+
+Native pack operations and working-file application share each endpoint's directory lock. A shared per-root
+apply record also blocks a different group/private repository from bypassing an unfinished apply. Only retrying
+the same owning group/plan/candidate can reconcile it. This strengthens recovery coordination; it does not add
+multiple-computer registration, shared identity resolution or coordinator handoff.
+First snapshots start independent sync history; ordinary main-branch history is neither rewritten nor exported.
+No extra tunnel, container, service, scheduler job or third-party Python dependency is required for production sync.
 
 **Agent sync context actions.** Data transfer also declares permanent cluster-side actions, independent of
 the SMB login. Enable Data transfer under the cluster's **Agents → Tunnel actions** settings. Inspection
